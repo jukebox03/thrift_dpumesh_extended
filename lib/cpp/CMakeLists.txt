@@ -51,6 +51,9 @@ set( thriftcpp_SOURCES
    src/thrift/transport/TServerSocket.cpp
    src/thrift/transport/TTransportUtils.cpp
    src/thrift/transport/TBufferTransports.cpp
+   src/thrift/transport/dpumesh_shm.c
+   src/thrift/transport/TDpumeshTransport.cpp
+   src/thrift/transport/TDpumeshServerTransport.cpp
    src/thrift/server/TConnectedClient.cpp
    src/thrift/server/TServerFramework.cpp
    src/thrift/server/TSimpleServer.cpp
