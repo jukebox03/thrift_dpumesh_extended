@@ -1,5 +1,61 @@
-Apache Thrift
-=============
+Apache Thrift + DPUmesh Transport
+==================================
+
+This is a modified version of Apache Thrift **0.12.0** with an additional
+**DPUmesh shared-memory transport layer** for the C++ library.
+DPUmesh enables zero-copy IPC via shared memory buffers (`/dev/shm/`),
+designed for high-performance communication between DPU and host services.
+
+DPUmesh Quick Start
+-------------------
+
+### Build
+
+DPUmesh files are already integrated into the CMake build. Build as usual:
+
+```bash
+mkdir build && cd build
+cmake ..
+make
+```
+
+### Server-side Usage (C++)
+
+Replace the standard TCP server transport with `TDpumeshServerTransport`:
+
+```cpp
+#include <thrift/transport/TDpumeshServerTransport.h>
+#include <thrift/transport/TDpumeshTransport.h>
+
+// Create server transport (app_name, worker_id)
+auto serverTransport = std::make_shared<TDpumeshServerTransport>("myapp", 0);
+
+// Use with any Thrift server (TSimpleServer, TThreadedServer, etc.)
+TSimpleServer server(processor, serverTransport, transportFactory, protocolFactory);
+server.serve();
+```
+
+### Environment Variables
+
+- `SHM_PREFIX` : prefix for shared memory files (default: `dpumesh`)
+
+### SHM Layout
+
+```
+/dev/shm/{SHM_PREFIX}_{app_name}_tx_body    # TX buffer pool (64 x 1MB slots)
+/dev/shm/{SHM_PREFIX}_{app_name}_rx_body    # RX buffer pool (64 x 1MB slots)
+/dev/shm/{SHM_PREFIX}_pod_{id}_tx_sq        # TX descriptor ring
+/dev/shm/{SHM_PREFIX}_pod_{id}_rx_sq        # RX descriptor ring
+/dev/shm/{SHM_PREFIX}_pod_registry          # Pod registry (JSON)
+```
+
+### Added Files
+
+- `lib/cpp/src/thrift/transport/dpumesh_shm.h / .c` — low-level SHM infrastructure
+- `lib/cpp/src/thrift/transport/TDpumeshTransport.h / .cpp` — per-request transport
+- `lib/cpp/src/thrift/transport/TDpumeshServerTransport.h / .cpp` — server transport
+
+---
 
 Introduction
 ============
