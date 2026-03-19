@@ -390,13 +390,29 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)calloc(1, sizeof(dpumesh_ctx_t));
     if (!ctx) return -1;
 
-    /* Resolve config: use provided values or defaults */
-    ctx->num_slots = (config && config->num_slots > 0)
-        ? config->num_slots : DPUMESH_NUM_SLOTS_DEFAULT;
-    ctx->slot_size = (config && config->slot_size > 0)
-        ? config->slot_size : DPUMESH_SLOT_SIZE_DEFAULT;
-    ctx->max_descriptors = (config && config->max_descriptors > 0)
-        ? config->max_descriptors : DPUMESH_MAX_DESCRIPTORS_DEFAULT;
+    /* Resolve config: provided value > env var > compiled default */
+    const char *env_val;
+
+    if (config && config->num_slots > 0)
+        ctx->num_slots = config->num_slots;
+    else if ((env_val = getenv("DPUMESH_NUM_SLOTS")) != NULL && atoi(env_val) > 0)
+        ctx->num_slots = atoi(env_val);
+    else
+        ctx->num_slots = DPUMESH_NUM_SLOTS_DEFAULT;
+
+    if (config && config->slot_size > 0)
+        ctx->slot_size = config->slot_size;
+    else if ((env_val = getenv("DPUMESH_SLOT_SIZE")) != NULL && atoi(env_val) > 0)
+        ctx->slot_size = atoi(env_val);
+    else
+        ctx->slot_size = DPUMESH_SLOT_SIZE_DEFAULT;
+
+    if (config && config->max_descriptors > 0)
+        ctx->max_descriptors = config->max_descriptors;
+    else if ((env_val = getenv("DPUMESH_MAX_DESCRIPTORS")) != NULL && atoi(env_val) > 0)
+        ctx->max_descriptors = atoi(env_val);
+    else
+        ctx->max_descriptors = DPUMESH_MAX_DESCRIPTORS_DEFAULT;
 
     snprintf(ctx->app_name, sizeof(ctx->app_name), "%s", app_name);
 
