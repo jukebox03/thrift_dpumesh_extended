@@ -18,12 +18,21 @@ extern "C" {
 #include <stdint.h>
 #include <stddef.h>
 
-/* ====== Constants (must match common.py) ====== */
-#define DPUMESH_SLOT_SIZE       (1024 * 1024)   /* 1MB */
-#define DPUMESH_NUM_SLOTS       64
-#define DPUMESH_DESCRIPTOR_SIZE 64
-#define DPUMESH_MAX_DESCRIPTORS 512
-#define DPUMESH_SHM_PREFIX_DEFAULT "dpumesh"
+/* ====== Default constants (must match common.py) ====== */
+#define DPUMESH_SLOT_SIZE_DEFAULT       (1024 * 1024)   /* 1MB */
+#define DPUMESH_NUM_SLOTS_DEFAULT       64
+#define DPUMESH_DESCRIPTOR_SIZE         64
+#define DPUMESH_MAX_DESCRIPTORS_DEFAULT 512
+#define DPUMESH_SHM_PREFIX_DEFAULT      "dpumesh"
+
+/* ====== Configuration ====== */
+typedef struct {
+    int num_slots;        /* slots per pool (0 = use default 64) */
+    int slot_size;        /* bytes per slot (0 = use default 1MB) */
+    int max_descriptors;  /* descriptor ring capacity (0 = use default 512) */
+} dpumesh_config_t;
+
+#define DPUMESH_CONFIG_DEFAULT { 0, 0, 0 }
 
 /* Flags (match Python CaseFlag, OpFlag) */
 #define CASE_EXTERNAL  1
@@ -64,8 +73,12 @@ typedef struct __attribute__((packed)) {
 typedef struct dpumesh_ctx dpumesh_ctx_t;
 
 /* ====== Lifecycle ====== */
-int  dpumesh_init(dpumesh_ctx_t **ctx, const char *app_name, int worker_id);
+int  dpumesh_init(dpumesh_ctx_t **ctx, const char *app_name, int worker_id,
+                  const dpumesh_config_t *config);  /* NULL = use defaults */
 void dpumesh_destroy(dpumesh_ctx_t *ctx);
+
+/* ====== Query configured values ====== */
+int dpumesh_get_slot_size(dpumesh_ctx_t *ctx);
 
 /* ====== Info ====== */
 int         dpumesh_get_notify_fd(dpumesh_ctx_t *ctx);

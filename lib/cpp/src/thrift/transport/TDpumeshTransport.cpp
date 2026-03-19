@@ -6,6 +6,7 @@
 #include <thrift/transport/TTransportException.h>
 #include <cstring>
 #include <algorithm>
+#include <string>
 
 namespace apache {
 namespace thrift {
@@ -67,6 +68,15 @@ void TDpumeshTransport::write(const uint8_t *buf, uint32_t len) {
 
 void TDpumeshTransport::flush() {
     if (write_buf_.empty()) return;
+
+    /* Check slot size limit */
+    int slot_size = dpumesh_get_slot_size(ctx_);
+    if (static_cast<int>(write_buf_.size()) > slot_size) {
+        throw TTransportException(TTransportException::INTERNAL_ERROR,
+                                  "DPUmesh write exceeds slot size ("
+                                  + std::to_string(write_buf_.size()) + " > "
+                                  + std::to_string(slot_size) + ")");
+    }
 
     /* Allocate TX slot */
     int tx_slot = dpumesh_tx_alloc(ctx_);

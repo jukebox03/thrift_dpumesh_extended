@@ -49,14 +49,15 @@ typedef struct {
     void   *mm;
 } buffer_pool_t;
 
-static int bp_init(buffer_pool_t *bp, const char *name, int create) {
+static int bp_init(buffer_pool_t *bp, const char *name, int create,
+                   int num_slots, int slot_size) {
     memset(bp, 0, sizeof(*bp));
     snprintf(bp->name, sizeof(bp->name), "%s", name);
     snprintf(bp->shm_path, sizeof(bp->shm_path), "/dev/shm/%s_%s",
              shm_prefix(), name);
     snprintf(bp->lock_path, sizeof(bp->lock_path), "%s.lock", bp->shm_path);
-    bp->num_slots = DPUMESH_NUM_SLOTS;
-    bp->slot_size = DPUMESH_SLOT_SIZE;
+    bp->num_slots = num_slots;
+    bp->slot_size = slot_size;
     bp->total_size = bp->num_slots + ((size_t)bp->num_slots * bp->slot_size);
     bp->shm_fd = -1;
     bp->mm = MAP_FAILED;
@@ -158,13 +159,14 @@ typedef struct {
     void   *mm;
 } desc_ring_t;
 
-static int dr_init(desc_ring_t *dr, const char *name, int create) {
+static int dr_init(desc_ring_t *dr, const char *name, int create,
+                   int max_descs) {
     memset(dr, 0, sizeof(*dr));
     snprintf(dr->name, sizeof(dr->name), "%s", name);
     snprintf(dr->shm_path, sizeof(dr->shm_path), "/dev/shm/%s_%s",
              shm_prefix(), name);
     snprintf(dr->lock_path, sizeof(dr->lock_path), "%s.lock", dr->shm_path);
-    dr->max_descs = DPUMESH_MAX_DESCRIPTORS;
+    dr->max_descs = max_descs;
     dr->total_size = 12 + (dr->max_descs * DPUMESH_DESCRIPTOR_SIZE);
     dr->shm_fd = -1;
     dr->mm = MAP_FAILED;
@@ -339,6 +341,11 @@ struct dpumesh_ctx {
     pthread_t   poller_tid;
     volatile int poller_running;
 
+    /* resolved config */
+    int         num_slots;
+    int         slot_size;
+    int         max_descriptors;
+
     buffer_pool_t tx_pool;          /* TX body */
     buffer_pool_t rx_pool;          /* RX body */
     desc_ring_t   tx_sq;
@@ -378,9 +385,18 @@ static void *dpumesh_poller_fn(void *arg) {
  * Public API Implementation
  * ==================================================================== */
 
-int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num) {
+int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
+                 const dpumesh_config_t *config) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)calloc(1, sizeof(dpumesh_ctx_t));
     if (!ctx) return -1;
+
+    /* Resolve config: use provided values or defaults */
+    ctx->num_slots = (config && config->num_slots > 0)
+        ? config->num_slots : DPUMESH_NUM_SLOTS_DEFAULT;
+    ctx->slot_size = (config && config->slot_size > 0)
+        ? config->slot_size : DPUMESH_SLOT_SIZE_DEFAULT;
+    ctx->max_descriptors = (config && config->max_descriptors > 0)
+        ? config->max_descriptors : DPUMESH_MAX_DESCRIPTORS_DEFAULT;
 
     snprintf(ctx->app_name, sizeof(ctx->app_name), "%s", app_name);
 
@@ -397,17 +413,19 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num) {
     /* Create service buffer pools (body only) */
     char name[128];
     snprintf(name, sizeof(name), "%s_tx_body", app_name);
-    if (bp_init(&ctx->tx_pool, name, 1) < 0) goto fail;
+    if (bp_init(&ctx->tx_pool, name, 1, ctx->num_slots, ctx->slot_size) < 0)
+        goto fail;
 
     snprintf(name, sizeof(name), "%s_rx_body", app_name);
-    if (bp_init(&ctx->rx_pool, name, 1) < 0) goto fail;
+    if (bp_init(&ctx->rx_pool, name, 1, ctx->num_slots, ctx->slot_size) < 0)
+        goto fail;
 
     /* Create worker SQs */
     snprintf(name, sizeof(name), "pod_%d_tx_sq", ctx->pod_id);
-    if (dr_init(&ctx->tx_sq, name, 1) < 0) goto fail;
+    if (dr_init(&ctx->tx_sq, name, 1, ctx->max_descriptors) < 0) goto fail;
 
     snprintf(name, sizeof(name), "pod_%d_rx_sq", ctx->pod_id);
-    if (dr_init(&ctx->rx_sq, name, 1) < 0) goto fail;
+    if (dr_init(&ctx->rx_sq, name, 1, ctx->max_descriptors) < 0) goto fail;
 
     /* Create notification pipe + poller thread */
     int pfd[2];
@@ -424,8 +442,10 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num) {
     if (pthread_create(&ctx->poller_tid, NULL, dpumesh_poller_fn, ctx) != 0)
         goto fail;
 
-    printf("[dpumesh] initialized: worker=%s pod_id=%d app=%s\n",
-           ctx->worker_id, ctx->pod_id, ctx->app_name);
+    printf("[dpumesh] initialized: worker=%s pod_id=%d app=%s "
+           "slots=%d slot_size=%d max_desc=%d\n",
+           ctx->worker_id, ctx->pod_id, ctx->app_name,
+           ctx->num_slots, ctx->slot_size, ctx->max_descriptors);
 
     *out = ctx;
     return 0;
@@ -458,6 +478,10 @@ int dpumesh_get_pod_id(dpumesh_ctx_t *ctx) {
 
 const char *dpumesh_get_worker_id(dpumesh_ctx_t *ctx) {
     return ctx->worker_id;
+}
+
+int dpumesh_get_slot_size(dpumesh_ctx_t *ctx) {
+    return ctx->slot_size;
 }
 
 

@@ -16,6 +16,17 @@ TDpumeshServerTransport::TDpumeshServerTransport(const std::string &app_name, in
       worker_id_(worker_id),
       ctx_(nullptr),
       listening_(false) {
+    dpumesh_config_t def = DPUMESH_CONFIG_DEFAULT;
+    config_ = def;
+}
+
+TDpumeshServerTransport::TDpumeshServerTransport(const std::string &app_name, int worker_id,
+                                                   const dpumesh_config_t &config)
+    : app_name_(app_name),
+      worker_id_(worker_id),
+      config_(config),
+      ctx_(nullptr),
+      listening_(false) {
 }
 
 TDpumeshServerTransport::~TDpumeshServerTransport() {
@@ -25,7 +36,7 @@ TDpumeshServerTransport::~TDpumeshServerTransport() {
 void TDpumeshServerTransport::listen() {
     if (ctx_) return;  /* already initialized */
 
-    int rc = dpumesh_init(&ctx_, app_name_.c_str(), worker_id_);
+    int rc = dpumesh_init(&ctx_, app_name_.c_str(), worker_id_, &config_);
     if (rc < 0) {
         throw TTransportException(TTransportException::NOT_OPEN,
                                   "Failed to initialize DPUmesh SHM for " + app_name_);

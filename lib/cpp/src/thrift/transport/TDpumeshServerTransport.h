@@ -26,8 +26,11 @@ public:
     /**
      * @param app_name  Service name for SHM pool naming (e.g. "unique-id-service")
      * @param worker_id Worker number for pod registration
+     * @param config    Optional SHM configuration (0 values = use defaults)
      */
     TDpumeshServerTransport(const std::string &app_name, int worker_id);
+    TDpumeshServerTransport(const std::string &app_name, int worker_id,
+                            const dpumesh_config_t &config);
 
     ~TDpumeshServerTransport() override;
 
@@ -44,6 +47,7 @@ protected:
 private:
     std::string app_name_;
     int worker_id_;
+    dpumesh_config_t config_;
     dpumesh_ctx_t *ctx_;
     volatile bool listening_;
 };
