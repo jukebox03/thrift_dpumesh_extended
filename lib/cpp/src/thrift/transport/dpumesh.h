@@ -1,15 +1,13 @@
 /*
- * dpumesh_shm.h - DPUmesh SHM transport layer for Thrift
+ * dpumesh.h - DPUmesh transport public API for Thrift
  *
- * Stripped-down version of dpumesh.h: only SHM infrastructure
- * (BufferPool, DescriptorRing, PodRegistry) + raw buffer API.
- * No HTTP parsing, no header pools, no callbacks.
- *
- * Binary-compatible with Python dpumesh common.py SHM structures.
+ * Backend-agnostic header. The actual implementation (SHM or DOCA)
+ * is selected at library build time via -DWITH_DOCA=ON|OFF.
+ * Application code should include only this header.
  */
 
-#ifndef DPUMESH_SHM_H
-#define DPUMESH_SHM_H
+#ifndef DPUMESH_H
+#define DPUMESH_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,12 +16,12 @@ extern "C" {
 #include <stdint.h>
 #include <stddef.h>
 
-/* ====== Default constants (must match common.py) ====== */
+/* ====== Default constants ====== */
 #define DPUMESH_SLOT_SIZE_DEFAULT       (1024 * 1024)   /* 1MB */
 #define DPUMESH_NUM_SLOTS_DEFAULT       64
 #define DPUMESH_DESCRIPTOR_SIZE         64
 #define DPUMESH_MAX_DESCRIPTORS_DEFAULT 512
-#define DPUMESH_SHM_PREFIX_DEFAULT      "dpumesh"
+#define DPUMESH_PREFIX_DEFAULT          "dpumesh"
 
 /* ====== Configuration ====== */
 typedef struct {
@@ -116,4 +114,4 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc);
 }
 #endif
 
-#endif /* DPUMESH_SHM_H */
+#endif /* DPUMESH_H */

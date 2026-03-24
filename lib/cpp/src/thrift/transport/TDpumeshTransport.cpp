@@ -1,5 +1,5 @@
 /*
- * TDpumeshTransport.cpp - Thrift transport over DPUmesh SHM
+ * TDpumeshTransport.cpp - Thrift transport over DPUmesh
  */
 
 #include <thrift/transport/TDpumeshTransport.h>
@@ -85,7 +85,7 @@ void TDpumeshTransport::flush() {
                                   "DPUmesh TX pool full");
     }
 
-    /* Copy write buffer to TX SHM slot */
+    /* Copy write buffer to TX slot */
     uint8_t *tx_ptr = dpumesh_tx_buf(ctx_, tx_slot);
     if (!tx_ptr) {
         dpumesh_tx_free(ctx_, tx_slot);

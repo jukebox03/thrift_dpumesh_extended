@@ -1,0 +1,21 @@
+version: 25.07
+ 
+partitions:
+  PARTITION_1:
+    vhca_id: 0
+    EU_allocation:
+      - abs_EUs: 0-63
+      # - core: 1
+      #   num_EUs: 14
+      # - core: 2
+      #   num_EUs: 8
+    # groups:
+    #   - name: EU1
+    #     EUs:
+    #       - abs_EUs: 16,17,20-22
+    #       - core: 2
+    #         num_EUs: 1
+    #   - name: EU1_1
+    #     EUs:
+    #       - abs_EUs: 26-28
+ 

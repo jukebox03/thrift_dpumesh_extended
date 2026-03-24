@@ -8,7 +8,7 @@
  */
 
 #define _GNU_SOURCE
-#include "dpumesh_shm.h"
+#include "dpumesh.h"
 
 #include <stdio.h>
 #include <stdlib.h>

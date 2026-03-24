@@ -1,7 +1,7 @@
 /*
- * TDpumeshTransport.h - Thrift transport over DPUmesh SHM
+ * TDpumeshTransport.h - Thrift transport over DPUmesh
  *
- * Per-request transport: reads from one SHM RX buffer, writes to TX buffer.
+ * Per-request transport: reads from RX buffer, writes to TX buffer.
  * stream_id (req_id) maps request to response via the sidecar.
  */
 
@@ -13,7 +13,7 @@
 #include <cstdint>
 
 extern "C" {
-#include <thrift/transport/dpumesh_shm.h>
+#include <thrift/transport/dpumesh.h>
 }
 
 namespace apache {

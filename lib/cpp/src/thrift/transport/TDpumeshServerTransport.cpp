@@ -1,5 +1,5 @@
 /*
- * TDpumeshServerTransport.cpp - Thrift server transport over DPUmesh SHM
+ * TDpumeshServerTransport.cpp - Thrift server transport over DPUmesh
  */
 
 #include <thrift/stdcxx.h>
@@ -39,7 +39,7 @@ void TDpumeshServerTransport::listen() {
     int rc = dpumesh_init(&ctx_, app_name_.c_str(), worker_id_, &config_);
     if (rc < 0) {
         throw TTransportException(TTransportException::NOT_OPEN,
-                                  "Failed to initialize DPUmesh SHM for " + app_name_);
+                                  "Failed to initialize DPUmesh for " + app_name_);
     }
     listening_ = true;
     printf("[TDpumeshServerTransport] listening: app=%s pod_id=%d\n",

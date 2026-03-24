@@ -1,100 +1,292 @@
 # DPUmesh Thrift Transport — Plan
 
-## 1. 클라이언트 Transport 구현
+## 실행 아키텍처: CPU / DPU / DPA에서 무엇이 도는가
+
+### 전체 구조
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Host (x86_64 CPU)                                      │
+│                                                         │
+│  ┌─────────────────────────────────────────────┐        │
+│  │ UniqueIdService (Thrift application)         │        │
+│  │   TDpumeshServerTransport                    │        │
+│  │     └─ dpumesh_doca.c (libthrift.so에 포함)  │        │
+│  │          ├─ TX: DMA ring에 desc 쓰기         │        │
+│  │          ├─ RX: condvar 대기 (comch 콜백)    │        │
+│  │          └─ PE progress thread (폴링)        │        │
+│  └─────────────┬───────────────────────┬────────┘        │
+│                │ comch ctrl path       │ DMA              │
+│                │ (RX: DPU→Host)        │ (TX: Host→DPU)   │
+│                ▼                       ▼                  │
+│           PCI 94:00.0 (ConnectX-7/BF3)                   │
+└─────────────────────────────────────────────────────────┘
+                         │ PCIe
+┌─────────────────────────────────────────────────────────┐
+│  DPU (BlueField-3, ARM aarch64)                         │
+│                                                         │
+│  ┌─────────────────────────────────────────────┐        │
+│  │ dpumesh_dpu (standalone binary)              │        │
+│  │   dpu_main.c → run_dpu_worker()              │        │
+│  │     ├─ comch server 시작 (Host client 대기)  │        │
+│  │     ├─ consumer datapath 초기화              │        │
+│  │     ├─ DPA 커널/스레드 초기화                │        │
+│  │     ├─ Host mmap export 수신 대기            │        │
+│  │     └─ 메인 루프: doca_pe_progress() 폴링    │        │
+│  └─────────────┬────────────────────────────────┘        │
+│                │ DPA thread 관리                          │
+│                ▼                                         │
+│  ┌─────────────────────────────────────────────┐        │
+│  │ DPA (Data Path Accelerator, HW thread)       │        │
+│  │   dpa_kernel.c → run_dma_manager()           │        │
+│  │     ├─ Host DMA ring 폴링 (desc.valid 감시)  │        │
+│  │     ├─ DMA copy 실행 (Host→DPU 메모리)       │        │
+│  │     └─ completion msg → Host consumer로 전송  │        │
+│  └──────────────────────────────────────────────┘        │
+│                                                         │
+│  PCI 03:00.0 (ConnectX-7, DPU측)                        │
+└─────────────────────────────────────────────────────────┘
+```
+
+### CPU (Host, x86_64)에서 도는 코드
+
+| 프로세스 | 파일 | 역할 |
+|----------|------|------|
+| UniqueIdService | `TDpumeshServerTransport.cpp` | Thrift 서버: accept → read → process → write |
+| (same) | `TDpumeshTransport.cpp` | 개별 연결 래퍼: read/write/flush |
+| (same) | `dpumesh_doca.c` | DOCA 백엔드: TX(DMA ring), RX(comch condvar), PE thread |
+| (same) | `doca/comch_client.c` | comch control path 클라이언트 (DPU 서버에 연결) |
+| (same) | `doca/comch_producer.c` | comch datapath producer (DPA msgq로 DMA 요청 전달) |
+| (same) | `doca/comch_consumer.c` | comch datapath consumer (DMA completion 수신) |
+| (same) | `doca/dpa.c` | DPA 객체 초기화 (Host측, thread/app/buf_arr 생성) |
+| (same) | `doca/dma.c` | DMA ring 설정, DMA 요청 메시지 구성 |
+| PE thread | `dpumesh_doca.c:pe_progress_fn()` | `doca_pe_progress()` 1µs 폴링, comch 콜백 구동 |
+
+빌드: `cmake -DWITH_DOCA=ON && make` → `libthrift.so`에 포함됨
+
+### DPU (BlueField-3, ARM aarch64)에서 도는 코드
+
+| 프로세스 | 파일 | 역할 |
+|----------|------|------|
+| dpumesh_dpu | `doca/dpu_main.c` | 진입점: 로깅, argp, 디바이스 open, rep open |
+| (same) | `doca/dpu_worker.c` | 워커: comch server → consumer → DPA init → PE 폴링 루프 |
+| (same) | `doca/config.c` | `-p`/`-r` PCI 주소 파싱 (doca_argp) |
+| (same) | `doca/comch_server.c` | comch control path 서버 (Host client 연결 수락) |
+| (same) | `doca/comch_consumer.c` | Host producer 메시지 수신 |
+| (same) | `doca/comch_producer.c` | Host consumer로 DMA completion 전송 |
+| (same) | `doca/dpa.c` | DPA 커널/스레드 생성, buf_arr 설정, DPA 실행 |
+
+빌드: `meson setup builddir && ninja -C builddir` (DPU에서 직접, DPACC 포함)
+실행: `./dpumesh_dpu -p 03:00.0 -r 94:00.0`
+
+### DPA (Data Path Accelerator, HW thread)에서 도는 코드
+
+| 함수 | 파일 | 역할 |
+|------|------|------|
+| `run_dma_manager()` | `doca/device/dpa_kernel.c` | DMA ring 폴링 → DMA copy → completion msg 전송 |
+| `thread_init_rpc()` | `doca/device/dpa_kernel.c` | DPA 스레드 초기화 RPC (consumer ack) |
+| `poll_desc_ring()` | `doca/device/dpa_kernel.c` | Host 메모리의 dma_desc ring 감시, valid=1이면 DMA 실행 |
+| `handle_msgs()` | `doca/device/dpa_kernel.c` | DPU→DPA comch 메시지 처리 (DMA 요청 등) |
+
+빌드: `build_dpacc.sh` → DPACC 컴파일러 → `dpa_kernel.a` (meson setup 시 자동 실행)
+실행: DPU worker가 `doca_dpa_thread_run()`으로 기동, 이후 HW에서 자율 실행
+
+### 데이터 흐름
+
+```
+[TX: Host→DPU]
+  App flush() → dpumesh_enqueue() → DMA ring에 desc 쓰기 (valid=1)
+  → DPA poll_desc_ring()이 감지 → doca_dpa_dev_comch_producer_dma_copy() 실행
+  → DPU 메모리로 DMA 완료 → completion msg → Host consumer 콜백
+
+[RX: DPU→Host] (임시, comch control path)
+  DPU에서 server_send_rx_data() → comch control path msg 전송
+  → Host comch client 콜백 → rx_data_hook() → RX buffer에 body 복사
+  → descriptor queue push → condvar signal
+  → App dpumesh_dequeue()에서 깨어남 → dpumesh_rx_buf()로 데이터 읽기
+```
+
+
+---
+
+## 1. 클라이언트 Transport 구현 — ❌ 미완료
 
 현재 서버 측(TDpumeshServerTransport + TDpumeshTransport)만 구현되어 있음.
 서비스 간 호출 체인(ComposePost → UniqueId 등)은 여전히 TCP(TSocket) 사용 중.
 
-### 해결해야 할 핵심 문제: 응답 매칭
+### 응답 매칭: condvar 방식 (결정됨)
 
-요청을 보낸 뒤 그에 대한 응답을 어떻게 매칭해서 받을 것인가.
-
-- `req_id` 필드가 이미 descriptor에 존재 (HTTP/2의 stream_id와 같은 역할)
-- `OP_REQUEST`/`OP_RESPONSE` flags로 요청/응답 구분 가능
-- 부족한 것: req_id → 대기 스레드 전달 메커니즘
-
-### 후보 방식
-
-| 방식 | 설명 | 장단점 |
-|---|---|---|
-| condvar (HTTP/2 스타일) | `map<req_id, {desc, cond, ready}>`, poller가 응답 도착 시 `cond_signal` | fd 불필요, 가벼움, thrift blocking 모델에 적합 |
-| pipe (mini_ms 방식) | per-request pipe fd, poller가 pipe에 write | libevent 통합 가능, fd 자원 소모 |
-
-dpu_daemon.py에서 이미 `threading.Event` 기반으로 동일 패턴 구현 검증됨.
-
-### 구현 시 고려사항
-
-- poller thread에서 OP_REQUEST/OP_RESPONSE 분류 로직 추가 필요
-  - 현재는 rx_sq에 오는 것이 전부 요청이라고 가정
-  - 클라이언트 역할도 하면 응답도 섞여 들어옴
-- 별도 클래스(TDpumeshClientTransport) vs 기존 클래스에 생성자 추가
-  - 서버/클라이언트의 read()/write() 동작이 상당히 다름
-  - 서버: 데이터가 이미 SHM에 있어서 즉시 읽기
-  - 클라이언트: 요청 보낸 뒤 응답 대기 필요
-- 구현할 메서드: open(), write(), flush(), read(), close(), isOpen()
-
-
-## 2. TNonblockingServer 호환
-
-### 문제
-
-TNonblockingServer는 TServerFramework를 상속하지 않고 TServer를 직접 상속.
-별도 인터페이스(TNonblockingServerTransport)를 사용하며, TSocket을 강제함.
+- `req_id` 필드로 요청/응답 매칭 (HTTP/2의 stream_id와 같은 역할)
+- `OP_REQUEST`/`OP_RESPONSE` flags로 요청/응답 구분
 
 ```
-TServerTransport::acceptImpl()              → shared_ptr<TTransport>  (범용)
-TNonblockingServerTransport::acceptImpl()   → shared_ptr<TSocket>     (TSocket 강제)
+poller thread:  rx_sq에서 desc 꺼냄 (64B) → flags 확인
+                  OP_REQUEST  → 기존 서버 처리 경로 (notify pipe)
+                  OP_RESPONSE → pending_[req_id].desc에 복사 (64B) → cv.notify_one()
+
+client thread:  요청 전송 → cv.wait() → 깨어남 → desc.body_buf_slot으로 SHM 직접 읽기 (zero-copy)
 ```
 
-TNonblockingServer 내부가 TSocket에 직접 의존하는 지점 3곳:
-1. `serverSocket_ = serverTransport_->getSocketFD()` — listen fd를 libevent에 등록
-2. `event_set(&event_, tSocket_->getSocketFD(), ...)` — 개별 연결 fd를 libevent에 등록
-3. `tSocket_->read()/write()` — workSocket()에서 fd 기반 recv/send
+### 구현 계획
 
-### 선택지
+- `TDpumeshClientTransport.h/cpp` 별도 클래스 (서버/클라이언트 read/write 동작이 다름)
+  - 구현할 메서드: open(), write(), flush(), read(), close(), isOpen()
+- `dpumesh_shm.c`에 condvar 기반 응답 매칭 추가 (순수 C 유지)
+  - `pending_entry_t` 배열 (크기 = NUM_SLOTS, pthread_mutex/cond 사용)
+  - poller thread에서 OP_REQUEST/OP_RESPONSE 분류 로직 추가
 
-#### A. Pipe 브릿지 (Thrift 코어 수정 없음)
 
-- SHM 데이터를 socketpair으로 복사 → TSocket(fd)에 감싸서 반환
-- 장점: Thrift 코어 수정 없음
-- 단점: zero-copy 장점 사라짐, 브릿지 스레드 복잡도
+## 2. TNonblockingServer 호환 — 보류
 
-#### B. 인터페이스 일반화 (Thrift 코어 수정)
-
-- `acceptImpl()` 반환 타입을 TSocket → TTransport로 변경
-- `workSocket()`에서 tSocket_->read() → tTransport_->read()로 변경
-- 장점: zero-copy 유지, 올바른 추상화
-- 단점: TNonblockingServer.h/.cpp, TNonblockingServerTransport.h, TTransport.h 수정 필요
-- 가장 어려운 지점: libevent는 fd를 감시하는 구조인데 dpumesh 개별 연결은 fd가 없음
-
-#### C. TNonblockingServer 지원 안 함
+### 결정: C. TNonblockingServer 지원 안 함
 
 - dpumesh에서는 데이터가 한 번에 도착 → NonBlocking의 "조금씩 읽기" 패턴 불필요
 - SHM slot 수(64개)가 동시 연결 상한 → 수천 연결 관리의 이점 없음
-- 장점: 수정 없음
-- 단점: transport layer 모듈로서 범용성 부족
-
-### 결정 시 고려할 질문
-
-1. TNonblockingServer를 dpumesh와 함께 사용할 실제 시나리오가 있는가?
-2. B를 선택할 경우, 개별 연결의 libevent 등록을 어떻게 처리할 것인가?
-3. Thrift 코어 수정의 유지보수 부담을 감수할 것인가?
+- TThreadedServer 사용으로 충분
 
 
-## 3. Python common.py 상수 동기화
+---
 
-C 코드(dpumesh_shm.h)에서 configurable하게 바꿨지만, Python 쪽(common.py)은 하드코딩:
+## 3. DOCA 백엔드 통합
 
-```python
-SLOT_SIZE = 1024 * 1024      # 고정
-NUM_SLOTS = 64               # 고정
-MAX_DESCRIPTORS = 512        # 고정
+### 환경
+
+- Host: Linux 5.15, x86_64, BF3 PCI `94:00.0`, DOCA SDK 3.1.0
+- DPU: Ubuntu 22.04, aarch64, PCI `03:00.0`, DOCA SDK 3.1.0105
+- DPU 접속: `ssh jukebox@192.168.100.2` (tmfifo_net0도 가능하나 192.168.100.2 사용)
+- DPU에 외부 인터넷 없음 (DNS resolve 불가, 패키지 설치 시 Host 경유 필요)
+- DPU에 cmake 없음, meson 0.61.2 + ninja 1.10.1 사용
+
+### 완료된 작업
+
+#### Part 1: DOCA 인프라 코드 통합 — ✅ 완료
+
+- `DPUMesh_doca/DPUMesh/` → `lib/cpp/src/thrift/transport/doca/` 복사 + 수정
+- `dpa_common.h` 수정: `comch_dma_comp_msg`에 `req_id`, `src_pod_id` 필드 추가
+
+#### Part 2: 통합 공개 API (`dpumesh.h`) — ✅ 완료
+
+- `dpumesh_doca.h`, `dpumesh_shm.h` → `dpumesh.h`로 통합
+- 애플리케이션 코드는 `dpumesh.h`만 include (SHM/DOCA 모름)
+
+#### Part 3: dpumesh_doca.c 구현 (TX + RX) — ✅ 완료
+
+- TX: DMA ring 기반 (Host→DPU)
+- RX: comch control path 임시 구현 (DPU→Host), condvar 기반
+
+#### Part 4: comch RX 메시지 프로토콜 — ✅ 완료
+
+- `DMESH_MSG_RX_DATA` 메시지 타입, `server_send_rx_data()`, `rx_data_hook()`
+
+#### Part 5: DPU 바이너리 — ✅ 완료 (코드 + 빌드)
+
+- `dpu_main.c`, `dpu_worker.c`, `config.c` 작성
+- CMakeLists.txt: `dpumesh_dpu` 타겟 (`EXCLUDE_FROM_ALL`)
+- meson.build 작성 (DPU cmake 없어서 meson 사용)
+- **DPU에서 빌드 성공** (meson + DPACC → `dpumesh_dpu` aarch64 ELF, 388K)
+- **DPU에서 실행 확인** (`./dpumesh_dpu -p 03:00.0 -r 94:00.0` → DPU worker 시작 로그)
+
+#### Part 6: CMakeLists.txt (Host) — ✅ 완료
+
+- `WITH_DOCA` 옵션, 조건부 소스, DOCA pkg-config 링크
+- Host 빌드 성공 확인
+
+#### Part 7: 배포 인프라 — ✅ 완료 (코드 작성)
+
+- `Dockerfile.uniqueid`: `WITH_DOCA` arg
+- `deploy-dpumesh.sh`: `--doca` 플래그
+- `UniqueIdService/CMakeLists.txt`: thrift 라이브러리만 링크
+
+#### DPU 환경 확인 — ✅ 완료
+
+- DPU SSH 접속: `ssh jukebox@192.168.100.2` (키 인증)
+- DOCA SDK 3.1.0105 설치됨
+- DPACC (`/opt/mellanox/doca/tools/dpacc`) 존재
+- PCI: `03:00.0` (ConnectX-7), Host PF representor = `pf0hpf` (PCI `94:00.0`)
+- 빌드 도구: gcc 11.4.0, meson 0.61.2, ninja 1.10.1 (cmake 없음)
+- 시간 동기화 안 됨 (clock skew 주의, `find . -exec touch {} +`로 우회)
+
+#### K8s 환경 정리 — ✅ 완료
+
+- `social-network` namespace 삭제 (Terminating 상태에서 막힘 → 원인: metrics-server 죽음)
+- metrics-server apiservice 삭제로 해결
+- namespace finalizer 제거 → 삭제 완료
+
+### 남은 작업
+
+#### End-to-End 테스트 — ✅ 부분 완료 (2026-03-24)
+
+1. ✅ DPU에서 `dpumesh_dpu -p 03:00.0 -r 94:00.0` 백그라운드 실행
+2. ✅ Host에서 comch client 연결 테스트 (dpumesh_init → 성공)
+   - comch control path 연결
+   - datapath producer/consumer 초기화
+   - DPA 초기화 + DMA manager thread 기동
+   - Host mmap export 2건 수신 (ring 64KB + buffer 64MB)
+   - DPU worker main loop 진입
+3. ✅ TX path: `dpumesh_enqueue()` 성공 (DMA ring에 descriptor 쓰기)
+4. ❌ UniqueIdService DOCA 빌드 → Thrift RPC 호출 — 미완료
+
+#### deploy-dpumesh.sh DOCA 모드 완성 — ❌ 미완료
+
+- DPU 바이너리 자동 배포 (SSH + scp + 실행)
+- K8s pod에 `DPUMESH_PCI_ADDR` 환경변수 설정
+- K8s device plugin으로 BF3 PCI 디바이스 컨테이너 노출
+
+#### RX 경로 DMA 전환 — ❌ 미완료 (향후)
+
+현재 RX는 comch control path (임시). 향후 DMA 기반 RX로 전환.
+
+### 확인 필요 사항
+
+1. **rep PCI 주소**: ✅ 해결 (2026-03-24)
+   - **잘못된 값**: `-r 03:00.0` (DPU의 SF representor `en3f0pf0sf0`에 바인딩됨)
+   - **올바른 값**: `-r 94:00.0` (Host PF representor `pf0hpf`에 바인딩)
+   - DPU의 representor 목록 (`doca_caps --list-rep-devs`):
+     - `94:00.0` → `pf0hpf` (Host PF, **comch server가 바인딩해야 하는 대상**)
+     - `03:00.0` → `en3f0pf0sf0` (SF, 잘못 사용하면 Host client가 syndrome 0xe5300으로 거부됨)
+   - `-r 03:00.0`으로 서버 시작 시: 서버는 정상 시작되나 Host client의 devx object 생성을
+     firmware가 거부 (EREMOTEIO, syndrome=0xe5300, DOCA_ERROR_CONNECTION_ABORTED)
+   - `-r 94:00.0`으로 서버 시작 시: NVIDIA 공식 comch 샘플로 연결 성공 확인
+2. **dpa_program.a**: DPACC로 DPU에서 재빌드 성공 (meson setup 시 자동)
+3. **K8s PCI passthrough**: DOCA 디바이스를 컨테이너에서 접근하는 방식
+
+
+---
+
+## 파일 구조
+
 ```
+thrift_dpumesh_extended/lib/cpp/src/thrift/transport/
+├── dpumesh.h                     ← 통합 공개 API (SHM/DOCA 공통)
+├── dpumesh_doca.c                ← DOCA 백엔드 (Host, TX+RX)       [CPU]
+├── dpumesh_shm.c                 ← SHM 백엔드 (시뮬레이션)         [CPU]
+├── TDpumeshTransport.cpp/h       ← Thrift C++ 래퍼                [CPU]
+├── TDpumeshServerTransport.cpp/h ← Thrift 서버 래퍼               [CPU]
+└── doca/
+    ├── meson.build               ← DPU 바이너리 빌드 (meson)
+    ├── dpu_main.c                ← DPU 바이너리 진입점             [DPU]
+    ├── dpu_worker.c/h            ← DPU 워커 (blocking)            [DPU]
+    ├── config.c/h                ← argp 파싱                      [DPU]
+    ├── common.c/h                ← DOCA 디바이스 유틸              [CPU+DPU]
+    ├── object.c/h                ← struct objects (중앙 상태)      [CPU+DPU]
+    ├── buffer.c/h                ← mmap + 버퍼 관리               [CPU+DPU]
+    ├── ring.c/h                  ← DMA ring                      [CPU+DPU]
+    ├── comch_common.h            ← 메시지 타입 정의               [CPU+DPU]
+    ├── comch_client.c/h          ← comch 클라이언트               [CPU]
+    ├── comch_server.c/h          ← comch 서버                    [DPU]
+    ├── comch_consumer.c/h        ← comch datapath consumer       [CPU+DPU]
+    ├── comch_producer.c/h        ← comch datapath producer       [CPU+DPU]
+    ├── comch_msgq.c/h            ← DPA message queue             [CPU+DPU]
+    ├── dma.c/h                   ← DMA 유틸                      [CPU+DPU]
+    ├── dpa.c/h                   ← DPA 초기화/실행               [CPU+DPU]
+    ├── dpa_common.h              ← DPA 공유 구조체               [CPU+DPU+DPA]
+    ├── build_dpacc.sh            ← DPACC 빌드 스크립트
+    └── device/
+        ├── dpa_kernel.c          ← DPA 커널 소스                 [DPA]
+        └── dpa_program.a         ← DPA 커널 아카이브 (DPACC로 빌드)
 
-C에서 config로 기본값이 아닌 값을 넣으면 Python과 SHM 레이아웃이 불일치.
-
-### 후보 방식
-
-- 환경변수로 Python/C 양쪽에서 읽기
-- SHM 메타데이터 영역에 config 값을 써놓고 양쪽에서 참조
-- 기본값만 사용하도록 제한하고 문서화
+빌드 방법:
+  Host (CPU):  cmake -DWITH_DOCA=ON .. && make       → libthrift.so
+  DPU (ARM):   meson setup builddir && ninja -C builddir → dpumesh_dpu
+  DPA:         build_dpacc.sh (meson setup 시 자동)    → dpa_kernel.a
+```

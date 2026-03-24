@@ -1,8 +1,8 @@
 /*
- * TDpumeshServerTransport.h - Thrift server transport over DPUmesh SHM
+ * TDpumeshServerTransport.h - Thrift server transport over DPUmesh
  *
- * Replaces TServerSocket: initializes DPUmesh SHM and accepts connections
- * by dequeuing descriptors from the RX SQ.
+ * Replaces TServerSocket: initializes DPUmesh and accepts connections
+ * by dequeuing descriptors from the RX queue.
  */
 
 #ifndef _THRIFT_TRANSPORT_TDPUMESHSERVERTRANSPORT_H_
@@ -14,7 +14,7 @@
 #include <string>
 
 extern "C" {
-#include <thrift/transport/dpumesh_shm.h>
+#include <thrift/transport/dpumesh.h>
 }
 
 namespace apache {
@@ -24,9 +24,9 @@ namespace transport {
 class TDpumeshServerTransport : public TServerTransport {
 public:
     /**
-     * @param app_name  Service name for SHM pool naming (e.g. "unique-id-service")
+     * @param app_name  Service name (e.g. "unique-id-service")
      * @param worker_id Worker number for pod registration
-     * @param config    Optional SHM configuration (0 values = use defaults)
+     * @param config    Optional configuration (0 values = use defaults)
      */
     TDpumeshServerTransport(const std::string &app_name, int worker_id);
     TDpumeshServerTransport(const std::string &app_name, int worker_id,

@@ -20,6 +20,8 @@
 include_directories(SYSTEM "${Boost_INCLUDE_DIRS}")
 include_directories(src)
 
+option(WITH_DOCA "Build with NVIDIA DOCA DPUmesh backend" OFF)
+
 # SYSLIBS contains libraries that need to be linked to all lib targets
 set(SYSLIBS "")
 
@@ -51,7 +53,6 @@ set( thriftcpp_SOURCES
    src/thrift/transport/TServerSocket.cpp
    src/thrift/transport/TTransportUtils.cpp
    src/thrift/transport/TBufferTransports.cpp
-   src/thrift/transport/dpumesh_shm.c
    src/thrift/transport/TDpumeshTransport.cpp
    src/thrift/transport/TDpumeshServerTransport.cpp
    src/thrift/server/TConnectedClient.cpp
@@ -60,6 +61,27 @@ set( thriftcpp_SOURCES
    src/thrift/server/TThreadPoolServer.cpp
    src/thrift/server/TThreadedServer.cpp
 )
+
+# DPUmesh backend selection: DOCA (real hardware) or SHM (simulation)
+if(WITH_DOCA)
+    list(APPEND thriftcpp_SOURCES
+        src/thrift/transport/dpumesh_doca.c
+        src/thrift/transport/doca/common.c
+        src/thrift/transport/doca/object.c
+        src/thrift/transport/doca/buffer.c
+        src/thrift/transport/doca/ring.c
+        src/thrift/transport/doca/comch_common.c
+        src/thrift/transport/doca/comch_client.c
+        src/thrift/transport/doca/comch_server.c
+        src/thrift/transport/doca/comch_consumer.c
+        src/thrift/transport/doca/comch_producer.c
+        src/thrift/transport/doca/dma.c
+    )
+else()
+    list(APPEND thriftcpp_SOURCES
+        src/thrift/transport/dpumesh_shm.c
+    )
+endif()
 
 # These files don't work on Windows CE as there is no pipe support
 # TODO: These files won't work with UNICODE support on windows. If fixed this can be re-added.
@@ -163,6 +185,39 @@ set( thriftcppqt_SOURCES
     src/thrift/qt/TQTcpServer.cpp
 )
 
+# DOCA SDK libraries (when building with NVIDIA DOCA backend)
+if(WITH_DOCA)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(DOCA_COMMON REQUIRED doca-common)
+    pkg_check_modules(DOCA_COMCH REQUIRED doca-comch)
+    pkg_check_modules(DOCA_DPA REQUIRED doca-dpa)
+    pkg_check_modules(DOCA_ARGP REQUIRED doca-argp)
+
+    include_directories(SYSTEM
+        ${DOCA_COMMON_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/thrift/transport/doca
+    )
+    link_directories(${DOCA_COMMON_LIBRARY_DIRS} ${DOCA_COMCH_LIBRARY_DIRS} ${DOCA_DPA_LIBRARY_DIRS})
+    list(APPEND SYSLIBS ${DOCA_COMMON_LIBRARIES} ${DOCA_COMCH_LIBRARIES} ${DOCA_DPA_LIBRARIES})
+
+    add_definitions(-DDOCA_ALLOW_EXPERIMENTAL_API)
+
+    # DPA kernel program archive (architecture-specific, built by dpacc)
+    # On DPU (ARM): linked into dpumesh_dpu binary
+    # On Host (x86): not directly linkable (different ELF arch)
+    set(DPA_PROGRAM_A ${CMAKE_CURRENT_SOURCE_DIR}/src/thrift/transport/doca/device/dpa_program.a)
+
+    # DPU binary (built when WITH_DOCA=ON; runs on BF3 ARM when DOCA_ARCH_DPU defined)
+    add_executable(dpumesh_dpu EXCLUDE_FROM_ALL
+        src/thrift/transport/doca/dpu_main.c
+        src/thrift/transport/doca/dpu_worker.c
+        src/thrift/transport/doca/config.c
+    )
+    target_include_directories(dpumesh_dpu PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/thrift/transport/doca
+    )
+endif()
+
 # Contains the thrift specific ADD_LIBRARY_THRIFT and TARGET_LINK_LIBRARIES_THRIFT
 include(ThriftMacros)
 
@@ -171,6 +226,11 @@ if(WIN32)
     TARGET_LINK_LIBRARIES_THRIFT(thrift ${SYSLIBS} ws2_32)
 else()
     TARGET_LINK_LIBRARIES_THRIFT(thrift ${SYSLIBS})
+endif()
+
+# Link DPU binary against thrift library (must be after thrift target)
+if(WITH_DOCA)
+    target_link_libraries(dpumesh_dpu thrift ${SYSLIBS} ${DOCA_ARGP_LIBRARIES} ${DPA_PROGRAM_A})
 endif()
 
 if(WITH_LIBEVENT)
