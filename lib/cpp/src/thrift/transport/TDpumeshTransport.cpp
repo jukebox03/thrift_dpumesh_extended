@@ -20,6 +20,7 @@ TDpumeshTransport::TDpumeshTransport(dpumesh_ctx_t *ctx, const sw_descriptor_t &
       read_done_(false),
       rx_slot_(-1),
       flushed_(false),
+      tx_slot_(-1),
       stream_id_(desc.req_id),
       src_pod_id_(desc.src_pod_id),
       flags_(desc.flags) {
@@ -39,6 +40,10 @@ void TDpumeshTransport::close() {
     if (rx_slot_ >= 0) {
         dpumesh_rx_free(ctx_, rx_slot_);
         rx_slot_ = -1;
+    }
+    if (tx_slot_ >= 0) {
+        dpumesh_tx_free(ctx_, tx_slot_);
+        tx_slot_ = -1;
     }
     read_buf_ = nullptr;
     read_done_ = true;
@@ -120,6 +125,7 @@ void TDpumeshTransport::flush() {
                                   "DPUmesh TX SQ full");
     }
 
+    tx_slot_ = tx_slot;  /* freed in close() after DMA completes */
     write_buf_.clear();
     flushed_ = true;
 }

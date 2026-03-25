@@ -55,6 +55,7 @@ set( thriftcpp_SOURCES
    src/thrift/transport/TBufferTransports.cpp
    src/thrift/transport/TDpumeshTransport.cpp
    src/thrift/transport/TDpumeshServerTransport.cpp
+   src/thrift/transport/TDpumeshClientTransport.cpp
    src/thrift/server/TConnectedClient.cpp
    src/thrift/server/TServerFramework.cpp
    src/thrift/server/TSimpleServer.cpp
@@ -75,7 +76,9 @@ if(WITH_DOCA)
         src/thrift/transport/doca/comch_server.c
         src/thrift/transport/doca/comch_consumer.c
         src/thrift/transport/doca/comch_producer.c
+        src/thrift/transport/doca/comch_msgq.c
         src/thrift/transport/doca/dma.c
+        src/thrift/transport/doca/dpa.c
     )
 else()
     list(APPEND thriftcpp_SOURCES
@@ -230,7 +233,7 @@ endif()
 
 # Link DPU binary against thrift library (must be after thrift target)
 if(WITH_DOCA)
-    target_link_libraries(dpumesh_dpu thrift ${SYSLIBS} ${DOCA_ARGP_LIBRARIES} ${DPA_PROGRAM_A})
+    target_link_libraries(dpumesh_dpu thrift ${SYSLIBS} ${DOCA_ARGP_LIBRARIES} ${DPA_PROGRAM_A} ${DOCA_DPA_LIBRARIES} -L/opt/mellanox/flexio/lib -lflexio)
 endif()
 
 if(WITH_LIBEVENT)

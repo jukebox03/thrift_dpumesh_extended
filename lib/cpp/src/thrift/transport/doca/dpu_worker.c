@@ -9,16 +9,22 @@
 #include "buffer.h"
 #include "ring.h"
 #include "dma.h"
+#include "../dpumesh.h"
 
 #include <doca_log.h>
 #include <doca_dev.h>
 #include <doca_pe.h>
 
 #include <time.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 DOCA_LOG_REGISTER(DPU_WORKER);
 
 #define DPU_BUFFER_SIZE (1024 * 1024)
+
+/* ====== DPU Worker ====== */
 
 void
 run_dpu_worker(struct objects *objs)
@@ -29,7 +35,12 @@ run_dpu_worker(struct objects *objs)
 
     DOCA_LOG_INFO("Starting DPU worker");
 
-    /* 1. comch control path server */
+    /* Init pods table */
+    memset(objs->pods, 0, sizeof(objs->pods));
+    objs->num_pods = 0;
+    pthread_mutex_init(&objs->pods_lock, NULL);
+
+    /* 1. comch control path server (waits for first connection) */
     result = init_comch_ctrl_path_server("DPUMesh", objs, true);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to init comch control path server: %s",
@@ -38,7 +49,7 @@ run_dpu_worker(struct objects *objs)
         return;
     }
 
-    /* 2. comch datapath consumer */
+    /* 2. comch datapath consumer (for DPA → DPU messages) */
     result = init_comch_datapath_consumer(objs);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to init comch datapath consumer: %s",
@@ -47,7 +58,7 @@ run_dpu_worker(struct objects *objs)
         return;
     }
 
-    /* 3. DPA objects */
+    /* 3. DPA app init (shared) */
     result = init_dpa_objects(objs);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to init DPA objects: %s",
@@ -56,7 +67,7 @@ run_dpu_worker(struct objects *objs)
         return;
     }
 
-    /* 4. DPA thread */
+    /* 4. DPA thread create (shared, not run yet — started on first pod) */
     result = dmesh_doca_dpa_thread_create(objs->dpa_thread);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create DPA thread: %s",
@@ -65,7 +76,7 @@ run_dpu_worker(struct objects *objs)
         return;
     }
 
-    /* 5. comch DPA message queue */
+    /* 5. comch DPA message queue (shared) */
     result = init_comch_dpa_msgq(objs, objs->consumer_pe);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to init comch DPA msgq: %s",
@@ -74,60 +85,18 @@ run_dpu_worker(struct objects *objs)
         return;
     }
 
-    /* 6. Wait for Host ring mmap */
-    while (objs->ring_mmap == NULL) {
-        doca_pe_progress(objs->pe);
-    }
+    /* 6. No more blocking waits — per-pod DMA setup is event-driven.
+     *    When a pod's ring_mmap + remote_mmap arrive (via process_mmap_msg),
+     *    setup_pod_dma() is called automatically, which sets up buf_arr,
+     *    local DMA buffer, DPA ring info, and starts DPA thread on first pod. */
 
-    /* 7. Setup DPA buffer array with remote mmap */
-    result = setup_dpa_buf_array(objs, DMA_RING_SIZE, objs->ring_mmap);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to setup DPA buffer array: %s",
-                     doca_error_get_descr(result));
-        cleanup_objects(objs);
-        return;
-    }
+    DOCA_LOG_INFO("DPU worker initialized (event-based), entering main loop");
 
-    /* 8. Allocate local DMA buffer + PCI export */
-    result = alloc_buffer_and_set_mmap(&objs->local_mmap, objs->dev,
-                                       &objs->dma_buffer, DPU_BUFFER_SIZE,
-                                       DOCA_ACCESS_FLAG_PCI_READ_WRITE);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to allocate DMA buffer: %s",
-                     doca_error_get_descr(result));
-        cleanup_objects(objs);
-        return;
-    }
-
-    /* 9. Wait for Host remote mmap */
-    while (objs->remote_mmap == NULL) {
-        doca_pe_progress(objs->pe);
-    }
-
-    /* 10. Run DPA thread */
-    result = dmesh_doca_run_dpa_thread(objs, objs->dpa_thread, objs->dpa_comch);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to run DPA thread: %s",
-                     doca_error_get_descr(result));
-        cleanup_objects(objs);
-        return;
-    }
-
-    /* 11. Send initial DMA request to DPA */
-    result = send_dma_request_to_dpa(objs);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to send DMA request to DPA: %s",
-                     doca_error_get_descr(result));
-        cleanup_objects(objs);
-        return;
-    }
-
-    DOCA_LOG_INFO("DPU worker initialized, entering main loop");
-
-    /* Main loop: poll consumer PE */
+    /* Main loop: poll consumer PE + ctrl path PE */
     clock_gettime(CLOCK_MONOTONIC, &last);
     while (true) {
         doca_pe_progress(objs->consumer_pe);
+        doca_pe_progress(objs->pe);  /* handle new connections, REGISTER, TX_DATA */
 
         clock_gettime(CLOCK_MONOTONIC, &now);
         elapsed = (now.tv_sec - last.tv_sec) +
@@ -141,4 +110,5 @@ run_dpu_worker(struct objects *objs)
             last = now;
         }
     }
+
 }

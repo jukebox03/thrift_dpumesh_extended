@@ -63,25 +63,4 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_msgq.c.o: \
  /usr/include/x86_64-linux-gnu/asm/posix_types.h \
  /usr/include/x86_64-linux-gnu/asm/posix_types_64.h \
  /usr/include/asm-generic/posix_types.h \
- /opt/mellanox/doca/include/doca_comch_msgq.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa.h \
- /opt/mellanox/doca/include/doca_dpa.h \
- /usr/lib/gcc/x86_64-linux-gnu/11/include/stdarg.h \
- /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
- /opt/mellanox/doca/include/doca_ctx.h \
- /opt/mellanox/doca/include/doca_pe.h \
- /opt/mellanox/doca/include/doca_buf_array.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/object.h \
- /opt/mellanox/doca/include/doca_dev.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa_common.h \
- /opt/mellanox/doca/include/doca_mmap.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h \
- /opt/mellanox/doca/include/doca_log.h /usr/include/stdio.h \
- /usr/include/x86_64-linux-gnu/bits/types/__fpos_t.h \
- /usr/include/x86_64-linux-gnu/bits/types/__mbstate_t.h \
- /usr/include/x86_64-linux-gnu/bits/types/__fpos64_t.h \
- /usr/include/x86_64-linux-gnu/bits/types/__FILE.h \
- /usr/include/x86_64-linux-gnu/bits/types/FILE.h \
- /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
- /usr/include/x86_64-linux-gnu/bits/stdio_lim.h
+ /opt/mellanox/doca/include/doca_comch_msgq.h

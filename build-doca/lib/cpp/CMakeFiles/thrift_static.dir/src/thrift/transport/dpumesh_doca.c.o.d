@@ -65,6 +65,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: \
  /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
  /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
  /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
+ /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
  /opt/mellanox/doca/include/doca_log.h \
  /opt/mellanox/doca/include/doca_compat.h \
  /opt/mellanox/doca/include/doca_config.h \

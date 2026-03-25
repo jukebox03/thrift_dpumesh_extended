@@ -79,7 +79,19 @@ lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.o: \
  /opt/mellanox/doca/include/doca_buf_inventory.h \
  /opt/mellanox/doca/include/doca_mmap.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/object.h \
+ /usr/include/pthread.h /usr/include/sched.h \
+ /usr/include/x86_64-linux-gnu/bits/sched.h \
+ /usr/include/x86_64-linux-gnu/bits/types/struct_sched_param.h \
+ /usr/include/x86_64-linux-gnu/bits/cpu-set.h /usr/include/time.h \
+ /usr/include/x86_64-linux-gnu/bits/time.h \
+ /usr/include/x86_64-linux-gnu/bits/types/struct_tm.h \
+ /usr/include/x86_64-linux-gnu/bits/types/struct_itimerspec.h \
+ /usr/include/x86_64-linux-gnu/bits/setjmp.h \
+ /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
+ /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
+ /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
  /opt/mellanox/doca/include/doca_pe.h \
  /opt/mellanox/doca/include/doca_ctx.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.h
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.h \
+ /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h

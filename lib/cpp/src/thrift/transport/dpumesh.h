@@ -110,6 +110,25 @@ void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot);
 /* Enqueue a descriptor to TX SQ. Returns 0 on success, -1 on failure. */
 int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc);
 
+/* ====== Client-side API (request/response matching) ====== */
+
+/* Allocate a unique request ID (atomic, thread-safe). */
+uint32_t dpumesh_alloc_req_id(dpumesh_ctx_t *ctx);
+
+/* Register a pending entry for req_id (must call before enqueue).
+ * Returns 0 on success, -1 on failure. */
+int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
+
+/* Wait for a response matching req_id.
+ * Blocks up to timeout_ms (-1 = forever, 0 = non-blocking).
+ * On success, fills resp and returns 0. On timeout, returns -1.
+ * Caller must free resp->body_buf_slot via dpumesh_rx_free(). */
+int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
+                          sw_descriptor_t *resp, int timeout_ms);
+
+/* Cancel a pending entry (e.g. on error path). */
+void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
+
 #ifdef __cplusplus
 }
 #endif

@@ -17,6 +17,7 @@ enum dmesh_msg_type {
     DMESH_MSG_EXPORT_DESC = 1,
     DMESH_MSG_EXPORT_DPA_COMP = 2,
     DMESH_MSG_RX_DATA = 3,
+    DMESH_MSG_REGISTER = 4,      /* Host→DPU: register pod_id */
 };
 
 enum mmap_type {
@@ -54,6 +55,13 @@ struct dmesh_rx_data_msg {
 };
 /* Header overhead: 72 bytes, max body = max_msg_size - 72 */
 
+/* Host→DPU: register this connection's pod_id */
+struct dmesh_register_msg {
+    enum dmesh_msg_type type;   /* = DMESH_MSG_REGISTER */
+    int32_t pod_id;
+    char app_name[64];
+};
+
 struct dmesh_comch_msg {
     enum dmesh_msg_type type;
     union 
@@ -64,8 +72,10 @@ struct dmesh_comch_msg {
 };
 doca_error_t
 export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer, size_t buf_size, enum mmap_type mmap_type, enum msg_direction direction);
+struct doca_comch_connection;
 doca_error_t
-process_mmap_msg(struct objects *objs, struct dmesh_mmap_msg *mmap_msg);
+process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
+                 struct dmesh_mmap_msg *mmap_msg);
 doca_error_t
 process_dpa_comp_msg(struct objects *objs, struct dmesh_dpa_comp_msg *dpa_comp_msg);
 #endif // COMCH_COMMON_H

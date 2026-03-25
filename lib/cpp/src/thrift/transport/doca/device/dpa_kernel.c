@@ -121,67 +121,80 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
     // DOCA_DPA_DEV_LOG_INFO("Handled %u msgs from host\n", num_msgs);
 }
 
-static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
+/*
+ * Multi-ring round-robin polling.
+ * Polls all registered rings (one per pod) in a non-blocking fashion.
+ */
+static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
     struct comch_dma_comp_msg msg;
     doca_dpa_dev_uintptr_t dev_ptr;
     doca_dpa_dev_buf_t buf;
     struct dma_desc *desc;
-    int desc_idx = 0;
-    uint32_t ring_size = thread_arg->buf_arr_size;
-    uint32_t buf_size = thread_arg->buf_size;
 
-    buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
-    dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-    desc = (struct dma_desc *)dev_ptr;
+    uint32_t desc_idx[MAX_DPA_RINGS] = {0};  /* per-ring position */
+    uint32_t pos[MAX_DPA_RINGS] = {0};       /* per-ring DMA buffer position */
 
-    desc = (struct dma_desc *)dev_ptr;
-        while (!desc->valid) {
-            __dpa_thread_window_read_inv();
-        }
-
-    /* polling descriptor ring in host memory */
     while (1) {
-
-        // desc = (struct dma_desc *)dev_ptr;
-        // while (!desc->valid) {
-        //     __dpa_thread_window_read_inv();
-        // }
-
-        /* if consumer is empty, wait */
-        while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
-            DOCA_DPA_DEV_LOG_INFO("Consumer is empty, waiting for messages...\n");
+        uint32_t nr = thread_arg->num_rings;
+        if (nr == 0) {
+            /* No rings yet — spin wait for first pod */
+            __dpa_thread_window_read_inv();
+            continue;
         }
 
-        msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
-        msg.pos = thread_arg->pos;
-        msg.length = desc->size;
+        for (uint32_t r = 0; r < nr; r++) {
+            struct dpa_ring_info *ring = &thread_arg->rings[r];
 
-        if (thread_arg->pos +desc->size > buf_size) {
-            DOCA_DPA_DEV_LOG_INFO("Reached end of buffer, resetting position\n");
-        }
-        
-        doca_dpa_dev_comch_producer_dma_copy(producer,
-                                    /*consumer_id=*/1,
-                                    thread_arg->dpu_mmap,
-                                    thread_arg->src_addr + thread_arg->pos,
-                                    thread_arg->host_mmap,
-                                    desc->addr,
-                                    desc->size,
-                                    (uint8_t *)&msg,
-                                    sizeof(struct comch_dma_comp_msg),
-                                    DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS | 
-                                    DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+            /* Get descriptor at current ring index */
+            buf = doca_dpa_dev_buf_array_get_buf(ring->buf_arr, desc_idx[r]);
+            dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+            desc = (struct dma_desc *)dev_ptr;
 
-        thread_arg->pos += desc->size;
-        if (thread_arg->pos >= buf_size) {
-            thread_arg->pos = 0;
+            /* Non-blocking check: skip if not valid */
+            __dpa_thread_window_read_inv();
+            if (!desc->valid)
+                continue;
+
+            /* Wait for consumer space */
+            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
+            }
+
+            /* Build completion message with routing info */
+            msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
+            msg.pos = pos[r];
+            msg.length = desc->size;
+            msg.req_id = (uint32_t)desc->idx;
+            msg.src_pod_id = ring->pod_id;
+            msg.dst_pod_id = desc->dst_pod_id;
+            msg.flags = desc->flags;
+
+            /* DMA copy: Host buffer → DPU local buffer */
+            doca_dpa_dev_comch_producer_dma_copy(producer,
+                                        /*consumer_id=*/1,
+                                        ring->dpu_mmap,
+                                        ring->dpu_addr + pos[r],
+                                        ring->host_mmap,
+                                        desc->addr,
+                                        desc->size,
+                                        (uint8_t *)&msg,
+                                        sizeof(struct comch_dma_comp_msg),
+                                        DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
+                                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+
+            pos[r] += desc->size;
+            if (pos[r] >= ring->dpu_buf_size) {
+                pos[r] = 0;
+            }
+
+            /* Clear valid flag so host can reuse this slot */
+            desc->valid = 0;
+            __dpa_thread_window_writeback();
+
+            /* Advance to next ring slot */
+            desc_idx[r] = (desc_idx[r] + 1) % ring->buf_arr_size;
         }
-        
-        // desc_idx = (desc_idx + 1) % ring_size;
-        // buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
-        // dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
     }
 }
 
@@ -189,18 +202,8 @@ __dpa_global__ void hello_world(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
 
-    DOCA_DPA_DEV_LOG_INFO("DPA buffer array handle: 0x%lx\n", thread_arg->dpa_buf_arr);
-    doca_dpa_dev_buf_t buf = 0;
-    doca_dpa_dev_uintptr_t dev_ptr = 0;
-    uint64_t buf_len = 0;
-    uintptr_t addr = 0;
-    DOCA_DPA_DEV_LOG_INFO("buf arr: 0x%lx\n", thread_arg->dpa_buf_arr);
-    buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, 0);
-    dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-    buf_len = doca_dpa_dev_buf_get_len(buf);
-    addr = doca_dpa_dev_buf_get_addr(buf);
+    DOCA_DPA_DEV_LOG_INFO("hello_world: num_rings=%u\n", thread_arg->num_rings);
 
-    // handle_msgs(thread_arg);
     doca_dpa_dev_thread_reschedule();
 }
 
@@ -208,11 +211,9 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
 
-    DOCA_DPA_DEV_LOG_INFO("Starting DMA manager thread...\n");
-    DOCA_DPA_DEV_LOG_INFO("DPA buffer array handle: 0x%lx, size: %u\n", thread_arg->dpa_buf_arr, thread_arg->buf_arr_size);
-    DOCA_DPA_DEV_LOG_INFO("DPU mmap: %u, addr: %p host mmap: %u\n", thread_arg->dpu_mmap, thread_arg->src_addr, thread_arg->host_mmap);
+    /* Handle the trigger message from DPU consumer first */
+    handle_msgs(thread_arg);
 
-    poll_desc_ring(thread_arg);
-    
-    doca_dpa_dev_thread_reschedule();
+    /* Go directly into polling loop — no reschedule (would stop the thread) */
+    poll_desc_rings(thread_arg);
 }

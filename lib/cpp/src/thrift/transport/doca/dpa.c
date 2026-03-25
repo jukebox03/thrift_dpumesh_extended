@@ -10,18 +10,26 @@
 
 #include "object.h"
 #include "dpa_common.h"
+#include "dpu_worker.h"
+#include "comch_server.h"
+#include "../dpumesh.h"
 #include "ring.h"
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <string.h>
 #include <time.h>
 
 DOCA_LOG_REGISTER(DPA);
 
-/* Kernel function declaration */
+#ifdef DOCA_ARCH_DPU
+/* Kernel function declaration (resolved from dpa_program.a stubs, DPU only) */
 extern doca_dpa_func_t hello_world;
 extern doca_dpa_func_t run_dma_manager;
 extern doca_dpa_func_t thread_init_rpc;
 
 extern struct doca_dpa_app *DPU_mesh_dpa_app;
+#endif
 
 #define TEST_DPA_MEMORY
 
@@ -49,12 +57,77 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     msg = (struct comch_msg *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
 
     switch (msg->type) {
-        case COMCH_MSG_TYPE_DMA_COMPLETED:
+        case COMCH_MSG_TYPE_DMA_COMPLETED: {
             struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
-            uint32_t *idx = (uint32_t *)(objs->dma_buffer + comp_msg->pos);
-            // DOCA_LOG_INFO("Received DMA completed message: pos=%u, length=%u, idx: %u",
-            //               comp_msg->pos, comp_msg->length, *idx);
+            int32_t src_pod_id = comp_msg->src_pod_id;
+            int32_t dst_pod_id = comp_msg->dst_pod_id;
+            uint32_t req_id = comp_msg->req_id;
+
+            /* Find the source pod's local DMA buffer for data */
+            struct pod_state *src_pod = find_pod_by_id(objs, src_pod_id);
+            uint8_t *data = NULL;
+            if (src_pod && src_pod->dma_buffer) {
+                data = (uint8_t *)src_pod->dma_buffer + comp_msg->pos;
+            } else {
+                DOCA_LOG_ERR("DMA completed but src_pod %d not found or no buffer", src_pod_id);
+                break;
+            }
+            uint32_t data_len = comp_msg->length;
+
+            DOCA_LOG_INFO("DMA completed: src_pod=%d, dst_pod=%d, req_id=%u, pos=%u, len=%u",
+                          src_pod_id, dst_pod_id, req_id, comp_msg->pos, data_len);
+
+            /* Route to destination pod */
+            int echo_mode = (dst_pod_id == -1 ||
+                             dst_pod_id == src_pod_id ||
+                             objs->num_pods <= 1);
+
+            if (!echo_mode) {
+                struct pod_state *dst = find_pod_by_id(objs, dst_pod_id);
+                if (dst && dst->connection) {
+                    /* Forward to destination pod */
+                    sw_descriptor_t fwd_desc;
+                    memset(&fwd_desc, 0, sizeof(fwd_desc));
+                    fwd_desc.header_buf_slot = -1;
+                    fwd_desc.body_buf_slot = -1;
+                    fwd_desc.body_len = data_len;
+                    fwd_desc.req_id = req_id;
+                    fwd_desc.src_pod_id = src_pod_id;
+                    fwd_desc.dst_pod_id = dst_pod_id;
+                    fwd_desc.flags = comp_msg->flags;
+                    fwd_desc.valid = 1;
+
+                    doca_error_t fwd_result = server_send_rx_data_to(
+                        objs, dst->connection,
+                        &fwd_desc, sizeof(fwd_desc), data, data_len);
+                    if (fwd_result != DOCA_SUCCESS)
+                        DOCA_LOG_ERR("Forward to pod %d failed for req_id=%u: %s",
+                                     dst_pod_id, req_id, doca_error_get_descr(fwd_result));
+                    else
+                        DOCA_LOG_INFO("Forwarded %u bytes to pod %d for req_id=%u",
+                                      data_len, dst_pod_id, req_id);
+                } else {
+                    DOCA_LOG_ERR("DMA completed: dst_pod=%d not found", dst_pod_id);
+                }
+            } else {
+                /* Echo mode: same pod or single-pod testing */
+                sw_descriptor_t echo_desc;
+                memset(&echo_desc, 0, sizeof(echo_desc));
+                echo_desc.header_buf_slot = -1;
+                echo_desc.body_buf_slot = -1;
+                echo_desc.body_len = data_len;
+                echo_desc.req_id = req_id;
+                echo_desc.flags = OP_RESPONSE;
+                echo_desc.valid = 1;
+
+                doca_error_t echo_result = server_send_rx_data(objs,
+                    &echo_desc, sizeof(echo_desc), data, data_len);
+                if (echo_result != DOCA_SUCCESS)
+                    DOCA_LOG_ERR("Echo back failed for req_id=%u: %s",
+                                 req_id, doca_error_get_descr(echo_result));
+            }
             break;
+        }
         default:
             DOCA_LOG_ERR("Received unknown message type: %u", msg->type);
             break;
@@ -177,6 +250,8 @@ void dmesh_doca_dpa_comch_msgq_ctx_state_changed_cb(const union doca_data user_d
 		break;
 	}
 }
+
+#ifdef DOCA_ARCH_DPU
 
 doca_error_t
 init_dpa_objects(struct objects *objs)
@@ -606,97 +681,55 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
  * @arg [out]: The returned thread argument that was filled
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t 
+/*
+ * Fill shared comch handles into DPA thread arg (no ring info yet — added per-pod).
+ */
+static doca_error_t
 dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
 {
     doca_error_t result;
-    struct dmesh_doca_dpa_comch *comch;
+    struct dmesh_doca_dpa_comch *comch = objs->dpa_comch;
     doca_dpa_dev_comch_consumer_completion_t dpa_consumer_comp;
-	doca_dpa_dev_completion_t dpa_producer_comp;
-	doca_dpa_dev_comch_producer_t dpa_producer;
-	doca_dpa_dev_comch_consumer_t dpa_consumer;
-    doca_dpa_dev_buf_arr_t dpa_buf_arr;
-    doca_dpa_dev_mmap_t dpu_mmap, host_mmap;
-
-    comch = objs->dpa_comch;
+    doca_dpa_dev_completion_t dpa_producer_comp;
+    doca_dpa_dev_comch_producer_t dpa_producer;
+    doca_dpa_dev_comch_consumer_t dpa_consumer;
 
     result = doca_comch_consumer_completion_get_dpa_handle(comch->consumer_comp, &dpa_consumer_comp);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get consumer completion DPA handle: %s",
-                doca_error_get_name(result));
+        DOCA_LOG_ERR("Failed to get consumer completion DPA handle: %s", doca_error_get_name(result));
         return result;
     }
     result = doca_dpa_completion_get_dpa_handle(comch->producer_comp, &dpa_producer_comp);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get producer completion DPA handle: %s",
-                doca_error_get_name(result));
+        DOCA_LOG_ERR("Failed to get producer completion DPA handle: %s", doca_error_get_name(result));
         return result;
     }
-    
     result = doca_comch_consumer_get_dpa_handle(comch->send.consumer, &dpa_consumer);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get consumer DPA handle: %s",
-                doca_error_get_name(result));
+        DOCA_LOG_ERR("Failed to get consumer DPA handle: %s", doca_error_get_name(result));
         return result;
     }
-
     result = doca_comch_producer_get_dpa_handle(comch->recv.producer, &dpa_producer);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get producer DPA handle: %s",   
-                doca_error_get_name(result));
-        return result;
-    }
-    
-#ifdef DOCA_ARCH_DPU
-    result = doca_buf_arr_get_dpa_handle(objs->buf_arr, &dpa_buf_arr);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get buf array DPA handle: %s",
-                doca_error_get_name(result));
+        DOCA_LOG_ERR("Failed to get producer DPA handle: %s", doca_error_get_name(result));
         return result;
     }
 
-    result = doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &dpu_mmap);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get mmap DPA handle: %s",
-                doca_error_get_name(result));
-        return result;
-    }
+    memset(arg, 0, sizeof(*arg));
+    arg->dpa_consumer_comp = dpa_consumer_comp;
+    arg->dpa_producer_comp = dpa_producer_comp;
+    arg->dpa_consumer = dpa_consumer;
+    arg->dpa_producer = dpa_producer;
+    arg->num_rings = 0;  /* rings added dynamically via setup_pod_dma */
 
-    result = doca_mmap_dev_get_dpa_handle(objs->remote_mmap, objs->dev, &host_mmap);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get mmap DPA handle: %s",
-                doca_error_get_name(result));
-        return result;
-    }
-
-#endif
-
-    *arg = (struct dpa_thread_arg) {
-        .dpa_consumer_comp = dpa_consumer_comp,
-        .dpa_producer_comp = dpa_producer_comp,
-        .dpa_consumer = dpa_consumer,
-        .dpa_producer = dpa_producer,
-#ifdef DOCA_ARCH_DPU
-        .dpa_buf_arr = dpa_buf_arr,
-        .buf_arr_size = DMA_RING_SIZE,
-        .host_mmap = host_mmap,
-        .dpu_mmap = dpu_mmap,
-        .src_addr = objs->dma_buffer,
-        .buf_size = 1024 * 1024,
-        .pos = 0,
-#endif
-    };
-
-    DOCA_LOG_INFO("dpa_consumer_comp: 0x%lx, dpa_producer_comp: 0x%lx, dpa_consumer: 0x%lx, dpa_producer: 0x%lx",
-        arg->dpa_consumer_comp,
-        arg->dpa_producer_comp,
-        arg->dpa_consumer,
-        arg->dpa_producer);
+    DOCA_LOG_INFO("DPA thread arg: consumer_comp=0x%lx, producer_comp=0x%lx, consumer=0x%lx, producer=0x%lx",
+        arg->dpa_consumer_comp, arg->dpa_producer_comp,
+        arg->dpa_consumer, arg->dpa_producer);
 
     return DOCA_SUCCESS;
 }
 
-/*  
+/*
  *  Initialize and run the DOCA DPA thread
  *
  */
@@ -834,27 +867,37 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
 doca_error_t
 setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mmap)
 {
+    return setup_dpa_buf_array_pod(objs, num_elem, mmap, &objs->buf_arr);
+}
+
+/*
+ * Create a DPA buffer array for a specific mmap (per-pod version).
+ */
+doca_error_t
+setup_dpa_buf_array_pod(struct objects *objs, size_t num_elem,
+                        struct doca_mmap *mmap, struct doca_buf_arr **out_buf_arr)
+{
     doca_error_t result;
 
-    result = doca_buf_arr_create(num_elem, &objs->buf_arr);
+    result = doca_buf_arr_create(num_elem, out_buf_arr);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create buffer array: %s", doca_error_get_descr(result));
         return result;
     }
 
-    result = doca_buf_arr_set_target_dpa(objs->buf_arr, objs->dpa_thread->dpa);
+    result = doca_buf_arr_set_target_dpa(*out_buf_arr, objs->dpa_thread->dpa);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set buffer array target DPA: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;
     }
 
-    result = doca_buf_arr_set_params(objs->buf_arr, mmap, sizeof(struct dma_desc), 0);
+    result = doca_buf_arr_set_params(*out_buf_arr, mmap, sizeof(struct dma_desc), 0);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set buffer array params: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;
     }
 
-    result = doca_buf_arr_start(objs->buf_arr);
+    result = doca_buf_arr_start(*out_buf_arr);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start buffer array: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;
@@ -862,10 +905,193 @@ setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mma
 
     return DOCA_SUCCESS;
 
-stop_buf_arr:
-    doca_buf_arr_stop(objs->buf_arr);
 destroy_buf_arr:
-    doca_buf_arr_destroy(objs->buf_arr);
-    objs->buf_arr = NULL;
+    doca_buf_arr_destroy(*out_buf_arr);
+    *out_buf_arr = NULL;
     return result;
 }
+
+#include "buffer.h"
+#include "dma.h"
+#include "comch_common.h"
+
+#define DPU_BUFFER_SIZE (1024 * 1024)
+
+/*
+ * Fill ring info for a specific pod.
+ */
+static doca_error_t
+dmesh_fill_dpa_ring_info(struct objects *objs, struct pod_state *pod,
+                         struct dpa_ring_info *ring_info)
+{
+    doca_error_t result;
+    doca_dpa_dev_buf_arr_t dpa_buf_arr;
+    doca_dpa_dev_mmap_t host_mmap, dpu_mmap;
+
+    result = doca_buf_arr_get_dpa_handle(pod->buf_arr, &dpa_buf_arr);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get buf array DPA handle: %s", doca_error_get_name(result));
+        return result;
+    }
+
+    result = doca_mmap_dev_get_dpa_handle(pod->remote_mmap, objs->dev, &host_mmap);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get host mmap DPA handle: %s", doca_error_get_name(result));
+        return result;
+    }
+
+    result = doca_mmap_dev_get_dpa_handle(pod->local_mmap, objs->dev, &dpu_mmap);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get DPU mmap DPA handle: %s", doca_error_get_name(result));
+        return result;
+    }
+
+    ring_info->buf_arr = dpa_buf_arr;
+    ring_info->buf_arr_size = DMA_RING_SIZE;
+    ring_info->host_mmap = host_mmap;
+    ring_info->dpu_mmap = dpu_mmap;
+    ring_info->dpu_addr = (uint64_t)pod->dma_buffer;
+    ring_info->dpu_buf_size = DPU_BUFFER_SIZE;
+    ring_info->pod_id = pod->pod_id;
+
+    return DOCA_SUCCESS;
+}
+
+/*
+ * Per-pod DMA setup. Called when both ring_mmap and remote_mmap arrive.
+ * 1. Create buf_arr for pod's ring_mmap
+ * 2. Allocate local DMA buffer for pod
+ * 3. Export local buffer to Host
+ * 4. Fill DPA ring info
+ * 5. Update DPA thread arg (h2d_memcpy)
+ * 6. If first pod, run DPA thread
+ */
+doca_error_t
+setup_pod_dma(struct objects *objs, struct pod_state *pod)
+{
+    doca_error_t result;
+
+    DOCA_LOG_INFO("setup_pod_dma: pod_id=%d", pod->pod_id);
+
+    /* 1. Create per-pod buf_arr over ring_mmap */
+    result = setup_dpa_buf_array_pod(objs, DMA_RING_SIZE, pod->ring_mmap, &pod->buf_arr);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("setup_pod_dma: buf_arr failed for pod %d: %s",
+                     pod->pod_id, doca_error_get_descr(result));
+        return result;
+    }
+
+    /* 2. Allocate local DMA buffer (DPU working buffer) + PCI export */
+    result = alloc_buffer_and_set_mmap(&pod->local_mmap, objs->dev,
+                                       &pod->dma_buffer, DPU_BUFFER_SIZE,
+                                       DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("setup_pod_dma: alloc buffer failed for pod %d: %s",
+                     pod->pod_id, doca_error_get_descr(result));
+        return result;
+    }
+
+    /* 3. Export local DMA buffer mmap back to Host */
+    result = export_mmap_to_remote(objs, pod->local_mmap, pod->dma_buffer,
+                                    DPU_BUFFER_SIZE, DMA_BUFFER, DPU_TO_HOST);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_WARN("setup_pod_dma: export to host failed (may be OK if Host doesn't need it): %s",
+                      doca_error_get_descr(result));
+        /* Non-fatal for now */
+    }
+
+    /* 4. Fill DPA ring info for this pod */
+    struct dpa_ring_info ring_info;
+    result = dmesh_fill_dpa_ring_info(objs, pod, &ring_info);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("setup_pod_dma: fill ring info failed for pod %d: %s",
+                     pod->pod_id, doca_error_get_descr(result));
+        return result;
+    }
+
+    /* 5. Update DPA thread arg: write ring info first, then increment num_rings */
+    struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_thread;
+    uint32_t ring_idx = objs->dpa_thread_running ? 0 : 0;  /* will use current num_rings */
+
+    /* We need to read current arg, update, and write back.
+     * Since we write the full arg via h2d_memcpy, build it locally. */
+    struct dpa_thread_arg arg;
+
+    if (!objs->dpa_thread_running) {
+        /* First pod: fill shared handles + first ring */
+        result = dmesh_fill_dpa_thread_arg(objs, &arg);
+        if (result != DOCA_SUCCESS)
+            return result;
+        arg.rings[0] = ring_info;
+        arg.num_rings = 1;
+    } else {
+        /* Subsequent pods: read current arg from DPA, add ring, write back */
+        result = doca_dpa_d2h_memcpy(dpa_thread->dpa, &arg, dpa_thread->arg,
+                                      sizeof(struct dpa_thread_arg));
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("setup_pod_dma: d2h_memcpy failed: %s", doca_error_get_descr(result));
+            return result;
+        }
+        if (arg.num_rings >= MAX_DPA_RINGS) {
+            DOCA_LOG_ERR("setup_pod_dma: max rings reached (%d)", MAX_DPA_RINGS);
+            return DOCA_ERROR_FULL;
+        }
+        arg.rings[arg.num_rings] = ring_info;
+        arg.num_rings++;
+    }
+
+    result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg,
+                                  &arg, sizeof(struct dpa_thread_arg));
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("setup_pod_dma: h2d_memcpy failed: %s", doca_error_get_descr(result));
+        return result;
+    }
+
+    /* 6. If first pod, run DPA thread */
+    if (!objs->dpa_thread_running) {
+        uint64_t rpc_ret;
+        uint32_t num_msg = CC_DPA_MAX_MSG_NUM;
+        result = doca_dpa_rpc(dpa_thread->dpa, thread_init_rpc, &rpc_ret,
+                              arg.dpa_consumer, num_msg);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("setup_pod_dma: thread_init_rpc failed: %s", doca_error_get_descr(result));
+            return result;
+        }
+
+        result = doca_dpa_thread_run(dpa_thread->thread);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("setup_pod_dma: dpa_thread_run failed: %s", doca_error_get_descr(result));
+            return result;
+        }
+        objs->dpa_thread_running = 1;
+        DOCA_LOG_INFO("DPA thread set to runnable (pod_id=%d), sending trigger msg", pod->pod_id);
+
+        /* Send trigger message to DPA consumer to activate the thread.
+         * DPA thread only runs when its attached completion ctx fires.
+         * The consumer_comp is attached to the thread, so sending any
+         * message via the DPU→DPA msgq triggers the first execution. */
+        {
+            struct comch_msg trigger;
+            trigger.type = COMCH_MSG_TYPE_DMA_COMPLETED;  /* reuse existing type */
+            trigger.dma_comp_msg.pos = 0;
+            trigger.dma_comp_msg.length = 0;
+            trigger.dma_comp_msg.req_id = 0;
+            trigger.dma_comp_msg.src_pod_id = -1;
+            trigger.dma_comp_msg.dst_pod_id = -1;
+            result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+                                               &trigger, sizeof(trigger));
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_WARN("Trigger msg to DPA failed: %s (thread may not start)",
+                              doca_error_get_descr(result));
+            } else {
+                DOCA_LOG_INFO("Trigger msg sent to DPA, thread should activate");
+            }
+        }
+    } else {
+        DOCA_LOG_INFO("Added ring for pod_id=%d (num_rings=%u)", pod->pod_id, arg.num_rings);
+    }
+
+    pod->dma_ready = 1;
+    return DOCA_SUCCESS;
+}
+#endif /* DOCA_ARCH_DPU */

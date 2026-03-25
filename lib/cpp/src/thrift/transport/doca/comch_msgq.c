@@ -1,5 +1,7 @@
 #include "comch_msgq.h"
 
+#ifdef DOCA_ARCH_DPU
+
 #include "dpa.h"
 #include "object.h"
 #include "dpa_common.h"
@@ -44,3 +46,4 @@ init_comch_dpa_msgq(struct objects *objs, struct doca_pe *pe)
 
 	return DOCA_SUCCESS;
 }
+#endif /* DOCA_ARCH_DPU */

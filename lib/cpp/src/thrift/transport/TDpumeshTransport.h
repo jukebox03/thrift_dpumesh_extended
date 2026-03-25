@@ -55,6 +55,7 @@ private:
     /* TX side: outgoing response data */
     std::vector<uint8_t> write_buf_;
     bool flushed_;
+    int tx_slot_;  /* TX slot allocated in flush(), freed in close() */
 
     /* Request metadata for response routing */
     uint32_t stream_id_;

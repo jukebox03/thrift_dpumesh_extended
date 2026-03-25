@@ -270,13 +270,13 @@ static void consumer_recv_task_comp_err_cb(struct doca_comch_consumer_task_post_
 
 	objs = (struct objects *)(ctx_user_data.ptr);
 	objs->consumer_result = doca_task_get_status(doca_comch_consumer_task_post_recv_as_task(task));
-	DOCA_LOG_ERR("Consumer failed to recv message with error = %s",
+	DOCA_LOG_ERR("Consumer failed to recv message with error = %s (non-fatal, continuing)",
 		     doca_error_get_name(objs->consumer_result));
 
 	buf = doca_comch_consumer_task_post_recv_get_buf(task);
 	(void)doca_buf_dec_refcount(buf, NULL);
 	doca_task_free(doca_comch_consumer_task_post_recv_as_task(task));
-	(void)doca_ctx_stop(doca_comch_consumer_as_ctx(objs->consumer));
+	/* Do NOT stop consumer context — allow other pods to continue working */
 }
 
 /**

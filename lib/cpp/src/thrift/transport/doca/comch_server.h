@@ -61,4 +61,28 @@ server_send_rx_data(struct objects *objs,
                     const void *desc, uint32_t desc_len,
                     const void *body, uint32_t body_len);
 
+/* Send RX data to a specific connection (for multi-pod routing) */
+doca_error_t
+server_send_rx_data_to(struct objects *objs,
+                       struct doca_comch_connection *conn,
+                       const void *desc, uint32_t desc_len,
+                       const void *body, uint32_t body_len);
+
+/* Find a pod by pod_id. Returns NULL if not found. */
+struct pod_state *
+find_pod_by_id(struct objects *objs, int32_t pod_id);
+
+/* Find a pod by connection. Returns NULL if not found. */
+struct pod_state *
+find_pod_by_connection(struct objects *objs, struct doca_comch_connection *conn);
+
+/* Register a new connection in the pods table. Returns 0 on success. */
+int
+pods_add_connection(struct objects *objs, struct doca_comch_connection *conn);
+
+/* Register pod_id for an existing connection. Returns 0 on success. */
+int
+pods_register(struct objects *objs, struct doca_comch_connection *conn,
+              int32_t pod_id, const char *app_name);
+
 #endif // COMCH_SERVER_H

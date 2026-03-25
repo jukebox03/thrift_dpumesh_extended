@@ -11,6 +11,7 @@
 #define CC_DPA_MAX_MSG_NUM  512
 
 struct objects;
+struct pod_state;
 
 /* DOCA DPA thread related objects */
 struct dmesh_doca_dpa_thread {
@@ -63,6 +64,7 @@ void dmesh_doca_dpa_comch_msgq_ctx_state_changed_cb(const union doca_data user_d
 							  enum doca_ctx_states prev_state,
 							  enum doca_ctx_states next_state);
 
+#ifdef DOCA_ARCH_DPU
 doca_error_t
 init_dpa_objects(struct objects *objs);
 
@@ -83,13 +85,22 @@ dmesh_doca_dpa_comch_create(struct objects *objs);
 doca_error_t
 dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dpa_thread, struct dmesh_doca_dpa_comch *comch);
 
-doca_error_t 
+doca_error_t
 dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t msg_size);
 
-doca_error_t 
+doca_error_t
 dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg,
                                 void *msg, uint32_t msg_size);
 
 doca_error_t
-setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mmap);					
+setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mmap);
+
+doca_error_t
+setup_dpa_buf_array_pod(struct objects *objs, size_t num_elem,
+                        struct doca_mmap *mmap, struct doca_buf_arr **out_buf_arr);
+
+doca_error_t
+setup_pod_dma(struct objects *objs, struct pod_state *pod);
+#endif /* DOCA_ARCH_DPU */
+
 #endif

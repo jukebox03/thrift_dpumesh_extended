@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../dpumesh.h"
+
 #include "common.h"
 #include "object.h"
 #include "dpa.h"
@@ -109,7 +111,10 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 	}
 
 	objs = (struct objects *)user_data.ptr;
-	objs->connection = comch_connection;
+
+	/* Update connection for primary (first) client — backward compat */
+	if (objs->connection == NULL)
+		objs->connection = comch_connection;
 
 	comch_msg = (struct dmesh_comch_msg *)recv_buffer;
 
@@ -121,8 +126,20 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 			DOCA_LOG_ERR("Received invalid MMAP message from client");
 			return;
 		}
-		result = process_mmap_msg(objs, (struct dmesh_mmap_msg *)recv_buffer);
+		result = process_mmap_msg(objs, comch_connection, (struct dmesh_mmap_msg *)recv_buffer);
 		break;
+
+	case DMESH_MSG_REGISTER: {
+		struct dmesh_register_msg *reg = (struct dmesh_register_msg *)recv_buffer;
+		if (msg_len < sizeof(struct dmesh_register_msg)) {
+			DOCA_LOG_ERR("Received invalid REGISTER message");
+			return;
+		}
+		pods_register(objs, comch_connection, reg->pod_id, reg->app_name);
+		DOCA_LOG_INFO("Pod registered: pod_id=%d, app=%s", reg->pod_id, reg->app_name);
+		break;
+	}
+
 	default:
 
 		DOCA_LOG_ERR("Received unknown message type from client: %u", comch_msg->type);
@@ -162,9 +179,15 @@ static void server_connection_event_callback(struct doca_comch_event_connection_
 	}
 
 	objs = (struct objects *)user_data.ptr;
-	objs->connection = comch_connection;
 
-	DOCA_LOG_INFO("New connection established with client");
+	/* First connection is the primary (backward compatible) */
+	if (objs->connection == NULL)
+		objs->connection = comch_connection;
+
+	/* Add to pods table */
+	pods_add_connection(objs, comch_connection);
+
+	DOCA_LOG_INFO("New connection established (total pods: %d)", objs->num_pods);
 }
 
 /**
@@ -415,4 +438,137 @@ server_send_rx_data(struct objects *objs,
 	doca_error_t result = server_send_msg(objs, (const char *)buf, total);
 	free(buf);
 	return result;
+}
+
+/* ====================================================================
+ * Send RX data to a specific connection (for multi-pod routing)
+ * ==================================================================== */
+
+static doca_error_t
+server_send_msg_to(struct objects *objs, struct doca_comch_connection *conn,
+                   const char *msg, size_t len)
+{
+	doca_error_t result;
+	struct doca_comch_task_send *task;
+
+	result = doca_comch_server_task_send_alloc_init(objs->cc_server, conn,
+							(void *)msg, len, &task);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("server_send_msg_to: alloc failed: %s", doca_error_get_name(result));
+		return result;
+	}
+
+	result = doca_task_submit(doca_comch_task_send_as_task(task));
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("server_send_msg_to: submit failed: %s", doca_error_get_name(result));
+		doca_task_free(doca_comch_task_send_as_task(task));
+		return result;
+	}
+
+	return DOCA_SUCCESS;
+}
+
+doca_error_t
+server_send_rx_data_to(struct objects *objs,
+                       struct doca_comch_connection *conn,
+                       const void *desc, uint32_t desc_len,
+                       const void *body, uint32_t body_len)
+{
+	size_t total = sizeof(struct dmesh_rx_data_msg) + body_len;
+
+	if (desc_len != 64) {
+		DOCA_LOG_ERR("server_send_rx_data_to: bad desc_len=%u", desc_len);
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+
+	uint8_t *buf = (uint8_t *)malloc(total);
+	if (!buf)
+		return DOCA_ERROR_NO_MEMORY;
+
+	struct dmesh_rx_data_msg *msg = (struct dmesh_rx_data_msg *)buf;
+	msg->type = DMESH_MSG_RX_DATA;
+	memcpy(msg->desc, desc, 64);
+	msg->body_len = body_len;
+	if (body_len > 0)
+		memcpy(msg->body, body, body_len);
+
+	doca_error_t result = server_send_msg_to(objs, conn, (const char *)buf, total);
+	free(buf);
+	return result;
+}
+
+/* ====================================================================
+ * Pod connection management
+ * ==================================================================== */
+
+int
+pods_add_connection(struct objects *objs, struct doca_comch_connection *conn)
+{
+	pthread_mutex_lock(&objs->pods_lock);
+	if (objs->num_pods >= MAX_PODS) {
+		pthread_mutex_unlock(&objs->pods_lock);
+		DOCA_LOG_ERR("pods_add_connection: table full (%d)", MAX_PODS);
+		return -1;
+	}
+
+	int idx = objs->num_pods;
+	objs->pods[idx].connection = conn;
+	objs->pods[idx].pod_id = -1;  /* not yet registered */
+	objs->pods[idx].app_name[0] = '\0';
+	objs->pods[idx].registered = 0;
+	objs->num_pods++;
+	pthread_mutex_unlock(&objs->pods_lock);
+
+	DOCA_LOG_INFO("pods_add_connection: slot %d", idx);
+	return 0;
+}
+
+int
+pods_register(struct objects *objs, struct doca_comch_connection *conn,
+              int32_t pod_id, const char *app_name)
+{
+	pthread_mutex_lock(&objs->pods_lock);
+	for (int i = 0; i < objs->num_pods; i++) {
+		if (objs->pods[i].connection == conn) {
+			objs->pods[i].pod_id = pod_id;
+			snprintf(objs->pods[i].app_name, sizeof(objs->pods[i].app_name),
+			         "%s", app_name);
+			objs->pods[i].registered = 1;
+			pthread_mutex_unlock(&objs->pods_lock);
+			DOCA_LOG_INFO("pods_register: slot %d → pod_id=%d app=%s",
+			              i, pod_id, app_name);
+			return 0;
+		}
+	}
+	pthread_mutex_unlock(&objs->pods_lock);
+	DOCA_LOG_ERR("pods_register: connection not found for pod_id=%d", pod_id);
+	return -1;
+}
+
+struct pod_state *
+find_pod_by_id(struct objects *objs, int32_t pod_id)
+{
+	pthread_mutex_lock(&objs->pods_lock);
+	for (int i = 0; i < objs->num_pods; i++) {
+		if (objs->pods[i].registered && objs->pods[i].pod_id == pod_id) {
+			pthread_mutex_unlock(&objs->pods_lock);
+			return &objs->pods[i];
+		}
+	}
+	pthread_mutex_unlock(&objs->pods_lock);
+	return NULL;
+}
+
+struct pod_state *
+find_pod_by_connection(struct objects *objs, struct doca_comch_connection *conn)
+{
+	pthread_mutex_lock(&objs->pods_lock);
+	for (int i = 0; i < objs->num_pods; i++) {
+		if (objs->pods[i].connection == conn) {
+			pthread_mutex_unlock(&objs->pods_lock);
+			return &objs->pods[i];
+		}
+	}
+	pthread_mutex_unlock(&objs->pods_lock);
+	return NULL;
 }

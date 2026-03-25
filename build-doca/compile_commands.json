@@ -136,6 +136,11 @@
 },
 {
   "directory": "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp",
+  "command": "/usr/bin/c++ -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL_API -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -Dthrift_EXPORTS -I/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3  -Wno-variadic-macros -Wno-long-long -g -fPIC -std=c++11 -o CMakeFiles/thrift.dir/src/thrift/transport/TDpumeshClientTransport.cpp.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshClientTransport.cpp",
+  "file": "/home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshClientTransport.cpp"
+},
+{
+  "directory": "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp",
   "command": "/usr/bin/c++ -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL_API -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -Dthrift_EXPORTS -I/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3  -Wno-variadic-macros -Wno-long-long -g -fPIC -std=c++11 -o CMakeFiles/thrift.dir/src/thrift/server/TConnectedClient.cpp.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/server/TConnectedClient.cpp",
   "file": "/home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/server/TConnectedClient.cpp"
 },
@@ -211,8 +216,18 @@
 },
 {
   "directory": "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp",
+  "command": "/usr/bin/cc -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL_API -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -Dthrift_EXPORTS -I/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3 -g -fPIC -o CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_msgq.c.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.c",
+  "file": "/home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.c"
+},
+{
+  "directory": "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp",
   "command": "/usr/bin/cc -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL_API -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -Dthrift_EXPORTS -I/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3 -g -fPIC -o CMakeFiles/thrift.dir/src/thrift/transport/doca/dma.c.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dma.c",
   "file": "/home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dma.c"
+},
+{
+  "directory": "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp",
+  "command": "/usr/bin/cc -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL_API -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -Dthrift_EXPORTS -I/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3 -g -fPIC -o CMakeFiles/thrift.dir/src/thrift/transport/doca/dpa.c.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa.c",
+  "file": "/home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa.c"
 },
 {
   "directory": "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp",
@@ -416,6 +431,11 @@
 },
 {
   "directory": "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp",
+  "command": "/usr/bin/c++ -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL_API -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -I/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3  -Wno-variadic-macros -Wno-long-long -g -std=c++11 -o CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshClientTransport.cpp",
+  "file": "/home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshClientTransport.cpp"
+},
+{
+  "directory": "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp",
   "command": "/usr/bin/c++ -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL_API -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -I/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3  -Wno-variadic-macros -Wno-long-long -g -std=c++11 -o CMakeFiles/thrift_static.dir/src/thrift/server/TConnectedClient.cpp.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/server/TConnectedClient.cpp",
   "file": "/home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/server/TConnectedClient.cpp"
 },
@@ -491,8 +511,18 @@
 },
 {
   "directory": "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp",
+  "command": "/usr/bin/cc -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL_API -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -I/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3 -g -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.c",
+  "file": "/home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.c"
+},
+{
+  "directory": "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp",
   "command": "/usr/bin/cc -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL_API -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -I/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3 -g -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dma.c.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dma.c",
   "file": "/home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dma.c"
+},
+{
+  "directory": "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp",
+  "command": "/usr/bin/cc -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL_API -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -I/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3 -g -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa.c",
+  "file": "/home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa.c"
 },
 {
   "directory": "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp",

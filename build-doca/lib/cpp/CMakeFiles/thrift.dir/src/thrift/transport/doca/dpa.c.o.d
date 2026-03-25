@@ -81,10 +81,23 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/dpa.c.o: \
  /opt/mellanox/doca/include/doca_comch_msgq.h \
  /opt/mellanox/doca/include/doca_mmap.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/object.h \
+ /usr/include/pthread.h /usr/include/sched.h \
+ /usr/include/x86_64-linux-gnu/bits/sched.h \
+ /usr/include/x86_64-linux-gnu/bits/types/struct_sched_param.h \
+ /usr/include/x86_64-linux-gnu/bits/cpu-set.h /usr/include/time.h \
+ /usr/include/x86_64-linux-gnu/bits/time.h \
+ /usr/include/x86_64-linux-gnu/bits/types/struct_tm.h \
+ /usr/include/x86_64-linux-gnu/bits/types/struct_itimerspec.h \
+ /usr/include/x86_64-linux-gnu/bits/setjmp.h \
+ /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
+ /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
+ /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
  /opt/mellanox/doca/include/doca_dev.h \
  /opt/mellanox/doca/include/doca_comch.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa_common.h \
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.h \
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/../dpumesh.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/ring.h \
  /usr/include/arpa/inet.h /usr/include/netinet/in.h \
  /usr/include/x86_64-linux-gnu/sys/socket.h \
@@ -97,7 +110,10 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/dpa.c.o: \
  /usr/include/x86_64-linux-gnu/asm/sockios.h \
  /usr/include/asm-generic/sockios.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_osockaddr.h \
- /usr/include/x86_64-linux-gnu/bits/in.h /usr/include/time.h \
- /usr/include/x86_64-linux-gnu/bits/time.h \
- /usr/include/x86_64-linux-gnu/bits/types/struct_tm.h \
- /usr/include/x86_64-linux-gnu/bits/types/struct_itimerspec.h
+ /usr/include/x86_64-linux-gnu/bits/in.h /usr/include/unistd.h \
+ /usr/include/x86_64-linux-gnu/bits/posix_opt.h \
+ /usr/include/x86_64-linux-gnu/bits/environments.h \
+ /usr/include/x86_64-linux-gnu/bits/confname.h \
+ /usr/include/x86_64-linux-gnu/bits/getopt_posix.h \
+ /usr/include/x86_64-linux-gnu/bits/getopt_core.h \
+ /usr/include/x86_64-linux-gnu/bits/unistd_ext.h

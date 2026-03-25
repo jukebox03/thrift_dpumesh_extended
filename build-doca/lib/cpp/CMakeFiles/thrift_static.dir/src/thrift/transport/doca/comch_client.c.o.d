@@ -84,6 +84,14 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.o:
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_consumer.h \
  /opt/mellanox/doca/include/doca_comch_consumer.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/object.h \
+ /usr/include/pthread.h /usr/include/sched.h \
+ /usr/include/x86_64-linux-gnu/bits/sched.h \
+ /usr/include/x86_64-linux-gnu/bits/types/struct_sched_param.h \
+ /usr/include/x86_64-linux-gnu/bits/cpu-set.h \
+ /usr/include/x86_64-linux-gnu/bits/setjmp.h \
+ /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
+ /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
+ /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
  /opt/mellanox/doca/include/doca_pe.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h
