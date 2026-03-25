@@ -21415,7 +21415,6 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o: ../lib/c
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
   ../lib/cpp/src/thrift/transport/doca/dpa_common.h \
   ../lib/cpp/src/thrift/transport/doca/dpu_worker.h \
-  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
   ../lib/cpp/src/thrift/transport/dpumesh.h \
   ../lib/cpp/src/thrift/transport/doca/ring.h \
   /usr/include/arpa/inet.h \
@@ -21780,11 +21779,11 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: ../l
   ../lib/cpp/src/thrift/transport/doca/dpa_common.h
 
 
+/usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h:
+
 ../lib/cpp/src/thrift/transport/doca/ring.c:
 
 ../lib/cpp/src/thrift/transport/doca/ring.h:
-
-/usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h:
 
 ../lib/cpp/src/thrift/transport/doca/dpu_worker.h:
 

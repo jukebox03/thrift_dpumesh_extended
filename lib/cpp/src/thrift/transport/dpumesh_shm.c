@@ -10,6 +10,10 @@
 #define _GNU_SOURCE
 #include "dpumesh.h"
 
+#ifndef DPUMESH_SHM_PREFIX_DEFAULT
+#define DPUMESH_SHM_PREFIX_DEFAULT "/dpumesh"
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

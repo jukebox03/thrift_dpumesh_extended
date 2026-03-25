@@ -21468,7 +21468,6 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/dpa.c.o
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa_common.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.h
- /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/dpumesh.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/ring.h
  /usr/include/arpa/inet.h
