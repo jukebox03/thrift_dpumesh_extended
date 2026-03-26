@@ -42,6 +42,7 @@ void TDpumeshTransport::close() {
         rx_slot_ = -1;
     }
     if (tx_slot_ >= 0) {
+        usleep(10000);
         dpumesh_tx_free(ctx_, tx_slot_);
         tx_slot_ = -1;
     }
