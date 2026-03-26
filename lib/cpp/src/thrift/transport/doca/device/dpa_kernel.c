@@ -145,7 +145,7 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
 static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
-    struct comch_dma_comp_msg msg;
+    struct comch_msg msg;
     doca_dpa_dev_uintptr_t dev_ptr;
     doca_dpa_dev_buf_t buf;
     struct dma_desc *desc;
@@ -208,12 +208,13 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
 
             /* Build completion message with routing info */
             msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
-            msg.pos = pos[r];
-            msg.length = desc->size;
-            msg.req_id = (uint32_t)desc->idx;
-            msg.src_pod_id = ring->pod_id;
-            msg.dst_pod_id = desc->dst_pod_id;
-            msg.flags = desc->flags;
+            msg.dma_comp_msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
+            msg.dma_comp_msg.pos = pos[r];
+            msg.dma_comp_msg.length = desc->size;
+            msg.dma_comp_msg.req_id = (uint32_t)desc->idx;
+            msg.dma_comp_msg.src_pod_id = ring->pod_id;
+            msg.dma_comp_msg.dst_pod_id = desc->dst_pod_id;
+            msg.dma_comp_msg.flags = desc->flags;
 
             /* DMA copy: Host buffer → DPU local buffer */
             doca_dpa_dev_comch_producer_dma_copy(producer,
@@ -224,7 +225,7 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                         desc->addr,
                                         desc->size,
                                         (uint8_t *)&msg,
-                                        sizeof(struct comch_dma_comp_msg),
+                                        sizeof(struct comch_msg),
                                         DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
             DOCA_DPA_DEV_LOG_INFO("DMA copy issued: ring=%u slot=%u req_id=%u src_addr=0x%lx size=%u\n",
