@@ -565,3 +565,29 @@ void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
 int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     return dr_put(&ctx->tx_sq, desc);
 }
+
+/* ====================================================================
+ * Client-side API stubs (SHM backend — not implemented, DOCA only)
+ * These must exist so libthrift.so links cleanly with SHM backend.
+ * At runtime, the DOCA-built libthrift.so replaces this library.
+ * ==================================================================== */
+
+uint32_t dpumesh_alloc_req_id(dpumesh_ctx_t *ctx) {
+    (void)ctx;
+    return 0;
+}
+
+int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
+    (void)ctx; (void)req_id;
+    return -1;
+}
+
+int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
+                          sw_descriptor_t *resp, int timeout_ms) {
+    (void)ctx; (void)req_id; (void)resp; (void)timeout_ms;
+    return -1;
+}
+
+void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
+    (void)ctx; (void)req_id;
+}
