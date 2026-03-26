@@ -43,7 +43,6 @@ static void send_msgs(struct dpa_thread_arg *thread_arg, int num_msg)
                                                    (uint8_t *)&msg,
                                                    sizeof(struct comch_msg),
                                                    DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-            								    //    DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS);
         
         while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &comp) == 0) {
         }
@@ -210,7 +209,6 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                         desc->size,
                                         (uint8_t *)&msg,
                                         sizeof(struct comch_dma_comp_msg),
-                                        DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
                                         DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
             DOCA_DPA_DEV_LOG_INFO("DMA copy issued: ring=%u, src_addr=0x%lx, size=%lu\n",
