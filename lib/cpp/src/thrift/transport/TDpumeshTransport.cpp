@@ -42,17 +42,14 @@ void TDpumeshTransport::close() {
         rx_slot_ = -1;
     }
     if (tx_slot_ >= 0) {
-        usleep(10000);
+        usleep(10000); 
         dpumesh_tx_free(ctx_, tx_slot_);
         tx_slot_ = -1;
     }
     read_buf_ = nullptr;
-    read_done_ = true;
 }
-
 uint32_t TDpumeshTransport::read(uint8_t *buf, uint32_t len) {
-    if (read_done_ || !read_buf_ || read_pos_ >= read_len_) {
-        read_done_ = true;
+    if (!read_buf_ || read_pos_ >= read_len_) {
         return 0;
     }
 
@@ -60,10 +57,6 @@ uint32_t TDpumeshTransport::read(uint8_t *buf, uint32_t len) {
     uint32_t to_read = std::min(len, avail);
     std::memcpy(buf, read_buf_ + read_pos_, to_read);
     read_pos_ += to_read;
-
-    if (read_pos_ >= read_len_) {
-        read_done_ = true;
-    }
 
     return to_read;
 }
