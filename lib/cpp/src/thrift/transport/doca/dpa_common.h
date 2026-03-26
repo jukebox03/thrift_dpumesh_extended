@@ -44,7 +44,6 @@ enum comch_msg_type {
 	COMCH_MSG_TYPE_DMA_COMPLETED = 2,
 	COMCH_MSG_TYPE_ADD_RING = 3,
 	COMCH_MSG_TYPE_TRIGGER = 4,   /* DPU→DPA: wake up thread (no payload) */
-	COMCH_MSG_TYPE_PING = 5,      /* DPA→DPU: diagnostics ping */
 };
 
 struct comch_dma_comp_msg {
@@ -76,12 +75,6 @@ struct comch_add_ring_msg {
 	struct dpa_ring_info ring;
 } __attribute__((__packed__, aligned(4)));
 
-struct comch_ping_msg {
-	enum comch_msg_type type;
-	uint32_t marker;
-	uint32_t target_consumer_id;
-} __attribute__((__packed__, aligned(4)));
-
 struct comch_msg {
 	enum comch_msg_type type;
 	union
@@ -89,7 +82,6 @@ struct comch_msg {
 		struct comch_dma_req_msg dma_req_msg;
 		struct comch_dma_comp_msg dma_comp_msg;
 		struct comch_add_ring_msg add_ring_msg;
-		struct comch_ping_msg ping_msg;
 	};
 } __attribute__((__packed__, aligned(4)));
 

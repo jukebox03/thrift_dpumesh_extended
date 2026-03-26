@@ -71,14 +71,6 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             int32_t dst_pod_id = comp_msg->dst_pod_id;
             uint32_t req_id = comp_msg->req_id;
 
-            DOCA_LOG_INFO("Callback DMA payload: req_id=%u src_pod=%d dst_pod=%d pos=%u len=%u flags=0x%x",
-                          req_id,
-                          src_pod_id,
-                          dst_pod_id,
-                          comp_msg->pos,
-                          comp_msg->length,
-                          (unsigned int)(uint8_t)comp_msg->flags);
-
             /* Find the source pod's local DMA buffer for data */
             struct pod_state *src_pod = find_pod_by_id(objs, src_pod_id);
             uint8_t *data = NULL;
@@ -158,11 +150,6 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
         case COMCH_MSG_TYPE_TRIGGER:
             DOCA_LOG_INFO("DPA MsgQ recv callback ping received (type=%u)",
                           (unsigned int)msg->type);
-            break;
-        case COMCH_MSG_TYPE_PING:
-            DOCA_LOG_INFO("DPA MsgQ recv callback PING: marker=0x%x target_consumer_id=%u",
-                          msg->ping_msg.marker,
-                          msg->ping_msg.target_consumer_id);
             break;
         default:
             DOCA_LOG_ERR("Received unknown message type: %u", msg->type);
@@ -423,6 +410,7 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
     doca_error_t result;
     struct doca_ctx *consumer_ctx;
     struct doca_ctx *producer_ctx;
+    uint32_t consumer_id;
 
     memset(msgq, 0, sizeof(*msgq));
 
@@ -489,6 +477,14 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                 doca_error_get_name(result));
         return result;
     }
+
+    result = doca_comch_consumer_get_id(msgq->consumer, &consumer_id);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get msgq consumer id - %s",
+                doca_error_get_name(result));
+        return result;
+    }
+    msgq->target_consumer_id = consumer_id;
     
     consumer_ctx = doca_comch_consumer_as_ctx(msgq->consumer);
     result = doca_comch_consumer_set_imm_data_len(msgq->consumer, sizeof(struct comch_msg));
@@ -864,7 +860,7 @@ dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t m
 							  NULL,
 							  msg,
 							  msg_size,
-							  /*consumer_id=*/1,
+                              msgq->target_consumer_id,
 							  &send_task);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to send msg using NVMf DOCA DPA MsgQ: Failed to allocate send task - %s",
@@ -906,7 +902,7 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
                                   NULL,
                                   msg,
                                   msg_size,
-                                  /*consumer_id=*/1,
+							  msgq->target_consumer_id,
                                   &send_task);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to send msg using NVMf DOCA DPA MsgQ: Failed to allocate send task - %s",

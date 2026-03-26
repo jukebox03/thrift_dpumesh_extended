@@ -58,9 +58,6 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
     uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
-    // doca_dpa_dev_comch_producer_t producer;
-    doca_dpa_dev_completion_element_t comp;
-    uint64_t start, end;
 
     switch(msg->type) {
         case COMCH_MSG_TYPE_DMA_REQ:
@@ -109,37 +106,6 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
         case COMCH_MSG_TYPE_TRIGGER:
             /* No-op: just waking up the thread via completion event */
             DOCA_DPA_DEV_LOG_INFO("Trigger received\n");
-
-            /* DPA->DPU datapath ping sweep to identify which consumer ID reaches callback. */
-            for (uint32_t test_cid = 0; test_cid < 4; test_cid++) {
-                struct comch_msg ping;
-                uint32_t spins = 0;
-                ping.ping_msg.type = COMCH_MSG_TYPE_PING;
-                ping.ping_msg.marker = 0xC0DE0000u | test_cid;
-                ping.ping_msg.target_consumer_id = test_cid;
-
-                while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, test_cid) == 1) {
-                    if (++spins >= 1000000u)
-                        break;
-                }
-
-                if (spins >= 1000000u) {
-                    DOCA_DPA_DEV_LOG_INFO("PING skip: consumer_id=%u appears empty\n", test_cid);
-                    continue;
-                }
-
-                doca_dpa_dev_comch_producer_post_send_imm_only(
-                    producer,
-                    test_cid,
-                    (uint8_t *)&ping,
-                    sizeof(struct comch_msg),
-                    DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-
-                DOCA_DPA_DEV_LOG_INFO("Sent DPA->DPU PING marker=0x%x to consumer_id=%u (configured=%u)\n",
-                                      ping.ping_msg.marker,
-                                      test_cid,
-                                      dpu_consumer_id);
-            }
             break;
         default:
             DOCA_DPA_DEV_LOG_INFO("Unknown msg type received from host: %d\n", msg->type);
@@ -155,31 +121,20 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
     doca_dpa_dev_comch_consumer_t consumer = thread_arg->dpa_consumer;
 	doca_dpa_dev_comch_consumer_completion_t consumer_comp = thread_arg->dpa_consumer_comp;
     uint32_t num_msgs = 0;
-    static uint32_t empty_polls = 0;
 
     while (doca_dpa_dev_comch_consumer_get_completion(consumer_comp, &completion) != 0) {
         msg = (struct comch_msg *)doca_dpa_dev_comch_consumer_get_completion_imm(completion, &msg_size);
-        if (msg == NULL) {
-            DOCA_DPA_DEV_LOG_INFO("handle_msgs: got completion with NULL imm (msg_size=%u)\n", msg_size);
-        } else {
-            DOCA_DPA_DEV_LOG_INFO("handle_msgs: completion msg_size=%u type=%u\n",
-                                  msg_size, (uint32_t)msg->type);
-        }
+        if (msg == NULL)
+            continue;
         handle_dpu_msg(thread_arg, msg);
         num_msgs++;
     }
 
     // send_msgs(thread_arg, num_msgs);
     if (num_msgs != 0) {
-        DOCA_DPA_DEV_LOG_INFO("handle_msgs: completion drained num_msgs=%u\n", num_msgs);
         doca_dpa_dev_comch_consumer_completion_ack(consumer_comp, num_msgs);
 		doca_dpa_dev_comch_consumer_completion_request_notification(consumer_comp);
 		doca_dpa_dev_comch_consumer_ack(consumer, num_msgs);
-        empty_polls = 0;
-    } else {
-        if ((++empty_polls & 0x3FFFFF) == 0) {
-            DOCA_DPA_DEV_LOG_INFO("handle_msgs: no completion yet (empty_polls=%u)\n", empty_polls);
-        }
     }
     // DOCA_DPA_DEV_LOG_INFO("Handled %u msgs from host\n", num_msgs);
 }
@@ -192,7 +147,6 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
     uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
-    doca_dpa_dev_completion_element_t prod_comp;
     struct comch_msg msg;
     doca_dpa_dev_uintptr_t dev_ptr;
     doca_dpa_dev_buf_t buf;
@@ -203,7 +157,6 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
 
     uint32_t poll_count = 0;
     uint32_t debug_count = 0;
-    uint32_t no_prod_comp_count = 0;
     uint32_t last_nr = 0;
 
     while (1) {
@@ -251,17 +204,7 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                   r, desc_idx[r], (uint32_t)desc->idx, desc->size,
                                   desc->dst_pod_id, desc->addr);
 
-            /* Wait for consumer space */
-            uint32_t wait_spins = 0;
             while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
-                if ((++wait_spins & 0xFFFFF) == 0) {
-                    DOCA_DPA_DEV_LOG_INFO("WAIT consumer space: ring=%u req_id=%u consumer_id=%u spins=%u\n",
-                                          r, (uint32_t)desc->idx, dpu_consumer_id, wait_spins);
-                }
-            }
-            if (wait_spins > 0) {
-                DOCA_DPA_DEV_LOG_INFO("ACQUIRE consumer space: ring=%u req_id=%u consumer_id=%u spins=%u\n",
-                                      r, (uint32_t)desc->idx, dpu_consumer_id, wait_spins);
             }
 
             /* Build completion message with routing info */
@@ -285,20 +228,6 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                         (uint8_t *)&msg,
                                         sizeof(struct comch_msg),
                                         DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-
-            DOCA_DPA_DEV_LOG_INFO("DMA copy submit returned: ring=%u req_id=%u consumer_id=%u imm_size=%u\n",
-                                  r, (uint32_t)desc->idx, dpu_consumer_id, (uint32_t)sizeof(struct comch_msg));
-
-            if (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &prod_comp) != 0) {
-                doca_dpa_dev_completion_type_t t = doca_dpa_dev_get_completion_type(prod_comp);
-                DOCA_DPA_DEV_LOG_INFO("producer completion observed: ring=%u req_id=%u type=%u\n",
-                                      r, (uint32_t)desc->idx, (uint32_t)t);
-            } else {
-                if ((++no_prod_comp_count & 0x3FFFF) == 0) {
-                    DOCA_DPA_DEV_LOG_INFO("producer completion not yet visible: ring=%u req_id=%u count=%u\n",
-                                          r, (uint32_t)desc->idx, no_prod_comp_count);
-                }
-            }
 
             DOCA_DPA_DEV_LOG_INFO("DMA copy issued: ring=%u slot=%u req_id=%u src_addr=0x%lx size=%u\n",
                                   r, desc_idx[r], (uint32_t)desc->idx, desc->addr, desc->size);
