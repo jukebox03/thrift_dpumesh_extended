@@ -64,6 +64,6 @@ struct dma_desc *get_next_dma_desc(struct dma_ring *ring)
 
     uint32_t next_head = (ring->head + 1) % ring->size;
     ring->head = next_head;
-    DOCA_LOG_DEBUG("Get next DMA desc - head: %u, desc: %p", ring->head, desc);
+    DOCA_LOG_DBG("Get next DMA desc - head: %u, desc: %p", ring->head, desc);
     return desc;
 }

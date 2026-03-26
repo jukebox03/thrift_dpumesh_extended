@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../libthriftzd.a CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o CMakeFiles/thriftz_static.dir/src/thrift/protocol/THeaderProtocol.cpp.o CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.o
-/usr/bin/ranlib ../libthriftzd.a
