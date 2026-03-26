@@ -89,7 +89,7 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                                     dma_msg->length,
                                     "test_dma_imm",
                                     sizeof("test_dma_imm"),
-                                    DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS | DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+                                    DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
             break;
         case COMCH_MSG_TYPE_ADD_RING: {
             struct comch_add_ring_msg *add_msg = (struct comch_add_ring_msg *)msg;
@@ -222,8 +222,8 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
             }
 
             /* Clear valid flag so host can reuse this slot */
-            desc->valid = 0;
-            __dpa_thread_window_writeback();
+            // desc->valid = 0;
+            // __dpa_thread_window_writeback();
 
             /* Advance to next ring slot */
             desc_idx[r] = (desc_idx[r] + 1) % ring->buf_arr_size;
