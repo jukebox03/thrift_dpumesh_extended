@@ -147,11 +147,19 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
     uint32_t pos[MAX_DPA_RINGS] = {0};       /* per-ring DMA buffer position */
 
     uint32_t poll_count = 0;
+    uint32_t debug_count = 0;
 
     while (1) {
         /* Periodically check for new messages (e.g., ADD_RING) from DPU */
         if ((poll_count++ & 0xFFFF) == 0)
             handle_msgs(thread_arg);
+
+        /* Periodic debug: log every ~16M iterations to show we're alive */
+        if ((debug_count++ & 0xFFFFFF) == 0) {
+            uint32_t nr_dbg = thread_arg->num_rings;
+            DOCA_DPA_DEV_LOG_INFO("poll alive: num_rings=%u, poll=%u\n",
+                                  nr_dbg, debug_count);
+        }
 
         uint32_t nr = thread_arg->num_rings;
         if (nr == 0) {
@@ -171,6 +179,9 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
             __dpa_thread_window_read_inv();
             if (!desc->valid)
                 continue;
+
+            DOCA_DPA_DEV_LOG_INFO("FOUND valid desc: ring=%u, idx=%u, size=%lu, dst_pod=%d, addr=0x%lx\n",
+                                  r, desc_idx[r], (uint64_t)desc->size, desc->dst_pod_id, desc->addr);
 
             /* Wait for consumer space */
             while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
@@ -197,6 +208,9 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                         sizeof(struct comch_dma_comp_msg),
                                         DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
                                         DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+
+            DOCA_DPA_DEV_LOG_INFO("DMA copy issued: ring=%u, src_addr=0x%lx, size=%lu\n",
+                                  r, desc->addr, (uint64_t)desc->size);
 
             pos[r] += desc->size;
             if (pos[r] >= ring->dpu_buf_size) {

@@ -102,9 +102,8 @@ run_dpu_worker(struct objects *objs)
         elapsed = (now.tv_sec - last.tv_sec) +
                   (now.tv_nsec - last.tv_nsec) / 1e9;
         if (elapsed >= 1.0) {
-            if (objs->sent_msg_cnt > 0 || objs->recv_msg_cnt > 0)
-                DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s",
-                              elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt);
+            DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s, pods: %d",
+                          elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt, objs->num_pods);
             objs->sent_msg_cnt = 0;
             objs->recv_msg_cnt = 0;
             last = now;
