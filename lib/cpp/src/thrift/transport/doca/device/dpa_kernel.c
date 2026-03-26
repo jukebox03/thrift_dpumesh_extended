@@ -124,6 +124,7 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
     doca_dpa_dev_comch_consumer_t consumer = thread_arg->dpa_consumer;
 	doca_dpa_dev_comch_consumer_completion_t consumer_comp = thread_arg->dpa_consumer_comp;
     uint32_t num_msgs = 0;
+    static uint32_t empty_polls = 0;
 
     while (doca_dpa_dev_comch_consumer_get_completion(consumer_comp, &completion) != 0) {
         msg = (struct comch_msg *)doca_dpa_dev_comch_consumer_get_completion_imm(completion, &msg_size);
@@ -133,9 +134,15 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
 
     // send_msgs(thread_arg, num_msgs);
     if (num_msgs != 0) {
+        DOCA_DPA_DEV_LOG_INFO("handle_msgs: completion drained num_msgs=%u\n", num_msgs);
         doca_dpa_dev_comch_consumer_completion_ack(consumer_comp, num_msgs);
 		doca_dpa_dev_comch_consumer_completion_request_notification(consumer_comp);
 		doca_dpa_dev_comch_consumer_ack(consumer, num_msgs);
+        empty_polls = 0;
+    } else {
+        if ((++empty_polls & 0x3FFFFF) == 0) {
+            DOCA_DPA_DEV_LOG_INFO("handle_msgs: no completion yet (empty_polls=%u)\n", empty_polls);
+        }
     }
     // DOCA_DPA_DEV_LOG_INFO("Handled %u msgs from host\n", num_msgs);
 }
@@ -261,6 +268,11 @@ __dpa_global__ void hello_world(uint64_t arg)
 __dpa_global__ void run_dma_manager(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
+
+    /* Arm completion notification once before the first poll/drain cycle. */
+    doca_dpa_dev_comch_consumer_completion_request_notification(thread_arg->dpa_consumer_comp);
+    DOCA_DPA_DEV_LOG_INFO("completion notification armed (consumer_id=%u)\n",
+                          thread_arg->dpu_consumer_id);
 
     /* Handle the trigger message from DPU consumer first */
     handle_msgs(thread_arg);
