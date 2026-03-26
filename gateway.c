@@ -124,14 +124,14 @@ static void *handle_connection(void *arg)
     }
 
     uint8_t *tx_buf = dpumesh_tx_buf(g_ctx, tx_slot);
-    memcpy(tx_buf, recv_buf + 4, recv_len - 4);  /* skip frame header */
+    memcpy(tx_buf, recv_buf, recv_len);
 
     /* Build request descriptor */
     sw_descriptor_t desc;
     memset(&desc, 0, sizeof(desc));
     desc.header_buf_slot = -1;
     desc.body_buf_slot = tx_slot;
-    desc.body_len = (uint32_t)(recv_len - 4); /* skip frame header*/
+    desc.body_len = (uint32_t)recv_len;
     desc.req_id = req_id;
     desc.dst_pod_id = 0;
     desc.src_pod_id = dpumesh_get_pod_id(g_ctx);
@@ -169,16 +169,6 @@ static void *handle_connection(void *arg)
     if (resp.body_buf_slot >= 0 && resp.body_len > 0) {
         uint8_t *resp_data = dpumesh_rx_buf(g_ctx, resp.body_buf_slot);
         if (resp_data) {
-            /* 4 byte frame header - Big Endian */
-            uint8_t header[4];
-            uint32_t payload_len = resp.body_len;
-            header[0] = (payload_len >> 24) & 0xFF;
-            header[1] = (payload_len >> 16) & 0xFF;
-            header[2] = (payload_len >> 8) & 0xFF;
-            header[3] = payload_len & 0xFF;
-
-            tcp_send_all(client_fd, header, 4);
-
             ssize_t sent = tcp_send_all(client_fd, resp_data, resp.body_len);
             printf("[gateway] Sent %zd bytes response for req_id=%u\n", sent, req_id);
         }

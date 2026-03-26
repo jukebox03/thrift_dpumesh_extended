@@ -110,7 +110,7 @@ void TDpumeshTransport::flush() {
     desc.step_id = 0;
     desc.dst_pod_id = src_pod_id_;
     desc.src_pod_id = dpumesh_get_pod_id(ctx_);
-    desc.flags = OP_RESPONSE | CASE_INGRESS;
+    desc.flags = (flags_ & ~OP_REQUEST) | OP_RESPONSE;  /* clear request flag, set response flag */
     desc.valid = 1;
     desc.src_body_pool_type = POOL_HOST_TX_BODY;
     desc.src_body_pod_id = dpumesh_get_pod_id(ctx_);
