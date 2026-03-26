@@ -91,6 +91,16 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                                     sizeof("test_dma_imm"),
                                     DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS | DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
             break;
+        case COMCH_MSG_TYPE_ADD_RING: {
+            struct comch_add_ring_msg *add_msg = (struct comch_add_ring_msg *)msg;
+            if (thread_arg->num_rings < MAX_DPA_RINGS) {
+                thread_arg->rings[thread_arg->num_rings] = add_msg->ring;
+                thread_arg->num_rings++;
+                DOCA_DPA_DEV_LOG_INFO("Added ring: pod_id=%d, num_rings=%u\n",
+                                      add_msg->ring.pod_id, thread_arg->num_rings);
+            }
+            break;
+        }
         default:
             DOCA_DPA_DEV_LOG_INFO("Unknown msg type received from host: %d\n", msg->type);
             break;
@@ -136,9 +146,13 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
     uint32_t desc_idx[MAX_DPA_RINGS] = {0};  /* per-ring position */
     uint32_t pos[MAX_DPA_RINGS] = {0};       /* per-ring DMA buffer position */
 
+    uint32_t poll_count = 0;
+
     while (1) {
-        /* Invalidate cache so we see num_rings updates from h2d_memcpy */
-        __dpa_thread_window_read_inv();
+        /* Periodically check for new messages (e.g., ADD_RING) from DPU */
+        if ((poll_count++ & 0xFFFF) == 0)
+            handle_msgs(thread_arg);
+
         uint32_t nr = thread_arg->num_rings;
         if (nr == 0) {
             /* No rings yet — spin wait for first pod */

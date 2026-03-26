@@ -1011,40 +1011,39 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
 
     /* 5. Update DPA thread arg: write ring info first, then increment num_rings */
     struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_thread;
-    uint32_t ring_idx = objs->dpa_thread_running ? 0 : 0;  /* will use current num_rings */
-
-    /* We need to read current arg, update, and write back.
-     * Since we write the full arg via h2d_memcpy, build it locally. */
     struct dpa_thread_arg arg;
 
     if (!objs->dpa_thread_running) {
-        /* First pod: fill shared handles + first ring */
+        /* First pod: fill shared handles + first ring, write via h2d_memcpy */
         result = dmesh_fill_dpa_thread_arg(objs, &arg);
         if (result != DOCA_SUCCESS)
             return result;
         arg.rings[0] = ring_info;
         arg.num_rings = 1;
-    } else {
-        /* Subsequent pods: read current arg from DPA, add ring, write back */
-        result = doca_dpa_d2h_memcpy(dpa_thread->dpa, &arg, dpa_thread->arg,
-                                      sizeof(struct dpa_thread_arg));
+
+        result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg,
+                                      &arg, sizeof(struct dpa_thread_arg));
         if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("setup_pod_dma: d2h_memcpy failed: %s", doca_error_get_descr(result));
+            DOCA_LOG_ERR("setup_pod_dma: h2d_memcpy failed: %s", doca_error_get_descr(result));
             return result;
         }
-        if (arg.num_rings >= MAX_DPA_RINGS) {
-            DOCA_LOG_ERR("setup_pod_dma: max rings reached (%d)", MAX_DPA_RINGS);
-            return DOCA_ERROR_FULL;
-        }
-        arg.rings[arg.num_rings] = ring_info;
-        arg.num_rings++;
-    }
+    } else {
+        /* Subsequent pods: send ADD_RING message via comch msgq to DPA thread.
+         * This avoids DPA local memory cache coherency issues with h2d_memcpy
+         * — the DPA thread updates its own data structures directly. */
+        struct comch_add_ring_msg add_msg;
+        memset(&add_msg, 0, sizeof(add_msg));
+        add_msg.type = COMCH_MSG_TYPE_ADD_RING;
+        add_msg.ring = ring_info;
 
-    result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg,
-                                  &arg, sizeof(struct dpa_thread_arg));
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("setup_pod_dma: h2d_memcpy failed: %s", doca_error_get_descr(result));
-        return result;
+        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+                                           &add_msg, sizeof(add_msg));
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("setup_pod_dma: send ADD_RING to DPA failed: %s",
+                         doca_error_get_descr(result));
+            return result;
+        }
+        DOCA_LOG_INFO("Sent ADD_RING to DPA for pod_id=%d", pod->pod_id);
     }
 
     /* 6. If first pod, run DPA thread */
@@ -1088,7 +1087,7 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
             }
         }
     } else {
-        DOCA_LOG_INFO("Added ring for pod_id=%d (num_rings=%u)", pod->pod_id, arg.num_rings);
+        DOCA_LOG_INFO("Sent ADD_RING msg to DPA for pod_id=%d", pod->pod_id);
     }
 
     pod->dma_ready = 1;

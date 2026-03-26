@@ -39,6 +39,7 @@ struct dpa_thread_arg {
 enum comch_msg_type {
 	COMCH_MSG_TYPE_DMA_REQ = 1,
 	COMCH_MSG_TYPE_DMA_COMPLETED = 2,
+	COMCH_MSG_TYPE_ADD_RING = 3,
 };
 
 struct comch_dma_comp_msg {
@@ -65,12 +66,18 @@ struct comch_dma_req_msg {
 	uint32_t length;
 } __attribute__((__packed__, aligned(8)));
 
+struct comch_add_ring_msg {
+	enum comch_msg_type type;
+	struct dpa_ring_info ring;
+} __attribute__((__packed__, aligned(4)));
+
 struct comch_msg {
 	enum comch_msg_type type;
 	union
 	{
 		struct comch_dma_req_msg dma_req_msg;
 		struct comch_dma_comp_msg dma_comp_msg;
+		struct comch_add_ring_msg add_ring_msg;
 	};
 } __attribute__((__packed__, aligned(4)));
 
