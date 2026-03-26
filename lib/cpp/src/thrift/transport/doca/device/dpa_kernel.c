@@ -110,23 +110,35 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             /* No-op: just waking up the thread via completion event */
             DOCA_DPA_DEV_LOG_INFO("Trigger received\n");
 
-            /* DPA->DPU datapath ping to verify producer->consumer delivery path. */
-            {
+            /* DPA->DPU datapath ping sweep to identify which consumer ID reaches callback. */
+            for (uint32_t test_cid = 0; test_cid < 4; test_cid++) {
                 struct comch_msg ping;
-                ping.type = COMCH_MSG_TYPE_TRIGGER;
+                uint32_t spins = 0;
+                ping.ping_msg.type = COMCH_MSG_TYPE_PING;
+                ping.ping_msg.marker = 0xC0DE0000u | test_cid;
+                ping.ping_msg.target_consumer_id = test_cid;
 
-                while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
+                while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, test_cid) == 1) {
+                    if (++spins >= 1000000u)
+                        break;
+                }
+
+                if (spins >= 1000000u) {
+                    DOCA_DPA_DEV_LOG_INFO("PING skip: consumer_id=%u appears empty\n", test_cid);
+                    continue;
                 }
 
                 doca_dpa_dev_comch_producer_post_send_imm_only(
                     producer,
-                    dpu_consumer_id,
+                    test_cid,
                     (uint8_t *)&ping,
                     sizeof(struct comch_msg),
                     DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
-                DOCA_DPA_DEV_LOG_INFO("Sent DPA->DPU ping imm (type=%d, consumer_id=%u)\n",
-                                      ping.type, dpu_consumer_id);
+                DOCA_DPA_DEV_LOG_INFO("Sent DPA->DPU PING marker=0x%x to consumer_id=%u (configured=%u)\n",
+                                      ping.ping_msg.marker,
+                                      test_cid,
+                                      dpu_consumer_id);
             }
             break;
         default:
