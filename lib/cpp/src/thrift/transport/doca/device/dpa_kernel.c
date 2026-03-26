@@ -109,6 +109,25 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
         case COMCH_MSG_TYPE_TRIGGER:
             /* No-op: just waking up the thread via completion event */
             DOCA_DPA_DEV_LOG_INFO("Trigger received\n");
+
+            /* DPA->DPU datapath ping to verify producer->consumer delivery path. */
+            {
+                struct comch_msg ping;
+                ping.type = COMCH_MSG_TYPE_TRIGGER;
+
+                while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
+                }
+
+                doca_dpa_dev_comch_producer_post_send_imm_only(
+                    producer,
+                    dpu_consumer_id,
+                    (uint8_t *)&ping,
+                    sizeof(struct comch_msg),
+                    DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+
+                DOCA_DPA_DEV_LOG_INFO("Sent DPA->DPU ping imm (type=%d, consumer_id=%u)\n",
+                                      ping.type, dpu_consumer_id);
+            }
             break;
         default:
             DOCA_DPA_DEV_LOG_INFO("Unknown msg type received from host: %d\n", msg->type);
@@ -213,7 +232,16 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                   desc->dst_pod_id, desc->addr);
 
             /* Wait for consumer space */
+            uint32_t wait_spins = 0;
             while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
+                if ((++wait_spins & 0xFFFFF) == 0) {
+                    DOCA_DPA_DEV_LOG_INFO("WAIT consumer space: ring=%u req_id=%u consumer_id=%u spins=%u\n",
+                                          r, (uint32_t)desc->idx, dpu_consumer_id, wait_spins);
+                }
+            }
+            if (wait_spins > 0) {
+                DOCA_DPA_DEV_LOG_INFO("ACQUIRE consumer space: ring=%u req_id=%u consumer_id=%u spins=%u\n",
+                                      r, (uint32_t)desc->idx, dpu_consumer_id, wait_spins);
             }
 
             /* Build completion message with routing info */
@@ -237,6 +265,9 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                         (uint8_t *)&msg,
                                         sizeof(struct comch_msg),
                                         DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+
+            DOCA_DPA_DEV_LOG_INFO("DMA copy submit returned: ring=%u req_id=%u consumer_id=%u imm_size=%u\n",
+                                  r, (uint32_t)desc->idx, dpu_consumer_id, (uint32_t)sizeof(struct comch_msg));
 
             DOCA_DPA_DEV_LOG_INFO("DMA copy issued: ring=%u slot=%u req_id=%u src_addr=0x%lx size=%u\n",
                                   r, desc_idx[r], (uint32_t)desc->idx, desc->addr, desc->size);

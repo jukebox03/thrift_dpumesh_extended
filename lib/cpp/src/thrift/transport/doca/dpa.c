@@ -147,6 +147,10 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             }
             break;
         }
+        case COMCH_MSG_TYPE_TRIGGER:
+            DOCA_LOG_INFO("DPA MsgQ recv callback ping received (type=%u)",
+                          (unsigned int)msg->type);
+            break;
         default:
             DOCA_LOG_ERR("Received unknown message type: %u", msg->type);
             break;
