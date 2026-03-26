@@ -118,6 +118,17 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
 
+	case DMESH_MSG_CONSUMER_ID: {
+		struct dmesh_consumer_id_msg *cid_msg = (struct dmesh_consumer_id_msg *)recv_buffer;
+		if (msg_len < sizeof(struct dmesh_consumer_id_msg)) {
+			DOCA_LOG_ERR("Received invalid CONSUMER_ID message");
+			return;
+		}
+		objs->remote_consumer_id = cid_msg->consumer_id;
+		DOCA_LOG_INFO("Received remote consumer ID = %u from DPU", cid_msg->consumer_id);
+		break;
+	}
+
 	default:
 		DOCA_LOG_INFO("Received unknown message type from server: %u", comch_msg->type);
 		break;

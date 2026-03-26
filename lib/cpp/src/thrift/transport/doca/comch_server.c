@@ -16,8 +16,14 @@
 
 #include <doca_pe.h>
 #include <doca_comch.h>
+#include <doca_comch_consumer.h>
 #include <doca_log.h>
 #include <doca_comch_producer.h>
+
+/* Forward declaration — defined below server_message_recv_callback */
+static doca_error_t
+server_send_msg_to(struct objects *objs, struct doca_comch_connection *conn,
+                   const char *msg, size_t len);
 
 
 DOCA_LOG_REGISTER(COMCH_SERVER);
@@ -137,6 +143,21 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 		}
 		pods_register(objs, comch_connection, reg->pod_id, reg->app_name);
 		DOCA_LOG_INFO("Pod registered: pod_id=%d, app=%s", reg->pod_id, reg->app_name);
+
+		/* Reply with consumer ID so the host can create its producer.
+		 * This is needed because the "new consumer" event only fires once
+		 * (when the consumer is first created), so the second+ pod never
+		 * gets the event and would block forever. */
+		if (objs->consumer != NULL) {
+			uint32_t cid;
+			doca_comch_consumer_get_id(objs->consumer, &cid);
+			struct dmesh_consumer_id_msg reply;
+			reply.type = DMESH_MSG_CONSUMER_ID;
+			reply.consumer_id = cid;
+			server_send_msg_to(objs, comch_connection,
+			                   (const char *)&reply, sizeof(reply));
+			DOCA_LOG_INFO("Sent CONSUMER_ID=%u to pod_id=%d", cid, reg->pod_id);
+		}
 		break;
 	}
 

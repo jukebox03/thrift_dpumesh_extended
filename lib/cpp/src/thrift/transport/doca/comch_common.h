@@ -18,6 +18,13 @@ enum dmesh_msg_type {
     DMESH_MSG_EXPORT_DPA_COMP = 2,
     DMESH_MSG_RX_DATA = 3,
     DMESH_MSG_REGISTER = 4,      /* Host→DPU: register pod_id */
+    DMESH_MSG_CONSUMER_ID = 5,   /* DPU→Host: consumer ID reply */
+};
+
+/* DPU→Host: tell the client what consumer ID to use for producer */
+struct dmesh_consumer_id_msg {
+    enum dmesh_msg_type type;   /* = DMESH_MSG_CONSUMER_ID */
+    uint32_t consumer_id;
 };
 
 enum mmap_type {
