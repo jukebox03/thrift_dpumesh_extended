@@ -278,9 +278,14 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         /* Route to pending table for client-side matching */
         uint32_t idx = desc.req_id % MAX_PENDING;
         dpumesh_pending_t *p = &ctx->pending[idx];
+        DOCA_LOG_INFO("RX_DATA OP_RESPONSE: req_id=%u idx=%u len=%u slot=%d flags=0x%x",
+                      desc.req_id, idx, desc.body_len, slot,
+                      (unsigned int)(uint8_t)desc.flags);
         pthread_mutex_lock(&p->lock);
         if (p->state == 0) {
             /* Someone is waiting for this response */
+            DOCA_LOG_INFO("Pending wake-up: req_id=%u idx=%u state=%d -> 1",
+                          desc.req_id, idx, p->state);
             p->desc = desc;
             p->state = 1;
             pthread_cond_signal(&p->cond);
@@ -744,10 +749,13 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
     dpumesh_pending_t *p = &ctx->pending[idx];
 
     pthread_mutex_lock(&p->lock);
+    DOCA_LOG_INFO("wait_response begin: req_id=%u idx=%u timeout_ms=%d state=%d",
+                  req_id, idx, timeout_ms, p->state);
     while (p->state == 0) {
         if (timeout_ms < 0) {
             pthread_cond_wait(&p->cond, &p->lock);
         } else if (timeout_ms == 0) {
+            DOCA_LOG_WARN("wait_response immediate timeout: req_id=%u idx=%u", req_id, idx);
             pthread_mutex_unlock(&p->lock);
             return -1;
         } else {
@@ -762,6 +770,8 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
             int rc = pthread_cond_timedwait(&p->cond, &p->lock, &ts);
             if (rc != 0) {
                 /* Timeout */
+                DOCA_LOG_WARN("wait_response timed out: req_id=%u idx=%u state=%d",
+                              req_id, idx, p->state);
                 p->state = -1;  /* reset to unused */
                 pthread_mutex_unlock(&p->lock);
                 return -1;
@@ -771,6 +781,8 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
 
     if (p->state == 1) {
         /* Response arrived */
+        DOCA_LOG_INFO("wait_response hit: req_id=%u idx=%u resp_slot=%d resp_len=%u",
+                      req_id, idx, p->desc.body_buf_slot, p->desc.body_len);
         *resp = p->desc;
         p->state = -1;  /* reset to unused */
         pthread_mutex_unlock(&p->lock);

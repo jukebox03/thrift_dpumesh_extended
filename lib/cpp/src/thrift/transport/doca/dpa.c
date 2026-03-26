@@ -9,46 +9,29 @@
 #include <doca_mmap.h>
 
 #include "object.h"
-#include "dpa_common.h"
-#include "dpu_worker.h"
-#include "comch_server.h"
-#include "../dpumesh.h"
-#include "ring.h"
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#include <string.h>
-#include <time.h>
 
-DOCA_LOG_REGISTER(DPA);
-
-#ifdef DOCA_ARCH_DPU
-/* Kernel function declaration (resolved from dpa_program.a stubs, DPU only) */
-extern doca_dpa_func_t hello_world;
-extern doca_dpa_func_t run_dma_manager;
-extern doca_dpa_func_t thread_init_rpc;
-
-extern struct doca_dpa_app *DPU_mesh_dpa_app;
-#endif
-
-#define TEST_DPA_MEMORY
-
-/*
- * Callback invoked once a message is received from DPA successfully
- *
- * @recv_task [in]: The receive task
- * @task_user_data [in]: User data that was previously provided with the task
- * @ctx_user_data [in]: User data that was previously set for the consumer context
- */
-static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_recv *recv_task,
-				       union doca_data task_user_data,
-				       union doca_data ctx_user_data)
-{
-	(void)task_user_data;
-
-	doca_error_t result;
-    uint32_t data_len;
-    struct comch_msg *msg;
+    for (i = 0; i < num_msg; i++) {
+        result = doca_comch_producer_task_send_alloc_init(msgq->producer,
+                                  NULL,
+                                  msg,
+                                  msg_size,
+                                  /*consumer_id=*/1,
+                                  &send_task);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to send msg using NVMf DOCA DPA MsgQ: Failed to allocate send task - %s",
+                     doca_error_get_name(result));
+            return result;
+        }
+        task = doca_comch_producer_task_send_as_task(send_task);
+        result = doca_task_submit(task);
+        if (result != DOCA_SUCCESS) {
+            if (result != DOCA_ERROR_AGAIN)
+                DOCA_LOG_ERR("Failed to send msg using NVMf DOCA DPA MsgQ: Failed to submit send task - %s",
+                     doca_error_get_name(result));
+            doca_task_free(task);
+            return result;
+        }
+    }
 
 	struct objects *objs = ctx_user_data.ptr;
 	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
@@ -58,7 +41,7 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 
     switch (msg->type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED: {
-            struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
+            struct comch_dma_comp_msg *comp_msg = &msg->dma_comp_msg;
             int32_t src_pod_id = comp_msg->src_pod_id;
             int32_t dst_pod_id = comp_msg->dst_pod_id;
             uint32_t req_id = comp_msg->req_id;
@@ -76,6 +59,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 
             DOCA_LOG_INFO("DMA completed: src_pod=%d, dst_pod=%d, req_id=%u, pos=%u, len=%u",
                           src_pod_id, dst_pod_id, req_id, comp_msg->pos, data_len);
+            DOCA_LOG_INFO("DMA completed route check: req_id=%u src=%d dst=%d flags=0x%x",
+                          req_id, src_pod_id, dst_pod_id, (unsigned int)(uint8_t)comp_msg->flags);
 
             /* Send TX ACK back to the source pod so host can free TX slot safely. */
             if (src_pod && src_pod->connection) {
@@ -96,6 +81,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             if (!echo_mode) {
                 struct pod_state *dst = find_pod_by_id(objs, dst_pod_id);
                 if (dst && dst->connection) {
+                    DOCA_LOG_INFO("Forward begin: req_id=%u src=%d -> dst=%d len=%u",
+                                  req_id, src_pod_id, dst_pod_id, data_len);
                     /* Forward to destination pod */
                     sw_descriptor_t fwd_desc;
                     memset(&fwd_desc, 0, sizeof(fwd_desc));
@@ -121,6 +108,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                     DOCA_LOG_ERR("DMA completed: dst_pod=%d not found", dst_pod_id);
                 }
             } else {
+                DOCA_LOG_INFO("Echo mode route: req_id=%u src=%d dst=%d len=%u",
+                              req_id, src_pod_id, dst_pod_id, data_len);
                 /* Echo mode: same pod or single-pod testing */
                 sw_descriptor_t echo_desc;
                 memset(&echo_desc, 0, sizeof(echo_desc));
@@ -847,7 +836,6 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
     struct doca_task *task;
 	doca_error_t result;
     int i;
-    struct comch_msg *comch_msg = (struct comch_msg *)msg;
 
     for (i = 0; i < num_msg; i++) {
         result = doca_comch_producer_task_send_alloc_init(msgq->producer,
