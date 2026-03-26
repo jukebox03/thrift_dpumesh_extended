@@ -616,8 +616,11 @@ void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
 int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     /* All pods use DMA ring path */
     struct dma_desc *dma = get_next_dma_desc(ctx->dma_ring);
+    uint32_t ring_slot;
     if (!dma)
         return -1;
+
+    ring_slot = (uint32_t)(dma - ctx->dma_ring->descs);
 
     if ((desc->flags & OP_RESPONSE) &&
         tx_inflight_register(ctx, desc->req_id, desc->dst_pod_id,
@@ -637,6 +640,15 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     /* Memory barrier to ensure fields are visible before valid flag */
     __sync_synchronize();
     dma->valid = 1;
+
+    DOCA_LOG_INFO("ENQUEUE publish: req_id=%u ring_slot=%u tx_slot=%d len=%u dst_pod=%d flags=0x%x addr=0x%lx",
+                  desc->req_id,
+                  ring_slot,
+                  desc->body_buf_slot,
+                  desc->body_len,
+                  desc->dst_pod_id,
+                  (unsigned int)(uint8_t)desc->flags,
+                  (unsigned long)dma->addr);
 
     return 0;
 }
