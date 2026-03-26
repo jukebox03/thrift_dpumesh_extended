@@ -178,7 +178,23 @@ static int tx_inflight_register(dpumesh_ctx_t *ctx, uint32_t req_id,
     ctx->tx_inflight[free_idx].slot = slot;
     ctx->tx_inflight[free_idx].in_use = 1;
     pthread_mutex_unlock(&ctx->tx_inflight_lock);
+    DOCA_LOG_INFO("TX inflight registered: req_id=%u dst_pod=%d slot=%d idx=%d",
+                  req_id, dst_pod_id, slot, free_idx);
     return 0;
+}
+
+/* Best-effort classifier: if req_id is still pending, TX_ACK without inflight is
+ * usually from OP_REQUEST path and is not an error. */
+static int pending_is_waiting(dpumesh_ctx_t *ctx, uint32_t req_id)
+{
+    uint32_t idx = req_id % MAX_PENDING;
+    dpumesh_pending_t *p = &ctx->pending[idx];
+    int waiting;
+
+    pthread_mutex_lock(&p->lock);
+    waiting = (p->state == 0);
+    pthread_mutex_unlock(&p->lock);
+    return waiting;
 }
 
 static void tx_inflight_ack_hook(void *hook_ctx, const uint8_t *data, uint32_t len)
@@ -201,12 +217,20 @@ static void tx_inflight_ack_hook(void *hook_ctx, const uint8_t *data, uint32_t l
             ctx->tx_inflight[i].in_use = 0;
             pthread_mutex_unlock(&ctx->tx_inflight_lock);
             dpumesh_tx_free(ctx, slot);
+            DOCA_LOG_INFO("TX_ACK matched inflight: req_id=%u dst_pod=%d slot=%d idx=%d",
+                          ack->req_id, ack->dst_pod_id, slot, i);
             return;
         }
     }
     pthread_mutex_unlock(&ctx->tx_inflight_lock);
-    DOCA_LOG_ERR("TX_ACK: no inflight entry for req_id=%u dst_pod=%d",
-                 ack->req_id, ack->dst_pod_id);
+
+    if (pending_is_waiting(ctx, ack->req_id)) {
+        DOCA_LOG_INFO("TX_ACK without inflight (expected request path): req_id=%u dst_pod=%d",
+                      ack->req_id, ack->dst_pod_id);
+    } else {
+        DOCA_LOG_WARN("TX_ACK orphan: no inflight/pending entry for req_id=%u dst_pod=%d",
+                      ack->req_id, ack->dst_pod_id);
+    }
 }
 
 static void tx_inflight_cleanup(dpumesh_ctx_t *ctx)

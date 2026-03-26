@@ -2,6 +2,7 @@
 #define DPA_COMMON_H_
 
 #include <stdint.h>
+#include <stddef.h>
 #include <doca_mmap.h>
 
 typedef uint64_t doca_dpa_dev_uintptr_t;
@@ -87,12 +88,21 @@ struct comch_msg {
 struct dma_desc {
 	doca_dpa_dev_mmap_t mmap; 	// 4B
 	uint64_t addr;			   // 8B
-	size_t size;				   // 8B
+	uint32_t size;			   // 4B (fixed width for Host/DPA ABI stability)
 	uint64_t idx;		   // 8B (req_id)
 	int32_t dst_pod_id;    // 4B (routing target)
 	int8_t flags;          // 1B (OP_REQUEST/OP_RESPONSE + CASE_*)
-	uint8_t reserved[30];  // 30B
+	uint8_t reserved[34];  // 34B
 	volatile uint8_t valid;		   // 1B
 } __attribute__((__packed__, aligned(8)));
+
+/* Keep Host/DPA descriptor ABI stable across toolchains. */
+_Static_assert(sizeof(struct dma_desc) == 64, "dma_desc must be 64 bytes");
+_Static_assert(offsetof(struct dma_desc, addr) == 4, "dma_desc.addr offset mismatch");
+_Static_assert(offsetof(struct dma_desc, size) == 12, "dma_desc.size offset mismatch");
+_Static_assert(offsetof(struct dma_desc, idx) == 16, "dma_desc.idx offset mismatch");
+_Static_assert(offsetof(struct dma_desc, dst_pod_id) == 24, "dma_desc.dst_pod_id offset mismatch");
+_Static_assert(offsetof(struct dma_desc, flags) == 28, "dma_desc.flags offset mismatch");
+_Static_assert(offsetof(struct dma_desc, valid) == 63, "dma_desc.valid offset mismatch");
 
 #endif

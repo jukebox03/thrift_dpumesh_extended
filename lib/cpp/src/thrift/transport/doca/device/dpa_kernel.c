@@ -94,9 +94,13 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             struct comch_add_ring_msg *add_msg = (struct comch_add_ring_msg *)msg;
             if (thread_arg->num_rings < MAX_DPA_RINGS) {
                 thread_arg->rings[thread_arg->num_rings] = add_msg->ring;
+                DOCA_DPA_DEV_LOG_INFO("ADD_RING received: pod_id=%d, buf_arr_size=%u\n",
+                                      add_msg->ring.pod_id, add_msg->ring.buf_arr_size);
                 thread_arg->num_rings++;
                 DOCA_DPA_DEV_LOG_INFO("Added ring: pod_id=%d, num_rings=%u\n",
                                       add_msg->ring.pod_id, thread_arg->num_rings);
+            } else {
+                DOCA_DPA_DEV_LOG_INFO("Ring add failed: too many rings=%u\n", thread_arg->num_rings);
             }
             break;
         }
@@ -151,6 +155,7 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
 
     uint32_t poll_count = 0;
     uint32_t debug_count = 0;
+    uint32_t last_nr = 0;
 
     while (1) {
         /* Periodically check for new messages (e.g., ADD_RING) from DPU */
@@ -167,7 +172,17 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
         uint32_t nr = thread_arg->num_rings;
         if (nr == 0) {
             /* No rings yet — spin wait for first pod */
+            if (nr != last_nr) {
+                DOCA_DPA_DEV_LOG_INFO("Waiting for first ring (num_rings=0)\n");
+                last_nr = nr;
+            }
             continue;
+        }
+        
+        /* Notify when first ring arrives */
+        if (nr != last_nr) {
+            DOCA_DPA_DEV_LOG_INFO("Rings now available: num_rings=%u (was %u)\n", nr, last_nr);
+            last_nr = nr;
         }
 
         for (uint32_t r = 0; r < nr; r++) {
@@ -183,8 +198,9 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
             if (!desc->valid)
                 continue;
 
-            DOCA_DPA_DEV_LOG_INFO("FOUND valid desc: ring=%u, idx=%u, size=%lu, dst_pod=%d, addr=0x%lx\n",
-                                  r, desc_idx[r], (uint64_t)desc->size, desc->dst_pod_id, desc->addr);
+            DOCA_DPA_DEV_LOG_INFO("FOUND valid desc: ring=%u slot=%u req_id=%u size=%u dst_pod=%d addr=0x%lx\n",
+                                  r, desc_idx[r], (uint32_t)desc->idx, desc->size,
+                                  desc->dst_pod_id, desc->addr);
 
             /* Wait for consumer space */
             while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
@@ -211,8 +227,8 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                         sizeof(struct comch_dma_comp_msg),
                                         DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
-            DOCA_DPA_DEV_LOG_INFO("DMA copy issued: ring=%u, src_addr=0x%lx, size=%lu\n",
-                                  r, desc->addr, (uint64_t)desc->size);
+            DOCA_DPA_DEV_LOG_INFO("DMA copy issued: ring=%u slot=%u req_id=%u src_addr=0x%lx size=%u\n",
+                                  r, desc_idx[r], (uint32_t)desc->idx, desc->addr, desc->size);
 
             pos[r] += desc->size;
             if (pos[r] >= ring->dpu_buf_size) {
@@ -220,8 +236,8 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
             }
 
             /* Clear valid flag so host can reuse this slot */
-            // desc->valid = 0;
-            // __dpa_thread_window_writeback();
+            desc->valid = 0;
+            __dpa_thread_window_writeback();
 
             /* Advance to next ring slot */
             desc_idx[r] = (desc_idx[r] + 1) % ring->buf_arr_size;

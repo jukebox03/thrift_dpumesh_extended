@@ -7,6 +7,20 @@
 #include <cstring>
 #include <algorithm>
 #include <string>
+#include <vector>
+
+namespace {
+inline bool hasFramedPrefix(const std::vector<uint8_t> &buf) {
+    if (buf.size() < 4) {
+        return false;
+    }
+    uint32_t frame_len = (static_cast<uint32_t>(buf[0]) << 24) |
+                         (static_cast<uint32_t>(buf[1]) << 16) |
+                         (static_cast<uint32_t>(buf[2]) << 8) |
+                         static_cast<uint32_t>(buf[3]);
+    return frame_len == (buf.size() - 4);
+}
+}
 
 namespace apache {
 namespace thrift {
@@ -67,6 +81,12 @@ void TDpumeshTransport::write(const uint8_t *buf, uint32_t len) {
 void TDpumeshTransport::flush() {
     if (write_buf_.empty()) return;
 
+    /* Thrift framed transports may prepend 4-byte frame length (big-endian).
+     * We forward the buffer exactly as provided so both framed and raw modes work. */
+    const bool framed = hasFramedPrefix(write_buf_);
+    const uint32_t payload_len = static_cast<uint32_t>(write_buf_.size());
+    (void)framed;
+
     /* Check slot size limit */
     int slot_size = dpumesh_get_slot_size(ctx_);
     if (static_cast<int>(write_buf_.size()) > slot_size) {
@@ -98,7 +118,7 @@ void TDpumeshTransport::flush() {
     desc.header_buf_slot = -1;
     desc.header_len = 0;
     desc.body_buf_slot = tx_slot;
-    desc.body_len = static_cast<uint32_t>(write_buf_.size());
+    desc.body_len = payload_len;
     desc.req_id = stream_id_;
     desc.step_id = 0;
     desc.dst_pod_id = src_pod_id_;

@@ -1,5 +1,6 @@
 #include "ring.h"
 #include <stdlib.h>
+#include <string.h>
 #include <doca_log.h>
 #include "dpa_common.h"
 #include "object.h"
@@ -33,6 +34,9 @@ int setup_dma_ring(struct objects *objs, size_t size)
         free(objs->dma_ring);
         return result;
     }
+
+    /* Descriptors must start as invalid; otherwise DPA may consume garbage slots. */
+    memset(ring->descs, 0, ring->size * sizeof(struct dma_desc));
     
     /* export mmap to DPU */
     result = export_mmap_to_remote(objs, ring->mmap, 
@@ -50,8 +54,16 @@ int setup_dma_ring(struct objects *objs, size_t size)
 
 struct dma_desc *get_next_dma_desc(struct dma_ring *ring)
 {
+    /* Valid bit is owned by DPA consumer; if still set, producer must not overwrite. */
     struct dma_desc *desc = ring->descs + ring->head;
-    ring->head = (ring->head + 1) % ring->size;
-    // DOCA_LOG_INFO("Get next DMA desc - head: %u, tail: %u, desc: %p", ring->head, ring->tail, desc);
+
+    if (desc->valid) {
+        DOCA_LOG_WARN("DMA ring busy at head=%u (size=%u)", ring->head, ring->size);
+        return NULL;
+    }
+
+    uint32_t next_head = (ring->head + 1) % ring->size;
+    ring->head = next_head;
+    DOCA_LOG_DEBUG("Get next DMA desc - head: %u, desc: %p", ring->head, desc);
     return desc;
 }
