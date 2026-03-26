@@ -137,10 +137,11 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
     uint32_t pos[MAX_DPA_RINGS] = {0};       /* per-ring DMA buffer position */
 
     while (1) {
+        /* Invalidate cache so we see num_rings updates from h2d_memcpy */
+        __dpa_thread_window_read_inv();
         uint32_t nr = thread_arg->num_rings;
         if (nr == 0) {
             /* No rings yet — spin wait for first pod */
-            __dpa_thread_window_read_inv();
             continue;
         }
 
