@@ -56,6 +56,14 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     data_len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
     msg = (struct comch_msg *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
 
+    if (msg == NULL) {
+        DOCA_LOG_ERR("DPA MsgQ recv callback entered with NULL imm data (len=%u)", data_len);
+        goto resubmit_recv_task;
+    }
+
+    DOCA_LOG_INFO("DPA MsgQ recv callback entered: imm_len=%u type=%u",
+                  data_len, (unsigned int)msg->type);
+
     switch (msg->type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED: {
             struct comch_dma_comp_msg *comp_msg = &msg->dma_comp_msg;
@@ -145,6 +153,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     }
 
     objs->recv_msg_cnt++;
+
+resubmit_recv_task:
 
 	result = doca_task_submit(task);
 	if (result != DOCA_SUCCESS) {
@@ -612,6 +622,7 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                 return result;
             }
         }
+            DOCA_LOG_INFO("DPA MsgQ pre-posted recv tasks: count=%u", attr->max_num_msg);
     }
 
     return DOCA_SUCCESS;
