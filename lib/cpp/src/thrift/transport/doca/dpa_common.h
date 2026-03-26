@@ -40,6 +40,7 @@ enum comch_msg_type {
 	COMCH_MSG_TYPE_DMA_REQ = 1,
 	COMCH_MSG_TYPE_DMA_COMPLETED = 2,
 	COMCH_MSG_TYPE_ADD_RING = 3,
+	COMCH_MSG_TYPE_TRIGGER = 4,   /* DPU→DPA: wake up thread (no payload) */
 };
 
 struct comch_dma_comp_msg {

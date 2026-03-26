@@ -101,6 +101,10 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             }
             break;
         }
+        case COMCH_MSG_TYPE_TRIGGER:
+            /* No-op: just waking up the thread via completion event */
+            DOCA_DPA_DEV_LOG_INFO("Trigger received\n");
+            break;
         default:
             DOCA_DPA_DEV_LOG_INFO("Unknown msg type received from host: %d\n", msg->type);
             break;

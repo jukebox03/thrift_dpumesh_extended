@@ -1071,12 +1071,8 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
          * message via the DPU→DPA msgq triggers the first execution. */
         {
             struct comch_msg trigger;
-            trigger.type = COMCH_MSG_TYPE_DMA_COMPLETED;  /* reuse existing type */
-            trigger.dma_comp_msg.pos = 0;
-            trigger.dma_comp_msg.length = 0;
-            trigger.dma_comp_msg.req_id = 0;
-            trigger.dma_comp_msg.src_pod_id = -1;
-            trigger.dma_comp_msg.dst_pod_id = -1;
+            memset(&trigger, 0, sizeof(trigger));
+            trigger.type = COMCH_MSG_TYPE_TRIGGER;
             result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
                                                &trigger, sizeof(trigger));
             if (result != DOCA_SUCCESS) {
