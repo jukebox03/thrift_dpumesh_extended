@@ -518,6 +518,19 @@ server_send_rx_data_to(struct objects *objs,
 	return result;
 }
 
+doca_error_t
+server_send_tx_ack_to(struct objects *objs,
+                      struct doca_comch_connection *conn,
+                      uint32_t req_id,
+                      int32_t dst_pod_id)
+{
+	struct dmesh_tx_ack_msg ack;
+	ack.type = DMESH_MSG_TX_ACK;
+	ack.req_id = req_id;
+	ack.dst_pod_id = dst_pod_id;
+	return server_send_msg_to(objs, conn, (const char *)&ack, sizeof(ack));
+}
+
 /* ====================================================================
  * Pod connection management
  * ==================================================================== */

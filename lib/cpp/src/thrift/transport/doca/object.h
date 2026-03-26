@@ -97,6 +97,10 @@ struct objects {
     void (*rx_data_hook)(void *hook_ctx, const uint8_t *data, uint32_t len);
     void *rx_hook_ctx;
 
+    /* TX ACK hook (comch control path → dpumesh_ctx) */
+    void (*tx_ack_hook)(void *hook_ctx, const uint8_t *data, uint32_t len);
+    void *tx_ack_hook_ctx;
+
     /* Multi-pod table (DPU only) */
     struct pod_state pods[MAX_PODS];
     int num_pods;

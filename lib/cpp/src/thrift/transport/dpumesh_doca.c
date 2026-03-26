@@ -45,12 +45,22 @@ DOCA_LOG_REGISTER(DPUMESH_DOCA);
 /* Pending response table for client-side request/response matching */
 #define MAX_PENDING 256
 
+/* Inflight TX table for ACK-based slot release (server response path) */
+#define MAX_TX_INFLIGHT 512
+
 typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     sw_descriptor_t desc;
     volatile int state;   /* -1=unused, 0=waiting, 1=arrived */
 } dpumesh_pending_t;
+
+typedef struct {
+    uint32_t req_id;
+    int32_t dst_pod_id;
+    int slot;
+    int in_use;
+} dpumesh_tx_inflight_t;
 
 struct dpumesh_ctx {
     char app_name[64];
@@ -93,6 +103,11 @@ struct dpumesh_ctx {
     /* Client-side pending response table */
     dpumesh_pending_t pending[MAX_PENDING];
     atomic_uint_fast32_t next_req_id;
+
+    /* TX inflight table for ACK-based release */
+    dpumesh_tx_inflight_t tx_inflight[MAX_TX_INFLIGHT];
+    pthread_mutex_t tx_inflight_lock;
+    int tx_inflight_lock_ready;
 };
 
 /* ====================================================================
@@ -129,6 +144,82 @@ static int rx_slot_alloc(dpumesh_ctx_t *ctx) {
     }
     pthread_mutex_unlock(&ctx->rx_slot_lock);
     return -1;
+}
+
+static int tx_inflight_register(dpumesh_ctx_t *ctx, uint32_t req_id,
+                                int32_t dst_pod_id, int slot)
+{
+    int free_idx = -1;
+
+    pthread_mutex_lock(&ctx->tx_inflight_lock);
+    for (int i = 0; i < MAX_TX_INFLIGHT; i++) {
+        if (ctx->tx_inflight[i].in_use) {
+            if (ctx->tx_inflight[i].req_id == req_id &&
+                ctx->tx_inflight[i].dst_pod_id == dst_pod_id) {
+                pthread_mutex_unlock(&ctx->tx_inflight_lock);
+                DOCA_LOG_ERR("TX inflight duplicate req_id=%u dst_pod=%d",
+                             req_id, dst_pod_id);
+                return -1;
+            }
+        } else if (free_idx < 0) {
+            free_idx = i;
+        }
+    }
+
+    if (free_idx < 0) {
+        pthread_mutex_unlock(&ctx->tx_inflight_lock);
+        DOCA_LOG_ERR("TX inflight table full for req_id=%u dst_pod=%d",
+                     req_id, dst_pod_id);
+        return -1;
+    }
+
+    ctx->tx_inflight[free_idx].req_id = req_id;
+    ctx->tx_inflight[free_idx].dst_pod_id = dst_pod_id;
+    ctx->tx_inflight[free_idx].slot = slot;
+    ctx->tx_inflight[free_idx].in_use = 1;
+    pthread_mutex_unlock(&ctx->tx_inflight_lock);
+    return 0;
+}
+
+static void tx_inflight_ack_hook(void *hook_ctx, const uint8_t *data, uint32_t len)
+{
+    dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)hook_ctx;
+    const struct dmesh_tx_ack_msg *ack = (const struct dmesh_tx_ack_msg *)data;
+
+    if (len < sizeof(struct dmesh_tx_ack_msg)) {
+        DOCA_LOG_ERR("TX_ACK: invalid len=%u", len);
+        return;
+    }
+
+    pthread_mutex_lock(&ctx->tx_inflight_lock);
+    for (int i = 0; i < MAX_TX_INFLIGHT; i++) {
+        if (!ctx->tx_inflight[i].in_use)
+            continue;
+        if (ctx->tx_inflight[i].req_id == ack->req_id &&
+            ctx->tx_inflight[i].dst_pod_id == ack->dst_pod_id) {
+            int slot = ctx->tx_inflight[i].slot;
+            ctx->tx_inflight[i].in_use = 0;
+            pthread_mutex_unlock(&ctx->tx_inflight_lock);
+            dpumesh_tx_free(ctx, slot);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&ctx->tx_inflight_lock);
+    DOCA_LOG_ERR("TX_ACK: no inflight entry for req_id=%u dst_pod=%d",
+                 ack->req_id, ack->dst_pod_id);
+}
+
+static void tx_inflight_cleanup(dpumesh_ctx_t *ctx)
+{
+    pthread_mutex_lock(&ctx->tx_inflight_lock);
+    for (int i = 0; i < MAX_TX_INFLIGHT; i++) {
+        if (ctx->tx_inflight[i].in_use) {
+            int slot = ctx->tx_inflight[i].slot;
+            ctx->tx_inflight[i].in_use = 0;
+            dpumesh_tx_free(ctx, slot);
+        }
+    }
+    pthread_mutex_unlock(&ctx->tx_inflight_lock);
 }
 
 static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
@@ -391,6 +482,13 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     ctx->doca_objs.rx_data_hook = rx_data_hook;
     ctx->doca_objs.rx_hook_ctx = ctx;
 
+    /* ---- Register TX ACK hook ---- */
+    pthread_mutex_init(&ctx->tx_inflight_lock, NULL);
+    ctx->tx_inflight_lock_ready = 1;
+    memset(ctx->tx_inflight, 0, sizeof(ctx->tx_inflight));
+    ctx->doca_objs.tx_ack_hook = tx_inflight_ack_hook;
+    ctx->doca_objs.tx_ack_hook_ctx = ctx;
+
     /* ---- Start PE progress thread ---- */
     ctx->pe_running = 1;
     if (pthread_create(&ctx->pe_tid, NULL, pe_progress_fn, ctx) != 0) {
@@ -409,6 +507,8 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
 fail_cleanup:
     cleanup_objects(&ctx->doca_objs);
 fail:
+    if (ctx->tx_inflight_lock_ready)
+        pthread_mutex_destroy(&ctx->tx_inflight_lock);
     if (ctx->slot_bitmap)
         free(ctx->slot_bitmap);
     free(ctx);
@@ -444,6 +544,12 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx) {
     for (int i = 0; i < MAX_PENDING; i++) {
         pthread_mutex_destroy(&ctx->pending[i].lock);
         pthread_cond_destroy(&ctx->pending[i].cond);
+    }
+
+    /* Free any remaining inflight TX slots */
+    if (ctx->tx_inflight_lock_ready) {
+        tx_inflight_cleanup(ctx);
+        pthread_mutex_destroy(&ctx->tx_inflight_lock);
     }
 
     free(ctx);
@@ -483,6 +589,12 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     struct dma_desc *dma = get_next_dma_desc(ctx->dma_ring);
     if (!dma)
         return -1;
+
+    if ((desc->flags & OP_RESPONSE) &&
+        tx_inflight_register(ctx, desc->req_id, desc->dst_pod_id,
+                             desc->body_buf_slot) != 0) {
+        return -1;
+    }
 
     /* Fill DMA descriptor: point to the TX slot's buffer region */
     dma->mmap = ctx->dpa_mmap_handle;

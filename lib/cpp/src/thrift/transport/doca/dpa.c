@@ -77,6 +77,17 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             DOCA_LOG_INFO("DMA completed: src_pod=%d, dst_pod=%d, req_id=%u, pos=%u, len=%u",
                           src_pod_id, dst_pod_id, req_id, comp_msg->pos, data_len);
 
+            /* Send TX ACK back to the source pod so host can free TX slot safely. */
+            if (src_pod && src_pod->connection) {
+                doca_error_t ack_result = server_send_tx_ack_to(objs,
+                    src_pod->connection, req_id, dst_pod_id);
+                if (ack_result != DOCA_SUCCESS) {
+                    DOCA_LOG_ERR("TX_ACK send failed to src_pod=%d req_id=%u dst_pod=%d: %s",
+                                 src_pod_id, req_id, dst_pod_id,
+                                 doca_error_get_descr(ack_result));
+                }
+            }
+
             /* Route to destination pod */
             int echo_mode = (dst_pod_id == -1 ||
                              dst_pod_id == src_pod_id ||

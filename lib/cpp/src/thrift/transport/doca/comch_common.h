@@ -19,6 +19,7 @@ enum dmesh_msg_type {
     DMESH_MSG_RX_DATA = 3,
     DMESH_MSG_REGISTER = 4,      /* Host→DPU: register pod_id */
     DMESH_MSG_CONSUMER_ID = 5,   /* DPU→Host: consumer ID reply */
+    DMESH_MSG_TX_ACK = 6,        /* DPU→Host: DMA completed, TX slot can be freed */
 };
 
 /* DPU→Host: tell the client what consumer ID to use for producer */
@@ -67,6 +68,13 @@ struct dmesh_register_msg {
     enum dmesh_msg_type type;   /* = DMESH_MSG_REGISTER */
     int32_t pod_id;
     char app_name[64];
+};
+
+/* DPU→Host: ACK for Host TX completion (keyed by req_id + dst_pod_id) */
+struct dmesh_tx_ack_msg {
+    enum dmesh_msg_type type;   /* = DMESH_MSG_TX_ACK */
+    uint32_t req_id;
+    int32_t dst_pod_id;
 };
 
 struct dmesh_comch_msg {

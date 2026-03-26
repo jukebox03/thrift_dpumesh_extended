@@ -422,3 +422,140 @@ sudo ./build/dpumesh_dpu -p 03:00.0 -r 94:00.0
 # 테스트 (Host에서)
 sudo ./test_comch
 ```
+
+## 6. 수정 계획 (2026-03-26)
+
+아래 계획은 "빌드/배포 계층 → DPA 하드웨어 제어 계층 → C++ 서비스 통신 계층" 순서로 진행한다.
+핵심 원칙은 "최신 소스가 반드시 빌드에 반영되도록 강제"하고, "DMA 완료 신호 기반으로만 버퍼를 회수"하는 것이다.
+
+### 6.1 빌드 및 배포 계층
+
+1. 배포 시 로컬 코드 덮어쓰기 방지
+- 대상: `deploy-dpumesh.sh` (외부/별도 저장소에 있으면 해당 스크립트)
+- 조치:
+  - 기본 동작에서 `git submodule update --remote` 제거
+  - 필요 시에만 `--update-submodule` 같은 명시적 플래그로 실행
+  - 배포 시작 전에 `git status --porcelain` 검사로 작업 트리 오염 경고
+- 완료 기준: 배포 스크립트 실행 전후에 로컬 수정 파일 해시가 변하지 않음
+
+2. 잔류 `.a` 바이너리 전송 차단
+- 대상: 배포 스크립트의 `scp/rsync` 단계
+- 조치:
+  - 전송 목록에서 `*.a` 제외 (`--exclude='*.a'`)
+  - DPU 쪽 수신 디렉터리 정리 후 필요한 산출물만 재생성
+  - 아티팩트 전송은 화이트리스트(실행 파일/설정 파일) 방식으로 전환
+- 완료 기준: 배포 산출물 목록에 정적 라이브러리 잔재가 포함되지 않음
+
+3. Meson의 DPA 커널 재빌드 트리거 보강
+- 대상: `lib/cpp/src/thrift/transport/doca/meson.build`, `lib/cpp/src/thrift/transport/doca/build_dpacc.sh`
+- 조치:
+  - `run_command()` 중심 구조를 `custom_target()` 기반으로 전환
+  - 입력(`device/dpa_kernel.c`, 관련 헤더) 변경 시 `dpa_kernel.a`가 자동 재생성되도록 의존성 선언
+  - `find_library()`는 생성된 산출물 경로를 참조하되, 재빌드 트리거는 `custom_target()`가 담당
+- 완료 기준: `device/dpa_kernel.c` 1줄 수정 후 `ninja -C build`만으로 `dpa_kernel.a` 타임스탬프 갱신
+
+### 6.2 DPA 하드웨어 제어 계층
+
+4. DMA 보고 플래그 운영 정책 고정
+- 대상: `lib/cpp/src/thrift/transport/doca/device/dpa_kernel.c`
+- 조치:
+  - 단건 요청에서도 완료 이벤트가 즉시 발생하는 플래그만 허용
+  - 성능 최적화 플래그(배치 보고)는 별도 빌드 옵션/런타임 옵션으로 격리
+  - 기본값은 안정성 우선(즉시 보고)
+- 완료 기준: 단일 `curl` 요청 반복 시 `recv: 0/s` 정체 없이 응답 지속
+
+5. descriptor 슬롯 소유권/해제 타이밍 정합성 보장
+- 대상: `lib/cpp/src/thrift/transport/doca/device/dpa_kernel.c`, `lib/cpp/src/thrift/transport/dpumesh_doca.c`
+- 조치:
+  - `desc->valid` 클리어 시점을 "DMA 요청 제출 성공 이후"로 고정
+  - 필요한 메모리 배리어를 명시하여 host/DPA 간 가시성 확보
+  - producer/consumer 소유권 규약(누가 valid를 세팅/클리어하는지) 문서화
+- 완료 기준: 고부하(1,000+ 요청)에서 데이터 오염/중복 처리/유실 재현되지 않음
+
+### 6.3 C++ 서비스 통신 계층
+
+6. `TDpumeshTransport` 읽기 상태 머신 정리
+- 대상: `lib/cpp/src/thrift/transport/TDpumeshTransport.cpp`, `lib/cpp/src/thrift/transport/TDpumeshTransport.h`
+- 조치:
+  - `read_done_`를 실제 read 완료 시점에 갱신하거나, 불필요하면 제거
+  - `isOpen()` 조건을 실제 수명주기와 일치하도록 정정
+  - 헤더/바디 분할 읽기 시나리오에서 조기 차단이 없도록 테스트 추가
+- 완료 기준: Thrift가 헤더+바디를 순차 읽을 때 전체 페이로드가 항상 전달
+
+7. 응답 TX 슬롯 해제를 ack 기반으로 전환
+- 대상: `lib/cpp/src/thrift/transport/TDpumeshTransport.cpp`, `lib/cpp/src/thrift/transport/dpumesh_doca.c`
+- 조치:
+  - `usleep()` 기반 지연 제거
+  - DMA 완료(또는 응답 소비 확인) 이벤트를 받아 `dpumesh_tx_free()` 호출
+  - 타임아웃/예외 경로에서만 안전한 fallback 정리 수행
+- 완료 기준: 부하 테스트에서 클라이언트 타임아웃 없이 응답 완결, 임의 지연 코드 제거
+
+### 6.4 검증 시나리오
+
+- Build 검증:
+  - `device/dpa_kernel.c` 수정 → `ninja -C build` → `dpa_kernel.a` 재생성 확인
+- 기능 검증:
+  - 단건 RPC 100회, 연속 RPC 1,000회, 동시성(4~16 worker) 테스트
+- 회귀 검증:
+  - `test_comch`, gateway 경로, `TDpumeshClientTransport` 요청/응답 매칭
+- 배포 검증:
+  - 배포 직전/직후 파일 해시 및 원격 아티팩트 목록 비교
+
+### 6.5 작업 우선순위
+
+1. Meson 재빌드 트리거 보강 (6.1-3)
+2. TX 슬롯 ack 기반 해제 (6.3-7)
+3. descriptor 소유권 정리 (6.2-5)
+4. read 상태 머신 정리 (6.3-6)
+5. 배포 스크립트 하드닝 (6.1-1, 6.1-2)
+
+### 6.6 DPU 배포 표준 절차 (dpacc 기준)
+
+주의: DPU 배포 빌드는 단순 `gcc` 빌드가 아니라, 아래 두 단계가 함께 필요하다.
+- Host 코드: Meson의 C 컴파일러(`cc`)로 `dpumesh_dpu` 링크
+- DPA 커널: `dpacc`로 `dpa_kernel.a` 생성 후 링크
+
+1. 소스 동기화
+- 권장: `rsync -av --delete --exclude='build/' --exclude='*.a'` 방식
+- 금지: 이전 빌드 산출물(`*.a`)을 그대로 전송
+
+2. DPU에서 clean configure/build
+```bash
+cd ~/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca
+rm -rf build
+meson setup build
+ninja -C build
+```
+
+3. 컴파일러 선택 규칙
+- `build_dpacc.sh`는 `HOSTCC` → `CC` → `cc` 순서로 host compiler를 선택
+- 필요 시 예시:
+```bash
+HOSTCC=clang meson setup build
+ninja -C build
+```
+
+4. 실행
+```bash
+sudo ./build/dpumesh_dpu -p 03:00.0 -r 94:00.0
+```
+
+5. 배포 검증
+- `ninja -C build` 직후 `build/device/dpa_kernel.a` 타임스탬프 확인
+- `./build/dpumesh_dpu` 실행 후 단건/부하 RPC 테스트 수행
+
+### 6.7 구현 완료 상태 (2026-03-26)
+
+- ✅ Meson 재빌드 트리거 보강 완료
+  - `meson.build`를 `custom_target(dpacc_dpa_kernel)` 기반으로 전환
+  - `ninja -C build`에서 `Generating dpacc_dpa_kernel` 실행 확인
+  - DPU 검증: `touch device/dpa_kernel.c` 후 `build/dpa_kernel.a` 타임스탬프 증가 확인
+
+- ✅ ACK 기반 TX 슬롯 회수 경로 추가 완료
+  - 신규 제어 메시지: `DMESH_MSG_TX_ACK`
+  - DPU(`dpa.c`)에서 DMA 완료 시 source pod로 ACK 전송
+  - Host(`dpumesh_doca.c`)에서 inflight 테이블(req_id + dst_pod_id)로 매칭 후 `dpumesh_tx_free`
+  - `TDpumeshTransport.cpp`의 `usleep()` 기반 해제 제거
+
+- ⚠️ 운영 참고
+  - DPU 시간 불일치(clock skew) 환경에서는 빌드 전 `find . -type f -exec touch {} +`가 필요할 수 있음

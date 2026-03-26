@@ -68,6 +68,13 @@ server_send_rx_data_to(struct objects *objs,
                        const void *desc, uint32_t desc_len,
                        const void *body, uint32_t body_len);
 
+/* Send TX ACK to a specific host connection (req_id + dst_pod_id key). */
+doca_error_t
+server_send_tx_ack_to(struct objects *objs,
+					  struct doca_comch_connection *conn,
+					  uint32_t req_id,
+					  int32_t dst_pod_id);
+
 /* Find a pod by pod_id. Returns NULL if not found. */
 struct pod_state *
 find_pod_by_id(struct objects *objs, int32_t pod_id);

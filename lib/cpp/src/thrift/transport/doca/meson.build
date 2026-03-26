@@ -38,31 +38,36 @@ srcs = [
 ]
 
 # Build DPA kernel via DPACC
-dpacc_build_script = meson.project_source_root() / 'build_dpacc.sh'
-device_src = meson.project_source_root() / 'device' / 'dpa_kernel.c'
+dpacc_build_script = files('build_dpacc.sh')
+device_src = files('device/dpa_kernel.c')
+device_hdr = files('dpa_common.h')
 dpacc_mcpu_flag = 'nv-dpa-bf3'
 doca_dep = dependency('doca-dpa')
 doca_lib_dir = doca_dep.get_variable(pkgconfig : 'libdir')
 
-result = run_command(dpacc_build_script,
-    meson.project_build_root(),
-    meson.project_source_root(),
-    device_src,
+dpacc_lib = custom_target('dpacc_dpa_kernel',
+  input : [device_src],
+  output : program_name + '.a',
+  command : [
+    dpacc_build_script,
+    meson.current_build_dir(),
+    meson.current_source_dir(),
+    '@INPUT@',
     program_name,
     dpacc_mcpu_flag,
     doca_lib_dir,
-    check: true)
-
-device_build_dir = meson.project_build_root() / 'device'
-dpa_program_lib = meson.get_compiler('c').find_library(
-    program_name,
-    dirs: device_build_dir,
-    static: true
+    '@OUTPUT@',
+  ],
+  depend_files : [device_hdr],
+  build_by_default : true,
 )
-deps += dpa_program_lib
+
+dpa_program_lib_path = meson.current_build_dir() / (program_name + '.a')
 
 executable('dpumesh_dpu', srcs,
   dependencies : deps,
+  link_args : [dpa_program_lib_path],
   include_directories : inc_dirs,
+  link_depends : [dpacc_lib],
   install : false,
 )

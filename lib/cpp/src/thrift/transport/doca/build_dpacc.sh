@@ -43,12 +43,14 @@ DPA_KERNELS_DEVICE_SRC=$3
 PROGRAM_NAME=$4
 DPACC_MCPU_FLAG=$5
 DOCA_LIB_DIR=$6
+OUTPUT_LIB_PATH=$7
 
 # DOCA Configurations
 DOCA_DIR="/opt/mellanox/doca"
 DOCA_INCLUDE="${DOCA_DIR}/include"
 DOCA_TOOLS="${DOCA_DIR}/tools"
 DOCA_DPACC="${DOCA_TOOLS}/dpacc"
+HOST_CC="${HOSTCC:-${CC:-cc}}"
 
 HOST_CC_FLAGS="-Wno-deprecated-declarations -Werror -Wall -Wextra -DFLEXIO_ALLOW_EXPERIMENTAL_API"
 DEVICE_CC_FLAGS="-Wno-deprecated-declarations -Wno-error -Wall -Wextra -DFLEXIO_DEV_ALLOW_EXPERIMENTAL_API -O2"
@@ -65,19 +67,25 @@ DPA_APP_NAME="DPU_mesh_dpa_app"
 
 # Build directory for the DPA device (kernel) code
 DEVICE_BUILD_DIR="${PROJECT_BUILD_DIR}/device"
+DEFAULT_OUTPUT_LIB="${DEVICE_BUILD_DIR}/${PROGRAM_NAME}.a"
 
-rm -rf ${DEVICE_BUILD_DIR}
-mkdir -p ${DEVICE_BUILD_DIR}
+if [[ -z "${OUTPUT_LIB_PATH}" ]]; then
+	OUTPUT_LIB_PATH="${DEFAULT_OUTPUT_LIB}"
+fi
+
+rm -rf "${DEVICE_BUILD_DIR}"
+mkdir -p "${DEVICE_BUILD_DIR}"
+mkdir -p "$(dirname "${OUTPUT_LIB_PATH}")"
 
 # Compile the DPA (kernel) device source code using the DPACC
-$DOCA_DPACC $DPA_KERNELS_DEVICE_SRC \
-	-o ${DEVICE_BUILD_DIR}/${PROGRAM_NAME}.a \
-	-mcpu=${DPACC_MCPU_FLAG} \
-	-hostcc=gcc \
+"${DOCA_DPACC}" "${DPA_KERNELS_DEVICE_SRC}" \
+	-o "${OUTPUT_LIB_PATH}" \
+	-mcpu="${DPACC_MCPU_FLAG}" \
+	-hostcc="${HOST_CC}" \
 	-hostcc-options="${HOST_CC_FLAGS}" \
 	--devicecc-options="${DEVICE_CC_FLAGS}" \
 	--app-name="${DPA_APP_NAME}" \
 	-device-libs="-L${DOCA_LIB_DIR} -ldoca_dpa_dev -ldoca_dpa_dev_comm" \
 	-flto \
-	-I${DOCA_INCLUDE} \
+	-I"${DOCA_INCLUDE}" \
 	-I"${PROJECT_SRC_DIR}/" \

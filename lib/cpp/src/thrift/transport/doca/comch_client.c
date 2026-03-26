@@ -118,6 +118,16 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
 
+	case DMESH_MSG_TX_ACK:
+		if (msg_len < sizeof(struct dmesh_tx_ack_msg)) {
+			DOCA_LOG_ERR("Received invalid TX_ACK message: len=%u < expected=%zu",
+				     msg_len, sizeof(struct dmesh_tx_ack_msg));
+			return;
+		}
+		if (objs->tx_ack_hook)
+			objs->tx_ack_hook(objs->tx_ack_hook_ctx, recv_buffer, msg_len);
+		break;
+
 	case DMESH_MSG_CONSUMER_ID: {
 		struct dmesh_consumer_id_msg *cid_msg = (struct dmesh_consumer_id_msg *)recv_buffer;
 		if (msg_len < sizeof(struct dmesh_consumer_id_msg)) {

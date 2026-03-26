@@ -42,8 +42,7 @@ void TDpumeshTransport::close() {
         rx_slot_ = -1;
     }
     if (tx_slot_ >= 0) {
-        usleep(10000); 
-        dpumesh_tx_free(ctx_, tx_slot_);
+        /* TX slot is released by DMESH_MSG_TX_ACK handler in dpumesh_doca.c. */
         tx_slot_ = -1;
     }
     read_buf_ = nullptr;
@@ -119,7 +118,7 @@ void TDpumeshTransport::flush() {
                                   "DPUmesh TX SQ full");
     }
 
-    tx_slot_ = tx_slot;  /* freed in close() after DMA completes */
+    tx_slot_ = tx_slot;  /* ownership transferred to ACK-based inflight table */
     write_buf_.clear();
     flushed_ = true;
 }
