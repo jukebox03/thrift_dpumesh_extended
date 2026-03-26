@@ -29,6 +29,7 @@ __dpa_rpc__ uint64_t thread_init_rpc(doca_dpa_dev_comch_consumer_t consumer, uin
 static void send_msgs(struct dpa_thread_arg *thread_arg, int num_msg)
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
+    uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
     doca_dpa_dev_completion_element_t comp;
     struct comch_msg msg;
     uint64_t start, end, tick;
@@ -39,7 +40,7 @@ static void send_msgs(struct dpa_thread_arg *thread_arg, int num_msg)
     for (int i = 0; i < num_msg; i++) {
         start =  __dpa_thread_time();
         doca_dpa_dev_comch_producer_post_send_imm_only(producer,
-                                                   /*consumer_id=*/1,
+                                                   dpu_consumer_id,
                                                    (uint8_t *)&msg,
                                                    sizeof(struct comch_msg),
                                                    DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
@@ -56,6 +57,7 @@ static void send_msgs(struct dpa_thread_arg *thread_arg, int num_msg)
 static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch_msg *msg)
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
+    uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
     // doca_dpa_dev_comch_producer_t producer;
     doca_dpa_dev_completion_element_t comp;
     uint64_t start, end;
@@ -74,13 +76,13 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                                  dma_msg->dst_addr,
                                  dma_msg->length);
                 
-            if (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1)) {
+            if (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id)) {
                 DOCA_DPA_DEV_LOG_INFO("Host consumer is empty, cannot send DMA completion\n");
                 break;
             }
 
             doca_dpa_dev_comch_producer_dma_copy(producer,
-                                    /*consumer_id=*/1,
+                                    dpu_consumer_id,
                                     dma_msg->dst_mmap,
                                     dma_msg->dst_addr,
                                     dma_msg->src_mmap,
@@ -145,6 +147,7 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
 static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
+    uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
     struct comch_msg msg;
     doca_dpa_dev_uintptr_t dev_ptr;
     doca_dpa_dev_buf_t buf;
@@ -203,7 +206,7 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                   desc->dst_pod_id, desc->addr);
 
             /* Wait for consumer space */
-            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
+            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
             }
 
             /* Build completion message with routing info */
@@ -218,7 +221,7 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
 
             /* DMA copy: Host buffer → DPU local buffer */
             doca_dpa_dev_comch_producer_dma_copy(producer,
-                                        /*consumer_id=*/1,
+                                        dpu_consumer_id,
                                         ring->dpu_mmap,
                                         ring->dpu_addr + pos[r],
                                         ring->host_mmap,

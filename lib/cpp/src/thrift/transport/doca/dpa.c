@@ -715,6 +715,7 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
     doca_dpa_dev_completion_t dpa_producer_comp;
     doca_dpa_dev_comch_producer_t dpa_producer;
     doca_dpa_dev_comch_consumer_t dpa_consumer;
+    uint32_t dpu_consumer_id;
 
     result = doca_comch_consumer_completion_get_dpa_handle(comch->consumer_comp, &dpa_consumer_comp);
     if (result != DOCA_SUCCESS) {
@@ -731,6 +732,11 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         DOCA_LOG_ERR("Failed to get consumer DPA handle: %s", doca_error_get_name(result));
         return result;
     }
+    result = doca_comch_consumer_get_id(comch->send.consumer, &dpu_consumer_id);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get DPU MsgQ consumer ID: %s", doca_error_get_name(result));
+        return result;
+    }
     result = doca_comch_producer_get_dpa_handle(comch->recv.producer, &dpa_producer);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get producer DPA handle: %s", doca_error_get_name(result));
@@ -742,11 +748,12 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
     arg->dpa_producer_comp = dpa_producer_comp;
     arg->dpa_consumer = dpa_consumer;
     arg->dpa_producer = dpa_producer;
+    arg->dpu_consumer_id = dpu_consumer_id;
     arg->num_rings = 0;  /* rings added dynamically via setup_pod_dma */
 
-    DOCA_LOG_INFO("DPA thread arg: consumer_comp=0x%lx, producer_comp=0x%lx, consumer=0x%lx, producer=0x%lx",
+    DOCA_LOG_INFO("DPA thread arg: consumer_comp=0x%lx, producer_comp=0x%lx, consumer=0x%lx, producer=0x%lx, dpu_consumer_id=%u",
         arg->dpa_consumer_comp, arg->dpa_producer_comp,
-        arg->dpa_consumer, arg->dpa_producer);
+        arg->dpa_consumer, arg->dpa_producer, arg->dpu_consumer_id);
 
     return DOCA_SUCCESS;
 }

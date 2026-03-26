@@ -28,6 +28,8 @@ struct dpa_thread_arg {
 	uint64_t dpa_producer_comp;
 	uint64_t dpa_producer;
 	uint64_t dpa_consumer;
+	uint32_t dpu_consumer_id; /* DPU-side comch consumer ID for DPA->DPU sends */
+	uint32_t _pad0;
 
 	/* Ring array (per-pod) */
 	volatile uint32_t num_rings;
