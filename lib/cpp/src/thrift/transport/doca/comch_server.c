@@ -162,6 +162,7 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 	}
 
 	case DMESH_MSG_NEW_DESC: {
+#ifdef DOCA_ARCH_DPU
 		/* Host doorbell: forward descriptor info to DPA via DPU→DPA comch msgq */
 		struct dmesh_new_desc_msg *nd = (struct dmesh_new_desc_msg *)recv_buffer;
 		struct pod_state *pod = find_pod_by_connection(objs, comch_connection);
@@ -191,6 +192,9 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 		} else {
 			DOCA_LOG_ERR("NEW_DESC: DPA comch not initialized");
 		}
+#else
+		DOCA_LOG_WARN("NEW_DESC received on host side (ignored)");
+#endif
 		break;
 	}
 
