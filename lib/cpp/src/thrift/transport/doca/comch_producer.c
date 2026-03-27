@@ -262,10 +262,6 @@ init_comch_datapath_producer(struct objects *objs)
         .tv_sec = 0,
         .tv_nsec = SLEEP_IN_NANOS,
     };
-	struct timespec last, now;
-	double elapsed;
-	clock_gettime(CLOCK_MONOTONIC, &last);
-
     struct comch_producer_cb_config producer_cb_cfg = {
         .send_task_comp_cb = producer_send_task_completion_callback,
         .send_task_comp_err_cb = producer_send_task_completion_err_callback,

@@ -4,6 +4,7 @@
 #include <doca_comch_producer.h>
 #include <doca_comch.h>
 #include <doca_ctx.h>
+#include <doca_pe.h>
 
 struct local_mem_bufs;
 
