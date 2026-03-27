@@ -10,6 +10,7 @@
 
 #include "object.h"
 #include "dpa_common.h"
+#include "comch_common.h"
 #include "dpu_worker.h"
 #include "comch_server.h"
 #include "comch_producer.h"
