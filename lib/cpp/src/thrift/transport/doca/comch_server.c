@@ -171,6 +171,10 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 			break;
 		}
 
+		DOCA_LOG_INFO("NEW_DESC received: pod_id=%d req_id=%u size=%u dst=%d addr=0x%lx",
+		              pod->pod_id, nd->req_id, nd->size, nd->dst_pod_id,
+		              (unsigned long)nd->addr);
+
 		struct comch_msg dpa_msg;
 		memset(&dpa_msg, 0, sizeof(dpa_msg));
 		dpa_msg.type = COMCH_MSG_TYPE_NEW_DESC;
@@ -188,6 +192,8 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 			if (result != DOCA_SUCCESS) {
 				DOCA_LOG_ERR("NEW_DESC: forward to DPA failed: %s",
 				             doca_error_get_descr(result));
+			} else {
+				DOCA_LOG_INFO("NEW_DESC: forwarded to DPA OK");
 			}
 		} else {
 			DOCA_LOG_ERR("NEW_DESC: DPA comch not initialized");
@@ -195,6 +201,23 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 #else
 		DOCA_LOG_WARN("NEW_DESC received on host side (ignored)");
 #endif
+		break;
+	}
+
+	case DMESH_MSG_POD_CONSUMER_ID: {
+		struct dmesh_pod_consumer_id_msg *cid = (struct dmesh_pod_consumer_id_msg *)recv_buffer;
+		if (msg_len < sizeof(struct dmesh_pod_consumer_id_msg)) {
+			DOCA_LOG_ERR("Received invalid POD_CONSUMER_ID message");
+			return;
+		}
+		struct pod_state *pod = find_pod_by_connection(objs, comch_connection);
+		if (!pod) {
+			DOCA_LOG_ERR("POD_CONSUMER_ID: connection not found");
+			break;
+		}
+		pod->remote_consumer_id = cid->consumer_id;
+		DOCA_LOG_INFO("POD_CONSUMER_ID registered: conn pod_id=%d msg_pod_id=%d consumer_id=%u",
+		              pod->pod_id, cid->pod_id, cid->consumer_id);
 		break;
 	}
 
@@ -587,6 +610,10 @@ pods_add_connection(struct objects *objs, struct doca_comch_connection *conn)
 	objs->pods[idx].pod_id = -1;  /* not yet registered */
 	objs->pods[idx].app_name[0] = '\0';
 	objs->pods[idx].registered = 0;
+	objs->pods[idx].remote_consumer_id = 0;
+	objs->pods[idx].producer_mem = NULL;
+	objs->pods[idx].producer = NULL;
+	objs->pods[idx].producer_pe = NULL;
 	objs->num_pods++;
 	pthread_mutex_unlock(&objs->pods_lock);
 

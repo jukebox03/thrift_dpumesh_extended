@@ -5,9 +5,9 @@
 #include <doca_comch.h>
 #include <doca_ctx.h>
 
-#define CC_DATA_PATH_MAX_MSG_SIZE (1024 * 1024) /* CC DATA PATH maximum message size */
+#define CC_DATA_PATH_MAX_MSG_SIZE (64 * 1024) /* CC DATA PATH maximum message size */
 #define CC_DATA_PATH_TASK_NUM       256
-#define CC_DATA_PATH_MSG_SIZE		64
+#define CC_DATA_PATH_MSG_SIZE		(64 * 1024)
 #define INVALID_CONSUMER_ID 0xffff
 
 struct comch_consumer_cb_config {

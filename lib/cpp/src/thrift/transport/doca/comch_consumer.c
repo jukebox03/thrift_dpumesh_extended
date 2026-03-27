@@ -1,6 +1,7 @@
 #include "comch_consumer.h"
 #include "object.h"
 #include "buffer.h"
+#include "comch_common.h"
 #include <time.h>
 
 #include <doca_comch.h>
@@ -224,6 +225,16 @@ static void consumer_recv_task_comp_cb(struct doca_comch_consumer_task_post_recv
 		DOCA_LOG_ERR("Failed to get data length from DOCA buf with error = %s",
 			     doca_error_get_name(objs->consumer_result));
 		goto err_out;
+	}
+
+	if (recv_msg_len > 0 && objs->rx_data_hook != NULL) {
+		if (recv_msg_len < sizeof(struct dmesh_rx_data_msg)) {
+			DOCA_LOG_ERR("Datapath payload too small: len=%zu header=%zu",
+				     recv_msg_len, sizeof(struct dmesh_rx_data_msg));
+		} else {
+			DOCA_LOG_INFO("Datapath RX received: len=%zu, dispatching to rx_data_hook", recv_msg_len);
+			objs->rx_data_hook(objs->rx_hook_ctx, (const uint8_t *)recv_msg, (uint32_t)recv_msg_len);
+		}
 	}
 
 	// DOCA_LOG_INFO("Received message number: %d", i);

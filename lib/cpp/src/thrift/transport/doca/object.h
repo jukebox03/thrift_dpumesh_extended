@@ -12,6 +12,7 @@
 struct dmesh_doca_dpa_thread;
 struct dmesh_doca_dpa_comch;
 struct dma_ring;
+struct local_mem_bufs;
 typedef uint64_t doca_dpa_dev_comch_producer_t;
 typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
@@ -26,6 +27,7 @@ struct pod_state {
     char app_name[64];
     int registered;         /* 1 = DMESH_MSG_REGISTER received */
     int dma_ready;          /* 1 = both mmaps arrived, DPA ring added */
+    uint32_t remote_consumer_id; /* Host datapath consumer ID (for DPU->Host payload) */
 
     /* Per-pod mmap (Host에서 export) */
     struct doca_mmap *ring_mmap;
@@ -39,6 +41,11 @@ struct pod_state {
     /* Per-pod local DMA buffer (DPU working buffer) */
     struct doca_mmap *local_mmap;
     void *dma_buffer;
+
+    /* Per-pod datapath sender (DPU -> Host pod) */
+    struct local_mem_bufs *producer_mem;
+    struct doca_comch_producer *producer;
+    struct doca_pe *producer_pe;
 };
 
 struct objects {

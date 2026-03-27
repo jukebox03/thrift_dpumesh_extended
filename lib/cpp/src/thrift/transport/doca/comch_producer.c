@@ -6,6 +6,7 @@
 #include <doca_log.h>
 #include <doca_error.h>
 #include <time.h>
+#include <string.h>
 
 DOCA_LOG_REGISTER(COMCH_PRODUCER);
 
@@ -22,53 +23,18 @@ static void producer_send_task_completion_callback(struct doca_comch_producer_ta
 {
 	struct objects *objs;
 	const struct doca_buf *buf;
-	uint8_t *data;
-	doca_error_t result;
-	struct timespec ts = {
-		.tv_sec = 0,
-		.tv_nsec = 10000,
-	};
 
 	(void)task_user_data;
 
 	objs = (struct objects *)(ctx_user_data.ptr);
 	objs->producer_result = DOCA_SUCCESS;
 	objs->sent_msg_cnt++;
+	DOCA_LOG_INFO("Datapath producer send completed (sent_msg_cnt=%d)", objs->sent_msg_cnt);
 
 	buf = doca_comch_producer_task_send_get_buf(task);
-	if (!buf) {
-		DOCA_LOG_ERR("Failed to get doca buf from producer task");
-		goto free_task;
-	}
-
-	/* data_len is not modified */
-	result = doca_buf_get_data(buf, (void **)&data);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get data pointer, error = %s", doca_error_get_name(result));
-		goto free_buf;
-	}
-
-	do {
-		result = doca_task_submit(doca_comch_producer_task_send_as_task(task));
-		if (result == DOCA_ERROR_AGAIN)
-			nanosleep(&ts, &ts);
-
-	} while (result == DOCA_ERROR_AGAIN);
-	
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed resubmitting send task with error = %s", 
-				doca_error_get_name(result));
-		goto free_buf;
-	}
-
-	// DOCA_LOG_INFO("producer resubmitted task with msg idx: %d", objs->msg_idx);
-	return;
-
-free_buf:
-	(void)doca_buf_dec_refcount((struct doca_buf *)buf, NULL);
-free_task:
+	if (buf)
+		(void)doca_buf_dec_refcount((struct doca_buf *)buf, NULL);
 	doca_task_free(doca_comch_producer_task_send_as_task(task));
-	// (void)doca_ctx_stop(doca_comch_producer_as_ctx(objs->producer));
 }
 
 /**
@@ -93,9 +59,10 @@ static void producer_send_task_completion_err_callback(struct doca_comch_produce
 		     doca_error_get_name(objs->producer_result));
 
 	buf = doca_comch_producer_task_send_get_buf(task);
-	(void)doca_buf_dec_refcount((struct doca_buf *)buf, NULL);
+	if (buf)
+		(void)doca_buf_dec_refcount((struct doca_buf *)buf, NULL);
 	doca_task_free(doca_comch_producer_task_send_as_task(task));
-	(void)doca_ctx_stop(doca_comch_producer_as_ctx(objs->producer));
+	DOCA_LOG_ERR("Producer send task cleaned after error");
 }
 
 /**
@@ -376,4 +343,130 @@ init_comch_datapath_producer(struct objects *objs)
 	DOCA_LOG_INFO("Producer context is now in RUNNING state");
 
     return objs->producer_result;
+}
+
+doca_error_t
+init_comch_datapath_producer_for_connection(struct objects *objs,
+											struct doca_comch_connection *connection,
+											struct local_mem_bufs **producer_mem,
+											struct doca_comch_producer **producer,
+											struct doca_pe **producer_pe)
+{
+	doca_error_t result;
+	struct comch_producer_cb_config producer_cb_cfg = {
+		.send_task_comp_cb = producer_send_task_completion_callback,
+		.send_task_comp_err_cb = producer_send_task_completion_err_callback,
+		.ctx_user_data = objs,
+		.ctx_state_changed_cb = producer_state_changed_callback
+	};
+
+	if (*producer_mem == NULL) {
+		*producer_mem = calloc(1, sizeof(struct local_mem_bufs));
+		if (*producer_mem == NULL) {
+			DOCA_LOG_ERR("Failed to allocate per-pod producer mem");
+			return DOCA_ERROR_NO_MEMORY;
+		}
+	}
+
+	(*producer_mem)->need_alloc_mem = true;
+	result = init_local_mem_bufs(*producer_mem, objs->dev, BUF_INV_TYPE_POOL,
+								 CC_DATA_PATH_MSG_SIZE, CC_DATA_PATH_TASK_NUM);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to init per-pod producer mem: %s", doca_error_get_name(result));
+		return result;
+	}
+
+	result = init_comch_producer(connection, &producer_cb_cfg, producer, producer_pe);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to init per-pod producer: %s", doca_error_get_name(result));
+		clean_local_mem_bufs(*producer_mem);
+		free(*producer_mem);
+		*producer_mem = NULL;
+		return result;
+	}
+
+	enum doca_ctx_states state;
+	do {
+		doca_pe_progress(*producer_pe);
+		doca_ctx_get_state(doca_comch_producer_as_ctx(*producer), &state);
+	} while (state != DOCA_CTX_STATE_RUNNING);
+
+	DOCA_LOG_INFO("Per-pod datapath producer initialized and RUNNING");
+	return DOCA_SUCCESS;
+}
+
+doca_error_t
+comch_datapath_send_payload(struct doca_comch_producer *producer,
+							struct local_mem_bufs *producer_mem,
+							uint32_t remote_consumer_id,
+							const void *payload,
+							uint32_t payload_len)
+{
+	doca_error_t result;
+	struct doca_buf *buf = NULL;
+	void *dst = NULL;
+	struct doca_comch_producer_task_send *send_task = NULL;
+
+	if (payload_len == 0 || payload == NULL) {
+		DOCA_LOG_ERR("Datapath send rejected: invalid payload");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+	if (payload_len > CC_DATA_PATH_MSG_SIZE) {
+		DOCA_LOG_ERR("Datapath send rejected: payload_len=%u > max=%u",
+					 payload_len, (unsigned int)CC_DATA_PATH_MSG_SIZE);
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+	if (remote_consumer_id == 0 || remote_consumer_id == INVALID_CONSUMER_ID) {
+		DOCA_LOG_ERR("Datapath send rejected: remote_consumer_id=%u", remote_consumer_id);
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+
+	result = doca_buf_pool_buf_alloc(producer_mem->bpool, &buf);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Datapath send: buffer allocation failed: %s", doca_error_get_name(result));
+		return result;
+	}
+
+	result = doca_buf_get_data(buf, &dst);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Datapath send: get data ptr failed: %s", doca_error_get_name(result));
+		(void)doca_buf_dec_refcount(buf, NULL);
+		return result;
+	}
+
+	memcpy(dst, payload, payload_len);
+
+	result = doca_buf_set_data_len(buf, payload_len);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Datapath send: set data len failed: %s", doca_error_get_name(result));
+		(void)doca_buf_dec_refcount(buf, NULL);
+		return result;
+	}
+
+	result = doca_comch_producer_task_send_alloc_init(producer,
+													  buf,
+													  NULL,
+													  0,
+													  remote_consumer_id,
+													  &send_task);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Datapath send: task alloc failed: %s", doca_error_get_name(result));
+		(void)doca_buf_dec_refcount(buf, NULL);
+		return result;
+	}
+
+	do {
+		result = doca_task_submit(doca_comch_producer_task_send_as_task(send_task));
+	} while (result == DOCA_ERROR_AGAIN);
+
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Datapath send: task submit failed: %s", doca_error_get_name(result));
+		(void)doca_buf_dec_refcount(buf, NULL);
+		doca_task_free(doca_comch_producer_task_send_as_task(send_task));
+		return result;
+	}
+
+	DOCA_LOG_INFO("Datapath send submitted: payload_len=%u remote_consumer_id=%u",
+				  payload_len, remote_consumer_id);
+	return DOCA_SUCCESS;
 }
