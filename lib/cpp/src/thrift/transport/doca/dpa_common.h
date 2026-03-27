@@ -44,6 +44,7 @@ enum comch_msg_type {
 	COMCH_MSG_TYPE_DMA_COMPLETED = 2,
 	COMCH_MSG_TYPE_ADD_RING = 3,
 	COMCH_MSG_TYPE_TRIGGER = 4,   /* DPU→DPA: wake up thread (no payload) */
+	COMCH_MSG_TYPE_NEW_DESC = 5,  /* DPU→DPA: new descriptor from host (doorbell) */
 };
 
 struct comch_dma_comp_msg {
@@ -75,6 +76,17 @@ struct comch_add_ring_msg {
 	struct dpa_ring_info ring;
 } __attribute__((__packed__, aligned(4)));
 
+/* DPU→DPA: host published a new descriptor (doorbell) */
+struct comch_new_desc_msg {
+	enum comch_msg_type type;
+	int32_t  src_pod_id;   /* which pod's ring this came from */
+	uint64_t addr;         /* host DMA buffer address */
+	uint32_t size;         /* payload length */
+	uint32_t req_id;       /* request ID */
+	int32_t  dst_pod_id;   /* routing target */
+	int8_t   flags;        /* OP_REQUEST/OP_RESPONSE */
+} __attribute__((__packed__, aligned(4)));
+
 struct comch_msg {
 	enum comch_msg_type type;
 	union
@@ -82,6 +94,7 @@ struct comch_msg {
 		struct comch_dma_req_msg dma_req_msg;
 		struct comch_dma_comp_msg dma_comp_msg;
 		struct comch_add_ring_msg add_ring_msg;
+		struct comch_new_desc_msg new_desc_msg;
 	};
 } __attribute__((__packed__, aligned(4)));
 

@@ -650,6 +650,24 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
                   (unsigned int)(uint8_t)desc->flags,
                   (unsigned long)dma->addr);
 
+    /* Send doorbell to DPU so DPA can process without window polling */
+    {
+        struct dmesh_new_desc_msg doorbell;
+        doorbell.type = DMESH_MSG_NEW_DESC;
+        doorbell.src_pod_id = ctx->pod_id;
+        doorbell.addr = dma->addr;
+        doorbell.size = dma->size;
+        doorbell.req_id = (uint32_t)dma->idx;
+        doorbell.dst_pod_id = dma->dst_pod_id;
+        doorbell.flags = dma->flags;
+        doca_error_t db_result = client_send_msg(&ctx->doca_objs,
+                                                  (const char *)&doorbell,
+                                                  sizeof(doorbell));
+        if (db_result != DOCA_SUCCESS) {
+            DOCA_LOG_WARN("Doorbell send failed: %s", doca_error_get_descr(db_result));
+        }
+    }
+
     return 0;
 }
 

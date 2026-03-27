@@ -20,6 +20,7 @@ enum dmesh_msg_type {
     DMESH_MSG_REGISTER = 4,      /* Host→DPU: register pod_id */
     DMESH_MSG_CONSUMER_ID = 5,   /* DPU→Host: consumer ID reply */
     DMESH_MSG_TX_ACK = 6,        /* DPU→Host: DMA completed, TX slot can be freed */
+    DMESH_MSG_NEW_DESC = 7,      /* Host→DPU: new descriptor published (doorbell) */
 };
 
 /* DPU→Host: tell the client what consumer ID to use for producer */
@@ -75,6 +76,17 @@ struct dmesh_tx_ack_msg {
     enum dmesh_msg_type type;   /* = DMESH_MSG_TX_ACK */
     uint32_t req_id;
     int32_t dst_pod_id;
+};
+
+/* Host→DPU: new descriptor doorbell */
+struct dmesh_new_desc_msg {
+    enum dmesh_msg_type type;   /* = DMESH_MSG_NEW_DESC */
+    int32_t  src_pod_id;
+    uint64_t addr;              /* host DMA buffer address */
+    uint32_t size;              /* payload length */
+    uint32_t req_id;
+    int32_t  dst_pod_id;
+    int8_t   flags;
 };
 
 struct dmesh_comch_msg {
