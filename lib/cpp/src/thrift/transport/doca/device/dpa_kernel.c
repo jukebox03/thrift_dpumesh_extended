@@ -169,6 +169,18 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
             uint32_t nr_dbg = thread_arg->num_rings;
             DOCA_DPA_DEV_LOG_INFO("poll alive: num_rings=%u, poll=%u\n",
                                   nr_dbg, debug_count);
+            /* Dump first ring's descriptor pointer and valid byte for debugging */
+            if (nr_dbg > 0) {
+                doca_dpa_dev_buf_t dbg_buf = doca_dpa_dev_buf_array_get_buf(
+                    thread_arg->rings[0].buf_arr, desc_idx[0]);
+                doca_dpa_dev_uintptr_t dbg_ptr = doca_dpa_dev_buf_get_external_ptr(dbg_buf);
+                struct dma_desc *dbg_desc = (struct dma_desc *)dbg_ptr;
+                __dpa_thread_window_read_inv();
+                DOCA_DPA_DEV_LOG_INFO("  ring[0] diag: desc_idx=%u dev_ptr=0x%lx valid=%u buf_arr=0x%lx\n",
+                                      desc_idx[0], dbg_ptr,
+                                      (uint32_t)dbg_desc->valid,
+                                      thread_arg->rings[0].buf_arr);
+            }
         }
 
         uint32_t nr = thread_arg->num_rings;
@@ -207,6 +219,10 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
             while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
             }
 
+            /* Wrap around if DMA would exceed DPU buffer boundary */
+            if (pos[r] + desc->size > ring->dpu_buf_size)
+                pos[r] = 0;
+
             /* Build completion message with routing info */
             msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
             msg.dma_comp_msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
@@ -233,9 +249,6 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                   r, desc_idx[r], (uint32_t)desc->idx, desc->addr, desc->size);
 
             pos[r] += desc->size;
-            if (pos[r] >= ring->dpu_buf_size) {
-                pos[r] = 0;
-            }
 
             /* Clear valid flag so host can reuse this slot */
             desc->valid = 0;

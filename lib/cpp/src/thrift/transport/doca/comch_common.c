@@ -137,7 +137,7 @@ doca_error_t
 process_dpa_comp_msg(struct objects *objs, struct dmesh_dpa_comp_msg *dpa_comp_msg)
 {
     objs->remote_dpa_producer = dpa_comp_msg->dpa_producer;
-    objs->remote_dpa_producer_comp = dpa_comp_msg->dpa_producer;
+    objs->remote_dpa_producer_comp = dpa_comp_msg->dpa_producer_comp;
 
     return DOCA_SUCCESS;
 }
