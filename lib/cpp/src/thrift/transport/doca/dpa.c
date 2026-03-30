@@ -181,8 +181,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                     fwd_desc.req_id = req_id;
                     fwd_desc.src_pod_id = src_pod_id;
                     fwd_desc.dst_pod_id = dst_pod_id;
-                    /* Ensure destination sees this as an INGRESS REQUEST */
-                    fwd_desc.flags = CASE_INGRESS | OP_REQUEST;
+                    /* Preserve request/response bit from DMA completion and keep ingress case. */
+                    fwd_desc.flags = (comp_msg->flags & OP_RESPONSE) | CASE_INGRESS;
                     fwd_desc.valid = 1;
 
                     doca_error_t fwd_result = send_rx_data_via_datapath_to_pod(
