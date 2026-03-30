@@ -20823,6 +20823,7 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_consumer.c.o
  /usr/include/x86_64-linux-gnu/bits/types/FILE.h
  /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h
  /usr/include/x86_64-linux-gnu/bits/stdio_lim.h
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h
 
 lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_msgq.c.o
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.c
@@ -20978,6 +20979,7 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_producer.c.o
  /usr/include/asm-generic/posix_types.h
  /opt/mellanox/doca/include/doca_comch.h
  /opt/mellanox/doca/include/doca_ctx.h
+ /opt/mellanox/doca/include/doca_pe.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_consumer.h
  /opt/mellanox/doca/include/doca_comch_consumer.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/object.h
@@ -20995,7 +20997,6 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_producer.c.o
  /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h
  /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h
  /opt/mellanox/doca/include/doca_dev.h
- /opt/mellanox/doca/include/doca_pe.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/buffer.h
@@ -21467,7 +21468,10 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/dpa.c.o
  /opt/mellanox/doca/include/doca_comch.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa_common.h
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.h
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_producer.h
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_consumer.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/dpumesh.h
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/ring.h
  /usr/include/arpa/inet.h

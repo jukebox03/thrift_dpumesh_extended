@@ -20775,7 +20775,8 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.
   /usr/include/x86_64-linux-gnu/bits/types/__FILE.h \
   /usr/include/x86_64-linux-gnu/bits/types/FILE.h \
   /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
-  /usr/include/x86_64-linux-gnu/bits/stdio_lim.h
+  /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
+  ../lib/cpp/src/thrift/transport/doca/comch_common.h
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o: ../lib/cpp/src/thrift/transport/doca/comch_msgq.c \
   /usr/include/stdc-predef.h \
@@ -20929,6 +20930,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_producer.c.
   /usr/include/asm-generic/posix_types.h \
   /opt/mellanox/doca/include/doca_comch.h \
   /opt/mellanox/doca/include/doca_ctx.h \
+  /opt/mellanox/doca/include/doca_pe.h \
   ../lib/cpp/src/thrift/transport/doca/comch_consumer.h \
   /opt/mellanox/doca/include/doca_comch_consumer.h \
   ../lib/cpp/src/thrift/transport/doca/object.h \
@@ -20946,7 +20948,6 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_producer.c.
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
   /opt/mellanox/doca/include/doca_dev.h \
-  /opt/mellanox/doca/include/doca_pe.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
   ../lib/cpp/src/thrift/transport/doca/buffer.h \
@@ -21414,7 +21415,10 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o: ../lib/c
   /opt/mellanox/doca/include/doca_comch.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
   ../lib/cpp/src/thrift/transport/doca/dpa_common.h \
+  ../lib/cpp/src/thrift/transport/doca/comch_common.h \
   ../lib/cpp/src/thrift/transport/doca/dpu_worker.h \
+  ../lib/cpp/src/thrift/transport/doca/comch_producer.h \
+  ../lib/cpp/src/thrift/transport/doca/comch_consumer.h \
   ../lib/cpp/src/thrift/transport/dpumesh.h \
   ../lib/cpp/src/thrift/transport/doca/ring.h \
   /usr/include/arpa/inet.h \
