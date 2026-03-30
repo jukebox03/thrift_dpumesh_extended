@@ -110,6 +110,7 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 				       union doca_data ctx_user_data)
 {
 	(void)task_user_data;
+    static uint64_t recv_cb_count = 0;
 
 	doca_error_t result;
     uint32_t data_len;
@@ -120,6 +121,9 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     
     data_len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
     msg = (struct comch_msg *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
+    recv_cb_count++;
+    DOCA_LOG_INFO("DPA MsgQ recv callback count=%lu imm_len=%u msg_ptr=%p",
+                  recv_cb_count, data_len, (void *)msg);
 
     if (msg == NULL) {
         DOCA_LOG_ERR("DPA MsgQ recv callback entered with NULL imm data (len=%u)", data_len);
@@ -272,32 +276,16 @@ static void dmesh_doca_dpa_msgq_send_cb(struct doca_comch_producer_task_send *se
 				       union doca_data task_user_data,
 				       union doca_data ctx_user_data)
 {
-    doca_error_t result;
-    struct comch_msg msg;
 	(void)task_user_data;
 	
     
     struct objects *objs = (struct objects *)ctx_user_data.ptr;
     objs->sent_msg_cnt++;
-    
-    // DOCA_LOG_INFO("Sent msg to DPA successfully, cnt: %d", objs->sent_msg_cnt);
-    doca_comch_producer_task_send_set_imm_data(send_task, (uint8_t *)&msg, sizeof(struct comch_msg));
+
+    DOCA_LOG_INFO("DPA MsgQ send completion callback: sent_msg_cnt=%d", objs->sent_msg_cnt);
     
 	struct doca_task *task = doca_comch_producer_task_send_as_task(send_task);
     doca_task_free(task);
-
-    /* Below code is used to resubmit the send task if needed, 
-     * but this leads to deadlock in our current design
-    do {
-        result = doca_task_submit(task);
-    } while (result == DOCA_ERROR_AGAIN);
-    
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to resubmit msgQ send task - %s",
-            doca_error_get_name(result));
-            doca_task_free(task);
-    }
-    */
 }
 
 /*

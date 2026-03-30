@@ -104,60 +104,10 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             break;
         }
         case COMCH_MSG_TYPE_NEW_DESC: {
-            /* Host doorbell: descriptor info forwarded via DPU, issue DMA copy */
+            /* Doorbell: just a wake-up signal, poll_desc_rings() handles DMA */
             struct comch_new_desc_msg *nd = (struct comch_new_desc_msg *)&msg->new_desc_msg;
-            static uint32_t doorbell_pos[MAX_DPA_RINGS] = {0};
-
-            /* Find ring by src_pod_id */
-            int ring_idx = -1;
-            for (uint32_t i = 0; i < thread_arg->num_rings; i++) {
-                if (thread_arg->rings[i].pod_id == nd->src_pod_id) {
-                    ring_idx = (int)i;
-                    break;
-                }
-            }
-            if (ring_idx < 0) {
-                DOCA_DPA_DEV_LOG_INFO("NEW_DESC: no ring for pod_id=%d\n", nd->src_pod_id);
-                break;
-            }
-
-            struct dpa_ring_info *ring = &thread_arg->rings[ring_idx];
-
-            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
-            }
-
-            /* Wrap around if DMA would exceed DPU buffer boundary */
-            if (doorbell_pos[ring_idx] + nd->size > ring->dpu_buf_size)
-                doorbell_pos[ring_idx] = 0;
-
-            /* Build completion message with routing info */
-            struct comch_msg comp_msg;
-            comp_msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
-            comp_msg.dma_comp_msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
-            comp_msg.dma_comp_msg.pos = doorbell_pos[ring_idx];
-            comp_msg.dma_comp_msg.length = nd->size;
-            comp_msg.dma_comp_msg.req_id = nd->req_id;
-            comp_msg.dma_comp_msg.src_pod_id = nd->src_pod_id;
-            comp_msg.dma_comp_msg.dst_pod_id = nd->dst_pod_id;
-            comp_msg.dma_comp_msg.flags = nd->flags;
-
-            /* DMA copy: Host buffer → DPU local buffer */
-            doca_dpa_dev_comch_producer_dma_copy(producer,
-                                        dpu_consumer_id,
-                                        ring->dpu_mmap,
-                                        ring->dpu_addr + doorbell_pos[ring_idx],
-                                        ring->host_mmap,
-                                        nd->addr,
-                                        nd->size,
-                                        (uint8_t *)&comp_msg,
-                                        sizeof(struct comch_msg),
-                                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-
-            DOCA_DPA_DEV_LOG_INFO("NEW_DESC DMA: pod=%d req_id=%u size=%u dst=%d pos=%u\n",
-                                  nd->src_pod_id, nd->req_id, nd->size,
-                                  nd->dst_pod_id, doorbell_pos[ring_idx]);
-
-            doorbell_pos[ring_idx] += nd->size;
+            DOCA_DPA_DEV_LOG_INFO("NEW_DESC doorbell: pod=%d req_id=%u size=%u dst=%d\n",
+                                  nd->src_pod_id, nd->req_id, nd->size, nd->dst_pod_id);
             break;
         }
         case COMCH_MSG_TYPE_TRIGGER:
@@ -290,6 +240,14 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
             msg.dma_comp_msg.dst_pod_id = desc->dst_pod_id;
             msg.dma_comp_msg.flags = desc->flags;
 
+            DOCA_DPA_DEV_LOG_INFO("DMA completion msg prepared: req_id=%u src_pod=%d dst_pod=%d pos=%u len=%u flags=0x%x\n",
+                                  msg.dma_comp_msg.req_id,
+                                  msg.dma_comp_msg.src_pod_id,
+                                  msg.dma_comp_msg.dst_pod_id,
+                                  msg.dma_comp_msg.pos,
+                                  msg.dma_comp_msg.length,
+                                  (unsigned int)(uint8_t)msg.dma_comp_msg.flags);
+
             /* DMA copy: Host buffer → DPU local buffer */
             doca_dpa_dev_comch_producer_dma_copy(producer,
                                         dpu_consumer_id,
@@ -301,6 +259,13 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                         (uint8_t *)&msg,
                                         sizeof(struct comch_msg),
                                         DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+
+            /* Drain producer completion so DPU consumer receives the message */
+            {
+                doca_dpa_dev_completion_element_t dma_comp;
+                while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &dma_comp) == 0) {
+                }
+            }
 
             DOCA_DPA_DEV_LOG_INFO("DMA copy issued: ring=%u slot=%u req_id=%u src_addr=0x%lx size=%u\n",
                                   r, desc_idx[r], (uint32_t)desc->idx, desc->addr, desc->size);
