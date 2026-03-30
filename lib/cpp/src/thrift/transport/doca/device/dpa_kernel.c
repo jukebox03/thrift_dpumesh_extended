@@ -248,7 +248,15 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                   msg.dma_comp_msg.length,
                                   (unsigned int)(uint8_t)msg.dma_comp_msg.flags);
 
-            /* DMA copy: Host buffer → DPU local buffer */
+            /* 1. Drain any stale completions before issuing new DMA */
+            {
+                doca_dpa_dev_completion_element_t stale_comp;
+                while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &stale_comp) != 0) {
+                    /* Just clearing the queue */
+                }
+            }
+
+            /* 2. DMA copy: Host buffer → DPU local buffer + Send completion to DPU */
             doca_dpa_dev_comch_producer_dma_copy(producer,
                                         dpu_consumer_id,
                                         ring->dpu_mmap,
@@ -260,10 +268,11 @@ static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
                                         sizeof(struct comch_msg),
                                         DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
-            /* Drain producer completion so DPU consumer receives the message */
+            /* 3. Wait for the DMA completion to be sure it's issued */
             {
                 doca_dpa_dev_completion_element_t dma_comp;
                 while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &dma_comp) == 0) {
+                    /* Block until at least one completion is found */
                 }
             }
 

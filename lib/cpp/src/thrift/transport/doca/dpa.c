@@ -165,10 +165,9 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                 }
             }
 
-            /* Route to destination pod */
+            /* Route to destination pod (dst_pod_id) */
             int echo_mode = (dst_pod_id == -1 ||
-                             dst_pod_id == src_pod_id ||
-                             objs->num_pods <= 1);
+                             dst_pod_id == src_pod_id);
 
             if (!echo_mode) {
                 struct pod_state *dst = find_pod_by_id(objs, dst_pod_id);
@@ -182,7 +181,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                     fwd_desc.req_id = req_id;
                     fwd_desc.src_pod_id = src_pod_id;
                     fwd_desc.dst_pod_id = dst_pod_id;
-                    fwd_desc.flags = comp_msg->flags;
+                    /* Ensure destination sees this as an INGRESS REQUEST */
+                    fwd_desc.flags = CASE_INGRESS | OP_REQUEST;
                     fwd_desc.valid = 1;
 
                     doca_error_t fwd_result = send_rx_data_via_datapath_to_pod(

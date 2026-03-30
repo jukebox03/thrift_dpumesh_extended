@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+import socket
+import struct
+import sys
+import threading
+import time
+
+# Thrift TBinaryProtocol types
+T_STOP   = 0
+T_I32    = 8
+T_I64    = 10
+T_STRING = 11
+T_MAP    = 13
+
+def build_thrift_framed_call(method_name, args_payload, seq_id=0):
+    """Wraps a TBinaryProtocol call in a Thrift Frame (4-byte length)."""
+    header = struct.pack('>HH', 0x8001, 1) # Version(0x8001), Type(Call=1)
+    name_bytes = method_name.encode('ascii')
+    header += struct.pack('>I', len(name_bytes)) + name_bytes
+    header += struct.pack('>I', seq_id)
+    
+    payload = header + args_payload
+    frame = struct.pack('>I', len(payload)) + payload
+    return frame
+
+def build_compose_unique_id_args(req_id=12345, post_type=1):
+    """Builds the binary payload for UniqueIdService.ComposeUniqueId arguments."""
+    f1 = struct.pack('>bHq', T_I64, 1, req_id)
+    f2 = struct.pack('>bHi', T_I32, 2, post_type)
+    f3 = struct.pack('>bHbbI', T_MAP, 3, T_STRING, T_STRING, 0) # empty map
+    stop = struct.pack('>b', T_STOP)
+    return f1 + f2 + f3 + stop
+
+def send_request(host, port, thread_id):
+    """Single request worker."""
+    req_id = 1000 + thread_id
+    args = build_compose_unique_id_args(req_id=req_id)
+    frame = build_thrift_framed_call("ComposeUniqueId", args, seq_id=thread_id)
+    
+    print(f"[Thread-{thread_id}] Connecting to {host}:{port}...")
+    try:
+        with socket.create_connection((host, port), timeout=10) as s:
+            s.sendall(frame)
+            
+            # Read response frame length (4 bytes)
+            resp_len_bytes = s.recv(4)
+            if not resp_len_bytes:
+                print(f"[Thread-{thread_id}] [!] Connection closed")
+                return False
+            
+            resp_len = struct.unpack('>I', resp_len_bytes)[0]
+            resp_payload = b""
+            while len(resp_payload) < resp_len:
+                chunk = s.recv(resp_len - len(resp_payload))
+                if not chunk: break
+                resp_payload += chunk
+            
+            print(f"[Thread-{thread_id}] [+] Received {len(resp_payload)} bytes response. (hex: {resp_payload[:16].hex()}...)")
+            return True
+    except Exception as e:
+        print(f"[Thread-{thread_id}] [!] Error: {e}")
+        return False
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <host> [port] [num_threads]")
+        sys.exit(1)
+        
+    host = sys.argv[1]
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 9091
+    num_threads = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+    
+    print(f"[*] Starting {num_threads} request thread(s) to {host}:{port}...")
+    
+    threads = []
+    results = [False] * num_threads
+    
+    def worker(idx):
+        results[idx] = send_request(host, port, idx)
+
+    for i in range(num_threads):
+        t = threading.Thread(target=worker, args=(i,))
+        threads.append(t)
+        t.start()
+        time.sleep(0.1) # Stagger starts slightly
+
+    for t in threads:
+        t.join()
+    
+    success_count = sum(1 for r in results if r)
+    print(f"\n[*] Summary: {success_count}/{num_threads} requests succeeded.")
+    
+    if success_count > 0:
+        print("[SUCCESS] DPU data exchange confirmed via Request Threads!")
+        sys.exit(0)
+    else:
+        print("[FAILURE] No requests succeeded.")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

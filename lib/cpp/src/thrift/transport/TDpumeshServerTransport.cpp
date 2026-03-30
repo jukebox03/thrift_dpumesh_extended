@@ -56,6 +56,8 @@ stdcxx::shared_ptr<TTransport> TDpumeshServerTransport::acceptImpl() {
     while (listening_) {
         int rc = dpumesh_dequeue(ctx_, &desc, 1000);  /* 1 second timeout */
         if (rc == 0) {
+            printf("[TDpumeshServerTransport] accepted: req_id=%u len=%u flags=0x%x src_pod=%d\n",
+                   desc.req_id, desc.body_len, (unsigned int)(uint8_t)desc.flags, desc.src_pod_id);
             return stdcxx::make_shared<TDpumeshTransport>(ctx_, desc);
         }
         /* timeout: loop and check listening_ flag */

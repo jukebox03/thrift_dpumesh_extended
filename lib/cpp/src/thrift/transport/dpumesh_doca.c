@@ -119,12 +119,19 @@ static void *pe_progress_fn(void *arg) {
     struct timespec ts = {0, 1000}; /* 1 µs */
 
     while (ctx->pe_running) {
-        if (ctx->doca_objs.pe) {
-            if (doca_pe_progress(ctx->doca_objs.pe) == 0)
-                nanosleep(&ts, &ts);
-        } else {
+        int progressed = 0;
+
+        if (ctx->doca_objs.pe)
+            progressed += doca_pe_progress(ctx->doca_objs.pe);
+
+        if (ctx->doca_objs.consumer_pe)
+            progressed += doca_pe_progress(ctx->doca_objs.consumer_pe);
+
+        if (ctx->doca_objs.producer_pe)
+            progressed += doca_pe_progress(ctx->doca_objs.producer_pe);
+
+        if (progressed == 0)
             nanosleep(&ts, &ts);
-        }
     }
     return NULL;
 }
@@ -250,6 +257,9 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)hook_ctx;
     const struct dmesh_rx_data_msg *msg = (const struct dmesh_rx_data_msg *)data;
 
+    DOCA_LOG_INFO("rx_data_hook ENTER: len=%u body_len=%u sizeof_hdr=%zu",
+                  len, msg->body_len, sizeof(struct dmesh_rx_data_msg));
+
     /* Validate body_len against actual received length */
     uint32_t expected = (uint32_t)sizeof(struct dmesh_rx_data_msg) + msg->body_len;
     if (len < expected) {
@@ -272,6 +282,10 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
     sw_descriptor_t desc;
     memcpy(&desc, msg->desc, sizeof(desc));
     desc.body_buf_slot = slot;
+
+    DOCA_LOG_INFO("rx_data_hook DESC: req_id=%u flags=0x%x dst_pod=%d src_pod=%d slot=%d body_len=%u",
+                  desc.req_id, (unsigned)(uint8_t)desc.flags, desc.dst_pod_id, desc.src_pod_id,
+                  slot, desc.body_len);
 
     /* Dispatch based on flags: OP_RESPONSE → pending table, else → server RX queue */
     if (desc.flags & OP_RESPONSE) {
@@ -410,41 +424,6 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     }
 
     {
-        /* ---- Comch datapath consumer (for DPU->Host payload) ---- */
-        result = init_comch_datapath_consumer(&ctx->doca_objs);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to init comch datapath consumer: %s",
-                         doca_error_get_descr(result));
-            goto fail_cleanup;
-        }
-
-        /* Advertise this pod's datapath consumer ID to DPU (control path signal). */
-        if (ctx->doca_objs.consumer != NULL) {
-            uint32_t local_consumer_id = 0;
-            doca_error_t cid_result = doca_comch_consumer_get_id(ctx->doca_objs.consumer,
-                                                                  &local_consumer_id);
-            if (cid_result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("Failed to get local datapath consumer id: %s",
-                             doca_error_get_descr(cid_result));
-                goto fail_cleanup;
-            }
-
-            struct dmesh_pod_consumer_id_msg pod_cid;
-            pod_cid.type = DMESH_MSG_POD_CONSUMER_ID;
-            pod_cid.pod_id = ctx->pod_id;
-            pod_cid.consumer_id = local_consumer_id;
-            cid_result = client_send_msg(&ctx->doca_objs,
-                                         (const char *)&pod_cid,
-                                         sizeof(pod_cid));
-            if (cid_result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("Failed to send POD_CONSUMER_ID to DPU: %s",
-                             doca_error_get_descr(cid_result));
-                goto fail_cleanup;
-            }
-            DOCA_LOG_INFO("Advertised POD_CONSUMER_ID to DPU: pod_id=%d consumer_id=%u",
-                          ctx->pod_id, local_consumer_id);
-        }
-
         /* ---- Comch datapath producer ---- */
         result = init_comch_datapath_producer(&ctx->doca_objs);
         if (result != DOCA_SUCCESS) {
@@ -684,24 +663,6 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
                   desc->dst_pod_id,
                   (unsigned int)(uint8_t)desc->flags,
                   (unsigned long)dma->addr);
-
-    /* Send doorbell to DPU so DPA can process without window polling */
-    {
-        struct dmesh_new_desc_msg doorbell;
-        doorbell.type = DMESH_MSG_NEW_DESC;
-        doorbell.src_pod_id = ctx->pod_id;
-        doorbell.addr = dma->addr;
-        doorbell.size = dma->size;
-        doorbell.req_id = (uint32_t)dma->idx;
-        doorbell.dst_pod_id = dma->dst_pod_id;
-        doorbell.flags = dma->flags;
-        doca_error_t db_result = client_send_msg(&ctx->doca_objs,
-                                                  (const char *)&doorbell,
-                                                  sizeof(doorbell));
-        if (db_result != DOCA_SUCCESS) {
-            DOCA_LOG_WARN("Doorbell send failed: %s", doca_error_get_descr(db_result));
-        }
-    }
 
     return 0;
 }
