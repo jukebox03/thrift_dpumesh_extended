@@ -73,6 +73,7 @@
 /usr/local/include/thrift/transport/doca/dpa.h
 /usr/local/include/thrift/transport/doca/common.h
 /usr/local/include/thrift/transport/doca/dpa_common.h
+/usr/local/include/thrift/transport/doca/dpumesh_common.h
 /usr/local/include/thrift/transport/doca/config.h
 /usr/local/include/thrift/transport/doca/comch_consumer.h
 /usr/local/include/thrift/transport/doca/ring.h
@@ -89,6 +90,7 @@
 /usr/local/include/thrift/transport/TNonblockingServerTransport.h
 /usr/local/include/thrift/transport/TServerTransport.h
 /usr/local/include/thrift/transport/TTransportException.h
+/usr/local/include/thrift/transport/TDpumeshTransportBase.h
 /usr/local/include/thrift/transport/TSocketPool.h
 /usr/local/include/thrift/transport/TDpumeshTransport.h
 /usr/local/include/thrift/transport/TPipe.h
