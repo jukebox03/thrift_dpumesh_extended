@@ -727,6 +727,18 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
 int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
     pthread_mutex_lock(&ctx->rx_lock);
 
+    /* Compute absolute deadline once before the loop */
+    struct timespec ts;
+    if (timeout_ms > 0) {
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += timeout_ms / 1000;
+        ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+    }
+
     while (ctx->rx_count == 0) {
         if (timeout_ms == 0) {
             /* Non-blocking */
@@ -737,14 +749,6 @@ int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
             pthread_cond_wait(&ctx->rx_cond, &ctx->rx_lock);
         } else {
             /* Timed wait */
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec  += timeout_ms / 1000;
-            ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
-            if (ts.tv_nsec >= 1000000000L) {
-                ts.tv_sec++;
-                ts.tv_nsec -= 1000000000L;
-            }
             int rc = pthread_cond_timedwait(&ctx->rx_cond, &ctx->rx_lock, &ts);
             if (rc != 0) {
                 /* Timeout or error */
@@ -810,10 +814,10 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
     dpumesh_pending_t *p = &ctx->pending[idx];
 
     pthread_mutex_lock(&p->lock);
-    if (p->state == 0) {
-        /* Someone else is already waiting on this slot — collision */
+    if (p->state != -1) {
+        /* Slot is in use (0=waiting, 1=arrived) — collision */
         pthread_mutex_unlock(&p->lock);
-        DOCA_LOG_ERR("Pending slot %u already in use (req_id=%u)", idx, req_id);
+        DOCA_LOG_ERR("Pending slot %u already in use (req_id=%u state=%d)", idx, req_id, p->state);
         return -1;
     }
     p->state = 0;  /* WAITING */
@@ -830,6 +834,19 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
     pthread_mutex_lock(&p->lock);
     DOCA_LOG_INFO("wait_response begin: req_id=%u idx=%u timeout_ms=%d state=%d",
                   req_id, idx, timeout_ms, p->state);
+
+    /* Compute absolute deadline once before the loop */
+    struct timespec ts;
+    if (timeout_ms > 0) {
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += timeout_ms / 1000;
+        ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+    }
+
     while (p->state == 0) {
         if (timeout_ms < 0) {
             pthread_cond_wait(&p->cond, &p->lock);
@@ -838,14 +855,6 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
             pthread_mutex_unlock(&p->lock);
             return -1;
         } else {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec  += timeout_ms / 1000;
-            ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
-            if (ts.tv_nsec >= 1000000000L) {
-                ts.tv_sec++;
-                ts.tv_nsec -= 1000000000L;
-            }
             int rc = pthread_cond_timedwait(&p->cond, &p->lock, &ts);
             if (rc != 0) {
                 /* Timeout */
