@@ -71,13 +71,14 @@ send_dma_request_to_dpa(struct objects *objs)
 
     dma_req_msg.type = COMCH_MSG_TYPE_DMA_REQ;
     dma_req_msg.dpa_producer = objs->remote_dpa_producer;
-    result = doca_dpa_completion_get_dpa_handle(objs->dpa_comch->producer_comp,
-                                               &dma_req_msg.dpa_producer_comp);
+    doca_dpa_dev_completion_t tmp_comp;
+    result = doca_dpa_completion_get_dpa_handle(objs->dpa_comch->producer_comp, &tmp_comp);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get producer_comp DPA handle: %s",
                      doca_error_get_descr(result));
         return result;
     }
+    dma_req_msg.dpa_producer_comp = tmp_comp;
     dma_req_msg.src_mmap = src_mmap;
     dma_req_msg.dst_mmap = dst_mmap;
     dma_req_msg.src_addr = (uint64_t)objs->remote_addr;
