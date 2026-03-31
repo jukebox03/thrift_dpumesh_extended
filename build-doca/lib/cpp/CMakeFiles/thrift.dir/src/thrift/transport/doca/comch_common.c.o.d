@@ -91,6 +91,7 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_common.c.o: \
  /opt/mellanox/doca/include/doca_comch.h \
  /opt/mellanox/doca/include/doca_ctx.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_client.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/common.h \
  /opt/mellanox/doca/include/doca_buf.h \

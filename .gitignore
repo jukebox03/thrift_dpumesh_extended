@@ -56,6 +56,11 @@ project.lock.json
 .vscode
 .vs
 
+# Thrift-specific ignores - environment files
+.env
+.env.*
+!.env.example
+
 /aclocal/libtool.m4
 /aclocal/lt*.m4
 /autoscan.log

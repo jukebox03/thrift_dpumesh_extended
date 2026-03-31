@@ -5,12 +5,12 @@
 #include <stddef.h>
 #include <doca_mmap.h>
 
+#include "dpumesh_common.h"
+
 typedef uint64_t doca_dpa_dev_uintptr_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
 
 /* ====== Multi-ring DPA thread arg ====== */
-
-#define MAX_DPA_RINGS 8
 
 struct dpa_ring_info {
 	doca_dpa_dev_buf_arr_t buf_arr;

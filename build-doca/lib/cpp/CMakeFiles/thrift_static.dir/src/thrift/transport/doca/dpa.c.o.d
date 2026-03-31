@@ -95,12 +95,14 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o: \
  /opt/mellanox/doca/include/doca_dev.h \
  /opt/mellanox/doca/include/doca_comch.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa_common.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_producer.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_consumer.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/../dpumesh.h \
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/../doca/dpumesh_common.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/ring.h \
  /usr/include/arpa/inet.h /usr/include/netinet/in.h \
  /usr/include/x86_64-linux-gnu/sys/socket.h \

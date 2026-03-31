@@ -83,6 +83,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_producer.c.
  /opt/mellanox/doca/include/doca_dev.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/buffer.h \
  /opt/mellanox/doca/include/doca_buf.h \
  /opt/mellanox/doca/include/doca_buf_pool.h \

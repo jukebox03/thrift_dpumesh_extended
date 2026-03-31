@@ -13,12 +13,22 @@
 
 set -euo pipefail
 
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+
+
+# DPU_HOST, DPU_PASS, DPU_PCI, HOST_PCI
+if [ -f ".env" ]; then
+    echo -e "${GREEN}[INFO]${NC} Loading environment variables from .env"
+    set -a
+    source .env
+    set +a
+else
+    echo -e "${RED}[ERR]${NC} .env file not found! Please create a .env file."
+    exit 1
+fi
+
 ### 설정 ###
 NS="test-dpumesh"
-DPU_HOST="jukebox@192.168.100.2"
-DPU_PASS="12341234"
-DPU_PCI="-p 03:00.0 -r 94:00.0"
-HOST_PCI="94:00.0"
 PROJ_ROOT="$HOME/thrift_dpumesh_extended"
 TRANSPORT_SRC="$PROJ_ROOT/lib/cpp/src/thrift/transport"
 DOCA_SRC="$TRANSPORT_SRC/doca"
@@ -29,7 +39,6 @@ BUILD_DOCA="$PROJ_ROOT/build-doca"
 GATEWAY_PORT=9091
 DPU_LOG="/tmp/dpumesh_dpu_test.log"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()   { echo -e "${RED}[ERR]${NC} $*"; }

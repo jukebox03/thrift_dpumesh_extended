@@ -394,9 +394,11 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/TDpumeshTransport.cpp.o: \
  /usr/include/boost/numeric/conversion/detail/numeric_cast_traits.hpp \
  /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_common.hpp \
  /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_long_long.hpp \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/dpumesh.h \
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshTransportBase.h \
  /usr/include/c++/11/cstring /usr/include/string.h /usr/include/strings.h \
  /usr/include/c++/11/algorithm /usr/include/c++/11/bits/stl_algo.h \
  /usr/include/c++/11/bits/algorithmfwd.h \
  /usr/include/c++/11/bits/stl_heap.h \
- /usr/include/c++/11/bits/uniform_int_dist.h
+ /usr/include/c++/11/bits/uniform_int_dist.h \
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/dpumesh.h \
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpumesh_common.h

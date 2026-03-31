@@ -8,6 +8,7 @@
 #include <doca_ctx.h>
 
 #include "comch_server.h"
+#include "dpumesh_common.h"
 
 struct dmesh_doca_dpa_thread;
 struct dmesh_doca_dpa_comch;
@@ -17,7 +18,6 @@ typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
 
 #define MAX_CONSUMERS 16
-#define MAX_PODS 8
 
 /* Per-pod state (DPU only) */
 struct pod_state {

@@ -9,18 +9,14 @@
 #define _THRIFT_TRANSPORT_TDPUMESHTRANSPORT_H_
 
 #include <thrift/transport/TVirtualTransport.h>
-#include <vector>
-#include <cstdint>
-
-extern "C" {
-#include <thrift/transport/dpumesh.h>
-}
+#include <thrift/transport/TDpumeshTransportBase.h>
 
 namespace apache {
 namespace thrift {
 namespace transport {
 
-class TDpumeshTransport : public TVirtualTransport<TDpumeshTransport> {
+class TDpumeshTransport : public TVirtualTransport<TDpumeshTransport>,
+                          public TDpumeshTransportBase {
 public:
     /**
      * Construct a per-request transport from a dequeued descriptor.
@@ -43,19 +39,8 @@ public:
     int32_t getSrcPodId() const { return src_pod_id_; }
 
 private:
-    dpumesh_ctx_t *ctx_;
-
-    /* RX side: incoming request data */
-    uint8_t *read_buf_;
-    uint32_t read_len_;
-    uint32_t read_pos_;
     bool read_done_;
-    int rx_slot_;
-
-    /* TX side: outgoing response data */
-    std::vector<uint8_t> write_buf_;
     bool flushed_;
-    int tx_slot_;  /* TX slot allocated in flush(), freed in close() */
 
     /* Request metadata for response routing */
     uint32_t stream_id_;

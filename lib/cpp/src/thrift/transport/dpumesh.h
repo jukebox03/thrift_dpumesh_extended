@@ -16,6 +16,8 @@ extern "C" {
 #include <stdint.h>
 #include <stddef.h>
 
+#include "doca/dpumesh_common.h"
+
 /* ====== Default constants ====== */
 #define DPUMESH_SLOT_SIZE_DEFAULT       (1024 * 1024)   /* 1MB */
 #define DPUMESH_NUM_SLOTS_DEFAULT       64
@@ -31,20 +33,6 @@ typedef struct {
 } dpumesh_config_t;
 
 #define DPUMESH_CONFIG_DEFAULT { 0, 0, 0 }
-
-/* Flags (match Python CaseFlag, OpFlag) */
-#define CASE_EXTERNAL  1
-#define CASE_INGRESS   2
-#define CASE_LOCAL     3
-#define OP_REQUEST     0x00
-#define OP_RESPONSE    0x10
-
-/* PoolType (match Python PoolType) */
-#define POOL_NONE           0
-#define POOL_HOST_TX_BODY   2
-#define POOL_HOST_RX_BODY   4
-#define POOL_DPU_TX_BODY    6
-#define POOL_DPU_RX_BODY    7
 
 /* ====== SwDescriptor (64 bytes, packed, matches '<iIiIIIiibbBBiiii12x') ====== */
 typedef struct __attribute__((packed)) {

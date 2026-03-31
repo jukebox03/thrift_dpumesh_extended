@@ -16,18 +16,14 @@
 #define _THRIFT_TRANSPORT_TDPUMESHCLIENTTRANSPORT_H_
 
 #include <thrift/transport/TVirtualTransport.h>
-#include <vector>
-#include <cstdint>
-
-extern "C" {
-#include <thrift/transport/dpumesh.h>
-}
+#include <thrift/transport/TDpumeshTransportBase.h>
 
 namespace apache {
 namespace thrift {
 namespace transport {
 
-class TDpumeshClientTransport : public TVirtualTransport<TDpumeshClientTransport> {
+class TDpumeshClientTransport : public TVirtualTransport<TDpumeshClientTransport>,
+                                public TDpumeshTransportBase {
 public:
     /**
      * @param ctx        Shared dpumesh context (must be initialized)
@@ -50,20 +46,11 @@ public:
 private:
     void cleanup_response();
 
-    dpumesh_ctx_t *ctx_;
     int32_t dst_pod_id_;
     int timeout_ms_;
 
-    /* Write buffer: accumulates request data before flush */
-    std::vector<uint8_t> write_buf_;
-
     /* Response state: populated after flush, consumed by read */
     uint32_t req_id_;
-    uint8_t *read_buf_;
-    uint32_t read_len_;
-    uint32_t read_pos_;
-    int rx_slot_;
-    int tx_slot_;  /* TX slot allocated in flush(), freed in cleanup_response() */
     bool response_ready_;
     bool pending_registered_;
 };

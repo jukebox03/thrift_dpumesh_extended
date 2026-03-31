@@ -11448,7 +11448,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTranspor
   /usr/include/boost/numeric/conversion/detail/numeric_cast_traits.hpp \
   /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_common.hpp \
   /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_long_long.hpp \
-  ../lib/cpp/src/thrift/transport/dpumesh.h \
+  ../lib/cpp/src/thrift/transport/TDpumeshTransportBase.h \
   /usr/include/c++/11/cstring \
   /usr/include/string.h \
   /usr/include/strings.h \
@@ -11456,7 +11456,9 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTranspor
   /usr/include/c++/11/bits/stl_algo.h \
   /usr/include/c++/11/bits/algorithmfwd.h \
   /usr/include/c++/11/bits/stl_heap.h \
-  /usr/include/c++/11/bits/uniform_int_dist.h
+  /usr/include/c++/11/bits/uniform_int_dist.h \
+  ../lib/cpp/src/thrift/transport/dpumesh.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.o: ../lib/cpp/src/thrift/transport/TDpumeshServerTransport.cpp \
   /usr/include/stdc-predef.h \
@@ -11906,7 +11908,17 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTranspor
   /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_long_long.hpp \
   ../lib/cpp/src/thrift/transport/TDpumeshTransport.h \
   ../lib/cpp/src/thrift/transport/TVirtualTransport.h \
-  ../lib/cpp/src/thrift/transport/dpumesh.h
+  ../lib/cpp/src/thrift/transport/TDpumeshTransportBase.h \
+  /usr/include/c++/11/cstring \
+  /usr/include/string.h \
+  /usr/include/strings.h \
+  /usr/include/c++/11/algorithm \
+  /usr/include/c++/11/bits/stl_algo.h \
+  /usr/include/c++/11/bits/algorithmfwd.h \
+  /usr/include/c++/11/bits/stl_heap.h \
+  /usr/include/c++/11/bits/uniform_int_dist.h \
+  ../lib/cpp/src/thrift/transport/dpumesh.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.o: ../lib/cpp/src/thrift/transport/TDpumeshTransport.cpp \
   /usr/include/stdc-predef.h \
@@ -12354,7 +12366,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.
   /usr/include/boost/numeric/conversion/detail/numeric_cast_traits.hpp \
   /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_common.hpp \
   /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_long_long.hpp \
-  ../lib/cpp/src/thrift/transport/dpumesh.h \
+  ../lib/cpp/src/thrift/transport/TDpumeshTransportBase.h \
   /usr/include/c++/11/cstring \
   /usr/include/string.h \
   /usr/include/strings.h \
@@ -12362,7 +12374,9 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.
   /usr/include/c++/11/bits/stl_algo.h \
   /usr/include/c++/11/bits/algorithmfwd.h \
   /usr/include/c++/11/bits/stl_heap.h \
-  /usr/include/c++/11/bits/uniform_int_dist.h
+  /usr/include/c++/11/bits/uniform_int_dist.h \
+  ../lib/cpp/src/thrift/transport/dpumesh.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TFDTransport.cpp.o: ../lib/cpp/src/thrift/transport/TFDTransport.cpp \
   /usr/include/stdc-predef.h \
@@ -20553,6 +20567,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.o:
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
   /opt/mellanox/doca/include/doca_pe.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/comch_common.h
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o: ../lib/cpp/src/thrift/transport/doca/comch_common.c \
@@ -20660,6 +20675,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o:
   /opt/mellanox/doca/include/doca_comch.h \
   /opt/mellanox/doca/include/doca_ctx.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/comch_client.h \
   ../lib/cpp/src/thrift/transport/doca/common.h \
   /opt/mellanox/doca/include/doca_buf.h \
@@ -20761,6 +20777,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.
   /opt/mellanox/doca/include/doca_pe.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/buffer.h \
   /opt/mellanox/doca/include/doca_buf.h \
   /opt/mellanox/doca/include/doca_buf_pool.h \
@@ -20950,6 +20967,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_producer.c.
   /opt/mellanox/doca/include/doca_dev.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/buffer.h \
   /opt/mellanox/doca/include/doca_buf.h \
   /opt/mellanox/doca/include/doca_buf_pool.h \
@@ -21047,6 +21065,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o:
   /usr/include/x86_64-linux-gnu/bits/types/struct_tm.h \
   /usr/include/x86_64-linux-gnu/bits/types/struct_itimerspec.h \
   ../lib/cpp/src/thrift/transport/dpumesh.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/common.h \
   /opt/mellanox/doca/include/doca_buf.h \
   /opt/mellanox/doca/include/doca_buf_inventory.h \
@@ -21063,6 +21082,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o:
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
   /opt/mellanox/doca/include/doca_pe.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/dpa.h \
   /opt/mellanox/doca/include/doca_dpa.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdarg.h \
@@ -21280,6 +21300,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dma.c.o: ../lib/c
   /usr/include/x86_64-linux-gnu/bits/types/struct_osockaddr.h \
   /usr/include/x86_64-linux-gnu/bits/in.h \
   ../lib/cpp/src/thrift/transport/doca/dpa_common.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/object.h \
   /usr/include/pthread.h \
   /usr/include/sched.h \
@@ -21414,12 +21435,14 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o: ../lib/c
   /opt/mellanox/doca/include/doca_dev.h \
   /opt/mellanox/doca/include/doca_comch.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/dpa_common.h \
   ../lib/cpp/src/thrift/transport/doca/comch_common.h \
   ../lib/cpp/src/thrift/transport/doca/dpu_worker.h \
   ../lib/cpp/src/thrift/transport/doca/comch_producer.h \
   ../lib/cpp/src/thrift/transport/doca/comch_consumer.h \
   ../lib/cpp/src/thrift/transport/dpumesh.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/ring.h \
   /usr/include/arpa/inet.h \
   /usr/include/netinet/in.h \
@@ -21534,6 +21557,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o: ../li
   /opt/mellanox/doca/include/doca_ctx.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   /opt/mellanox/doca/include/doca_log.h \
   /usr/include/stdio.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdarg.h \
@@ -21630,6 +21654,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o: ../lib/
   /usr/include/x86_64-linux-gnu/asm/posix_types.h \
   /usr/include/x86_64-linux-gnu/asm/posix_types_64.h \
   /usr/include/asm-generic/posix_types.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/object.h \
   /usr/include/pthread.h \
   /usr/include/sched.h \
@@ -21677,6 +21702,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: ../l
   /usr/include/x86_64-linux-gnu/bits/stdint-intn.h \
   /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stddef.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   /usr/include/stdio.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdarg.h \
   /usr/include/x86_64-linux-gnu/bits/types/__fpos_t.h \
@@ -21766,6 +21792,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: ../l
   /opt/mellanox/doca/include/doca_comch.h \
   /opt/mellanox/doca/include/doca_ctx.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/config.h \
   ../lib/cpp/src/thrift/transport/doca/buffer.h \
   /opt/mellanox/doca/include/doca_buf_pool.h \
@@ -22162,6 +22189,8 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: ../l
 ../lib/cpp/src/thrift/transport/TDpumeshServerTransport.h:
 
 ../lib/cpp/src/thrift/transport/dpumesh.h:
+
+../lib/cpp/src/thrift/transport/TDpumeshTransportBase.h:
 
 ../lib/cpp/src/thrift/transport/TDpumeshClientTransport.h:
 
@@ -24576,6 +24605,8 @@ thrift/config.h:
 /usr/include/boost/mpl/greater_equal.hpp:
 
 ../lib/cpp/src/thrift/transport/THttpServer.h:
+
+../lib/cpp/src/thrift/transport/doca/dpumesh_common.h:
 
 /usr/include/boost/preprocessor/iteration/detail/bounds/upper1.hpp:
 

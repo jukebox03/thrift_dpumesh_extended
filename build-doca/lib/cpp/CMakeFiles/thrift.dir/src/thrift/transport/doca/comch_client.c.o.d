@@ -94,4 +94,5 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_client.c.o: \
  /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
  /opt/mellanox/doca/include/doca_pe.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
+ /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
  /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h

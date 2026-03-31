@@ -35,6 +35,8 @@
 
 DOCA_LOG_REGISTER(DPUMESH_DOCA);
 
+static void cleanup_ctx(struct dpumesh_ctx *ctx);
+
 /* ====================================================================
  * dpumesh_ctx — internal state
  * ==================================================================== */
@@ -331,6 +333,118 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
     }
 }
 
+static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, const char *app_name, int worker_num) {
+    const char *env_val;
+
+    if (config && config->num_slots > 0)
+        ctx->num_slots = config->num_slots;
+    else if ((env_val = getenv("DPUMESH_NUM_SLOTS")) != NULL && atoi(env_val) > 0)
+        ctx->num_slots = atoi(env_val);
+    else
+        ctx->num_slots = DPUMESH_NUM_SLOTS_DEFAULT;
+
+    if (config && config->slot_size > 0)
+        ctx->slot_size = config->slot_size;
+    else if ((env_val = getenv("DPUMESH_SLOT_SIZE")) != NULL && atoi(env_val) > 0)
+        ctx->slot_size = atoi(env_val);
+    else
+        ctx->slot_size = DPUMESH_SLOT_SIZE_DEFAULT;
+
+    if (config && config->max_descriptors > 0)
+        ctx->max_descriptors = config->max_descriptors;
+    else if ((env_val = getenv("DPUMESH_MAX_DESCRIPTORS")) != NULL && atoi(env_val) > 0)
+        ctx->max_descriptors = atoi(env_val);
+    else
+        ctx->max_descriptors = DPUMESH_MAX_DESCRIPTORS_DEFAULT;
+
+    snprintf(ctx->app_name, sizeof(ctx->app_name), "%s", app_name);
+    snprintf(ctx->worker_id, sizeof(ctx->worker_id),
+             "%s-worker-%d", app_name, worker_num);
+
+    if ((env_val = getenv("DPUMESH_POD_ID")) != NULL)
+        ctx->pod_id = atoi(env_val);
+    else
+        ctx->pod_id = worker_num;
+}
+
+static doca_error_t init_doca_device(dpumesh_ctx_t *ctx) {
+    const char *pci_addr = getenv("DPUMESH_PCI_ADDR");
+    if (!pci_addr) pci_addr = "94:00.0";
+
+    doca_log_backend_create_standard();
+    fprintf(stderr, "[dpumesh] Opening DOCA device at %s...\n", pci_addr);
+    return open_doca_device_with_pci(pci_addr, NULL, &ctx->doca_objs.dev);
+}
+
+static doca_error_t init_control_path(dpumesh_ctx_t *ctx) {
+    doca_error_t result;
+
+    fprintf(stderr, "[dpumesh] Connecting comch client...\n");
+    result = init_comch_ctrl_path_client("DPUMesh", &ctx->doca_objs, true);
+    if (result != DOCA_SUCCESS) return result;
+
+    /* Register pod_id with DPU */
+    struct dmesh_register_msg reg;
+    reg.type = DMESH_MSG_REGISTER;
+    reg.pod_id = ctx->pod_id;
+    snprintf(reg.app_name, sizeof(reg.app_name), "%s", ctx->app_name);
+    
+    result = client_send_msg(&ctx->doca_objs, (const char *)&reg, sizeof(reg));
+    if (result == DOCA_SUCCESS) {
+        DOCA_LOG_INFO("Sent REGISTER to DPU: pod_id=%d app=%s", ctx->pod_id, ctx->app_name);
+    }
+    return result;
+}
+
+static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
+    doca_error_t result;
+
+    /* 1. Comch datapath consumer */
+    result = init_comch_datapath_consumer(&ctx->doca_objs);
+    if (result != DOCA_SUCCESS) return result;
+
+    if (ctx->doca_objs.consumer != NULL) {
+        uint32_t local_consumer_id = 0;
+        result = doca_comch_consumer_get_id(ctx->doca_objs.consumer, &local_consumer_id);
+        if (result != DOCA_SUCCESS) return result;
+
+        struct dmesh_pod_consumer_id_msg pod_cid;
+        pod_cid.type = DMESH_MSG_POD_CONSUMER_ID;
+        pod_cid.pod_id = ctx->pod_id;
+        pod_cid.consumer_id = local_consumer_id;
+        client_send_msg(&ctx->doca_objs, (const char *)&pod_cid, sizeof(pod_cid));
+    }
+
+    /* 2. Comch datapath producer */
+    result = init_comch_datapath_producer(&ctx->doca_objs);
+    if (result != DOCA_SUCCESS) return result;
+
+    /* 3. DMA ring */
+    result = setup_dma_ring(&ctx->doca_objs, ctx->max_descriptors);
+    if (result != DOCA_SUCCESS) return result;
+    ctx->dma_ring = ctx->doca_objs.dma_ring;
+
+    /* 4. DMA buffer */
+    size_t buf_size = (size_t)ctx->num_slots * ctx->slot_size;
+    result = alloc_buffer_and_set_mmap(&ctx->doca_objs.local_mmap,
+                                       ctx->doca_objs.dev,
+                                       &ctx->doca_objs.dma_buffer,
+                                       buf_size,
+                                       DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    if (result != DOCA_SUCCESS) return result;
+    ctx->dma_buffer = ctx->doca_objs.dma_buffer;
+    ctx->dma_buffer_mmap = ctx->doca_objs.local_mmap;
+
+    /* 5. Export mmap to DPU */
+    result = export_mmap_to_remote(&ctx->doca_objs, ctx->doca_objs.local_mmap,
+                                   ctx->doca_objs.dma_buffer, buf_size,
+                                   DMA_BUFFER, HOST_TO_DPU);
+    if (result != DOCA_SUCCESS) return result;
+
+    /* 6. DPA handle */
+    return doca_mmap_dev_get_dpa_handle(ctx->doca_objs.local_mmap, ctx->doca_objs.dev, &ctx->dpa_mmap_handle);
+}
+
 /* ====================================================================
  * dpumesh_init — DOCA initialization sequence
  * ==================================================================== */
@@ -400,7 +514,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     result = init_comch_ctrl_path_client("DPUMesh", &ctx->doca_objs, true);
     if (result != DOCA_SUCCESS) {
         fprintf(stderr, "[dpumesh] FAIL: comch client: %s\n", doca_error_get_descr(result));
-        goto fail_cleanup;
+        goto fail;
     }
     fprintf(stderr, "[dpumesh] Comch client connected OK\n");
 
@@ -429,7 +543,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to init comch datapath consumer: %s",
                          doca_error_get_descr(result));
-            goto fail_cleanup;
+            goto fail;
         }
 
         /* Advertise this pod's datapath consumer ID to DPU (control path signal). */
@@ -440,7 +554,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
             if (cid_result != DOCA_SUCCESS) {
                 DOCA_LOG_ERR("Failed to get local datapath consumer id: %s",
                              doca_error_get_descr(cid_result));
-                goto fail_cleanup;
+                goto fail;
             }
 
             struct dmesh_pod_consumer_id_msg pod_cid;
@@ -453,7 +567,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
             if (cid_result != DOCA_SUCCESS) {
                 DOCA_LOG_ERR("Failed to send POD_CONSUMER_ID to DPU: %s",
                              doca_error_get_descr(cid_result));
-                goto fail_cleanup;
+                goto fail;
             }
             DOCA_LOG_INFO("Advertised POD_CONSUMER_ID to DPU: pod_id=%d consumer_id=%u",
                           ctx->pod_id, local_consumer_id);
@@ -464,7 +578,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to init comch datapath producer: %s",
                          doca_error_get_descr(result));
-            goto fail_cleanup;
+            goto fail;
         }
 
         /* ---- DMA ring ---- */
@@ -472,7 +586,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to setup DMA ring: %s",
                          doca_error_get_descr(result));
-            goto fail_cleanup;
+            goto fail;
         }
         ctx->dma_ring = ctx->doca_objs.dma_ring;
 
@@ -486,7 +600,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to allocate DMA buffer: %s",
                          doca_error_get_descr(result));
-            goto fail_cleanup;
+            goto fail;
         }
         ctx->dma_buffer = ctx->doca_objs.dma_buffer;
         ctx->dma_buffer_mmap = ctx->doca_objs.local_mmap;
@@ -498,7 +612,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to export mmap to DPU: %s",
                          doca_error_get_descr(result));
-            goto fail_cleanup;
+            goto fail;
         }
 
         /* ---- Cache DPA mmap handle for TX descriptor fill ---- */
@@ -508,24 +622,24 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to get DPA mmap handle: %s",
                          doca_error_get_descr(result));
-            goto fail_cleanup;
+            goto fail;
         }
     }
 
     /* ---- TX slot bitmap + mutex ---- */
     ctx->slot_bitmap = (uint8_t *)calloc(ctx->num_slots, 1);
     if (!ctx->slot_bitmap)
-        goto fail_cleanup;
+        goto fail;
     pthread_mutex_init(&ctx->slot_lock, NULL);
 
     /* ---- RX buffer pool + slot bitmap ---- */
     size_t rx_buf_size = (size_t)ctx->num_slots * ctx->slot_size;
     ctx->rx_buffer = calloc(1, rx_buf_size);
     if (!ctx->rx_buffer)
-        goto fail_cleanup;
+        goto fail;
     ctx->rx_slot_bitmap = (uint8_t *)calloc(ctx->num_slots, 1);
     if (!ctx->rx_slot_bitmap)
-        goto fail_cleanup;
+        goto fail;
     pthread_mutex_init(&ctx->rx_slot_lock, NULL);
 
     /* ---- RX descriptor queue ---- */
@@ -543,7 +657,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to query comch max msg size: %s",
                          doca_error_get_descr(result));
-            goto fail_cleanup;
+            goto fail;
         }
         ctx->comch_max_msg_size = max_msg_sz;
     }
@@ -571,7 +685,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     ctx->pe_running = 1;
     if (pthread_create(&ctx->pe_tid, NULL, pe_progress_fn, ctx) != 0) {
         DOCA_LOG_ERR("Failed to create PE progress thread");
-        goto fail_cleanup;
+        goto fail;
     }
 
     DOCA_LOG_INFO("DPUmesh DOCA initialized: worker=%s pod_id=%d pci=%s "
@@ -582,39 +696,31 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     *out = ctx;
     return 0;
 
-fail_cleanup:
-    cleanup_objects(&ctx->doca_objs);
 fail:
-    if (ctx->tx_inflight_lock_ready)
-        pthread_mutex_destroy(&ctx->tx_inflight_lock);
-    if (ctx->slot_bitmap)
-        free(ctx->slot_bitmap);
-    free(ctx);
+    cleanup_ctx(ctx);
     return -1;
 }
 
-/* ====================================================================
- * dpumesh_destroy
- * ==================================================================== */
-
-void dpumesh_destroy(dpumesh_ctx_t *ctx) {
+static void cleanup_ctx(dpumesh_ctx_t *ctx) {
     if (!ctx) return;
 
     /* Stop PE thread */
-    ctx->pe_running = 0;
-    pthread_join(ctx->pe_tid, NULL);
+    if (ctx->pe_running) {
+        ctx->pe_running = 0;
+        pthread_join(ctx->pe_tid, NULL);
+    }
 
     /* Cleanup DOCA objects */
     cleanup_objects(&ctx->doca_objs);
 
     /* Free TX bitmap + mutex */
     pthread_mutex_destroy(&ctx->slot_lock);
-    free(ctx->slot_bitmap);
+    if (ctx->slot_bitmap) free(ctx->slot_bitmap);
 
     /* Free RX resources */
     pthread_mutex_destroy(&ctx->rx_slot_lock);
-    free(ctx->rx_slot_bitmap);
-    free(ctx->rx_buffer);
+    if (ctx->rx_slot_bitmap) free(ctx->rx_slot_bitmap);
+    if (ctx->rx_buffer) free(ctx->rx_buffer);
     pthread_mutex_destroy(&ctx->rx_lock);
     pthread_cond_destroy(&ctx->rx_cond);
 
@@ -631,6 +737,12 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx) {
     }
 
     free(ctx);
+}
+
+void dpumesh_destroy(dpumesh_ctx_t *ctx) {
+    if (!ctx) return;
+    DOCA_LOG_INFO("Destroying DPUmesh context: worker=%s", ctx->worker_id);
+    cleanup_ctx(ctx);
 }
 
 /* ====================================================================
