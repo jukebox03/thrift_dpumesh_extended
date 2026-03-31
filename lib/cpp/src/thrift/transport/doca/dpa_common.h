@@ -35,6 +35,10 @@ struct dpa_thread_arg {
 	volatile uint32_t num_rings;
 	uint32_t _pad;
 	struct dpa_ring_info rings[MAX_DPA_RINGS];
+
+	/* Per-ring state (persistent across reschedule) */
+	uint32_t desc_idx[MAX_DPA_RINGS];
+	uint32_t pos[MAX_DPA_RINGS];
 } __attribute__((__packed__, aligned(8)));
 
 /* ====== Comch message types (DPU ↔ DPA) ====== */

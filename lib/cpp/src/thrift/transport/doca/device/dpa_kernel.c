@@ -137,158 +137,128 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
         num_msgs++;
     }
 
-    // send_msgs(thread_arg, num_msgs);
     if (num_msgs != 0) {
         doca_dpa_dev_comch_consumer_completion_ack(consumer_comp, num_msgs);
-		doca_dpa_dev_comch_consumer_completion_request_notification(consumer_comp);
 		doca_dpa_dev_comch_consumer_ack(consumer, num_msgs);
     }
-    // DOCA_DPA_DEV_LOG_INFO("Handled %u msgs from host\n", num_msgs);
+    /* Always re-arm notification so next message wakes the thread */
+    doca_dpa_dev_comch_consumer_completion_request_notification(consumer_comp);
 }
 
 /*
- * Multi-ring round-robin polling.
- * Polls all registered rings (one per pod) in a non-blocking fashion.
+ * Process one descriptor from the given ring.
+ * Returns 1 if a descriptor was processed, 0 if ring was idle.
  */
-static void poll_desc_rings(struct dpa_thread_arg *thread_arg)
+static int process_one_desc(struct dpa_thread_arg *thread_arg,
+                            uint32_t r)
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
     uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
+    struct dpa_ring_info *ring = &thread_arg->rings[r];
     struct comch_msg msg;
-    doca_dpa_dev_uintptr_t dev_ptr;
     doca_dpa_dev_buf_t buf;
+    doca_dpa_dev_uintptr_t dev_ptr;
     struct dma_desc *desc;
 
-    uint32_t desc_idx[MAX_DPA_RINGS] = {0};  /* per-ring position */
-    uint32_t pos[MAX_DPA_RINGS] = {0};       /* per-ring DMA buffer position */
+    buf = doca_dpa_dev_buf_array_get_buf(ring->buf_arr, thread_arg->desc_idx[r]);
+    dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+    desc = (struct dma_desc *)dev_ptr;
 
-    uint32_t poll_count = 0;
-    uint32_t debug_count = 0;
-    uint32_t last_nr = 0;
+    __dpa_thread_window_read_inv();
+    if (!desc->valid)
+        return 0;
 
-    while (1) {
-        /* Check for new messages (doorbell, ADD_RING) from DPU every 256 iterations */
-        if ((poll_count++ & 0xFF) == 0)
-            handle_msgs(thread_arg);
+    DOCA_DPA_DEV_LOG_INFO("FOUND valid desc: ring=%u slot=%u req_id=%u size=%u dst_pod=%d addr=0x%lx\n",
+                          r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->size,
+                          desc->dst_pod_id, desc->addr);
 
-        /* Periodic debug: log every ~16M iterations to show we're alive */
-        if ((debug_count++ & 0xFFFFFF) == 0) {
-            uint32_t nr_dbg = thread_arg->num_rings;
-            DOCA_DPA_DEV_LOG_INFO("poll alive: num_rings=%u, poll=%u\n",
-                                  nr_dbg, debug_count);
-            /* Dump first ring's descriptor pointer and valid byte for debugging */
-            if (nr_dbg > 0) {
-                doca_dpa_dev_buf_t dbg_buf = doca_dpa_dev_buf_array_get_buf(
-                    thread_arg->rings[0].buf_arr, desc_idx[0]);
-                doca_dpa_dev_uintptr_t dbg_ptr = doca_dpa_dev_buf_get_external_ptr(dbg_buf);
-                struct dma_desc *dbg_desc = (struct dma_desc *)dbg_ptr;
-                __dpa_thread_window_read_inv();
-                DOCA_DPA_DEV_LOG_INFO("  ring[0] diag: desc_idx=%u dev_ptr=0x%lx valid=%u buf_arr=0x%lx\n",
-                                      desc_idx[0], dbg_ptr,
-                                      (uint32_t)dbg_desc->valid,
-                                      thread_arg->rings[0].buf_arr);
-            }
-        }
+    while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
+    }
 
-        uint32_t nr = thread_arg->num_rings;
-        if (nr == 0) {
-            /* No rings yet — spin wait for first pod */
-            if (nr != last_nr) {
-                DOCA_DPA_DEV_LOG_INFO("Waiting for first ring (num_rings=0)\n");
-                last_nr = nr;
-            }
-            continue;
-        }
-        
-        /* Notify when first ring arrives */
-        if (nr != last_nr) {
-            DOCA_DPA_DEV_LOG_INFO("Rings now available: num_rings=%u (was %u)\n", nr, last_nr);
-            last_nr = nr;
-        }
+    /* Wrap around if DMA would exceed DPU buffer boundary */
+    if (thread_arg->pos[r] + desc->size > ring->dpu_buf_size)
+        thread_arg->pos[r] = 0;
 
-        for (uint32_t r = 0; r < nr; r++) {
-            struct dpa_ring_info *ring = &thread_arg->rings[r];
+    /* Build completion message with routing info */
+    msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
+    msg.dma_comp_msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
+    msg.dma_comp_msg.pos = thread_arg->pos[r];
+    msg.dma_comp_msg.length = desc->size;
+    msg.dma_comp_msg.req_id = (uint32_t)desc->idx;
+    msg.dma_comp_msg.src_pod_id = ring->pod_id;
+    msg.dma_comp_msg.dst_pod_id = desc->dst_pod_id;
+    msg.dma_comp_msg.flags = desc->flags;
 
-            /* Get descriptor at current ring index */
-            buf = doca_dpa_dev_buf_array_get_buf(ring->buf_arr, desc_idx[r]);
-            dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-            desc = (struct dma_desc *)dev_ptr;
+    DOCA_DPA_DEV_LOG_INFO("DMA completion msg prepared: req_id=%u src_pod=%d dst_pod=%d pos=%u len=%u flags=0x%x\n",
+                          msg.dma_comp_msg.req_id,
+                          msg.dma_comp_msg.src_pod_id,
+                          msg.dma_comp_msg.dst_pod_id,
+                          msg.dma_comp_msg.pos,
+                          msg.dma_comp_msg.length,
+                          (unsigned int)(uint8_t)msg.dma_comp_msg.flags);
 
-            /* Non-blocking check: skip if not valid */
-            __dpa_thread_window_read_inv();
-            if (!desc->valid)
-                continue;
-
-            DOCA_DPA_DEV_LOG_INFO("FOUND valid desc: ring=%u slot=%u req_id=%u size=%u dst_pod=%d addr=0x%lx\n",
-                                  r, desc_idx[r], (uint32_t)desc->idx, desc->size,
-                                  desc->dst_pod_id, desc->addr);
-
-            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
-            }
-
-            /* Wrap around if DMA would exceed DPU buffer boundary */
-            if (pos[r] + desc->size > ring->dpu_buf_size)
-                pos[r] = 0;
-
-            /* Build completion message with routing info */
-            msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
-            msg.dma_comp_msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
-            msg.dma_comp_msg.pos = pos[r];
-            msg.dma_comp_msg.length = desc->size;
-            msg.dma_comp_msg.req_id = (uint32_t)desc->idx;
-            msg.dma_comp_msg.src_pod_id = ring->pod_id;
-            msg.dma_comp_msg.dst_pod_id = desc->dst_pod_id;
-            msg.dma_comp_msg.flags = desc->flags;
-
-            DOCA_DPA_DEV_LOG_INFO("DMA completion msg prepared: req_id=%u src_pod=%d dst_pod=%d pos=%u len=%u flags=0x%x\n",
-                                  msg.dma_comp_msg.req_id,
-                                  msg.dma_comp_msg.src_pod_id,
-                                  msg.dma_comp_msg.dst_pod_id,
-                                  msg.dma_comp_msg.pos,
-                                  msg.dma_comp_msg.length,
-                                  (unsigned int)(uint8_t)msg.dma_comp_msg.flags);
-
-            /* 1. Drain any stale completions before issuing new DMA */
-            {
-                doca_dpa_dev_completion_element_t stale_comp;
-                while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &stale_comp) != 0) {
-                    /* Just clearing the queue */
-                }
-            }
-
-            /* 2. DMA copy: Host buffer → DPU local buffer + Send completion to DPU */
-            doca_dpa_dev_comch_producer_dma_copy(producer,
-                                        dpu_consumer_id,
-                                        ring->dpu_mmap,
-                                        ring->dpu_addr + pos[r],
-                                        ring->host_mmap,
-                                        desc->addr,
-                                        desc->size,
-                                        (uint8_t *)&msg,
-                                        sizeof(struct comch_msg),
-                                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-
-            /* 3. Wait for the DMA completion to be sure it's issued */
-            {
-                doca_dpa_dev_completion_element_t dma_comp;
-                while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &dma_comp) == 0) {
-                    /* Block until at least one completion is found */
-                }
-            }
-
-            DOCA_DPA_DEV_LOG_INFO("DMA copy issued: ring=%u slot=%u req_id=%u src_addr=0x%lx size=%u\n",
-                                  r, desc_idx[r], (uint32_t)desc->idx, desc->addr, desc->size);
-
-            pos[r] += desc->size;
-
-            /* Clear valid flag so host can reuse this slot */
-            desc->valid = 0;
-            __dpa_thread_window_writeback();
-
-            /* Advance to next ring slot */
-            desc_idx[r] = (desc_idx[r] + 1) % ring->buf_arr_size;
+    /* 1. Drain any stale completions before issuing new DMA */
+    {
+        doca_dpa_dev_completion_element_t stale_comp;
+        while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &stale_comp) != 0) {
         }
     }
+
+    /* 2. DMA copy: Host buffer → DPU local buffer + Send completion to DPU */
+    doca_dpa_dev_comch_producer_dma_copy(producer,
+                                dpu_consumer_id,
+                                ring->dpu_mmap,
+                                ring->dpu_addr + thread_arg->pos[r],
+                                ring->host_mmap,
+                                desc->addr,
+                                desc->size,
+                                (uint8_t *)&msg,
+                                sizeof(struct comch_msg),
+                                DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+
+    /* 3. Wait for DMA completion */
+    {
+        doca_dpa_dev_completion_element_t dma_comp;
+        while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &dma_comp) == 0) {
+        }
+    }
+
+    DOCA_DPA_DEV_LOG_INFO("DMA copy issued: ring=%u slot=%u req_id=%u src_addr=0x%lx size=%u\n",
+                          r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->addr, desc->size);
+
+    thread_arg->pos[r] += desc->size;
+
+    /* Clear valid flag so host can reuse this slot */
+    desc->valid = 0;
+    __dpa_thread_window_writeback();
+
+    /* Advance to next ring slot */
+    thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
+    return 1;
+}
+
+/*
+ * Drain all valid descriptors across all rings.
+ * Returns total number of descriptors processed.
+ */
+static int drain_all_rings(struct dpa_thread_arg *thread_arg)
+{
+    int total = 0;
+    int found;
+
+    do {
+        found = 0;
+        handle_msgs(thread_arg);
+
+        uint32_t nr = thread_arg->num_rings;
+        for (uint32_t r = 0; r < nr; r++) {
+            if (process_one_desc(thread_arg, r))
+                found++;
+        }
+        total += found;
+    } while (found > 0);
+
+    return total;
 }
 
 __dpa_global__ void hello_world(uint64_t arg)
@@ -304,7 +274,7 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
 
-    /* Arm completion notification once before the first poll/drain cycle. */
+    /* Arm completion notification once before the first drain cycle. */
     doca_dpa_dev_comch_consumer_completion_request_notification(thread_arg->dpa_consumer_comp);
     DOCA_DPA_DEV_LOG_INFO("completion notification armed (consumer_id=%u)\n",
                           thread_arg->dpu_consumer_id);
@@ -312,6 +282,15 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
     /* Handle the trigger message from DPU consumer first */
     handle_msgs(thread_arg);
 
-    /* Go directly into polling loop — no reschedule (would stop the thread) */
-    poll_desc_rings(thread_arg);
+    /* Event loop: process all pending work, then yield until next doorbell */
+    while (1) {
+        drain_all_rings(thread_arg);
+
+        /* No more work — yield. Thread resumes on next completion event
+         * (NEW_DESC doorbell or ADD_RING from DPU). handle_msgs always
+         * re-arms notification, so the next message will wake us. */
+        DOCA_DPA_DEV_LOG_INFO("idle, rescheduling (num_rings=%u)\n",
+                              thread_arg->num_rings);
+        doca_dpa_dev_thread_reschedule();
+    }
 }
