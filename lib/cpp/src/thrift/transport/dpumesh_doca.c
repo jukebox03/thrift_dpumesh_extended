@@ -35,6 +35,10 @@
 
 DOCA_LOG_REGISTER(DPUMESH_DOCA);
 
+static const char *doca_err_str(doca_error_t rc) {
+    return doca_error_get_descr(rc);
+}
+
 static void cleanup_ctx(struct dpumesh_ctx *ctx);
 
 /* ====================================================================
@@ -74,7 +78,6 @@ struct dpumesh_ctx {
     /* DOCA objects */
     struct objects doca_objs;
     void *dma_buffer;
-    struct doca_mmap *dma_buffer_mmap;
     struct dma_ring *dma_ring;
     doca_dpa_dev_mmap_t dpa_mmap_handle;  /* DPA handle for local mmap (used in TX descriptors) */
 
@@ -192,8 +195,6 @@ static int tx_inflight_register(dpumesh_ctx_t *ctx, uint32_t req_id,
     return 0;
 }
 
-/* Best-effort classifier: if req_id is still pending, TX_ACK without inflight is
- * usually from OP_REQUEST path and is not an error. */
 static int pending_is_waiting(dpumesh_ctx_t *ctx, uint32_t req_id)
 {
     uint32_t idx = req_id % MAX_PENDING;
@@ -262,25 +263,21 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
     DOCA_LOG_INFO("rx_data_hook ENTER: len=%u body_len=%u sizeof_hdr=%zu",
                   len, msg->body_len, sizeof(struct dmesh_rx_data_msg));
 
-    /* Validate body_len against actual received length */
     uint32_t expected = (uint32_t)sizeof(struct dmesh_rx_data_msg) + msg->body_len;
     if (len < expected) {
         DOCA_LOG_ERR("RX_DATA: truncated message: got %u, need %u", len, expected);
         return;
     }
 
-    /* Allocate an RX slot for the body */
     int slot = rx_slot_alloc(ctx);
     if (slot < 0) {
         DOCA_LOG_ERR("RX_DATA: no free RX slots, dropping message");
         return;
     }
 
-    /* Copy body into RX buffer pool */
     uint8_t *dst = (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
     memcpy(dst, msg->body, msg->body_len);
 
-    /* Build descriptor: copy from message, then patch body_buf_slot to local slot */
     sw_descriptor_t desc;
     memcpy(&desc, msg->desc, sizeof(desc));
     desc.body_buf_slot = slot;
@@ -289,24 +286,15 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
                   desc.req_id, (unsigned)(uint8_t)desc.flags, desc.dst_pod_id, desc.src_pod_id,
                   slot, desc.body_len);
 
-    /* Dispatch based on flags: OP_RESPONSE → pending table, else → server RX queue */
     if (desc.flags & OP_RESPONSE) {
-        /* Route to pending table for client-side matching */
         uint32_t idx = desc.req_id % MAX_PENDING;
         dpumesh_pending_t *p = &ctx->pending[idx];
-        DOCA_LOG_INFO("RX_DATA OP_RESPONSE: req_id=%u idx=%u len=%u slot=%d flags=0x%x",
-                      desc.req_id, idx, desc.body_len, slot,
-                      (unsigned int)(uint8_t)desc.flags);
         pthread_mutex_lock(&p->lock);
         if (p->state == 0) {
-            /* Someone is waiting for this response */
-            DOCA_LOG_INFO("Pending wake-up: req_id=%u idx=%u state=%d -> 1",
-                          desc.req_id, idx, p->state);
             p->desc = desc;
             p->state = 1;
             pthread_cond_signal(&p->cond);
         } else {
-            /* No waiter — free the RX slot */
             DOCA_LOG_ERR("RX_DATA: OP_RESPONSE for req_id=%u but no waiter (state=%d)",
                          desc.req_id, p->state);
             pthread_mutex_lock(&ctx->rx_slot_lock);
@@ -315,7 +303,6 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         }
         pthread_mutex_unlock(&p->lock);
     } else {
-        /* OP_REQUEST: push to server RX queue (existing behavior) */
         pthread_mutex_lock(&ctx->rx_lock);
         if (ctx->rx_count >= RX_QUEUE_SIZE) {
             pthread_mutex_unlock(&ctx->rx_lock);
@@ -383,7 +370,6 @@ static doca_error_t init_control_path(dpumesh_ctx_t *ctx) {
     result = init_comch_ctrl_path_client("DPUMesh", &ctx->doca_objs, true);
     if (result != DOCA_SUCCESS) return result;
 
-    /* Register pod_id with DPU */
     struct dmesh_register_msg reg;
     reg.type = DMESH_MSG_REGISTER;
     reg.pod_id = ctx->pod_id;
@@ -399,7 +385,6 @@ static doca_error_t init_control_path(dpumesh_ctx_t *ctx) {
 static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
     doca_error_t result;
 
-    /* 1. Comch datapath consumer */
     result = init_comch_datapath_consumer(&ctx->doca_objs);
     if (result != DOCA_SUCCESS) return result;
 
@@ -415,16 +400,13 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
         client_send_msg(&ctx->doca_objs, (const char *)&pod_cid, sizeof(pod_cid));
     }
 
-    /* 2. Comch datapath producer */
     result = init_comch_datapath_producer(&ctx->doca_objs);
     if (result != DOCA_SUCCESS) return result;
 
-    /* 3. DMA ring */
-    result = setup_dma_ring(&ctx->doca_objs, ctx->max_descriptors);
+    result = setup_dma_ring(&ctx->doca_objs, DMA_RING_SIZE);
     if (result != DOCA_SUCCESS) return result;
     ctx->dma_ring = ctx->doca_objs.dma_ring;
 
-    /* 4. DMA buffer */
     size_t buf_size = (size_t)ctx->num_slots * ctx->slot_size;
     result = alloc_buffer_and_set_mmap(&ctx->doca_objs.local_mmap,
                                        ctx->doca_objs.dev,
@@ -433,236 +415,43 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
                                        DOCA_ACCESS_FLAG_PCI_READ_WRITE);
     if (result != DOCA_SUCCESS) return result;
     ctx->dma_buffer = ctx->doca_objs.dma_buffer;
-    ctx->dma_buffer_mmap = ctx->doca_objs.local_mmap;
 
-    /* 5. Export mmap to DPU */
     result = export_mmap_to_remote(&ctx->doca_objs, ctx->doca_objs.local_mmap,
                                    ctx->doca_objs.dma_buffer, buf_size,
                                    DMA_BUFFER, HOST_TO_DPU);
     if (result != DOCA_SUCCESS) return result;
 
-    /* 6. DPA handle */
     return doca_mmap_dev_get_dpa_handle(ctx->doca_objs.local_mmap, ctx->doca_objs.dev, &ctx->dpa_mmap_handle);
 }
 
-/* ====================================================================
- * dpumesh_init — DOCA initialization sequence
- * ==================================================================== */
-
 int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
                  const dpumesh_config_t *config) {
-    doca_error_t result;
-    dpumesh_ctx_t *ctx;
-    const char *env_val;
-
-    ctx = (dpumesh_ctx_t *)calloc(1, sizeof(dpumesh_ctx_t));
+    dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)calloc(1, sizeof(dpumesh_ctx_t));
     if (!ctx) return -1;
 
-    /* ---- Resolve config ---- */
-    if (config && config->num_slots > 0)
-        ctx->num_slots = config->num_slots;
-    else if ((env_val = getenv("DPUMESH_NUM_SLOTS")) != NULL && atoi(env_val) > 0)
-        ctx->num_slots = atoi(env_val);
-    else
-        ctx->num_slots = DPUMESH_NUM_SLOTS_DEFAULT;
+    init_config(ctx, config, app_name, worker_num);
 
-    if (config && config->slot_size > 0)
-        ctx->slot_size = config->slot_size;
-    else if ((env_val = getenv("DPUMESH_SLOT_SIZE")) != NULL && atoi(env_val) > 0)
-        ctx->slot_size = atoi(env_val);
-    else
-        ctx->slot_size = DPUMESH_SLOT_SIZE_DEFAULT;
+    if (init_doca_device(ctx) != DOCA_SUCCESS) goto fail;
+    if (init_control_path(ctx) != DOCA_SUCCESS) goto fail;
+    if (init_datapath(ctx) != DOCA_SUCCESS) goto fail;
 
-    if (config && config->max_descriptors > 0)
-        ctx->max_descriptors = config->max_descriptors;
-    else if ((env_val = getenv("DPUMESH_MAX_DESCRIPTORS")) != NULL && atoi(env_val) > 0)
-        ctx->max_descriptors = atoi(env_val);
-    else
-        ctx->max_descriptors = DPUMESH_MAX_DESCRIPTORS_DEFAULT;
-
-    snprintf(ctx->app_name, sizeof(ctx->app_name), "%s", app_name);
-    snprintf(ctx->worker_id, sizeof(ctx->worker_id),
-             "%s-worker-%d", app_name, worker_num);
-
-    /* pod_id: from env or default to worker_num */
-    if ((env_val = getenv("DPUMESH_POD_ID")) != NULL)
-        ctx->pod_id = atoi(env_val);
-    else
-        ctx->pod_id = worker_num;
-
-    /* ---- PCI address from env ---- */
-    const char *pci_addr = getenv("DPUMESH_PCI_ADDR");
-    if (!pci_addr)
-        pci_addr = "94:00.0";
-
-    /* ---- DOCA logging ---- */
-    doca_log_backend_create_standard();
-
-    /* ---- Open DOCA device ---- */
-    memset(&ctx->doca_objs, 0, sizeof(ctx->doca_objs));
-
-    fprintf(stderr, "[dpumesh] Opening DOCA device at %s...\n", pci_addr);
-    result = open_doca_device_with_pci(pci_addr, NULL, &ctx->doca_objs.dev);
-    if (result != DOCA_SUCCESS) {
-        fprintf(stderr, "[dpumesh] FAIL: open_doca_device_with_pci: %s\n", doca_error_get_descr(result));
-        goto fail;
-    }
-    fprintf(stderr, "[dpumesh] Device opened OK\n");
-
-    /* ---- Comch control path (client) ---- */
-    fprintf(stderr, "[dpumesh] Connecting comch client...\n");
-    result = init_comch_ctrl_path_client("DPUMesh", &ctx->doca_objs, true);
-    if (result != DOCA_SUCCESS) {
-        fprintf(stderr, "[dpumesh] FAIL: comch client: %s\n", doca_error_get_descr(result));
-        goto fail;
-    }
-    fprintf(stderr, "[dpumesh] Comch client connected OK\n");
-
-    /* ---- Send REGISTER message to DPU (pod_id + app_name) ----
-     * Must be sent BEFORE mmap exports so DPU has the correct pod_id
-     * when setup_pod_dma() runs (triggered by mmap arrival). */
-    {
-        struct dmesh_register_msg reg;
-        reg.type = DMESH_MSG_REGISTER;
-        reg.pod_id = ctx->pod_id;
-        snprintf(reg.app_name, sizeof(reg.app_name), "%s", app_name);
-        doca_error_t reg_result = client_send_msg(&ctx->doca_objs,
-                                                   (const char *)&reg, sizeof(reg));
-        if (reg_result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to send REGISTER to DPU: %s",
-                         doca_error_get_descr(reg_result));
-        } else {
-            DOCA_LOG_INFO("Sent REGISTER to DPU: pod_id=%d app=%s",
-                          ctx->pod_id, app_name);
-        }
-    }
-
-    {
-        /* ---- Comch datapath consumer (for DPU->Host payload) ---- */
-        result = init_comch_datapath_consumer(&ctx->doca_objs);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to init comch datapath consumer: %s",
-                         doca_error_get_descr(result));
-            goto fail;
-        }
-
-        /* Advertise this pod's datapath consumer ID to DPU (control path signal). */
-        if (ctx->doca_objs.consumer != NULL) {
-            uint32_t local_consumer_id = 0;
-            doca_error_t cid_result = doca_comch_consumer_get_id(ctx->doca_objs.consumer,
-                                                                  &local_consumer_id);
-            if (cid_result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("Failed to get local datapath consumer id: %s",
-                             doca_error_get_descr(cid_result));
-                goto fail;
-            }
-
-            struct dmesh_pod_consumer_id_msg pod_cid;
-            pod_cid.type = DMESH_MSG_POD_CONSUMER_ID;
-            pod_cid.pod_id = ctx->pod_id;
-            pod_cid.consumer_id = local_consumer_id;
-            cid_result = client_send_msg(&ctx->doca_objs,
-                                         (const char *)&pod_cid,
-                                         sizeof(pod_cid));
-            if (cid_result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("Failed to send POD_CONSUMER_ID to DPU: %s",
-                             doca_error_get_descr(cid_result));
-                goto fail;
-            }
-            DOCA_LOG_INFO("Advertised POD_CONSUMER_ID to DPU: pod_id=%d consumer_id=%u",
-                          ctx->pod_id, local_consumer_id);
-        }
-
-        /* ---- Comch datapath producer ---- */
-        result = init_comch_datapath_producer(&ctx->doca_objs);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to init comch datapath producer: %s",
-                         doca_error_get_descr(result));
-            goto fail;
-        }
-
-        /* ---- DMA ring ---- */
-        result = setup_dma_ring(&ctx->doca_objs, DMA_RING_SIZE);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to setup DMA ring: %s",
-                         doca_error_get_descr(result));
-            goto fail;
-        }
-        ctx->dma_ring = ctx->doca_objs.dma_ring;
-
-        /* ---- Allocate DMA buffer (num_slots * slot_size) ---- */
-        size_t buf_size = (size_t)ctx->num_slots * ctx->slot_size;
-        result = alloc_buffer_and_set_mmap(&ctx->doca_objs.local_mmap,
-                                           ctx->doca_objs.dev,
-                                           &ctx->doca_objs.dma_buffer,
-                                           buf_size,
-                                           DOCA_ACCESS_FLAG_PCI_READ_WRITE);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to allocate DMA buffer: %s",
-                         doca_error_get_descr(result));
-            goto fail;
-        }
-        ctx->dma_buffer = ctx->doca_objs.dma_buffer;
-        ctx->dma_buffer_mmap = ctx->doca_objs.local_mmap;
-
-        /* ---- Export DMA buffer mmap to DPU ---- */
-        result = export_mmap_to_remote(&ctx->doca_objs, ctx->doca_objs.local_mmap,
-                                       ctx->doca_objs.dma_buffer, buf_size,
-                                       DMA_BUFFER, HOST_TO_DPU);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to export mmap to DPU: %s",
-                         doca_error_get_descr(result));
-            goto fail;
-        }
-
-        /* ---- Cache DPA mmap handle for TX descriptor fill ---- */
-        result = doca_mmap_dev_get_dpa_handle(ctx->doca_objs.local_mmap,
-                                              ctx->doca_objs.dev,
-                                              &ctx->dpa_mmap_handle);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to get DPA mmap handle: %s",
-                         doca_error_get_descr(result));
-            goto fail;
-        }
-    }
-
-    /* ---- TX slot bitmap + mutex ---- */
     ctx->slot_bitmap = (uint8_t *)calloc(ctx->num_slots, 1);
-    if (!ctx->slot_bitmap)
-        goto fail;
+    if (!ctx->slot_bitmap) goto fail;
     pthread_mutex_init(&ctx->slot_lock, NULL);
 
-    /* ---- RX buffer pool + slot bitmap ---- */
-    size_t rx_buf_size = (size_t)ctx->num_slots * ctx->slot_size;
-    ctx->rx_buffer = calloc(1, rx_buf_size);
-    if (!ctx->rx_buffer)
-        goto fail;
+    ctx->rx_buffer = calloc(1, (size_t)ctx->num_slots * ctx->slot_size);
+    if (!ctx->rx_buffer) goto fail;
     ctx->rx_slot_bitmap = (uint8_t *)calloc(ctx->num_slots, 1);
-    if (!ctx->rx_slot_bitmap)
-        goto fail;
+    if (!ctx->rx_slot_bitmap) goto fail;
     pthread_mutex_init(&ctx->rx_slot_lock, NULL);
 
-    /* ---- RX descriptor queue ---- */
-    ctx->rx_head = 0;
-    ctx->rx_tail = 0;
-    ctx->rx_count = 0;
     pthread_mutex_init(&ctx->rx_lock, NULL);
     pthread_cond_init(&ctx->rx_cond, NULL);
 
-    /* ---- Query and cache comch max_msg_size ---- */
-    {
-        uint32_t max_msg_sz = 0;
-        result = doca_comch_cap_get_max_msg_size(
-            doca_dev_as_devinfo(ctx->doca_objs.dev), &max_msg_sz);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to query comch max msg size: %s",
-                         doca_error_get_descr(result));
-            goto fail;
-        }
+    uint32_t max_msg_sz = 0;
+    if (doca_comch_cap_get_max_msg_size(doca_dev_as_devinfo(ctx->doca_objs.dev), &max_msg_sz) == DOCA_SUCCESS)
         ctx->comch_max_msg_size = max_msg_sz;
-    }
 
-    /* ---- Initialize pending table ---- */
     atomic_init(&ctx->next_req_id, 1);
     for (int i = 0; i < MAX_PENDING; i++) {
         pthread_mutex_init(&ctx->pending[i].lock, NULL);
@@ -670,28 +459,17 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         ctx->pending[i].state = -1;
     }
 
-    /* ---- Register RX data hook ---- */
-    ctx->doca_objs.rx_data_hook = rx_data_hook;
-    ctx->doca_objs.rx_hook_ctx = ctx;
-
-    /* ---- Register TX ACK hook ---- */
     pthread_mutex_init(&ctx->tx_inflight_lock, NULL);
     ctx->tx_inflight_lock_ready = 1;
-    memset(ctx->tx_inflight, 0, sizeof(ctx->tx_inflight));
+    ctx->doca_objs.rx_data_hook = rx_data_hook;
+    ctx->doca_objs.rx_hook_ctx = ctx;
     ctx->doca_objs.tx_ack_hook = tx_inflight_ack_hook;
     ctx->doca_objs.tx_ack_hook_ctx = ctx;
 
-    /* ---- Start PE progress thread ---- */
     ctx->pe_running = 1;
-    if (pthread_create(&ctx->pe_tid, NULL, pe_progress_fn, ctx) != 0) {
-        DOCA_LOG_ERR("Failed to create PE progress thread");
-        goto fail;
-    }
+    if (pthread_create(&ctx->pe_tid, NULL, pe_progress_fn, ctx) != 0) goto fail;
 
-    DOCA_LOG_INFO("DPUmesh DOCA initialized: worker=%s pod_id=%d pci=%s "
-                  "slots=%d slot_size=%d",
-                  ctx->worker_id, ctx->pod_id, pci_addr,
-                  ctx->num_slots, ctx->slot_size);
+    DOCA_LOG_INFO("DPUmesh DOCA initialized: worker=%s pod_id=%d", ctx->worker_id, ctx->pod_id);
 
     *out = ctx;
     return 0;
@@ -704,33 +482,27 @@ fail:
 static void cleanup_ctx(dpumesh_ctx_t *ctx) {
     if (!ctx) return;
 
-    /* Stop PE thread */
     if (ctx->pe_running) {
         ctx->pe_running = 0;
         pthread_join(ctx->pe_tid, NULL);
     }
 
-    /* Cleanup DOCA objects */
     cleanup_objects(&ctx->doca_objs);
 
-    /* Free TX bitmap + mutex */
     pthread_mutex_destroy(&ctx->slot_lock);
     if (ctx->slot_bitmap) free(ctx->slot_bitmap);
 
-    /* Free RX resources */
     pthread_mutex_destroy(&ctx->rx_slot_lock);
     if (ctx->rx_slot_bitmap) free(ctx->rx_slot_bitmap);
     if (ctx->rx_buffer) free(ctx->rx_buffer);
     pthread_mutex_destroy(&ctx->rx_lock);
     pthread_cond_destroy(&ctx->rx_cond);
 
-    /* Free pending table */
     for (int i = 0; i < MAX_PENDING; i++) {
         pthread_mutex_destroy(&ctx->pending[i].lock);
         pthread_cond_destroy(&ctx->pending[i].cond);
     }
 
-    /* Free any remaining inflight TX slots */
     if (ctx->tx_inflight_lock_ready) {
         tx_inflight_cleanup(ctx);
         pthread_mutex_destroy(&ctx->tx_inflight_lock);
@@ -775,7 +547,6 @@ void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
 }
 
 int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
-    /* All pods use DMA ring path */
     struct dma_desc *dma = get_next_dma_desc(ctx->dma_ring);
     uint32_t ring_slot;
     if (!dma)
@@ -789,7 +560,6 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
         return -1;
     }
 
-    /* Fill DMA descriptor: point to the TX slot's buffer region */
     dma->mmap = ctx->dpa_mmap_handle;
     dma->addr = (uint64_t)ctx->dma_buffer +
                 ((size_t)desc->body_buf_slot * ctx->slot_size);
@@ -798,48 +568,33 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     dma->dst_pod_id = desc->dst_pod_id;
     dma->flags = desc->flags;
 
-    /* Memory barrier to ensure fields are visible before valid flag */
     __sync_synchronize();
     dma->valid = 1;
 
     DOCA_LOG_INFO("ENQUEUE publish: req_id=%u ring_slot=%u tx_slot=%d len=%u dst_pod=%d flags=0x%x addr=0x%lx",
-                  desc->req_id,
-                  ring_slot,
-                  desc->body_buf_slot,
-                  desc->body_len,
-                  desc->dst_pod_id,
-                  (unsigned int)(uint8_t)desc->flags,
-                  (unsigned long)dma->addr);
+                  desc->req_id, ring_slot, desc->body_buf_slot, desc->body_len,
+                  desc->dst_pod_id, (unsigned int)(uint8_t)desc->flags, (unsigned long)dma->addr);
 
-    /* Send doorbell to DPU so DPA can process without window polling */
-    {
-        struct dmesh_new_desc_msg doorbell;
-        doorbell.type = DMESH_MSG_NEW_DESC;
-        doorbell.src_pod_id = ctx->pod_id;
-        doorbell.addr = dma->addr;
-        doorbell.size = dma->size;
-        doorbell.req_id = (uint32_t)dma->idx;
-        doorbell.dst_pod_id = dma->dst_pod_id;
-        doorbell.flags = dma->flags;
-        doca_error_t db_result = client_send_msg(&ctx->doca_objs,
-                                                  (const char *)&doorbell,
-                                                  sizeof(doorbell));
-        if (db_result != DOCA_SUCCESS) {
-            DOCA_LOG_WARN("Doorbell send failed: %s", doca_error_get_descr(db_result));
-        }
-    }
+    struct dmesh_new_desc_msg doorbell;
+    doorbell.type = DMESH_MSG_NEW_DESC;
+    doorbell.src_pod_id = ctx->pod_id;
+    doorbell.addr = dma->addr;
+    doorbell.size = dma->size;
+    doorbell.req_id = (uint32_t)dma->idx;
+    doorbell.dst_pod_id = dma->dst_pod_id;
+    doorbell.flags = dma->flags;
+    client_send_msg(&ctx->doca_objs, (const char *)&doorbell, sizeof(doorbell));
 
     return 0;
 }
 
 /* ====================================================================
- * RX functions (comch control path temporary implementation)
+ * RX functions
  * ==================================================================== */
 
 int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
     pthread_mutex_lock(&ctx->rx_lock);
 
-    /* Compute absolute deadline once before the loop */
     struct timespec ts;
     if (timeout_ms > 0) {
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -853,24 +608,19 @@ int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
 
     while (ctx->rx_count == 0) {
         if (timeout_ms == 0) {
-            /* Non-blocking */
             pthread_mutex_unlock(&ctx->rx_lock);
             return -1;
         } else if (timeout_ms < 0) {
-            /* Block forever */
             pthread_cond_wait(&ctx->rx_cond, &ctx->rx_lock);
         } else {
-            /* Timed wait */
             int rc = pthread_cond_timedwait(&ctx->rx_cond, &ctx->rx_lock, &ts);
             if (rc != 0) {
-                /* Timeout or error */
                 pthread_mutex_unlock(&ctx->rx_lock);
                 return -1;
             }
         }
     }
 
-    /* Pop from head */
     *desc = ctx->rx_queue[ctx->rx_head];
     ctx->rx_head = (ctx->rx_head + 1) % RX_QUEUE_SIZE;
     ctx->rx_count--;
@@ -900,7 +650,6 @@ int dpumesh_get_slot_size(dpumesh_ctx_t *ctx) {
 }
 
 int dpumesh_get_notify_fd(dpumesh_ctx_t *ctx) {
-    /* No notify fd in DOCA mode (PE-based) */
     (void)ctx;
     return -1;
 }
@@ -914,7 +663,7 @@ const char *dpumesh_get_worker_id(dpumesh_ctx_t *ctx) {
 }
 
 /* ====================================================================
- * Client-side API: request/response matching
+ * Client-side API
  * ==================================================================== */
 
 uint32_t dpumesh_alloc_req_id(dpumesh_ctx_t *ctx) {
@@ -927,12 +676,10 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
 
     pthread_mutex_lock(&p->lock);
     if (p->state != -1) {
-        /* Slot is in use (0=waiting, 1=arrived) — collision */
         pthread_mutex_unlock(&p->lock);
-        DOCA_LOG_ERR("Pending slot %u already in use (req_id=%u state=%d)", idx, req_id, p->state);
         return -1;
     }
-    p->state = 0;  /* WAITING */
+    p->state = 0;
     memset(&p->desc, 0, sizeof(p->desc));
     pthread_mutex_unlock(&p->lock);
     return 0;
@@ -944,10 +691,7 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
     dpumesh_pending_t *p = &ctx->pending[idx];
 
     pthread_mutex_lock(&p->lock);
-    DOCA_LOG_INFO("wait_response begin: req_id=%u idx=%u timeout_ms=%d state=%d",
-                  req_id, idx, timeout_ms, p->state);
 
-    /* Compute absolute deadline once before the loop */
     struct timespec ts;
     if (timeout_ms > 0) {
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -963,16 +707,12 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
         if (timeout_ms < 0) {
             pthread_cond_wait(&p->cond, &p->lock);
         } else if (timeout_ms == 0) {
-            DOCA_LOG_WARN("wait_response immediate timeout: req_id=%u idx=%u", req_id, idx);
             pthread_mutex_unlock(&p->lock);
             return -1;
         } else {
             int rc = pthread_cond_timedwait(&p->cond, &p->lock, &ts);
             if (rc != 0) {
-                /* Timeout */
-                DOCA_LOG_WARN("wait_response timed out: req_id=%u idx=%u state=%d",
-                              req_id, idx, p->state);
-                p->state = -1;  /* reset to unused */
+                p->state = -1;
                 pthread_mutex_unlock(&p->lock);
                 return -1;
             }
@@ -980,16 +720,12 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
     }
 
     if (p->state == 1) {
-        /* Response arrived */
-        DOCA_LOG_INFO("wait_response hit: req_id=%u idx=%u resp_slot=%d resp_len=%u",
-                      req_id, idx, p->desc.body_buf_slot, p->desc.body_len);
         *resp = p->desc;
-        p->state = -1;  /* reset to unused */
+        p->state = -1;
         pthread_mutex_unlock(&p->lock);
         return 0;
     }
 
-    /* Unexpected state */
     p->state = -1;
     pthread_mutex_unlock(&p->lock);
     return -1;
@@ -1000,6 +736,6 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
     dpumesh_pending_t *p = &ctx->pending[idx];
 
     pthread_mutex_lock(&p->lock);
-    p->state = -1;  /* reset to unused */
+    p->state = -1;
     pthread_mutex_unlock(&p->lock);
 }

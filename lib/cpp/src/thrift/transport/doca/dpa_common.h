@@ -77,8 +77,9 @@ struct comch_dma_req_msg {
 
 struct comch_add_ring_msg {
 	enum comch_msg_type type;
+	uint32_t _pad;
 	struct dpa_ring_info ring;
-} __attribute__((__packed__, aligned(4)));
+} __attribute__((__packed__, aligned(8)));
 
 /* DPU→DPA: host published a new descriptor (doorbell) */
 struct comch_new_desc_msg {

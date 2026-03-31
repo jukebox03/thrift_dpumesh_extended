@@ -10,14 +10,6 @@
  * @return: returns RPC_RETURN_STATUS_SUCCESS on success and RPC_RETURN_STATUS_ERROR otherwise
  */
 
-static inline uint32_t bswap32(uint32_t x) {
-    return ((x & 0x000000FF) << 24) |
-           ((x & 0x0000FF00) << 8)  |
-           ((x & 0x00FF0000) >> 8)  |
-           
-           ((x & 0xFF000000) >> 24);
-}
-
 __dpa_rpc__ uint64_t thread_init_rpc(doca_dpa_dev_comch_consumer_t consumer, uint32_t num_msg)
 {
     DOCA_DPA_DEV_LOG_INFO("recv thread init RPC, num_msg: %u\n", num_msg);
@@ -26,45 +18,17 @@ __dpa_rpc__ uint64_t thread_init_rpc(doca_dpa_dev_comch_consumer_t consumer, uin
 	return 0;
 }
 
-static void send_msgs(struct dpa_thread_arg *thread_arg, int num_msg)
-{
-    doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
-    uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
-    doca_dpa_dev_completion_element_t comp;
-    struct comch_msg msg;
-    uint64_t start, end, tick;
-    doca_dpa_dev_completion_type_t t;
-    tick = __dpa_thread_time();
-
-    DOCA_DPA_DEV_LOG_INFO("tick frequency: %lu\n", tick);
-    for (int i = 0; i < num_msg; i++) {
-        start =  __dpa_thread_time();
-        doca_dpa_dev_comch_producer_post_send_imm_only(producer,
-                                                   dpu_consumer_id,
-                                                   (uint8_t *)&msg,
-                                                   sizeof(struct comch_msg),
-                                                   DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-        
-        while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &comp) == 0) {
-        }
-
-        end =  __dpa_thread_time();
-        t = doca_dpa_dev_get_completion_type(comp);
-                                                
-        DOCA_DPA_DEV_LOG_INFO("type: %d, cycles: %lu\n", t, end - start);
-    }
-}
 static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch_msg *msg)
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
     uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
 
     switch(msg->type) {
-        case COMCH_MSG_TYPE_DMA_REQ:
+        case COMCH_MSG_TYPE_DMA_REQ: {
             struct comch_dma_req_msg *dma_msg = (struct comch_dma_req_msg *)msg;
             if (dma_msg->dpa_producer)
                 producer = dma_msg->dpa_producer;
-            // producer = dma_msg->dpa_producer;
+
             DOCA_DPA_DEV_LOG_INFO("Received DMA REQ msg from host: producer=0x%lx, src_mmap=%u, dst_mmap=%u, src_addr=0x%lx, dst_addr=0x%lx, length=%u\n",
                                 producer,                 
                                 dma_msg->src_mmap,
@@ -85,10 +49,11 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                                     dma_msg->src_mmap,
                                     dma_msg->src_addr,
                                     dma_msg->length,
-                                    "test_dma_imm",
+                                    (const uint8_t *)"test_dma_imm",
                                     sizeof("test_dma_imm"),
                                     DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
             break;
+        }
         case COMCH_MSG_TYPE_ADD_RING: {
             struct comch_add_ring_msg *add_msg = (struct comch_add_ring_msg *)msg;
             if (thread_arg->num_rings < MAX_DPA_RINGS) {

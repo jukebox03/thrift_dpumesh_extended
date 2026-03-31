@@ -345,7 +345,6 @@ doca_error_t
 init_dpa_objects(struct objects *objs)
 {
     doca_error_t result;
-    struct dmesh_doca_dpa_thread *dpa_thread;
 
     if (!objs->dpa_thread) {
 		objs->dpa_thread = malloc(sizeof(struct dmesh_doca_dpa_thread));
@@ -709,9 +708,9 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
 {
     struct dmesh_doca_dpa_comch *comch = objs->dpa_comch;
     struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_thread;
-    uint32_t max_num_recv, imm_data_len;
     doca_error_t result;
     
+    (void)dpa_thread;
     memset(comch, 0, sizeof(*comch));
 
     result = doca_comch_consumer_completion_create(&(comch->consumer_comp));
@@ -956,7 +955,6 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
     struct doca_task *task;
 	doca_error_t result;
     int i;
-    struct comch_msg *comch_msg = (struct comch_msg *)msg;
 
     for (i = 0; i < num_msg; i++) {
         result = doca_comch_producer_task_send_alloc_init(msgq->producer,
