@@ -2,20 +2,23 @@ Apache Thrift + DPUmesh Transport
 ==================================
 
 This is a modified version of Apache Thrift **0.12.0** with an additional
-**DPUmesh shared-memory transport layer** for the C++ library.
-DPUmesh enables zero-copy IPC via shared memory buffers (`/dev/shm/`),
-designed for high-performance communication between DPU and host services.
+**DPUmesh transport layer** for the C++ library.
+
+DPUmesh is intended for high-performance request/response delivery between
+gateway/service processes on BlueField DOCA-based environments.
 
 DPUmesh Quick Start
 -------------------
 
 ### Build
 
-DPUmesh files are already integrated into the CMake build. Build as usual:
+DPUmesh files are already integrated into the CMake build.
+
+Build with DOCA backend:
 
 ```bash
-mkdir build && cd build
-cmake ..
+mkdir build-doca && cd build-doca
+cmake .. -DWITH_DOCA=ON
 make
 ```
 
@@ -35,24 +38,31 @@ TSimpleServer server(processor, serverTransport, transportFactory, protocolFacto
 server.serve();
 ```
 
+### Client-side Usage (C++)
+
+Create a DPUmesh context, then wrap it with `TDpumeshClientTransport`:
+
+```cpp
+#include <thrift/transport/TDpumeshClientTransport.h>
+
+dpumesh_ctx_t* ctx = nullptr;
+dpumesh_config_t cfg = DPUMESH_CONFIG_DEFAULT;
+dpumesh_init(&ctx, "gateway", 1, &cfg);
+
+auto clientTransport = std::make_shared<TDpumeshClientTransport>(ctx, /*dst_pod_id=*/0);
+```
+
 ### Environment Variables
 
-- `SHM_PREFIX` : prefix for shared memory files (default: `dpumesh`)
-
-### SHM Layout
-
-```
-/dev/shm/{SHM_PREFIX}_{app_name}_tx_body    # TX buffer pool (64 x 1MB slots)
-/dev/shm/{SHM_PREFIX}_{app_name}_rx_body    # RX buffer pool (64 x 1MB slots)
-/dev/shm/{SHM_PREFIX}_pod_{id}_tx_sq        # TX descriptor ring
-/dev/shm/{SHM_PREFIX}_pod_{id}_rx_sq        # RX descriptor ring
-/dev/shm/{SHM_PREFIX}_pod_registry          # Pod registry (JSON)
-```
+- `DPUMESH_PCI_ADDR`: host PCI address used by DPUmesh DOCA transport
+- `DPUMESH_POD_ID`: optional explicit pod id (otherwise worker id is used)
+- `DPUMESH_NUM_SLOTS`, `DPUMESH_SLOT_SIZE`, `DPUMESH_MAX_DESCRIPTORS`: optional buffer/ring tuning
 
 ### Added Files
 
-- `lib/cpp/src/thrift/transport/dpumesh_shm.h / .c` — low-level SHM infrastructure
+- `lib/cpp/src/thrift/transport/dpumesh_doca.c` — DOCA backend implementation
 - `lib/cpp/src/thrift/transport/TDpumeshTransport.h / .cpp` — per-request transport
+- `lib/cpp/src/thrift/transport/TDpumeshClientTransport.h / .cpp` — client transport wrapper
 - `lib/cpp/src/thrift/transport/TDpumeshServerTransport.h / .cpp` — server transport
 
 ---
