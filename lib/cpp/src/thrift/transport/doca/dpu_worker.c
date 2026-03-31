@@ -92,11 +92,17 @@ run_dpu_worker(struct objects *objs)
 
     DOCA_LOG_INFO("DPU worker initialized (event-based), entering main loop");
 
-    /* Main loop: poll consumer PE + ctrl path PE */
+    /* Main loop: poll consumer PE + ctrl path PE + per-pod producer PE */
     clock_gettime(CLOCK_MONOTONIC, &last);
     while (true) {
         doca_pe_progress(objs->consumer_pe);
         doca_pe_progress(objs->pe);  /* handle new connections, REGISTER, TX_DATA */
+
+        /* per-pod producer PE progress (응답 전송 완료 처리) */
+        for (int i = 0; i < objs->num_pods; i++) {
+            if (objs->pods[i].producer_pe)
+                doca_pe_progress(objs->pods[i].producer_pe);
+        }
 
         clock_gettime(CLOCK_MONOTONIC, &now);
         elapsed = (now.tv_sec - last.tv_sec) +
