@@ -93,7 +93,8 @@ static doca_error_t send_rx_data_via_datapath_to_pod(struct objects *objs,
                                          pod->producer_mem,
                                          pod->remote_consumer_id,
                                          msg_buf,
-                                         (uint32_t)total);
+                                         (uint32_t)total,
+                                         pod->producer_pe);
     free(msg_buf);
     return result;
 }
@@ -933,13 +934,19 @@ dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t m
     user_data.ptr = msgq;
     doca_task_set_user_data(task, user_data);
 
+    int retry = 0;
+    const int max_retry = 10000;
     do {
         result = doca_task_submit(task);
-    } while (result == DOCA_ERROR_AGAIN);
-    
+        if (result == DOCA_ERROR_AGAIN) {
+            doca_pe_progress(msgq->pe);
+            retry++;
+        }
+    } while (result == DOCA_ERROR_AGAIN && retry < max_retry);
+
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to send msg using NVMf DOCA DPA MsgQ: Failed to submit send task - %s",
-			     doca_error_get_name(result));
+		DOCA_LOG_ERR("DPA MsgQ send failed: %s (retries=%d, msg_size=%u)",
+			     doca_error_get_name(result), retry, msg_size);
 		doca_task_free(task);
 		return result;
 	}
@@ -969,11 +976,18 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
             return result;
         }
         task = doca_comch_producer_task_send_as_task(send_task);
-        result = doca_task_submit(task);
+        int retry = 0;
+        const int max_retry = 10000;
+        do {
+            result = doca_task_submit(task);
+            if (result == DOCA_ERROR_AGAIN) {
+                doca_pe_progress(msgq->pe);
+                retry++;
+            }
+        } while (result == DOCA_ERROR_AGAIN && retry < max_retry);
         if (result != DOCA_SUCCESS) {
-            if (result != DOCA_ERROR_AGAIN)
-                DOCA_LOG_ERR("Failed to send msg using NVMf DOCA DPA MsgQ: Failed to submit send task - %s",
-                     doca_error_get_name(result));
+            DOCA_LOG_ERR("DPA MsgQ bulk send failed: %s (retries=%d, msg_size=%u, idx=%d)",
+                     doca_error_get_name(result), retry, msg_size, i);
             doca_task_free(task);
             return result;
         }

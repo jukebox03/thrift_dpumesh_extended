@@ -36,6 +36,7 @@ comch_datapath_send_payload(struct doca_comch_producer *producer,
 							struct local_mem_bufs *producer_mem,
 							uint32_t remote_consumer_id,
 							const void *payload,
-							uint32_t payload_len);
+							uint32_t payload_len,
+							struct doca_pe *pe);
 
 #endif /* COMCH_PRODUCER_H */

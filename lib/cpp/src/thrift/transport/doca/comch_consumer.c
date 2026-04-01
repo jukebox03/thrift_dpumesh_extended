@@ -416,6 +416,28 @@ init_comch_datapath_consumer(struct objects *objs)
 	doca_comch_consumer_cap_get_max_consumers(doca_dev_as_devinfo(objs->dev), &max_consumers);
 	DOCA_LOG_INFO("Device supports max %u concurrent consumers", max_consumers);
 
+	uint32_t consumer_max_buf_size;
+	result = doca_comch_consumer_cap_get_max_buf_size(doca_dev_as_devinfo(objs->dev), &consumer_max_buf_size);
+	if (result == DOCA_SUCCESS) {
+		DOCA_LOG_INFO("Consumer HW max_buf_size: %u, configured: %u",
+			      consumer_max_buf_size, (unsigned int)CC_DATA_PATH_MSG_SIZE);
+		if (consumer_max_buf_size < CC_DATA_PATH_MSG_SIZE) {
+			DOCA_LOG_WARN("Consumer HW max_buf_size(%u) < CC_DATA_PATH_MSG_SIZE(%u)",
+				      consumer_max_buf_size, (unsigned int)CC_DATA_PATH_MSG_SIZE);
+		}
+	}
+
+	uint32_t consumer_max_tasks;
+	result = doca_comch_consumer_cap_get_max_num_tasks(doca_dev_as_devinfo(objs->dev), &consumer_max_tasks);
+	if (result == DOCA_SUCCESS) {
+		DOCA_LOG_INFO("Consumer max_num_tasks: %u, configured: %u",
+			      consumer_max_tasks, (unsigned int)CC_DATA_PATH_TASK_NUM);
+		if (consumer_max_tasks < CC_DATA_PATH_TASK_NUM) {
+			DOCA_LOG_WARN("Consumer HW max_num_tasks(%u) < CC_DATA_PATH_TASK_NUM(%u)",
+				      consumer_max_tasks, (unsigned int)CC_DATA_PATH_TASK_NUM);
+		}
+	}
+
 	result = init_comch_consumer(objs->connection,
 					cmem->mmap,
 					&consumer_cb_cfg,

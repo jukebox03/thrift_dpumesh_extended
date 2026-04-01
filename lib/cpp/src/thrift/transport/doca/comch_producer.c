@@ -249,8 +249,26 @@ init_comch_datapath_producer(struct objects *objs)
 		DOCA_LOG_ERR("Failed to get max buf list len with error = %s", doca_error_get_name(result));
 		return result;
 	}
-	DOCA_LOG_INFO("Consumer capabilities - max consumers: %u, max_buf_size: %u, max buf list len: %u",
+	DOCA_LOG_INFO("Producer capabilities - max_producers: %u, max_buf_size: %u, max_buf_list_len: %u",
 		      max_producers, max_buf_size, max_buf_list_len);
+
+	if (max_buf_size < CC_DATA_PATH_MSG_SIZE) {
+		DOCA_LOG_WARN("HW max_buf_size(%u) < CC_DATA_PATH_MSG_SIZE(%u), "
+			      "data path send will be limited to %u bytes",
+			      max_buf_size, (unsigned int)CC_DATA_PATH_MSG_SIZE, max_buf_size);
+	}
+
+	uint32_t max_num_tasks;
+	result = doca_comch_producer_cap_get_max_num_tasks(doca_dev_as_devinfo(objs->dev), &max_num_tasks);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to get max num tasks with error = %s", doca_error_get_name(result));
+		return result;
+	}
+	DOCA_LOG_INFO("Producer max_num_tasks: %u, configured: %u", max_num_tasks, (unsigned int)CC_DATA_PATH_TASK_NUM);
+	if (max_num_tasks < CC_DATA_PATH_TASK_NUM) {
+		DOCA_LOG_WARN("HW max_num_tasks(%u) < CC_DATA_PATH_TASK_NUM(%u)",
+			      max_num_tasks, (unsigned int)CC_DATA_PATH_TASK_NUM);
+	}
 
 
     /* init a CC producer */
@@ -305,6 +323,18 @@ init_comch_datapath_producer_for_connection(struct objects *objs,
 		return result;
 	}
 
+	/* Validate HW capabilities for per-pod producer */
+	uint32_t max_buf_size;
+	result = doca_comch_producer_cap_get_max_buf_size(doca_dev_as_devinfo(objs->dev), &max_buf_size);
+	if (result == DOCA_SUCCESS) {
+		DOCA_LOG_INFO("Per-pod producer HW max_buf_size: %u, configured: %u",
+			      max_buf_size, (unsigned int)CC_DATA_PATH_MSG_SIZE);
+		if (max_buf_size < CC_DATA_PATH_MSG_SIZE) {
+			DOCA_LOG_WARN("Per-pod producer: HW max_buf_size(%u) < CC_DATA_PATH_MSG_SIZE(%u)",
+				      max_buf_size, (unsigned int)CC_DATA_PATH_MSG_SIZE);
+		}
+	}
+
 	result = init_comch_producer(connection, &producer_cb_cfg, producer, producer_pe);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to init per-pod producer: %s", doca_error_get_name(result));
@@ -329,7 +359,8 @@ comch_datapath_send_payload(struct doca_comch_producer *producer,
 							struct local_mem_bufs *producer_mem,
 							uint32_t remote_consumer_id,
 							const void *payload,
-							uint32_t payload_len)
+							uint32_t payload_len,
+							struct doca_pe *pe)
 {
 	doca_error_t result;
 	struct doca_buf *buf = NULL;
@@ -384,18 +415,26 @@ comch_datapath_send_payload(struct doca_comch_producer *producer,
 		return result;
 	}
 
+	int retry = 0;
+	const int max_retry = 10000;
 	do {
 		result = doca_task_submit(doca_comch_producer_task_send_as_task(send_task));
-	} while (result == DOCA_ERROR_AGAIN);
+		if (result == DOCA_ERROR_AGAIN) {
+			if (pe)
+				doca_pe_progress(pe);
+			retry++;
+		}
+	} while (result == DOCA_ERROR_AGAIN && retry < max_retry);
 
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Datapath send: task submit failed: %s", doca_error_get_name(result));
+		DOCA_LOG_ERR("Datapath send FAILED: payload_len=%u consumer=%u error=%s retries=%d",
+			     payload_len, remote_consumer_id, doca_error_get_name(result), retry);
 		(void)doca_buf_dec_refcount(buf, NULL);
 		doca_task_free(doca_comch_producer_task_send_as_task(send_task));
 		return result;
 	}
 
-	DOCA_LOG_INFO("Datapath send submitted: payload_len=%u remote_consumer_id=%u",
-				  payload_len, remote_consumer_id);
+	DOCA_LOG_INFO("Datapath send submitted: payload_len=%u remote_consumer_id=%u retries=%d",
+				  payload_len, remote_consumer_id, retry);
 	return DOCA_SUCCESS;
 }
