@@ -36,69 +36,6 @@ extern struct doca_dpa_app *DPU_mesh_dpa_app;
 
 #define TEST_DPA_MEMORY
 
-static doca_error_t ensure_pod_datapath_sender(struct objects *objs, struct pod_state *pod)
-{
-    if (pod->producer != NULL && pod->producer_pe != NULL && pod->producer_mem != NULL)
-        return DOCA_SUCCESS;
-
-    DOCA_LOG_INFO("Initializing per-pod datapath sender: pod_id=%d", pod->pod_id);
-    return init_comch_datapath_producer_for_connection(objs,
-                                                        pod->connection,
-                                                        &pod->producer_mem,
-                                                        &pod->producer,
-                                                        &pod->producer_pe);
-}
-
-static doca_error_t send_rx_data_via_datapath_to_pod(struct objects *objs,
-                                                     struct pod_state *pod,
-                                                     const sw_descriptor_t *desc,
-                                                     const uint8_t *body,
-                                                     uint32_t body_len)
-{
-    size_t total = sizeof(struct dmesh_rx_data_msg) + body_len;
-    uint8_t *msg_buf;
-    struct dmesh_rx_data_msg *msg;
-    doca_error_t result;
-
-    if (total > CC_DATA_PATH_MSG_SIZE) {
-        DOCA_LOG_ERR("Datapath payload too large for pod_id=%d: total=%zu max=%u",
-                     pod->pod_id, total, (unsigned int)CC_DATA_PATH_MSG_SIZE);
-        return DOCA_ERROR_INVALID_VALUE;
-    }
-
-    if (pod->remote_consumer_id == 0 || pod->remote_consumer_id == INVALID_CONSUMER_ID) {
-        DOCA_LOG_ERR("Datapath route missing consumer_id for pod_id=%d", pod->pod_id);
-        return DOCA_ERROR_NOT_FOUND;
-    }
-
-    result = ensure_pod_datapath_sender(objs, pod);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to init datapath sender for pod_id=%d: %s",
-                     pod->pod_id, doca_error_get_descr(result));
-        return result;
-    }
-
-    msg_buf = (uint8_t *)malloc(total);
-    if (msg_buf == NULL)
-        return DOCA_ERROR_NO_MEMORY;
-
-    msg = (struct dmesh_rx_data_msg *)msg_buf;
-    msg->type = DMESH_MSG_RX_DATA;
-    memcpy(msg->desc, desc, sizeof(sw_descriptor_t));
-    msg->body_len = body_len;
-    if (body_len > 0)
-        memcpy(msg->body, body, body_len);
-
-    result = comch_datapath_send_payload(pod->producer,
-                                         pod->producer_mem,
-                                         pod->remote_consumer_id,
-                                         msg_buf,
-                                         (uint32_t)total,
-                                         pod->producer_pe);
-    free(msg_buf);
-    return result;
-}
-
 /*
  * Callback invoked once a message is received from DPA successfully
  *
@@ -186,9 +123,9 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                     fwd_desc.flags = (comp_msg->flags & OP_RESPONSE) | CASE_INGRESS;
                     fwd_desc.valid = 1;
 
-                    doca_error_t fwd_result = send_rx_data_via_datapath_to_pod(
-                        objs, dst,
-                        &fwd_desc,
+                    doca_error_t fwd_result = server_send_rx_data_to(
+                        objs, dst->connection,
+                        &fwd_desc, sizeof(sw_descriptor_t),
                         data,
                         data_len);
                     if (fwd_result != DOCA_SUCCESS)
@@ -213,9 +150,9 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 
                 doca_error_t echo_result = DOCA_ERROR_NOT_FOUND;
                 if (src_pod && src_pod->connection) {
-                    echo_result = send_rx_data_via_datapath_to_pod(objs,
-                        src_pod,
-                        &echo_desc,
+                    echo_result = server_send_rx_data_to(objs,
+                        src_pod->connection,
+                        &echo_desc, sizeof(sw_descriptor_t),
                         data,
                         data_len);
                 }
