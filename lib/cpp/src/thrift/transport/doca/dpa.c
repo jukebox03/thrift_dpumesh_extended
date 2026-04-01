@@ -60,7 +60,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     data_len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
     msg = (struct comch_msg *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
     recv_cb_count++;
-    DOCA_LOG_INFO("DPA MsgQ recv callback count=%lu imm_len=%u msg_ptr=%p",
+    
+    DOCA_LOG_INFO(">>> [CRITICAL] DPA MSQ RECV CALLBACK #%lu: imm_len=%u msg_ptr=%p",
                   recv_cb_count, data_len, (void *)msg);
 
     if (msg == NULL) {
@@ -68,8 +69,7 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
         goto resubmit_recv_task;
     }
 
-    DOCA_LOG_INFO("DPA MsgQ recv callback entered: imm_len=%u type=%u",
-                  data_len, (unsigned int)msg->type);
+    DOCA_LOG_INFO("DPA MsgQ recv message type: %u", (unsigned int)msg->type);
 
     switch (msg->type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED: {
@@ -174,13 +174,20 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     objs->recv_msg_cnt++;
 
 resubmit_recv_task:
+    int resubmit_retry = 0;
+    do {
+        result = doca_task_submit(task);
+        if (result == DOCA_ERROR_AGAIN) {
+            doca_pe_progress(objs->consumer_pe);
+            resubmit_retry++;
+        }
+    } while (result == DOCA_ERROR_AGAIN && resubmit_retry < 1000);
 
-	result = doca_task_submit(task);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("DPA MsgQ receive callback failed: Failed to resubmit receive task - %s",
-			     doca_error_get_name(result));
-		doca_task_free(task);
-	}
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("DPA MsgQ receive callback failed: Failed to resubmit receive task after %d retries - %s",
+                     resubmit_retry, doca_error_get_name(result));
+        doca_task_free(task);
+    }
 }
 
 /*

@@ -595,6 +595,9 @@ server_send_rx_data_to(struct objects *objs,
 		memcpy(msg->body, body, body_len);
 
 	struct pod_state *pod = find_pod_by_connection(objs, conn);
+	DOCA_LOG_INFO(">>> [DEBUG] server_send_rx_data_to: total_len=%zu, pod=%p, pod_id=%d, remote_consumer_id=%u", 
+	             total, (void*)pod, pod ? pod->pod_id : -1, pod ? pod->remote_consumer_id : 0);
+
 	if (pod != NULL && pod->remote_consumer_id != 0) {
 		/* Data Path Ready */
 		result = ensure_pod_datapath_sender(objs, pod);

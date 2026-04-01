@@ -403,6 +403,8 @@ comch_datapath_send_payload(struct doca_comch_producer *producer,
 		return result;
 	}
 
+	DOCA_LOG_INFO(">>> [DATAPATH] Attempting producer send. len=%u, remote_consumer_id=%u", payload_len, remote_consumer_id);
+
 	result = doca_comch_producer_task_send_alloc_init(producer,
 													  buf,
 													  NULL,
@@ -427,14 +429,13 @@ comch_datapath_send_payload(struct doca_comch_producer *producer,
 	} while (result == DOCA_ERROR_AGAIN && retry < max_retry);
 
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Datapath send FAILED: payload_len=%u consumer=%u error=%s retries=%d",
-			     payload_len, remote_consumer_id, doca_error_get_name(result), retry);
+		DOCA_LOG_ERR(">>> [FAILED] Datapath send: payload_len=%u error=%s",
+			     payload_len, doca_error_get_name(result));
 		(void)doca_buf_dec_refcount(buf, NULL);
 		doca_task_free(doca_comch_producer_task_send_as_task(send_task));
 		return result;
 	}
 
-	DOCA_LOG_INFO("Datapath send submitted: payload_len=%u remote_consumer_id=%u retries=%d",
-				  payload_len, remote_consumer_id, retry);
+	DOCA_LOG_INFO(">>> [SUCCESS] Datapath send submitted. len=%u, retries=%d", payload_len, retry);
 	return DOCA_SUCCESS;
 }
