@@ -60,6 +60,9 @@ struct comch_dma_comp_msg {
 	int32_t  dst_pod_id;  /* destination pod */
 	int8_t   flags;       /* OP_REQUEST / OP_RESPONSE + CASE_* */
 };
+/* Sent as immediate data via doca_dpa_dev_comch_producer_dma_copy() — max 32 bytes */
+_Static_assert(sizeof(struct comch_dma_comp_msg) <= 32,
+               "comch_dma_comp_msg must fit in 32-byte immediate data limit");
 
 typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_comch_producer_t;

@@ -52,28 +52,30 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 
 	doca_error_t result;
     uint32_t data_len;
-    struct comch_msg *msg;
 
 	struct objects *objs = ctx_user_data.ptr;
 	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
-    
-    data_len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
-    msg = (struct comch_msg *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
-    recv_cb_count++;
-    
-    DOCA_LOG_INFO(">>> [CRITICAL] DPA MSQ RECV CALLBACK #%lu: imm_len=%u msg_ptr=%p",
-                  recv_cb_count, data_len, (void *)msg);
 
-    if (msg == NULL) {
+    data_len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
+    /* DPA sends comch_dma_comp_msg directly (25 bytes) rather than the full
+     * comch_msg union, so read raw bytes and dispatch by the leading type field. */
+    uint8_t *raw = (uint8_t *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
+    recv_cb_count++;
+
+    DOCA_LOG_INFO(">>> [CRITICAL] DPA MSQ RECV CALLBACK #%lu: imm_len=%u msg_ptr=%p",
+                  recv_cb_count, data_len, (void *)raw);
+
+    if (raw == NULL) {
         DOCA_LOG_ERR("DPA MsgQ recv callback entered with NULL imm data (len=%u)", data_len);
         goto resubmit_recv_task;
     }
 
-    DOCA_LOG_INFO("DPA MsgQ recv message type: %u", (unsigned int)msg->type);
+    enum comch_msg_type msg_type = *(enum comch_msg_type *)raw;
+    DOCA_LOG_INFO("DPA MsgQ recv message type: %u", (unsigned int)msg_type);
 
-    switch (msg->type) {
+    switch (msg_type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED: {
-            struct comch_dma_comp_msg *comp_msg = &msg->dma_comp_msg;
+            struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)raw;
             int32_t src_pod_id = comp_msg->src_pod_id;
             int32_t dst_pod_id = comp_msg->dst_pod_id;
             uint32_t req_id = comp_msg->req_id;
@@ -164,10 +166,10 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
         }
         case COMCH_MSG_TYPE_TRIGGER:
             DOCA_LOG_INFO("DPA MsgQ recv callback ping received (type=%u)",
-                          (unsigned int)msg->type);
+                          (unsigned int)msg_type);
             break;
         default:
-            DOCA_LOG_ERR("Received unknown message type: %u", msg->type);
+            DOCA_LOG_ERR("Received unknown message type: %u", msg_type);
             break;
     }
 

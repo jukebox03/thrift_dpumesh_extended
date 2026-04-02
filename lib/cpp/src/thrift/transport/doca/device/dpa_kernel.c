@@ -120,7 +120,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
     uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
     struct dpa_ring_info *ring = &thread_arg->rings[r];
-    struct comch_msg msg;
+    struct comch_dma_comp_msg comp;
     doca_dpa_dev_buf_t buf;
     doca_dpa_dev_uintptr_t dev_ptr;
     struct dma_desc *desc;
@@ -144,23 +144,24 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     if (thread_arg->pos[r] + desc->size > ring->dpu_buf_size)
         thread_arg->pos[r] = 0;
 
-    /* Build completion message with routing info */
-    msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
-    msg.dma_comp_msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
-    msg.dma_comp_msg.pos = thread_arg->pos[r];
-    msg.dma_comp_msg.length = desc->size;
-    msg.dma_comp_msg.req_id = (uint32_t)desc->idx;
-    msg.dma_comp_msg.src_pod_id = ring->pod_id;
-    msg.dma_comp_msg.dst_pod_id = desc->dst_pod_id;
-    msg.dma_comp_msg.flags = desc->flags;
+    /* Build completion message with routing info.
+     * Use comch_dma_comp_msg directly (25 bytes) instead of comch_msg union (~52 bytes)
+     * to stay within the 32-byte immediate data limit of doca_dpa_dev_comch_producer_dma_copy(). */
+    comp.type = COMCH_MSG_TYPE_DMA_COMPLETED;
+    comp.pos = thread_arg->pos[r];
+    comp.length = desc->size;
+    comp.req_id = (uint32_t)desc->idx;
+    comp.src_pod_id = ring->pod_id;
+    comp.dst_pod_id = desc->dst_pod_id;
+    comp.flags = desc->flags;
 
     DOCA_DPA_DEV_LOG_INFO("DMA completion msg prepared: req_id=%u src_pod=%d dst_pod=%d pos=%u len=%u flags=0x%x\n",
-                          msg.dma_comp_msg.req_id,
-                          msg.dma_comp_msg.src_pod_id,
-                          msg.dma_comp_msg.dst_pod_id,
-                          msg.dma_comp_msg.pos,
-                          msg.dma_comp_msg.length,
-                          (unsigned int)(uint8_t)msg.dma_comp_msg.flags);
+                          comp.req_id,
+                          comp.src_pod_id,
+                          comp.dst_pod_id,
+                          comp.pos,
+                          comp.length,
+                          (unsigned int)(uint8_t)comp.flags);
 
     /* 1. Drain any stale completions before issuing new DMA */
     {
@@ -170,12 +171,12 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     }
 
     DOCA_DPA_DEV_LOG_INFO("Processing DMA completion: req_id=%u src_pod=%d dst_pod=%d pos=%u len=%u flags=0x%x\n",
-                          msg.dma_comp_msg.req_id,
-                          msg.dma_comp_msg.src_pod_id,
-                          msg.dma_comp_msg.dst_pod_id,
-                          msg.dma_comp_msg.pos,
-                          msg.dma_comp_msg.length,
-                          (unsigned int)(uint8_t)msg.dma_comp_msg.flags);
+                          comp.req_id,
+                          comp.src_pod_id,
+                          comp.dst_pod_id,
+                          comp.pos,
+                          comp.length,
+                          (unsigned int)(uint8_t)comp.flags);
 
     /* 2. DMA copy: Host buffer → DPU local buffer + Send completion to DPU */
     doca_dpa_dev_comch_producer_dma_copy(producer,
@@ -185,8 +186,8 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                 ring->host_mmap,
                                 desc->addr,
                                 desc->size,
-                                (uint8_t *)&msg,
-                                sizeof(struct comch_msg),
+                                (uint8_t *)&comp,
+                                sizeof(struct comch_dma_comp_msg),
                                 DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
     
