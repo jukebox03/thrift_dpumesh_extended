@@ -2,6 +2,8 @@
 
 #include <time.h>
 #include <assert.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <doca_comch.h>
 #include <doca_ctx.h>
@@ -30,13 +32,14 @@ static void client_send_task_completion_callback(struct doca_comch_task_send *ta
 						 union doca_data ctx_user_data)
 {
 	struct objects *objs;
-
-	(void)task_user_data;
+	void *payload_copy = task_user_data.ptr;
 
 	objs = (struct objects *)(ctx_user_data.ptr);
 	(void)objs;
 
 	DOCA_LOG_INFO("Client task sent successfully");
+	if (payload_copy != NULL)
+		free(payload_copy);
 	doca_task_free(doca_comch_task_send_as_task(task));
 }
 
@@ -52,11 +55,12 @@ static void client_send_task_completion_err_callback(struct doca_comch_task_send
 						     union doca_data ctx_user_data)
 {
 	struct objects *objs;
-
-	(void)task_user_data;
+	void *payload_copy = task_user_data.ptr;
 
 	objs = (struct objects *)(ctx_user_data.ptr);
 	(void)objs;
+	if (payload_copy != NULL)
+		free(payload_copy);
 	doca_task_free(doca_comch_task_send_as_task(task));
 	(void)doca_ctx_stop(doca_comch_client_as_ctx(objs->cc_client));
 }
@@ -159,21 +163,37 @@ doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
 {
 	doca_error_t result;
 	struct doca_comch_task_send *task;
+	void *msg_copy;
+	union doca_data task_user_data;
+	struct doca_task *task_obj;
+
+	msg_copy = malloc(len);
+	if (msg_copy == NULL) {
+		DOCA_LOG_ERR("Failed to allocate client payload copy");
+		return DOCA_ERROR_NO_MEMORY;
+	}
+	memcpy(msg_copy, msg, len);
 
 	result = doca_comch_client_task_send_alloc_init(objs->cc_client,
 							objs->connection,
-							(void *)msg,
+								msg_copy,
 							len,
 							&task);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to allocate client task with error = %s", doca_error_get_name(result));
+		free(msg_copy);
 		return result;
 	}
 
-	result = doca_task_submit(doca_comch_task_send_as_task(task));
+	task_obj = doca_comch_task_send_as_task(task);
+	task_user_data.ptr = msg_copy;
+	doca_task_set_user_data(task_obj, task_user_data);
+
+	result = doca_task_submit(task_obj);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to send client task with error = %s", doca_error_get_name(result));
-		doca_task_free(doca_comch_task_send_as_task(task));
+		free(msg_copy);
+		doca_task_free(task_obj);
 		return result;
 	}
 

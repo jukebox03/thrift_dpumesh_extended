@@ -239,13 +239,15 @@ static void dmesh_doca_dpa_msgq_send_cb(struct doca_comch_producer_task_send *se
 				       union doca_data task_user_data,
 				       union doca_data ctx_user_data)
 {
-	(void)task_user_data;
+	void *payload_copy = task_user_data.ptr;
 	
     
     struct objects *objs = (struct objects *)ctx_user_data.ptr;
     objs->sent_msg_cnt++;
 
     DOCA_LOG_INFO("DPA MsgQ send completion callback: sent_msg_cnt=%d", objs->sent_msg_cnt);
+	if (payload_copy != NULL)
+		free(payload_copy);
     
 	struct doca_task *task = doca_comch_producer_task_send_as_task(send_task);
     doca_task_free(task);
@@ -262,12 +264,15 @@ static void dmesh_doca_dpa_msgq_send_error_cb(struct doca_comch_producer_task_se
 					     union doca_data task_user_data,
 					     union doca_data ctx_user_data)
 {
-	(void)task_user_data;
-	(void)ctx_user_data;
+    void *payload_copy = task_user_data.ptr;
+    (void)ctx_user_data;
 
-	struct doca_task *task = doca_comch_producer_task_send_as_task(send_task);
+    struct doca_task *task = doca_comch_producer_task_send_as_task(send_task);
     DOCA_LOG_ERR("Failed to send msg");
-	doca_task_free(task);
+    if (payload_copy != NULL) {
+        free(payload_copy);
+    }
+    doca_task_free(task);
 }
 
 /*
@@ -902,23 +907,33 @@ dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t m
 {
 	doca_error_t result;
     union doca_data user_data;
+    void *msg_copy;
 
 	struct doca_comch_producer_task_send *send_task;
+    struct doca_task *task;
+
+    msg_copy = malloc(msg_size);
+    if (msg_copy == NULL) {
+        DOCA_LOG_ERR("DPA MsgQ send failed: payload copy allocation failed");
+        return DOCA_ERROR_NO_MEMORY;
+    }
+    memcpy(msg_copy, msg, msg_size);
 	result = doca_comch_producer_task_send_alloc_init(msgq->producer,
 							  NULL,
-							  msg,
+                                msg_copy,
 							  msg_size,
                               msgq->target_consumer_id,
 							  &send_task);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to send msg using NVMf DOCA DPA MsgQ: Failed to allocate send task - %s",
 			     doca_error_get_name(result));
+        free(msg_copy);
 		return result;
 	}
 
-	struct doca_task *task = doca_comch_producer_task_send_as_task(send_task);
+    task = doca_comch_producer_task_send_as_task(send_task);
 
-    user_data.ptr = msgq;
+    user_data.ptr = msg_copy;
     doca_task_set_user_data(task, user_data);
 
     int retry = 0;
@@ -934,6 +949,7 @@ dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t m
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("DPA MsgQ send failed: %s (retries=%d, msg_size=%u)",
 			     doca_error_get_name(result), retry, msg_size);
+        free(msg_copy);
 		doca_task_free(task);
 		return result;
 	}
@@ -948,21 +964,32 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
 	struct doca_comch_producer_task_send *send_task;
     struct doca_task *task;
 	doca_error_t result;
+    union doca_data user_data;
+    void *msg_copy;
     int i;
 
     for (i = 0; i < num_msg; i++) {
+        msg_copy = malloc(msg_size);
+        if (msg_copy == NULL) {
+            DOCA_LOG_ERR("DPA MsgQ bulk send failed: payload copy allocation failed at idx=%d", i);
+            return DOCA_ERROR_NO_MEMORY;
+        }
+        memcpy(msg_copy, msg, msg_size);
         result = doca_comch_producer_task_send_alloc_init(msgq->producer,
                                   NULL,
-                                  msg,
+                              msg_copy,
                                   msg_size,
 							  msgq->target_consumer_id,
                                   &send_task);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to send msg using NVMf DOCA DPA MsgQ: Failed to allocate send task - %s",
                      doca_error_get_name(result));
+            free(msg_copy);
             return result;
         }
         task = doca_comch_producer_task_send_as_task(send_task);
+        user_data.ptr = msg_copy;
+        doca_task_set_user_data(task, user_data);
         int retry = 0;
         const int max_retry = 10000;
         do {
@@ -975,6 +1002,7 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("DPA MsgQ bulk send failed: %s (retries=%d, msg_size=%u, idx=%d)",
                      doca_error_get_name(result), retry, msg_size, i);
+            free(msg_copy);
             doca_task_free(task);
             return result;
         }
