@@ -57,7 +57,7 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
 
     data_len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
-    /* DPA sends comch_dma_comp_msg directly (25 bytes) rather than the full
+    /* DPA sends comch_dma_comp_msg directly (<=32 bytes) rather than the full
      * comch_msg union, so read raw bytes and dispatch by the leading type field. */
     uint8_t *raw = (uint8_t *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
     recv_cb_count++;
@@ -70,11 +70,21 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
         goto resubmit_recv_task;
     }
 
+    if (data_len < sizeof(enum comch_msg_type)) {
+        DOCA_LOG_ERR("DPA MsgQ recv: imm data too short for type field (len=%u)", data_len);
+        goto resubmit_recv_task;
+    }
+
     enum comch_msg_type msg_type = *(enum comch_msg_type *)raw;
     DOCA_LOG_INFO("DPA MsgQ recv message type: %u", (unsigned int)msg_type);
 
     switch (msg_type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED: {
+            if (data_len < sizeof(struct comch_dma_comp_msg)) {
+                DOCA_LOG_ERR("DPA MsgQ recv: DMA_COMPLETED too short (len=%u, need=%zu)",
+                             data_len, sizeof(struct comch_dma_comp_msg));
+                break;
+            }
             struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)raw;
             int32_t src_pod_id = comp_msg->src_pod_id;
             int32_t dst_pod_id = comp_msg->dst_pod_id;
@@ -494,10 +504,11 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
     msgq->target_consumer_id = consumer_id;
     
     consumer_ctx = doca_comch_consumer_as_ctx(msgq->consumer);
+    /* DPU→DPA direction: must fit the largest message (ADD_RING, NEW_DESC, etc.) */
     result = doca_comch_consumer_set_imm_data_len(msgq->consumer, sizeof(struct comch_msg));
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to set imm data len to 64 - %s",
-                doca_error_get_name(result));
+        DOCA_LOG_ERR("Failed to set imm data len to %zu - %s",
+                sizeof(struct comch_msg), doca_error_get_name(result));
         return result;
     }
     
@@ -676,9 +687,13 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
         return result;
     }
 
+    /* Must match the consumer's imm_data_len (consumer <= completion required by DOCA).
+     * DPA actually sends only sizeof(comch_dma_comp_msg) bytes, but the buffer
+     * must be large enough for the consumer's configured imm size. */
     result = doca_comch_consumer_completion_set_imm_data_len(comch->consumer_comp, sizeof(struct comch_msg));
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to set imm data len - %s",
+        DOCA_LOG_ERR("Failed to set completion imm data len to %zu - %s",
+            sizeof(struct comch_msg),
             doca_error_get_name(result));
         return result;
         }
