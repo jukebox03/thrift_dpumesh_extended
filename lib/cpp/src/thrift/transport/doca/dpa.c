@@ -508,6 +508,8 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
         return result;
     }
     msgq->target_consumer_id = consumer_id;
+    DOCA_LOG_INFO("[PAIRCHK] msgq_create begin: is_send=%d target_consumer_id=%u max_num_msg=%u",
+                  (int)attr->is_send, msgq->target_consumer_id, attr->max_num_msg);
     
     consumer_ctx = doca_comch_consumer_as_ctx(msgq->consumer);
     /* DPU→DPA direction: must fit the largest message (ADD_RING, NEW_DESC, etc.) */
@@ -532,6 +534,8 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                     doca_error_get_name(result));
             return result;
         }
+        DOCA_LOG_INFO("[PAIRCHK] msgq_create(is_send=1): consumer completion attached: consumer=%p consumer_comp=%p",
+                  (void *)msgq->consumer, (void *)attr->consumer_comp);
         result = doca_comch_consumer_set_dev_max_num_recv(msgq->consumer, attr->max_num_msg);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to set consumer max # of recv messages - %s",
@@ -636,6 +640,8 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                     doca_error_get_name(result));
             return result;
         }
+        DOCA_LOG_INFO("[PAIRCHK] msgq_create(is_send=0): producer completion attached: producer=%p producer_comp=%p",
+                      (void *)msgq->producer, (void *)attr->producer_comp);
     }
     result = doca_ctx_start(producer_ctx);
     if (result != DOCA_SUCCESS) {
@@ -643,6 +649,10 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                 doca_error_get_name(result));
         return result;
     }
+
+    DOCA_LOG_INFO("[PAIRCHK] msgq_create done: is_send=%d consumer=%p producer=%p target_consumer_id=%u",
+                  (int)attr->is_send, (void *)msgq->consumer, (void *)msgq->producer,
+                  msgq->target_consumer_id);
 
     /* Pre-post recv tasks if MsgQ is used for receiving from DPA */
     if (attr->is_send == false) {
@@ -800,6 +810,10 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         return result;
     }
 
+    DOCA_LOG_INFO("[PAIRCHK] fill_arg handles: send.consumer=%p recv.consumer=%p recv.producer=%p producer_comp=%p",
+                  (void *)comch->send.consumer, (void *)comch->recv.consumer,
+                  (void *)comch->recv.producer, (void *)comch->producer_comp);
+
     memset(arg, 0, sizeof(*arg));
     arg->dpa_consumer_comp = dpa_consumer_comp;
     arg->dpa_producer_comp = dpa_producer_comp;
@@ -812,6 +826,9 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         arg->dpa_consumer_comp, arg->dpa_producer_comp,
         arg->dpa_consumer, arg->dpa_producer, arg->dpu_consumer_id,
         send_consumer_id, recv_consumer_id);
+
+    DOCA_LOG_INFO("[PAIRCHK] fill_arg ids: send_consumer_id=%u recv_consumer_id=%u dpu_consumer_id=%u",
+                  send_consumer_id, recv_consumer_id, dpu_consumer_id);
 
     return DOCA_SUCCESS;
 }
@@ -835,6 +852,9 @@ dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dp
 
     uint64_t rpc_ret;
     uint32_t num_msg = CC_DPA_MAX_MSG_NUM;
+    DOCA_LOG_INFO("[PAIRCHK] run_dpa_thread pre-rpc: arg.consumer=0x%lx arg.producer=0x%lx arg.consumer_comp=0x%lx arg.producer_comp=0x%lx consumer_id=%u",
+                  arg.dpa_consumer, arg.dpa_producer,
+                  arg.dpa_consumer_comp, arg.dpa_producer_comp, arg.dpu_consumer_id);
     result = doca_dpa_rpc(dpa_thread->dpa, 
                         thread_init_rpc,
                         &rpc_ret,

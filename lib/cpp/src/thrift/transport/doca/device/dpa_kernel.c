@@ -215,6 +215,13 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                           ring->dpu_addr + thread_arg->pos[r],
                           desc->size);
 
+    DOCA_DPA_DEV_LOG_INFO("[PAIRCHK] submit handles: producer=0x%lx producer_comp=0x%lx consumer=0x%lx consumer_comp=0x%lx consumer_id=%u\n",
+                          producer,
+                          thread_arg->dpa_producer_comp,
+                          thread_arg->dpa_consumer,
+                          thread_arg->dpa_consumer_comp,
+                          dpu_consumer_id);
+
     /* 2. DMA copy: Host buffer → DPU local buffer + Send completion to DPU */
     doca_dpa_dev_comch_producer_dma_copy(producer,
                                 dpu_consumer_id,
@@ -310,6 +317,14 @@ __dpa_global__ void hello_world(uint64_t arg)
 __dpa_global__ void run_dma_manager(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
+
+    DOCA_DPA_DEV_LOG_INFO("[PAIRCHK] run_dma_manager arg: consumer_comp=0x%lx producer_comp=0x%lx consumer=0x%lx producer=0x%lx consumer_id=%u num_rings=%u\n",
+                          thread_arg->dpa_consumer_comp,
+                          thread_arg->dpa_producer_comp,
+                          thread_arg->dpa_consumer,
+                          thread_arg->dpa_producer,
+                          thread_arg->dpu_consumer_id,
+                          thread_arg->num_rings);
 
     /* Arm completion notification once before the first drain cycle. */
     doca_dpa_dev_comch_consumer_completion_request_notification(thread_arg->dpa_consumer_comp);
