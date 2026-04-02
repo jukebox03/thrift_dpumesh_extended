@@ -81,6 +81,13 @@ struct dpumesh_ctx {
     struct dma_ring *dma_ring;
     doca_dpa_dev_mmap_t dpa_mmap_handle;  /* DPA handle for local mmap (used in TX descriptors) */
 
+    /* Doorbell pool (matching dma_ring size) for async comch sends */
+    struct dmesh_new_desc_msg *doorbell_pool;
+
+    /* Persistent buffers for initial registration to avoid stack UAF */
+    struct dmesh_register_msg reg_msg;
+    struct dmesh_pod_consumer_id_msg pod_cid_msg;
+
     /* TX slot management */
     uint8_t *slot_bitmap;
     pthread_mutex_t slot_lock;
@@ -370,12 +377,11 @@ static doca_error_t init_control_path(dpumesh_ctx_t *ctx) {
     result = init_comch_ctrl_path_client("DPUMesh", &ctx->doca_objs, true);
     if (result != DOCA_SUCCESS) return result;
 
-    struct dmesh_register_msg reg;
-    reg.type = DMESH_MSG_REGISTER;
-    reg.pod_id = ctx->pod_id;
-    snprintf(reg.app_name, sizeof(reg.app_name), "%s", ctx->app_name);
+    ctx->reg_msg.type = DMESH_MSG_REGISTER;
+    ctx->reg_msg.pod_id = ctx->pod_id;
+    snprintf(ctx->reg_msg.app_name, sizeof(ctx->reg_msg.app_name), "%s", ctx->app_name);
     
-    result = client_send_msg(&ctx->doca_objs, (const char *)&reg, sizeof(reg));
+    result = client_send_msg(&ctx->doca_objs, (const char *)&ctx->reg_msg, sizeof(ctx->reg_msg));
     if (result == DOCA_SUCCESS) {
         DOCA_LOG_INFO("Sent REGISTER to DPU: pod_id=%d app=%s", ctx->pod_id, ctx->app_name);
     }
@@ -393,11 +399,10 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
         result = doca_comch_consumer_get_id(ctx->doca_objs.consumer, &local_consumer_id);
         if (result != DOCA_SUCCESS) return result;
 
-        struct dmesh_pod_consumer_id_msg pod_cid;
-        pod_cid.type = DMESH_MSG_POD_CONSUMER_ID;
-        pod_cid.pod_id = ctx->pod_id;
-        pod_cid.consumer_id = local_consumer_id;
-        client_send_msg(&ctx->doca_objs, (const char *)&pod_cid, sizeof(pod_cid));
+        ctx->pod_cid_msg.type = DMESH_MSG_POD_CONSUMER_ID;
+        ctx->pod_cid_msg.pod_id = ctx->pod_id;
+        ctx->pod_cid_msg.consumer_id = local_consumer_id;
+        client_send_msg(&ctx->doca_objs, (const char *)&ctx->pod_cid_msg, sizeof(ctx->pod_cid_msg));
     }
 
     result = init_comch_datapath_producer(&ctx->doca_objs);
@@ -434,6 +439,9 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     if (init_doca_device(ctx) != DOCA_SUCCESS) goto fail;
     if (init_control_path(ctx) != DOCA_SUCCESS) goto fail;
     if (init_datapath(ctx) != DOCA_SUCCESS) goto fail;
+
+    ctx->doorbell_pool = (struct dmesh_new_desc_msg *)calloc(DMA_RING_SIZE, sizeof(struct dmesh_new_desc_msg));
+    if (!ctx->doorbell_pool) goto fail;
 
     ctx->slot_bitmap = (uint8_t *)calloc(ctx->num_slots, 1);
     if (!ctx->slot_bitmap) goto fail;
@@ -507,6 +515,8 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
         tx_inflight_cleanup(ctx);
         pthread_mutex_destroy(&ctx->tx_inflight_lock);
     }
+
+    if (ctx->doorbell_pool) free(ctx->doorbell_pool);
 
     free(ctx);
 }
@@ -593,23 +603,18 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
                   desc->req_id, ring_slot, desc->body_buf_slot, desc->body_len,
                   desc->dst_pod_id, (unsigned int)(uint8_t)desc->flags, (unsigned long)dma->addr);
 
-    /* BUG FIX: Cannot use stack buffer for async send
-     * client_send_msg submits to PE, which processes later.
-     * Stack variable would be overwritten before transmission.
-     * Solution: Use static buffer in ctx (reused per-enqueue since comch copies or sends inline).
-     * Actually, DOCA comch likely copies the message, so this should work.
-     * Let's verify by checking if message arrives. If not, we need persistent allocation.
-     */
-    struct dmesh_new_desc_msg doorbell;
-    doorbell.type = DMESH_MSG_NEW_DESC;
-    doorbell.src_pod_id = ctx->pod_id;
-    doorbell.addr = dma->addr;
-    doorbell.size = dma->size;
-    doorbell.req_id = (uint32_t)dma->idx;
-    doorbell.dst_pod_id = dma->dst_pod_id;
-    doorbell.flags = dma->flags;
+    /* Use persistent doorbell from pool to avoid stack UAF for async comch send.
+     * ring_slot is protected by dma->valid bit (DPA won't reuse slot until done). */
+    struct dmesh_new_desc_msg *doorbell = &ctx->doorbell_pool[ring_slot];
+    doorbell->type = DMESH_MSG_NEW_DESC;
+    doorbell->src_pod_id = ctx->pod_id;
+    doorbell->addr = dma->addr;
+    doorbell->size = dma->size;
+    doorbell->req_id = (uint32_t)dma->idx;
+    doorbell->dst_pod_id = dma->dst_pod_id;
+    doorbell->flags = dma->flags;
 
-    doca_error_t result = client_send_msg(&ctx->doca_objs, (const char *)&doorbell, sizeof(doorbell));
+    doca_error_t result = client_send_msg(&ctx->doca_objs, (const char *)doorbell, sizeof(*doorbell));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("ENQUEUE: client_send_msg failed: %s", doca_error_get_descr(result));
         return -1;

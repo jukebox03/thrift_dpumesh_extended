@@ -205,11 +205,11 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                           comp.length,
                           (unsigned int)(uint8_t)comp.flags);
 
+    /* 1. Arm notification BEFORE submitting DMA so completion cannot be missed */
+    doca_dpa_dev_completion_request_notification(thread_arg->dpa_producer_comp);
+
     /* 2. DMA copy: Host buffer → DPU local buffer + Send completion to DPU.
-     * Do NOT wait for producer completion here — FLUSH guarantees the DMA is
-     * submitted to HW, and the DPU ARM recv callback serves as the true
-     * end-to-end completion signal.  Removing the wait avoids the hang
-     * observed when producer_comp never fires for dma_copy operations. */
+     * We use FLUSH to ensure submission. */
     doca_dpa_dev_comch_producer_dma_copy(producer,
                                 dpu_consumer_id,
                                 ring->dpu_mmap,
@@ -221,13 +221,22 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                 sizeof(struct comch_dma_comp_msg),
                                 DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
-    DOCA_DPA_DEV_LOG_INFO("DMA copy submitted (no-wait): ring=%u slot=%u req_id=%u src_addr=0x%lx dst_addr=0x%lx size=%u\n",
-                          r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->addr,
-                          ring->dpu_addr + thread_arg->pos[r], desc->size);
+    DOCA_DPA_DEV_LOG_INFO("DMA copy submitted: ring=%u slot=%u req_id=%u size=%u\n",
+                          r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->size);
+
+    /* 3. Wait for DMA completion on DPA to ensure data is moved and imm data is sent */
+    {
+        doca_dpa_dev_completion_element_t dma_comp;
+        while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &dma_comp) == 0) {
+            /* Spin wait for completion */
+        }
+        doca_dpa_dev_completion_ack(thread_arg->dpa_producer_comp, 1);
+    }
 
     thread_arg->pos[r] += desc->size;
 
-    /* Clear valid flag so host can reuse this slot */
+    /* Ensure DMA is finished before host sees valid=0 */
+    __dpa_thread_window_writeback();
     desc->valid = 0;
     __dpa_thread_window_writeback();
 
