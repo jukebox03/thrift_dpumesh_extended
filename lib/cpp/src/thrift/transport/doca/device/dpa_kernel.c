@@ -205,52 +205,11 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                           comp.length,
                           (unsigned int)(uint8_t)comp.flags);
 
-    /* 1. Drain any stale completions before issuing new DMA */
-    {
-        doca_dpa_dev_completion_element_t stale_comp;
-        uint64_t stale_cnt = 0;
-        while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &stale_comp) != 0) {
-            stale_cnt++;
-        }
-        if (stale_cnt > 0) {
-            doca_dpa_dev_completion_ack(thread_arg->dpa_producer_comp, stale_cnt);
-            DOCA_DPA_DEV_LOG_INFO("Drained stale producer completions: %lu\n", stale_cnt);
-        }
-    }
-
-    DOCA_DPA_DEV_LOG_INFO("Processing DMA completion: req_id=%u src_pod=%d dst_pod=%d pos=%u len=%u flags=0x%x\n",
-                          comp.req_id,
-                          comp.src_pod_id,
-                          comp.dst_pod_id,
-                          comp.pos,
-                          comp.length,
-                          (unsigned int)(uint8_t)comp.flags);
-
-    DOCA_DPA_DEV_LOG_INFO("DMA submit context: ring=%u ring_pod=%d dst_pod=%d producer=0x%lx consumer_id=%u host_mmap=%u dpu_mmap=%u host_range=[0x%lx..0x%lx) src=0x%lx dst=0x%lx len=%u\n",
-                          r,
-                          ring->pod_id,
-                          desc->dst_pod_id,
-                          producer,
-                          dpu_consumer_id,
-                          ring->host_mmap,
-                          ring->dpu_mmap,
-                          ring->host_addr,
-                          ring->host_addr + ring->host_buf_size,
-                          desc->addr,
-                          ring->dpu_addr + thread_arg->pos[r],
-                          desc->size);
-
-    DOCA_DPA_DEV_LOG_INFO("[PAIRCHK] submit handles: producer=0x%lx producer_comp=0x%lx consumer=0x%lx consumer_comp=0x%lx consumer_id=%u\n",
-                          producer,
-                          thread_arg->dpa_producer_comp,
-                          thread_arg->dpa_consumer,
-                          thread_arg->dpa_consumer_comp,
-                          dpu_consumer_id);
-
-    /* Arm notification BEFORE submitting DMA so completion cannot be missed */
-    doca_dpa_dev_completion_request_notification(thread_arg->dpa_producer_comp);
-
-    /* 2. DMA copy: Host buffer → DPU local buffer + Send completion to DPU */
+    /* 2. DMA copy: Host buffer → DPU local buffer + Send completion to DPU.
+     * Do NOT wait for producer completion here — FLUSH guarantees the DMA is
+     * submitted to HW, and the DPU ARM recv callback serves as the true
+     * end-to-end completion signal.  Removing the wait avoids the hang
+     * observed when producer_comp never fires for dma_copy operations. */
     doca_dpa_dev_comch_producer_dma_copy(producer,
                                 dpu_consumer_id,
                                 ring->dpu_mmap,
@@ -262,57 +221,9 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                 sizeof(struct comch_dma_comp_msg),
                                 DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
-    DOCA_DPA_DEV_LOG_INFO("DMA copy submitted: ring=%u slot=%u req_id=%u src_addr=0x%lx dst_addr=0x%lx size=%u\n",
+    DOCA_DPA_DEV_LOG_INFO("DMA copy submitted (no-wait): ring=%u slot=%u req_id=%u src_addr=0x%lx dst_addr=0x%lx size=%u\n",
                           r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->addr,
                           ring->dpu_addr + thread_arg->pos[r], desc->size);
-
-    /* 3. Wait for DMA completion */
-    {
-        doca_dpa_dev_completion_element_t dma_comp;
-        uint32_t wait_loops = 0;
-        while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &dma_comp) == 0) {
-            wait_loops++;
-            if ((wait_loops & 0xFFFFF) == 0) {
-                uint32_t consumer_empty = doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id);
-                DOCA_DPA_DEV_LOG_INFO("Waiting DMA completion: ring=%u ring_pod=%d slot=%u req_id=%u loops=%u consumer_empty=%u producer=0x%lx producer_comp=0x%lx\n",
-                                      r,
-                                      ring->pod_id,
-                                      thread_arg->desc_idx[r],
-                                      (uint32_t)desc->idx,
-                                      wait_loops,
-                                      consumer_empty,
-                                      producer,
-                                      thread_arg->dpa_producer_comp);
-
-                if ((wait_loops & 0xFFFFFF) == 0) {
-                    doca_dpa_dev_completion_request_notification(thread_arg->dpa_producer_comp);
-                    DOCA_DPA_DEV_LOG_INFO("Re-armed producer completion notification: ring=%u req_id=%u loops=%u\n",
-                                          r,
-                                          (uint32_t)desc->idx,
-                                          wait_loops);
-                }
-            }
-        }
-
-        {
-            doca_dpa_dev_completion_type_t comp_type = doca_dpa_dev_get_completion_type(dma_comp);
-            DOCA_DPA_DEV_LOG_INFO("DMA completion dequeued: ring=%u req_id=%u type=%u\n",
-                                  r,
-                                  (uint32_t)desc->idx,
-                                  (unsigned int)comp_type);
-            if (comp_type == DOCA_DPA_DEV_COMP_SEND_ERR || comp_type == DOCA_DPA_DEV_COMP_RECV_ERR) {
-                DOCA_DPA_DEV_LOG_INFO("DMA completion error: type=%u syndrome=%u vendor_syndrome=%u\n",
-                                      (unsigned int)comp_type,
-                                      doca_dpa_dev_completion_element_get_error_syndrome(dma_comp),
-                                      doca_dpa_dev_completion_element_get_vendor_error_syndrome(dma_comp));
-            }
-        }
-
-        doca_dpa_dev_completion_ack(thread_arg->dpa_producer_comp, 1);
-    }
-
-    DOCA_DPA_DEV_LOG_INFO("DMA copy issued: ring=%u slot=%u req_id=%u src_addr=0x%lx size=%u\n",
-                          r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->addr, desc->size);
 
     thread_arg->pos[r] += desc->size;
 
