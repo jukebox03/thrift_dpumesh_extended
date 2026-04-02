@@ -56,10 +56,16 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 	struct objects *objs = ctx_user_data.ptr;
 	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
 
+    DOCA_LOG_INFO(">>> DPA MsgQ recv callback #%lu entered", recv_cb_count + 1);
+
     data_len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
+
+    DOCA_LOG_INFO("DPA MsgQ recv callback imm data length: %u", data_len);
     /* DPA sends comch_dma_comp_msg directly (<=32 bytes) rather than the full
      * comch_msg union, so read raw bytes and dispatch by the leading type field. */
     uint8_t *raw = (uint8_t *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
+
+    DOCA_LOG_INFO("DPA MsgQ recv callback imm data pointer: %p", (void *)raw);
     recv_cb_count++;
 
     DOCA_LOG_INFO(">>> [CRITICAL] DPA MSQ RECV CALLBACK #%lu: imm_len=%u msg_ptr=%p",
