@@ -166,7 +166,13 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     /* 1. Drain any stale completions before issuing new DMA */
     {
         doca_dpa_dev_completion_element_t stale_comp;
+        uint64_t stale_cnt = 0;
         while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &stale_comp) != 0) {
+            stale_cnt++;
+        }
+        if (stale_cnt > 0) {
+            doca_dpa_dev_completion_ack(thread_arg->dpa_producer_comp, stale_cnt);
+            DOCA_DPA_DEV_LOG_INFO("Drained stale producer completions: %lu\n", stale_cnt);
         }
     }
 
@@ -190,6 +196,9 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                 sizeof(struct comch_dma_comp_msg),
                                 DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
+    /* Ensure new producer completions can trigger the attached DPA thread. */
+    doca_dpa_dev_completion_request_notification(thread_arg->dpa_producer_comp);
+
     
     DOCA_DPA_DEV_LOG_INFO("DMA copy submitted: ring=%u slot=%u req_id=%u src_addr=0x%lx dst_addr=0x%lx size=%u\n",
                           r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->addr,
@@ -198,8 +207,26 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     /* 3. Wait for DMA completion */
     {
         doca_dpa_dev_completion_element_t dma_comp;
+        uint32_t wait_loops = 0;
         while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &dma_comp) == 0) {
+            wait_loops++;
+            if ((wait_loops & 0xFFFFF) == 0) {
+                DOCA_DPA_DEV_LOG_INFO("Waiting DMA completion: ring=%u slot=%u req_id=%u loops=%u\n",
+                                      r, thread_arg->desc_idx[r], (uint32_t)desc->idx, wait_loops);
+            }
         }
+
+        {
+            doca_dpa_dev_completion_type_t comp_type = doca_dpa_dev_get_completion_type(dma_comp);
+            if (comp_type == DOCA_DPA_DEV_COMP_SEND_ERR || comp_type == DOCA_DPA_DEV_COMP_RECV_ERR) {
+                DOCA_DPA_DEV_LOG_INFO("DMA completion error: type=%u syndrome=%u vendor_syndrome=%u\n",
+                                      (unsigned int)comp_type,
+                                      doca_dpa_dev_completion_element_get_error_syndrome(dma_comp),
+                                      doca_dpa_dev_completion_element_get_vendor_error_syndrome(dma_comp));
+            }
+        }
+
+        doca_dpa_dev_completion_ack(thread_arg->dpa_producer_comp, 1);
     }
 
     DOCA_DPA_DEV_LOG_INFO("DMA copy issued: ring=%u slot=%u req_id=%u src_addr=0x%lx size=%u\n",

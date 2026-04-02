@@ -89,6 +89,12 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		return result;
 	}
 
+	if (remote_addr == NULL || buf_size == 0) {
+		DOCA_LOG_ERR("Invalid remote mmap metadata: remote_addr=%p buf_size=%zu",
+			     remote_addr, buf_size);
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+
 	pod->remote_addr = remote_addr;
 	pod->remote_buf_size = buf_size;
 
@@ -124,6 +130,12 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		DOCA_LOG_ERR("Failed to create remote mmap from export desc: %s",
 			     doca_error_get_name(result));
 		return result;
+	}
+
+	if (remote_addr == NULL || buf_size == 0) {
+		DOCA_LOG_ERR("Invalid remote mmap metadata: remote_addr=%p buf_size=%zu",
+			     remote_addr, buf_size);
+		return DOCA_ERROR_INVALID_VALUE;
 	}
 
 	objs->remote_addr = remote_addr;

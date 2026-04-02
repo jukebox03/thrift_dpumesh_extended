@@ -549,6 +549,24 @@ void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
 int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     struct dma_desc *dma = get_next_dma_desc(ctx->dma_ring);
     uint32_t ring_slot;
+
+    if (desc == NULL) {
+        DOCA_LOG_ERR("ENQUEUE rejected: desc is NULL");
+        return -1;
+    }
+
+    if (desc->body_buf_slot < 0 || desc->body_buf_slot >= ctx->num_slots) {
+        DOCA_LOG_ERR("ENQUEUE rejected: invalid body_buf_slot=%d (num_slots=%d)",
+                     desc->body_buf_slot, ctx->num_slots);
+        return -1;
+    }
+
+    if (desc->body_len > (uint32_t)ctx->slot_size) {
+        DOCA_LOG_ERR("ENQUEUE rejected: body_len=%u exceeds slot_size=%d",
+                     desc->body_len, ctx->slot_size);
+        return -1;
+    }
+
     if (!dma)
         return -1;
 
