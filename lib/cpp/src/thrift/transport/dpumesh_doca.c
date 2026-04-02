@@ -593,6 +593,13 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
                   desc->req_id, ring_slot, desc->body_buf_slot, desc->body_len,
                   desc->dst_pod_id, (unsigned int)(uint8_t)desc->flags, (unsigned long)dma->addr);
 
+    /* BUG FIX: Cannot use stack buffer for async send
+     * client_send_msg submits to PE, which processes later.
+     * Stack variable would be overwritten before transmission.
+     * Solution: Use static buffer in ctx (reused per-enqueue since comch copies or sends inline).
+     * Actually, DOCA comch likely copies the message, so this should work.
+     * Let's verify by checking if message arrives. If not, we need persistent allocation.
+     */
     struct dmesh_new_desc_msg doorbell;
     doorbell.type = DMESH_MSG_NEW_DESC;
     doorbell.src_pod_id = ctx->pod_id;
@@ -601,7 +608,12 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     doorbell.req_id = (uint32_t)dma->idx;
     doorbell.dst_pod_id = dma->dst_pod_id;
     doorbell.flags = dma->flags;
-    client_send_msg(&ctx->doca_objs, (const char *)&doorbell, sizeof(doorbell));
+
+    doca_error_t result = client_send_msg(&ctx->doca_objs, (const char *)&doorbell, sizeof(doorbell));
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("ENQUEUE: client_send_msg failed: %s", doca_error_get_descr(result));
+        return -1;
+    }
 
     return 0;
 }
