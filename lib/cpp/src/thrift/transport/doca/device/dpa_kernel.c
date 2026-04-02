@@ -169,6 +169,14 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         }
     }
 
+    DOCA_DPA_DEV_LOG_INFO("Processing DMA completion: req_id=%u src_pod=%d dst_pod=%d pos=%u len=%u flags=0x%x\n",
+                          msg.dma_comp_msg.req_id,
+                          msg.dma_comp_msg.src_pod_id,
+                          msg.dma_comp_msg.dst_pod_id,
+                          msg.dma_comp_msg.pos,
+                          msg.dma_comp_msg.length,
+                          (unsigned int)(uint8_t)msg.dma_comp_msg.flags);
+
     /* 2. DMA copy: Host buffer → DPU local buffer + Send completion to DPU */
     doca_dpa_dev_comch_producer_dma_copy(producer,
                                 dpu_consumer_id,
@@ -180,6 +188,11 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                 (uint8_t *)&msg,
                                 sizeof(struct comch_msg),
                                 DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+
+    
+    DOCA_DPA_DEV_LOG_INFO("DMA copy submitted: ring=%u slot=%u req_id=%u src_addr=0x%lx dst_addr=0x%lx size=%u\n",
+                          r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->addr,
+                          ring->dpu_addr + thread_arg->pos[r], desc->size);
 
     /* 3. Wait for DMA completion */
     {
