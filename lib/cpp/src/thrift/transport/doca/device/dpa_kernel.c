@@ -137,6 +137,26 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                           r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->size,
                           desc->dst_pod_id, desc->addr);
 
+    {
+        uint64_t src_addr = desc->addr;
+        uint64_t src_len = (uint64_t)desc->size;
+        uint64_t host_base = ring->host_addr;
+        uint64_t host_size = ring->host_buf_size;
+        uint64_t host_end = host_base + host_size;
+        uint64_t src_end = src_addr + src_len;
+
+        if (host_size == 0 || host_end < host_base || src_end < src_addr ||
+            src_addr < host_base || src_end > host_end) {
+            DOCA_DPA_DEV_LOG_INFO("Descriptor source out of host range: ring=%u slot=%u req_id=%u src=[0x%lx..0x%lx) host=[0x%lx..0x%lx) len=%u\n",
+                                  r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
+                                  src_addr, src_end, host_base, host_end, desc->size);
+            desc->valid = 0;
+            __dpa_thread_window_writeback();
+            thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
+            return 1;
+        }
+    }
+
     while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
     }
 
@@ -183,6 +203,17 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                           comp.pos,
                           comp.length,
                           (unsigned int)(uint8_t)comp.flags);
+
+    DOCA_DPA_DEV_LOG_INFO("DMA submit context: producer=0x%lx consumer_id=%u host_mmap=%u dpu_mmap=%u host_range=[0x%lx..0x%lx) src=0x%lx dst=0x%lx len=%u\n",
+                          producer,
+                          dpu_consumer_id,
+                          ring->host_mmap,
+                          ring->dpu_mmap,
+                          ring->host_addr,
+                          ring->host_addr + ring->host_buf_size,
+                          desc->addr,
+                          ring->dpu_addr + thread_arg->pos[r],
+                          desc->size);
 
     /* 2. DMA copy: Host buffer → DPU local buffer + Send completion to DPU */
     doca_dpa_dev_comch_producer_dma_copy(producer,

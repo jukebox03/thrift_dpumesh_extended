@@ -16,6 +16,8 @@ struct dpa_ring_info {
 	doca_dpa_dev_buf_arr_t buf_arr;
 	uint32_t buf_arr_size;
 	doca_dpa_dev_mmap_t host_mmap;   /* Host DMA buffer mmap */
+	uint64_t host_addr;              /* Host DMA buffer base address */
+	uint64_t host_buf_size;          /* Host DMA buffer size */
 	doca_dpa_dev_mmap_t dpu_mmap;    /* DPU local buffer mmap */
 	uint64_t dpu_addr;               /* DPU local buffer addr */
 	uint32_t dpu_buf_size;

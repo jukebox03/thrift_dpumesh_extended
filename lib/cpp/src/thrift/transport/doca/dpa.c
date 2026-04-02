@@ -1048,6 +1048,8 @@ dmesh_fill_dpa_ring_info(struct objects *objs, struct pod_state *pod,
     ring_info->buf_arr = dpa_buf_arr;
     ring_info->buf_arr_size = DMA_RING_SIZE;
     ring_info->host_mmap = host_mmap;
+    ring_info->host_addr = (uint64_t)pod->remote_addr;
+    ring_info->host_buf_size = (uint64_t)pod->remote_buf_size;
     ring_info->dpu_mmap = dpu_mmap;
     ring_info->dpu_addr = (uint64_t)pod->dma_buffer;
     ring_info->dpu_buf_size = DPU_BUFFER_SIZE;
