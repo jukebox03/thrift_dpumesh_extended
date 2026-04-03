@@ -3,6 +3,9 @@
 #include "doca_dpa_dev_buf.h"
 #include "dpaintrin.h"
 #include "dpa_common.h"
+
+#define DMA_DIAG_EMPTY_WAIT_WARN_LOOPS  0x100000
+#define DMA_DIAG_EMPTY_WAIT_FAIL_LOOPS  0x800000
 /*
  * RPC for initializing DPA IO thread called before running the thread
  *
@@ -133,6 +136,33 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     if (!desc->valid)
         return 0;
 
+    if (ring->dpu_mmap == 0) {
+        DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Protection Error]: invalid dst mmap handle (ring=%u slot=%u req_id=%u dpu_mmap=0)\n",
+                              r, thread_arg->desc_idx[r], (uint32_t)desc->idx);
+        desc->valid = 0;
+        __dpa_thread_window_writeback();
+        thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
+        return 1;
+    }
+
+    if (ring->host_mmap == 0) {
+        DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Remote Access Error]: invalid src mmap handle (ring=%u slot=%u req_id=%u host_mmap=0)\n",
+                              r, thread_arg->desc_idx[r], (uint32_t)desc->idx);
+        desc->valid = 0;
+        __dpa_thread_window_writeback();
+        thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
+        return 1;
+    }
+
+    if (desc->size == 0) {
+        DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Length Error]: zero-length descriptor (ring=%u slot=%u req_id=%u)\n",
+                              r, thread_arg->desc_idx[r], (uint32_t)desc->idx);
+        desc->valid = 0;
+        __dpa_thread_window_writeback();
+        thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
+        return 1;
+    }
+
     DOCA_DPA_DEV_LOG_INFO("FOUND valid desc: ring=%u slot=%u req_id=%u size=%u dst_pod=%d addr=0x%lx\n",
                           r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->size,
                           desc->dst_pod_id, desc->addr);
@@ -147,6 +177,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
 
         if (host_size == 0 || host_end < host_base || src_end < src_addr ||
             src_addr < host_base || src_end > host_end) {
+            DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Remote Access Error]: src out of host mmap range\n");
             DOCA_DPA_DEV_LOG_INFO("Descriptor source out of host range: ring=%u slot=%u req_id=%u src=[0x%lx..0x%lx) host=[0x%lx..0x%lx) len=%u\n",
                                   r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
                                   src_addr, src_end, host_base, host_end, desc->size);
@@ -167,6 +198,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
 
         if (dpu_size == 0 || dpu_end < dpu_base || dst_end < dst_addr ||
             dst_addr < dpu_base || dst_end > dpu_end) {
+            DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Protection Error]: dst out of DPU mmap range\n");
             DOCA_DPA_DEV_LOG_INFO("Descriptor destination out of DPU range: ring=%u slot=%u req_id=%u dst=[0x%lx..0x%lx) dpu=[0x%lx..0x%lx) len=%u\n",
                                   r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
                                   dst_addr, dst_end, dpu_base, dpu_end, desc->size);
@@ -181,8 +213,8 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         uint32_t empty_wait_loops = 0;
         while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
             empty_wait_loops++;
-            if ((empty_wait_loops & 0xFFFFF) == 0) {
-                DOCA_DPA_DEV_LOG_INFO("Waiting consumer credits: ring=%u ring_pod=%d slot=%u req_id=%u consumer_id=%u loops=%u producer=0x%lx\n",
+            if ((empty_wait_loops % DMA_DIAG_EMPTY_WAIT_WARN_LOOPS) == 0) {
+                DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Receiver Not Ready]: consumer has no posted recv tasks/credits yet (ring=%u ring_pod=%d slot=%u req_id=%u consumer_id=%u loops=%u producer=0x%lx)\n",
                                       r,
                                       ring->pod_id,
                                       thread_arg->desc_idx[r],
@@ -190,6 +222,17 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                       dpu_consumer_id,
                                       empty_wait_loops,
                                       producer);
+            }
+
+            if (empty_wait_loops >= DMA_DIAG_EMPTY_WAIT_FAIL_LOOPS) {
+                DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Receiver Not Ready]: timeout waiting consumer credits (ring=%u ring_pod=%d slot=%u req_id=%u consumer_id=%u loops=%u). Will retry later.\n",
+                                      r,
+                                      ring->pod_id,
+                                      thread_arg->desc_idx[r],
+                                      (uint32_t)desc->idx,
+                                      dpu_consumer_id,
+                                      empty_wait_loops);
+                return 0;
             }
         }
         if (empty_wait_loops > 0) {
@@ -207,6 +250,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         thread_arg->pos[r] = 0;
 
     if (desc->size > ring->dpu_buf_size) {
+        DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Length Error]: requested length exceeds DPU destination buffer\n");
         DOCA_DPA_DEV_LOG_INFO("Descriptor too large for DPU buffer: ring=%u slot=%u req_id=%u size=%u dpu_buf_size=%u\n",
                               r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
                               desc->size, ring->dpu_buf_size);
@@ -262,26 +306,6 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
 
     DOCA_DPA_DEV_LOG_INFO("DMA copy submitted (fire-and-forget): ring=%u slot=%u req_id=%u size=%u\n",
                           r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->size);
-
-    /* DEBUG: poll DPU buffer to distinguish DMA failure vs completion failure.
-     * Spin briefly then sample the first 4 bytes at the DMA destination.
-     * If all zeros after many loops → DMA not writing; if non-zero → DMA OK, completion broken. */
-    {
-        volatile uint8_t *dst = (volatile uint8_t *)(uintptr_t)(ring->dpu_addr + thread_arg->pos[r]);
-        uint32_t poll = 0;
-        const uint32_t max_poll = 2000000;
-        while (poll < max_poll) {
-            if (dst[0] != 0 || dst[1] != 0 || dst[2] != 0 || dst[3] != 0)
-                break;
-            poll++;
-        }
-        DOCA_DPA_DEV_LOG_INFO("DEBUG DMA dst poll: ring=%u pos=%u loops=%u "
-                              "dst[0..3]=0x%02x 0x%02x 0x%02x 0x%02x (%s)\n",
-                              r, thread_arg->pos[r], poll,
-                              (unsigned)dst[0], (unsigned)dst[1],
-                              (unsigned)dst[2], (unsigned)dst[3],
-                              (poll < max_poll) ? "DATA_ARRIVED" : "NO_DATA_TIMEOUT");
-    }
 
     thread_arg->pos[r] += desc->size;
 
