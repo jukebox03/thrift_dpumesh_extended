@@ -227,10 +227,42 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     /* 3. Wait for DMA completion on DPA to ensure data is moved and imm data is sent */
     {
         doca_dpa_dev_completion_element_t dma_comp;
-        while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &dma_comp) == 0) {
-            /* Spin wait for completion */
-        }
+        uint32_t wait_loops = 0;
+        int comp_rc;
+
+        DOCA_DPA_DEV_LOG_INFO("Waiting DMA completion: producer_comp=0x%lx ring=%u slot=%u req_id=%u\n",
+                              thread_arg->dpa_producer_comp,
+                              r,
+                              thread_arg->desc_idx[r],
+                              (uint32_t)desc->idx);
+
+        do {
+            comp_rc = doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &dma_comp);
+            if (comp_rc == 0) {
+                wait_loops++;
+                if ((wait_loops & 0xFFFFF) == 0) {
+                    DOCA_DPA_DEV_LOG_INFO("Still waiting DMA completion: producer_comp=0x%lx ring=%u slot=%u req_id=%u loops=%u\n",
+                                          thread_arg->dpa_producer_comp,
+                                          r,
+                                          thread_arg->desc_idx[r],
+                                          (uint32_t)desc->idx,
+                                          wait_loops);
+                }
+            }
+        } while (comp_rc == 0);
+
+        DOCA_DPA_DEV_LOG_INFO("DMA completion received: rc=%d type=%u user_data=%u imm=%u wait_loops=%u req_id=%u\n",
+                              comp_rc,
+                              (unsigned int)doca_dpa_dev_get_completion_type(dma_comp),
+                              doca_dpa_dev_get_completion_user_data(dma_comp),
+                              doca_dpa_dev_get_completion_immediate(dma_comp),
+                              wait_loops,
+                              (uint32_t)desc->idx);
+
         doca_dpa_dev_completion_ack(thread_arg->dpa_producer_comp, 1);
+        DOCA_DPA_DEV_LOG_INFO("DMA completion acked: producer_comp=0x%lx req_id=%u\n",
+                              thread_arg->dpa_producer_comp,
+                              (uint32_t)desc->idx);
     }
 
     thread_arg->pos[r] += desc->size;

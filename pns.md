@@ -1,48 +1,69 @@
-# Proposal and Strategy (PNS): Resolving the 128B Data Limit
+# Proposal and Strategy (PNS): DPA DMA Completion Stall (Code-Verified)
 
 ## 1. Problem Definition
-*   **Issue**: Thrift requests or responses larger than 128 bytes fail or cause the system to hang.
-*   **Observation**: The Host-to-DPU path (using DMA) works correctly, but the **DPU-to-Host (Service/Gateway)** path is restricted by a 128-byte hardware limit.
+- Symptom: traffic reaches DPA, log shows "DMA copy submitted", but upper layers stop progressing (for example, recv remains 0/s on DPU side).
+- Scope: the current blocking behavior is observed in the DPA DMA/completion path, not yet proven as a strict 128-byte payload boundary issue.
 
-## 2. Root Cause Analysis
-The system utilizes three distinct communication methods, but the DPU-to-Host delivery is failing due to configuration omissions and path misuse.
+## 2. Verified Facts From Current Code
 
-### A. Missing Data Path Configuration (Primary Cause)
-*   **File**: `lib/cpp/src/thrift/transport/doca/comch_producer.c`
-*   **Root Cause**: The `doca_comch_producer` is initialized without explicitly calling `doca_comch_producer_set_max_msg_size()`.
-*   **Consequence**: The hardware defaults the MTU to **128 bytes**. Even though `comch_datapath_send_payload` is designed for large transfers, it is being throttled by this hardware-default limit.
+### A. DPA DMA completion metadata is intentionally small
+- File: lib/cpp/src/thrift/transport/doca/dpa_common.h
+- comch_dma_comp_msg is constrained to fit immediate data for dma_copy:
+	- Static assert requires sizeof(struct comch_dma_comp_msg) <= 32.
+	- Comments in kernel path also state a 32-byte immediate data limit for this API usage.
+- Implication: in this path, immediate data carries completion metadata only, not full payload.
 
-### B. Misuse of Control Path (Fallback Path Issue)
-*   **File**: `lib/cpp/src/thrift/transport/doca/comch_server.c`
-*   **Root Cause**: The function `server_send_rx_data` attempts to send Thrift payloads inline via the **Control Path** (`doca_comch_server_task_send`).
-*   **Consequence**: The Control Path has a strict hardware MTU of **128 bytes** (including headers). After the 72-byte `dmesh_rx_data_msg` header, only **56 bytes** remain for actual data.
+### B. Completion channel wiring is present and internally consistent
+- File: lib/cpp/src/thrift/transport/doca/dpa.c
+- DPA producer completion is:
+	- created (doca_dpa_completion_create),
+	- bound to DPA thread (doca_dpa_completion_set_thread),
+	- started (doca_dpa_completion_start),
+	- attached to producer (doca_comch_producer_dpa_completion_attach).
+- The same completion handle is exported into dpa_thread_arg and consumed in DPA kernel.
 
-### C. DPA Immediate Data Constraints
-*   **File**: `lib/cpp/src/thrift/transport/doca/device/dpa_kernel.c`
-*   **Detail**: The `doca_dpa_dev_comch_producer_dma_copy` function uses "Immediate Data" for completion signals, which is hardware-limited to **128 bytes**. While currently used for small metadata (~52B), this path cannot be used for payload delivery.
+### C. DPA kernel has two blocking wait points
+- File: lib/cpp/src/thrift/transport/doca/device/dpa_kernel.c
+- In process_one_desc:
+	- waits until producer has credits (producer_is_consumer_empty loop),
+	- then submits doca_dpa_dev_comch_producer_dma_copy,
+	- then spin-waits on dpa_producer_comp completion.
+- Either wait can stall forward progress if events/credits never arrive.
 
-## 3. Communication Matrix (Current State)
+### D. DPU ARM completion consumer exists
+- File: lib/cpp/src/thrift/transport/doca/dpa.c
+- dmesh_doca_dpa_msgq_recv_cb handles COMCH_MSG_TYPE_DMA_COMPLETED and performs:
+	- TX_ACK to source pod,
+	- RX_DATA forwarding to destination pod.
+- If this callback does not fire, the end-to-end pipeline appears frozen above DPA.
 
-| Component | Inbound Method | Outbound Method | 128B Limit? |
-| :--- | :--- | :--- | :--- |
-| **Gateway (Host)** | Comch Data/Ctrl | **DMA** + Doorbell | **Yes (on Recv)** |
-| **DPU (ARM)** | Ctrl Path / DPA Signal | Data Path (Producer) | **Yes (Default MTU)** |
-| **DPA (Device)** | DMA | Comch MsgQ (Imm Data) | **Yes (Hardware)** |
-| **Service (Host)** | Comch Data/Ctrl | **DMA** + Doorbell | **Yes (on Recv)** |
+## 3. What Is Not Proven (Yet)
+- A hard 128-byte threshold as the primary root cause for the current stall in this specific DPA DMA completion path.
+- In particular, the DPA dma_copy immediate payload here is already <= 32 bytes, so stall cannot be explained solely by oversized immediate metadata.
 
-## 4. Proposed Solution Strategy
+## 4. Most Likely Failure Modes (Current Priority)
+1. Credit starvation before dma_copy submit (producer_is_consumer_empty loop does not exit).
+2. Completion not observed on dpa_producer_comp after submit (get_completion loop does not exit).
+3. Downstream DPU callback path not consuming DMA_COMPLETED even when DMA completes.
 
-### Strategy 1: Explicit Data Path Sizing
-*   Modify `comch_producer.c` and `comch_consumer.c` to explicitly set `max_msg_size` to **64KB** (or higher) during initialization. This unlocks the full capacity of Method 2 (Data Path).
+## 5. Strategy (Updated)
 
-### Strategy 2: Standardize on Data Path
-*   Deprecate the Control Path-based payload delivery (`server_send_rx_data`).
-*   Unify all DPU-to-Host data forwarding to use the high-capacity **Data Path (Method 2)**.
+### Strategy 1: Instrument the exact stall point
+- Add loop heartbeat counters/timestamps around:
+	- credit wait loop,
+	- completion wait loop,
+	- dmesh_doca_dpa_msgq_recv_cb entry/exit.
+- Goal: distinguish "submit never happened" vs "submit happened, completion missing" vs "completion delivered but not consumed".
 
-### Strategy 3: Zero-Copy Optimization (Future)
-*   Implement **RDMA WRITE** from the DPU directly into Host RX slots, using the Control Path only for minimal doorbell signals (~32 bytes).
+### Strategy 2: Bound unproductive spin waits
+- Replace infinite waits with bounded retry + yield/reschedule + diagnostic logs.
+- Goal: avoid hard deadlock and preserve observability under fault.
 
-## 5. Implementation Plan
-1.  **Fix Producer MTU**: Add `doca_comch_producer_set_max_msg_size` call in `init_comch_datapath_producer`.
-2.  **Verify Forwarding Logic**: Ensure `dpa.c` correctly utilizes the reconfigured Data Path for all pod-to-pod routing.
-3.  **Validation**: Update `test_thrift.py` to send 1KB+ payloads and confirm successful end-to-end delivery.
+### Strategy 3: Keep metadata path minimal and explicit
+- Keep comch_dma_comp_msg within immediate size limits (already enforced).
+- Do not route payload through immediate data; payload stays in DMA buffer path.
+
+## 6. Implementation Plan
+1. Add targeted diagnostics around both DPA wait loops and callback consume points.
+2. Run small and large payload tests and compare where progress stops.
+3. If completion queue starvation is confirmed, adjust completion/credit flow first before revisiting payload-size hypotheses.
