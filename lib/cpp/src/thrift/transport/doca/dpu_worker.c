@@ -110,6 +110,34 @@ run_dpu_worker(struct objects *objs)
         if (elapsed >= 1.0) {
             DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s, pods: %d",
                           elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt, objs->num_pods);
+
+            /* Poll DMA buffers directly to check if DMA data actually arrived */
+            for (int i = 0; i < objs->num_pods; i++) {
+                struct pod_state *pod = &objs->pods[i];
+                if (pod->dma_buffer && pod->dma_ready) {
+                    volatile uint8_t *buf = (volatile uint8_t *)pod->dma_buffer;
+                    int nonzero = 0;
+                    for (int b = 0; b < 64 && b < DPU_BUFFER_SIZE; b++) {
+                        if (buf[b] != 0) nonzero++;
+                    }
+                    if (nonzero > 0) {
+                        DOCA_LOG_INFO("[DMA_POLL] pod=%d (id=%d) buf=%p: first 16 bytes: "
+                                      "%02x %02x %02x %02x %02x %02x %02x %02x "
+                                      "%02x %02x %02x %02x %02x %02x %02x %02x "
+                                      "(nonzero in first 64: %d)",
+                                      i, pod->pod_id, (void *)pod->dma_buffer,
+                                      buf[0], buf[1], buf[2], buf[3],
+                                      buf[4], buf[5], buf[6], buf[7],
+                                      buf[8], buf[9], buf[10], buf[11],
+                                      buf[12], buf[13], buf[14], buf[15],
+                                      nonzero);
+                    } else {
+                        DOCA_LOG_INFO("[DMA_POLL] pod=%d (id=%d) buf=%p: all zeros in first 64 bytes",
+                                      i, pod->pod_id, (void *)pod->dma_buffer);
+                    }
+                }
+            }
+
             objs->sent_msg_cnt = 0;
             objs->recv_msg_cnt = 0;
             last = now;
