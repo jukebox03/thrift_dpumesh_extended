@@ -158,6 +158,26 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     }
 
     {
+        uint64_t dst_addr = ring->dpu_addr + thread_arg->pos[r];
+        uint64_t dst_len = (uint64_t)desc->size;
+        uint64_t dpu_base = ring->dpu_addr;
+        uint64_t dpu_size = (uint64_t)ring->dpu_buf_size;
+        uint64_t dpu_end = dpu_base + dpu_size;
+        uint64_t dst_end = dst_addr + dst_len;
+
+        if (dpu_size == 0 || dpu_end < dpu_base || dst_end < dst_addr ||
+            dst_addr < dpu_base || dst_end > dpu_end) {
+            DOCA_DPA_DEV_LOG_INFO("Descriptor destination out of DPU range: ring=%u slot=%u req_id=%u dst=[0x%lx..0x%lx) dpu=[0x%lx..0x%lx) len=%u\n",
+                                  r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
+                                  dst_addr, dst_end, dpu_base, dpu_end, desc->size);
+            desc->valid = 0;
+            __dpa_thread_window_writeback();
+            thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
+            return 1;
+        }
+    }
+
+    {
         uint32_t empty_wait_loops = 0;
         while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
             empty_wait_loops++;
@@ -186,6 +206,16 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     if (thread_arg->pos[r] + desc->size > ring->dpu_buf_size)
         thread_arg->pos[r] = 0;
 
+    if (desc->size > ring->dpu_buf_size) {
+        DOCA_DPA_DEV_LOG_INFO("Descriptor too large for DPU buffer: ring=%u slot=%u req_id=%u size=%u dpu_buf_size=%u\n",
+                              r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
+                              desc->size, ring->dpu_buf_size);
+        desc->valid = 0;
+        __dpa_thread_window_writeback();
+        thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
+        return 1;
+    }
+
     /* Build completion message with routing info.
      * Use comch_dma_comp_msg directly (25 bytes) instead of comch_msg union (~52 bytes)
      * to stay within the 32-byte immediate data limit of doca_dpa_dev_comch_producer_dma_copy(). */
@@ -207,6 +237,16 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
 
     /* 1. Arm notification BEFORE submitting DMA so completion cannot be missed */
     doca_dpa_dev_completion_request_notification(thread_arg->dpa_producer_comp);
+
+    DOCA_DPA_DEV_LOG_INFO("DMA copy args: producer=0x%lx producer_comp=0x%lx consumer_id=%u dst_mmap=%u dst_addr=0x%lx src_mmap=%u src_addr=0x%lx len=%u\n",
+                          producer,
+                          thread_arg->dpa_producer_comp,
+                          dpu_consumer_id,
+                          ring->dpu_mmap,
+                          ring->dpu_addr + thread_arg->pos[r],
+                          ring->host_mmap,
+                          desc->addr,
+                          desc->size);
 
     /* 2. DMA copy: Host buffer → DPU local buffer + Send completion to DPU.
      * We use FLUSH to ensure submission. */
@@ -241,12 +281,20 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
             if (comp_rc == 0) {
                 wait_loops++;
                 if ((wait_loops & 0xFFFFF) == 0) {
+                    int consumer_empty = doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id);
                     DOCA_DPA_DEV_LOG_INFO("Still waiting DMA completion: producer_comp=0x%lx ring=%u slot=%u req_id=%u loops=%u\n",
                                           thread_arg->dpa_producer_comp,
                                           r,
                                           thread_arg->desc_idx[r],
                                           (uint32_t)desc->idx,
                                           wait_loops);
+                    DOCA_DPA_DEV_LOG_INFO("Wait-state detail: producer=0x%lx consumer_id=%u consumer_empty=%d dst_addr=0x%lx src_addr=0x%lx len=%u\n",
+                                          producer,
+                                          dpu_consumer_id,
+                                          consumer_empty,
+                                          ring->dpu_addr + thread_arg->pos[r],
+                                          desc->addr,
+                                          desc->size);
                 }
             }
         } while (comp_rc == 0);
