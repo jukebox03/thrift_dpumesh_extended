@@ -152,6 +152,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                     else
                         DOCA_LOG_INFO("Forwarded %u bytes via datapath to pod %d for req_id=%u",
                                       data_len, dst_pod_id, req_id);
+                    /* Clear DMA buffer region after forwarding to prevent stale data on wrap-around */
+                    memset(data, 0, data_len);
                 } else {
                     DOCA_LOG_ERR("DMA completed: dst_pod=%d not found", dst_pod_id);
                 }
@@ -177,6 +179,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                 if (echo_result != DOCA_SUCCESS)
                     DOCA_LOG_ERR("Echo back failed for req_id=%u: %s",
                                  req_id, doca_error_get_descr(echo_result));
+                /* Clear DMA buffer region after echo to prevent stale data on wrap-around */
+                memset(data, 0, data_len);
             }
             break;
         }

@@ -551,6 +551,9 @@ uint8_t *dpumesh_tx_buf(dpumesh_ctx_t *ctx, int slot) {
 
 void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
     if (slot < 0 || slot >= ctx->num_slots) return;
+    /* Clear TX buffer before releasing slot to prevent stale data */
+    uint8_t *buf = (uint8_t *)ctx->dma_buffer + ((size_t)slot * ctx->slot_size);
+    memset(buf, 0, ctx->slot_size);
     pthread_mutex_lock(&ctx->slot_lock);
     ctx->slot_bitmap[slot] = 0;
     pthread_mutex_unlock(&ctx->slot_lock);
@@ -671,6 +674,9 @@ uint8_t *dpumesh_rx_buf(dpumesh_ctx_t *ctx, int slot) {
 
 void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot) {
     if (slot < 0 || slot >= ctx->num_slots) return;
+    /* Clear RX buffer before releasing slot to prevent stale data */
+    uint8_t *buf = (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
+    memset(buf, 0, ctx->slot_size);
     pthread_mutex_lock(&ctx->rx_slot_lock);
     ctx->rx_slot_bitmap[slot] = 0;
     pthread_mutex_unlock(&ctx->rx_slot_lock);

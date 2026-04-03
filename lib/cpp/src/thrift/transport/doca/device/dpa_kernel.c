@@ -349,7 +349,14 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     }
 
     __dpa_thread_window_writeback();
+    /* Clear descriptor fields to prevent stale data, then mark invalid */
     desc->valid = 0;
+    desc->mmap = 0;
+    desc->addr = 0;
+    desc->size = 0;
+    desc->idx = 0;
+    desc->dst_pod_id = 0;
+    desc->flags = 0;
     __dpa_thread_window_writeback();
 
     thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
