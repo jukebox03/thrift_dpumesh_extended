@@ -263,6 +263,26 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     DOCA_DPA_DEV_LOG_INFO("DMA copy submitted (fire-and-forget): ring=%u slot=%u req_id=%u size=%u\n",
                           r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->size);
 
+    /* DEBUG: poll DPU buffer to distinguish DMA failure vs completion failure.
+     * Spin briefly then sample the first 4 bytes at the DMA destination.
+     * If all zeros after many loops → DMA not writing; if non-zero → DMA OK, completion broken. */
+    {
+        volatile uint8_t *dst = (volatile uint8_t *)(uintptr_t)(ring->dpu_addr + thread_arg->pos[r]);
+        uint32_t poll = 0;
+        const uint32_t max_poll = 2000000;
+        while (poll < max_poll) {
+            if (dst[0] != 0 || dst[1] != 0 || dst[2] != 0 || dst[3] != 0)
+                break;
+            poll++;
+        }
+        DOCA_DPA_DEV_LOG_INFO("DEBUG DMA dst poll: ring=%u pos=%u loops=%u "
+                              "dst[0..3]=0x%02x 0x%02x 0x%02x 0x%02x (%s)\n",
+                              r, thread_arg->pos[r], poll,
+                              (unsigned)dst[0], (unsigned)dst[1],
+                              (unsigned)dst[2], (unsigned)dst[3],
+                              (poll < max_poll) ? "DATA_ARRIVED" : "NO_DATA_TIMEOUT");
+    }
+
     thread_arg->pos[r] += desc->size;
 
     if (thread_arg->pos[r] >= ring->dpu_buf_size) {

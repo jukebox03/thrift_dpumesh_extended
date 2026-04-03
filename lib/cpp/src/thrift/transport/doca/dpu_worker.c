@@ -110,6 +110,22 @@ run_dpu_worker(struct objects *objs)
         if (elapsed >= 1.0) {
             DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s, pods: %d",
                           elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt, objs->num_pods);
+            /* DEBUG: check if DMA data arrived in each pod's dma_buffer at multiple offsets */
+            for (int i = 0; i < objs->num_pods; i++) {
+                uint8_t *buf = (uint8_t *)objs->pods[i].dma_buffer;
+                if (buf) {
+                    /* Check offset 0, 59, 118, 177 (assuming 59-byte requests) */
+                    static const uint32_t dbg_offsets[] = {0, 59, 118, 177, 236};
+                    for (int oi = 0; oi < 5; oi++) {
+                        uint32_t off = dbg_offsets[oi];
+                        DOCA_LOG_INFO("DEBUG dma_buffer pod=%d off=%u: "
+                                      "%02x %02x %02x %02x %02x %02x %02x %02x",
+                                      objs->pods[i].pod_id, off,
+                                      buf[off+0], buf[off+1], buf[off+2], buf[off+3],
+                                      buf[off+4], buf[off+5], buf[off+6], buf[off+7]);
+                    }
+                }
+            }
             objs->sent_msg_cnt = 0;
             objs->recv_msg_cnt = 0;
             last = now;
