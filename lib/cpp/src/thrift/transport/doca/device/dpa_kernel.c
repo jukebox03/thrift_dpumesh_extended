@@ -245,8 +245,9 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                           desc->addr,
                           desc->size);
 
-    /* 1. DMA copy: Host buffer → DPU local buffer + Send completion to DPU.
-     * We use FLUSH to ensure submission. */
+    /* DMA copy: Host buffer → DPU local buffer + Send imm data to DPU consumer.
+     * Fire-and-forget: dma_copy does NOT post to producer_comp.
+     * OPTIMIZE_REPORTS suppresses producer-side completion generation. */
     doca_dpa_dev_comch_producer_dma_copy(producer,
                                 dpu_consumer_id,
                                 ring->dpu_mmap,
@@ -256,88 +257,18 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                 desc->size,
                                 (uint8_t *)&comp,
                                 sizeof(struct comch_dma_comp_msg),
+                                DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
                                 DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
-    DOCA_DPA_DEV_LOG_INFO("DMA copy submitted: ring=%u slot=%u req_id=%u size=%u\n",
+    DOCA_DPA_DEV_LOG_INFO("DMA copy submitted (fire-and-forget): ring=%u slot=%u req_id=%u size=%u\n",
                           r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->size);
-
-    /* 2. Wait for DMA completion on DPA to ensure data is moved and imm data is sent */
-    {
-        doca_dpa_dev_completion_element_t dma_comp;
-        uint32_t wait_loops = 0;
-        const uint32_t wait_yield_interval = 0x20000;       /* 131,072 loops */
-        const uint32_t wait_timeout_loops = 0x800000;       /* 8,388,608 loops */
-        int comp_rc;
-
-        DOCA_DPA_DEV_LOG_INFO("Waiting DMA completion: producer_comp=0x%lx ring=%u slot=%u req_id=%u\n",
-                              thread_arg->dpa_producer_comp,
-                              r,
-                              thread_arg->desc_idx[r],
-                              (uint32_t)desc->idx);
-
-        do {
-            comp_rc = doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &dma_comp);
-            if (comp_rc == 0) {
-                wait_loops++;
-                if ((wait_loops % wait_yield_interval) == 0) {
-                    int consumer_empty = doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id);
-                    DOCA_DPA_DEV_LOG_INFO("Still waiting DMA completion: producer_comp=0x%lx ring=%u slot=%u req_id=%u loops=%u\n",
-                                          thread_arg->dpa_producer_comp,
-                                          r,
-                                          thread_arg->desc_idx[r],
-                                          (uint32_t)desc->idx,
-                                          wait_loops);
-                    DOCA_DPA_DEV_LOG_INFO("Wait-state detail: producer=0x%lx consumer_id=%u consumer_empty=%d dst_addr=0x%lx src_addr=0x%lx len=%u\n",
-                                          producer,
-                                          dpu_consumer_id,
-                                          consumer_empty,
-                                          ring->dpu_addr + thread_arg->pos[r],
-                                          desc->addr,
-                                          desc->size);
-
-                    if (wait_loops >= wait_timeout_loops) {
-                        DOCA_DPA_DEV_LOG_INFO("DMA completion timeout: producer_comp=0x%lx ring=%u slot=%u req_id=%u loops=%u type_hint=timeout\n",
-                                              thread_arg->dpa_producer_comp,
-                                              r,
-                                              thread_arg->desc_idx[r],
-                                              (uint32_t)desc->idx,
-                                              wait_loops);
-                        break;
-                    }
-                }
-            }
-        } while (comp_rc == 0);
-
-        if (comp_rc == 0) {
-            /* Timeout path: drop this descriptor so the thread can keep processing subsequent work. */
-            desc->valid = 0;
-            __dpa_thread_window_writeback();
-            thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
-            return 1;
-        }
-
-        DOCA_DPA_DEV_LOG_INFO("DMA completion received: rc=%d type=%u user_data=%u imm=%u wait_loops=%u req_id=%u\n",
-                              comp_rc,
-                              (unsigned int)doca_dpa_dev_get_completion_type(dma_comp),
-                              doca_dpa_dev_get_completion_user_data(dma_comp),
-                              doca_dpa_dev_get_completion_immediate(dma_comp),
-                              wait_loops,
-                              (uint32_t)desc->idx);
-
-        doca_dpa_dev_completion_ack(thread_arg->dpa_producer_comp, 1);
-        DOCA_DPA_DEV_LOG_INFO("DMA completion acked: producer_comp=0x%lx req_id=%u\n",
-                              thread_arg->dpa_producer_comp,
-                              (uint32_t)desc->idx);
-    }
 
     thread_arg->pos[r] += desc->size;
 
-    /* Ensure DMA is finished before host sees valid=0 */
     __dpa_thread_window_writeback();
     desc->valid = 0;
     __dpa_thread_window_writeback();
 
-    /* Advance to next ring slot */
     thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
     return 1;
 }
