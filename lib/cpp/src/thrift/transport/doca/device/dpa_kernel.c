@@ -289,9 +289,10 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                           desc->addr,
                           desc->size);
 
-    /* DMA copy: Host buffer → DPU local buffer + Send imm data to DPU consumer.
-     * Fire-and-forget: dma_copy does NOT post to producer_comp.
-     * OPTIMIZE_REPORTS suppresses producer-side completion generation. */
+    /* DMA copy: Host buffer → DPU local buffer.
+     * Fire-and-forget for the DMA itself (OPTIMIZE_REPORTS suppresses producer completion).
+     * Then send completion notification separately via post_send_imm_only so
+     * DPU consumer always receives it regardless of DMA success/failure. */
     doca_dpa_dev_comch_producer_dma_copy(producer,
                                 dpu_consumer_id,
                                 ring->dpu_mmap,
