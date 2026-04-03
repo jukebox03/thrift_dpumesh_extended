@@ -49,7 +49,7 @@ static void cleanup_ctx(struct dpumesh_ctx *ctx);
 #define RX_QUEUE_SIZE 512
 
 /* Pending response table for client-side request/response matching */
-#define MAX_PENDING 256
+#define MAX_PENDING 4096
 
 /* Inflight TX table for ACK-based slot release (server response path) */
 #define MAX_TX_INFLIGHT 512

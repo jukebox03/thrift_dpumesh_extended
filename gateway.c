@@ -159,8 +159,9 @@ static void *handle_connection(void *arg)
     rc = dpumesh_wait_response(g_ctx, req_id, &resp, RESPONSE_TIMEOUT);
     if (rc < 0) {
         fprintf(stderr, "[gateway] Response timeout for req_id=%u\n", req_id);
-        /* Free TX slot on timeout to prevent leak */
+        /* Free TX slot and cancel pending entry on timeout to prevent leak */
         dpumesh_tx_free(g_ctx, tx_slot);
+        dpumesh_cancel_pending(g_ctx, req_id);
         goto done;
     }
 

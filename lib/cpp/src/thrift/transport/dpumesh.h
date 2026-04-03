@@ -20,7 +20,7 @@ extern "C" {
 
 /* ====== Default constants ====== */
 #define DPUMESH_SLOT_SIZE_DEFAULT       (1024 * 1024)   /* 1MB */
-#define DPUMESH_NUM_SLOTS_DEFAULT       64
+#define DPUMESH_NUM_SLOTS_DEFAULT       256
 #define DPUMESH_DESCRIPTOR_SIZE         64
 #define DPUMESH_MAX_DESCRIPTORS_DEFAULT 1024
 #define DPUMESH_PREFIX_DEFAULT          "dpumesh"
