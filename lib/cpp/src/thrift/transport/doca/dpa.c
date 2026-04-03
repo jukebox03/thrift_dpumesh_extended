@@ -288,19 +288,48 @@ void dmesh_doca_dpa_comch_msgq_ctx_state_changed_cb(const union doca_data user_d
 							  enum doca_ctx_states prev_state,
 							  enum doca_ctx_states next_state)
 {
-	(void)ctx;
 	(void)prev_state;
-
-	// struct nvmf_doca_io *io = user_data.ptr;
 
 	switch (next_state) {
 	case DOCA_CTX_STATE_IDLE:
         DOCA_LOG_ERR("DPA comch msgQ state is idle.");
-		// nvmf_doca_dpa_comch_stop_continue(&io->comch);
 		break;
     case DOCA_CTX_STATE_STARTING:
-    case DOCA_CTX_STATE_RUNNING:
-        DOCA_LOG_ERR("DPA comch msgQ state is running.");
+        DOCA_LOG_INFO("DPA comch msgQ state is starting.");
+        break;
+    case DOCA_CTX_STATE_RUNNING: {
+        /* recv.consumer가 RUNNING 상태가 되면 recv task를 등록한다.
+         * msgq_create 시점(STARTING)에는 task 등록이 유효하지 않을 수 있으므로
+         * RUNNING 전환 콜백에서 등록한다. */
+        struct objects *objs = user_data.ptr;
+        DOCA_LOG_INFO("DPA comch msgQ ctx RUNNING.");
+        if (objs == NULL || objs->dpa_comch == NULL)
+            break;
+        struct dmesh_doca_dpa_msgq *recv_msgq = &objs->dpa_comch->recv;
+        if (ctx != doca_comch_consumer_as_ctx(recv_msgq->consumer))
+            break;
+        uint32_t posted = 0;
+        for (uint32_t idx = 0; idx < CC_DPA_MAX_MSG_NUM; idx++) {
+            struct doca_comch_consumer_task_post_recv *recv_task;
+            doca_error_t r = doca_comch_consumer_task_post_recv_alloc_init(
+                recv_msgq->consumer, NULL, &recv_task);
+            if (r != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("recv.consumer RUNNING: alloc recv task failed at idx=%u: %s",
+                             idx, doca_error_get_name(r));
+                break;
+            }
+            r = doca_task_submit(doca_comch_consumer_task_post_recv_as_task(recv_task));
+            if (r != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("recv.consumer RUNNING: submit recv task failed at idx=%u: %s",
+                             idx, doca_error_get_name(r));
+                doca_task_free(doca_comch_consumer_task_post_recv_as_task(recv_task));
+                break;
+            }
+            posted++;
+        }
+        DOCA_LOG_INFO("recv.consumer RUNNING: posted %u recv tasks", posted);
+        break;
+    }
 	case DOCA_CTX_STATE_STOPPING:
 	default:
 		break;
@@ -659,25 +688,8 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                   (int)attr->is_send, (void *)msgq->consumer, (void *)msgq->producer,
                   msgq->target_consumer_id);
 
-    /* Pre-post recv tasks if MsgQ is used for receiving from DPA */
-    if (attr->is_send == false) {
-        for (uint32_t idx = 0; idx < attr->max_num_msg; idx++) {
-            struct doca_comch_consumer_task_post_recv *recv_task;
-            result = doca_comch_consumer_task_post_recv_alloc_init(msgq->consumer, NULL, &recv_task);
-            if (result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("Failed to allocate consumer post recv task - %s",
-                        doca_error_get_name(result));
-                return result;
-            }
-            result = doca_task_submit(doca_comch_consumer_task_post_recv_as_task(recv_task));
-            if (result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("Failed to submit consumer post recv task - %s",
-                        doca_error_get_name(result));
-                return result;
-            }
-        }
-            DOCA_LOG_INFO("DPA MsgQ pre-posted recv tasks: count=%u", attr->max_num_msg);
-    }
+    /* recv task 등록은 consumer ctx가 RUNNING 상태가 된 후
+     * dmesh_doca_dpa_comch_msgq_ctx_state_changed_cb에서 수행한다. */
 
     return DOCA_SUCCESS;
 }
