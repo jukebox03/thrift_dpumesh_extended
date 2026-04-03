@@ -189,7 +189,18 @@ doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
 	task_user_data.ptr = msg_copy;
 	doca_task_set_user_data(task_obj, task_user_data);
 
-	result = doca_task_submit(task_obj);
+	/* Retry with PE progress if task queue is temporarily full */
+	{
+		int retry = 0;
+		do {
+			result = doca_task_submit(task_obj);
+			if (result == DOCA_ERROR_AGAIN) {
+				if (objs->pe)
+					doca_pe_progress(objs->pe);
+				retry++;
+			}
+		} while (result == DOCA_ERROR_AGAIN && retry < 1000);
+	}
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to send client task with error = %s", doca_error_get_name(result));
 		free(msg_copy);

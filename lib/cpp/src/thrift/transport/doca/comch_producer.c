@@ -418,12 +418,17 @@ comch_datapath_send_payload(struct doca_comch_producer *producer,
 	}
 
 	int retry = 0;
-	const int max_retry = 10000;
+	const int max_retry = 1000;
 	do {
 		result = doca_task_submit(doca_comch_producer_task_send_as_task(send_task));
 		if (result == DOCA_ERROR_AGAIN) {
-			if (pe)
-				doca_pe_progress(pe);
+			/* Drain multiple completions per retry cycle */
+			for (int p = 0; p < 10; p++) {
+				if (pe)
+					doca_pe_progress(pe);
+			}
+			struct timespec backoff = {0, 1000}; /* 1µs */
+			nanosleep(&backoff, NULL);
 			retry++;
 		}
 	} while (result == DOCA_ERROR_AGAIN && retry < max_retry);

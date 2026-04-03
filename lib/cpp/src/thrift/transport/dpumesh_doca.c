@@ -560,7 +560,7 @@ void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
 }
 
 int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
-    struct dma_desc *dma = get_next_dma_desc(ctx->dma_ring);
+    struct dma_desc *dma;
     uint32_t ring_slot;
 
     if (desc == NULL) {
@@ -580,8 +580,23 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
         return -1;
     }
 
-    if (!dma)
-        return -1;
+    /* Retry with backoff if DMA ring is temporarily full */
+    {
+        int ring_retry = 0;
+        const int max_ring_retry = 100;
+        struct timespec backoff = {0, 10000}; /* 10µs */
+        while (ring_retry < max_ring_retry) {
+            dma = get_next_dma_desc(ctx->dma_ring);
+            if (dma)
+                break;
+            nanosleep(&backoff, NULL);
+            ring_retry++;
+        }
+        if (!dma) {
+            DOCA_LOG_ERR("ENQUEUE failed: DMA ring exhausted after %d retries", max_ring_retry);
+            return -1;
+        }
+    }
 
     ring_slot = (uint32_t)(dma - ctx->dma_ring->descs);
 
