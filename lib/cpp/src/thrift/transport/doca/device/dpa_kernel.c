@@ -265,6 +265,12 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
 
     thread_arg->pos[r] += desc->size;
 
+    if (thread_arg->pos[r] >= ring->dpu_buf_size) {
+        DOCA_DPA_DEV_LOG_INFO("Ring buffer wrap-around: ring=%u pos=%u buf_size=%u\n",
+                              r, thread_arg->pos[r], ring->dpu_buf_size);
+        thread_arg->pos[r] = 0;
+    }
+
     __dpa_thread_window_writeback();
     desc->valid = 0;
     __dpa_thread_window_writeback();
