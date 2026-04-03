@@ -81,7 +81,7 @@ doca_error_t init_local_mem_bufs(struct local_mem_bufs *local, struct doca_dev *
 		goto destroy_mmap;
 	}
 
-	result = doca_mmap_set_permissions(local->mmap, DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+	result = doca_mmap_set_permissions(local->mmap, DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_READ_WRITE);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Unable to set permission to mmap: %s", doca_error_get_descr(result));
 		goto destroy_mmap;

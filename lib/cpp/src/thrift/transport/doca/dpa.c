@@ -1130,7 +1130,7 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
     /* 2. Allocate local DMA buffer (DPU working buffer) + PCI export */
     result = alloc_buffer_and_set_mmap(&pod->local_mmap, objs->dev,
                                        &pod->dma_buffer, DPU_BUFFER_SIZE,
-                                       DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+                                       DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_READ_WRITE);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("setup_pod_dma: alloc buffer failed for pod %d: %s",
                      pod->pod_id, doca_error_get_descr(result));
