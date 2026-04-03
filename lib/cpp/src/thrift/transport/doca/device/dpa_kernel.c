@@ -291,8 +291,9 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
 
     /* DMA copy: Host buffer → DPU local buffer.
      * Split into 128-byte chunks to work around observed DPA DMA size limit.
-     * All chunks except the last are fire-and-forget (OPTIMIZE_REPORTS).
-     * The last chunk carries the completion notification (imm data). */
+     * Non-last chunks: DMA only, imm_length=0 so DPU consumer is NOT notified.
+     * Last chunk: DMA + completion notification (imm data with comp msg).
+     * PCIe ordering guarantees earlier DMAs complete before later ones. */
     {
         uint32_t total = desc->size;
         uint32_t offset = 0;
@@ -306,7 +307,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
             int is_last = (offset + chunk >= total);
 
             if (is_last) {
-                /* Last chunk: send with completion notification */
+                /* Last chunk: DMA + send completion notification to DPU consumer */
                 doca_dpa_dev_comch_producer_dma_copy(producer,
                     dpu_consumer_id,
                     ring->dpu_mmap,
@@ -318,7 +319,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                     sizeof(struct comch_dma_comp_msg),
                     DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
             } else {
-                /* Non-last chunk: fire-and-forget, no imm data needed */
+                /* Non-last chunk: DMA only, no consumer notification (imm_length=0) */
                 doca_dpa_dev_comch_producer_dma_copy(producer,
                     dpu_consumer_id,
                     ring->dpu_mmap,
@@ -326,8 +327,8 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                     ring->host_mmap,
                     desc->addr + offset,
                     chunk,
-                    (uint8_t *)&comp,
-                    sizeof(struct comch_dma_comp_msg),
+                    NULL,
+                    0,
                     DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
                     DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
             }
