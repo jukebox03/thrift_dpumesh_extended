@@ -418,6 +418,28 @@ run_test() {
     fi
 }
 
+### 사이즈 경계 테스트 ###
+run_size_test() {
+    step "=== Running DMA Size Boundary Test ==="
+    sleep 3
+
+    local gw_ip
+    gw_ip=$(kubectl get pod -n "$NS" -l app=dpumesh-gateway -o jsonpath='{.items[0].status.podIP}' 2>/dev/null || true)
+    if [ -z "$gw_ip" ]; then
+        err "Gateway pod not found"
+        kubectl get pods -n "$NS"
+        return 1
+    fi
+
+    info "Gateway IP: $gw_ip:$GATEWAY_PORT"
+
+    if [ -f "$PROJ_ROOT/test_thrift.py" ]; then
+        python3 "$PROJ_ROOT/test_thrift.py" "$gw_ip" "$GATEWAY_PORT" size
+    else
+        warn "test_thrift.py not found, skipping"
+    fi
+}
+
 ### 로그 확인 ###
 show_logs() {
     echo ""
@@ -534,6 +556,9 @@ case "$CMD" in
     test)
         run_test
         ;;
+    test-size)
+        run_size_test
+        ;;
     logs)
         show_logs
         ;;
@@ -547,7 +572,7 @@ case "$CMD" in
         cleanup
         ;;
     *)
-        echo "Usage: $0 {deploy|dpu|host|restart|test|logs|status|cleanup|dpu-log}"
+        echo "Usage: $0 {deploy|dpu|host|restart|test|test-size|logs|status|cleanup|dpu-log}"
         echo ""
         echo "Commands:"
         echo "  deploy   - 전체: sync + build(DPU+Host) + 순서대로 시작 + test"
@@ -555,6 +580,7 @@ case "$CMD" in
         echo "  host     - Host만: libthrift.so 재빌드"
         echo "  restart  - Pods만: 순서대로 재시작 (Gateway → Service)"
         echo "  test     - test_thrift.py 실행"
+        echo "  test-size - DMA 사이즈 경계 테스트 (59~1024B)"
         echo "  logs     - DPU + pod 로그 확인"
         echo "  status   - 전체 상태 확인"
         echo "  dpu-log  - DPU 로그 실시간 follow"

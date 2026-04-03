@@ -290,23 +290,54 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                           desc->size);
 
     /* DMA copy: Host buffer → DPU local buffer.
-     * Fire-and-forget for the DMA itself (OPTIMIZE_REPORTS suppresses producer completion).
-     * Then send completion notification separately via post_send_imm_only so
-     * DPU consumer always receives it regardless of DMA success/failure. */
-    doca_dpa_dev_comch_producer_dma_copy(producer,
-                                dpu_consumer_id,
-                                ring->dpu_mmap,
-                                ring->dpu_addr + thread_arg->pos[r],
-                                ring->host_mmap,
-                                desc->addr,
-                                desc->size,
-                                (uint8_t *)&comp,
-                                sizeof(struct comch_dma_comp_msg),
-                                DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
-                                DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+     * Split into 128-byte chunks to work around observed DPA DMA size limit.
+     * All chunks except the last are fire-and-forget (OPTIMIZE_REPORTS).
+     * The last chunk carries the completion notification (imm data). */
+    {
+        uint32_t total = desc->size;
+        uint32_t offset = 0;
+        uint32_t chunk_max = 128;
 
-    DOCA_DPA_DEV_LOG_INFO("DMA copy submitted (fire-and-forget): ring=%u slot=%u req_id=%u size=%u\n",
-                          r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->size);
+        while (offset < total) {
+            uint32_t chunk = total - offset;
+            if (chunk > chunk_max)
+                chunk = chunk_max;
+
+            int is_last = (offset + chunk >= total);
+
+            if (is_last) {
+                /* Last chunk: send with completion notification */
+                doca_dpa_dev_comch_producer_dma_copy(producer,
+                    dpu_consumer_id,
+                    ring->dpu_mmap,
+                    ring->dpu_addr + thread_arg->pos[r] + offset,
+                    ring->host_mmap,
+                    desc->addr + offset,
+                    chunk,
+                    (uint8_t *)&comp,
+                    sizeof(struct comch_dma_comp_msg),
+                    DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+            } else {
+                /* Non-last chunk: fire-and-forget, no imm data needed */
+                doca_dpa_dev_comch_producer_dma_copy(producer,
+                    dpu_consumer_id,
+                    ring->dpu_mmap,
+                    ring->dpu_addr + thread_arg->pos[r] + offset,
+                    ring->host_mmap,
+                    desc->addr + offset,
+                    chunk,
+                    (uint8_t *)&comp,
+                    sizeof(struct comch_dma_comp_msg),
+                    DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
+                    DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+            }
+            offset += chunk;
+        }
+    }
+
+    DOCA_DPA_DEV_LOG_INFO("DMA copy submitted: ring=%u slot=%u req_id=%u size=%u chunks=%u\n",
+                          r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->size,
+                          (desc->size + 127) / 128);
 
     thread_arg->pos[r] += desc->size;
 
