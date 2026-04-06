@@ -6,6 +6,15 @@
 
 #define DMA_DIAG_EMPTY_WAIT_WARN_LOOPS  0x100000
 #define DMA_DIAG_EMPTY_WAIT_FAIL_LOOPS  0x800000
+
+/* Max descriptors to process before pausing for DPU consumer to catch up.
+ * Set well below CC_DPA_MAX_MSG_NUM (1024) — each desc sends one completion
+ * to the DPU consumer, consuming one recv task. After this many, we spin-wait
+ * for the consumer to drain and resubmit, preventing silent message loss. */
+#define DPA_DRAIN_BATCH_LIMIT  512
+
+/* Spin iterations waiting for DPU consumer to resubmit recv tasks */
+#define DPA_CONSUMER_WAIT_LOOPS  0x200000
 /*
  * RPC for initializing DPA IO thread called before running the thread
  *
@@ -111,6 +120,28 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
     }
     /* Always re-arm notification so next message wakes the thread */
     doca_dpa_dev_comch_consumer_completion_request_notification(consumer_comp);
+}
+
+/*
+ * Drain all pending producer completions (DMA copy acks).
+ * Each doca_dpa_dev_comch_producer_dma_copy() consumes one send slot.
+ * This function acknowledges completed sends to free those slots.
+ * Without this, the producer runs out of send slots after CC_DPA_MAX_MSG_NUM
+ * copies and subsequent dma_copy calls silently fail.
+ */
+static void drain_producer_completions(struct dpa_thread_arg *thread_arg)
+{
+    doca_dpa_dev_completion_t producer_comp = thread_arg->dpa_producer_comp;
+    doca_dpa_dev_completion_element_t elem;
+    uint32_t count = 0;
+
+    while (doca_dpa_dev_get_completion(producer_comp, &elem) != 0) {
+        count++;
+    }
+
+    if (count > 0) {
+        doca_dpa_dev_completion_ack(producer_comp, count);
+    }
 }
 
 /*
@@ -369,6 +400,8 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
  */
 static int drain_all_rings(struct dpa_thread_arg *thread_arg)
 {
+    doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
+    uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
     int total = 0;
     int found;
 
@@ -376,12 +409,42 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
         found = 0;
         handle_msgs(thread_arg);
 
+        /* Free producer send slots so dma_copy doesn't silently fail */
+        drain_producer_completions(thread_arg);
+
         uint32_t nr = thread_arg->num_rings;
         for (uint32_t r = 0; r < nr; r++) {
             if (process_one_desc(thread_arg, r))
                 found++;
         }
         total += found;
+
+        /* After DPA_DRAIN_BATCH_LIMIT completions sent, the DPU consumer's
+         * recv tasks may be nearly exhausted. Pause and wait for the DPU to
+         * process callbacks and resubmit tasks before continuing. */
+        if (total >= DPA_DRAIN_BATCH_LIMIT) {
+            /* Drain producer completions to free send slots before pause */
+            drain_producer_completions(thread_arg);
+
+            /* Wait until consumer runs empty (all our completions delivered) */
+            uint32_t wait = 0;
+            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) != 1) {
+                wait++;
+                if (wait >= DPA_CONSUMER_WAIT_LOOPS)
+                    break;
+            }
+            /* Now wait until consumer has tasks again (DPU resubmitted) */
+            wait = 0;
+            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
+                wait++;
+                if (wait >= DPA_CONSUMER_WAIT_LOOPS) {
+                    DOCA_DPA_DEV_LOG_INFO("drain: consumer still empty after wait, total=%d\n", total);
+                    break;
+                }
+            }
+            DOCA_DPA_DEV_LOG_INFO("drain batch pause: %d descs processed, resuming\n", total);
+            total = 0;  /* reset counter for next batch */
+        }
     } while (found > 0);
 
     return total;
@@ -419,6 +482,9 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
     /* Event loop: process all pending work, then yield until next doorbell */
     while (1) {
         drain_all_rings(thread_arg);
+
+        /* Free any remaining producer send slots before going idle */
+        drain_producer_completions(thread_arg);
 
         /* No more work — yield. Thread resumes on next completion event
          * (NEW_DESC doorbell or ADD_RING from DPU). handle_msgs always

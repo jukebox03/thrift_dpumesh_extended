@@ -8,7 +8,7 @@
 // #include <doca_dpa_dev.h>
 // #include <doca_dpa_dev_comch_msgq.h>
 
-#define CC_DPA_MAX_MSG_NUM  512
+#define CC_DPA_MAX_MSG_NUM  1024
 
 struct objects;
 struct pod_state;

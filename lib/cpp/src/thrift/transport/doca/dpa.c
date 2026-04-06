@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -98,89 +99,46 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 
             /* Find the source pod's local DMA buffer for data */
             struct pod_state *src_pod = find_pod_by_id(objs, src_pod_id);
-            uint8_t *data = NULL;
+            uint8_t *payload_src = NULL;
             if (src_pod && src_pod->dma_buffer) {
-                data = (uint8_t *)src_pod->dma_buffer + comp_msg->pos;
+                payload_src = (uint8_t *)src_pod->dma_buffer + comp_msg->pos;
             } else {
                 DOCA_LOG_ERR("DMA completed but src_pod %d not found or no buffer", src_pod_id);
                 break;
             }
-            uint32_t data_len = comp_msg->length;
+            uint32_t payload_len = comp_msg->length;
 
             DOCA_LOG_INFO("DMA completed: src_pod=%d, dst_pod=%d, req_id=%u, pos=%u, len=%u",
-                          src_pod_id, dst_pod_id, req_id, comp_msg->pos, data_len);
+                          src_pod_id, dst_pod_id, req_id, comp_msg->pos, payload_len);
 
-            /* Send TX ACK back to the source pod so host can free TX slot safely. */
-            if (src_pod && src_pod->connection) {
-                doca_error_t ack_result = server_send_tx_ack_to(objs,
-                    src_pod->connection, req_id, dst_pod_id);
-                if (ack_result != DOCA_SUCCESS) {
-                    DOCA_LOG_ERR("TX_ACK send failed to src_pod=%d req_id=%u dst_pod=%d: %s",
-                                 src_pod_id, req_id, dst_pod_id,
-                                 doca_error_get_descr(ack_result));
-                }
+            /* --- Deferred completion: enqueue instead of blocking send --- */
+            dpu_comp_entry_t entry;
+            entry.src_pod_id = src_pod_id;
+            entry.dst_pod_id = dst_pod_id;
+            entry.req_id = req_id;
+            entry.length = payload_len;
+            entry.flags = comp_msg->flags;
+
+            /* Heap-copy the DMA payload so main loop can send it later */
+            entry.data = (uint8_t *)malloc(payload_len);
+            if (entry.data) {
+                memcpy(entry.data, payload_src, payload_len);
+            } else {
+                DOCA_LOG_ERR("malloc(%u) failed for comp queue entry req_id=%u",
+                             payload_len, req_id);
+                break;
             }
 
-            /* Route to destination pod (dst_pod_id) */
-            int echo_mode = (dst_pod_id == -1 ||
-                             dst_pod_id == src_pod_id);
+            /* Clear DMA buffer region immediately to prevent stale data on wrap-around */
+            memset(payload_src, 0, payload_len);
 
-            if (!echo_mode) {
-                struct pod_state *dst = find_pod_by_id(objs, dst_pod_id);
-                if (dst && dst->connection) {
-                    /* Forward to destination pod */
-                    sw_descriptor_t fwd_desc;
-                    memset(&fwd_desc, 0, sizeof(fwd_desc));
-                    fwd_desc.header_buf_slot = -1;
-                    fwd_desc.body_buf_slot = -1;
-                    fwd_desc.body_len = data_len;
-                    fwd_desc.req_id = req_id;
-                    fwd_desc.src_pod_id = src_pod_id;
-                    fwd_desc.dst_pod_id = dst_pod_id;
-                    /* Preserve request/response bit from DMA completion and keep ingress case. */
-                    fwd_desc.flags = (comp_msg->flags & OP_RESPONSE) | CASE_INGRESS;
-                    fwd_desc.valid = 1;
-
-                    doca_error_t fwd_result = server_send_rx_data_to(
-                        objs, dst->connection,
-                        &fwd_desc, sizeof(sw_descriptor_t),
-                        data,
-                        data_len);
-                    if (fwd_result != DOCA_SUCCESS)
-                        DOCA_LOG_ERR("Forward to pod %d failed for req_id=%u: %s",
-                                     dst_pod_id, req_id, doca_error_get_descr(fwd_result));
-                    else
-                        DOCA_LOG_INFO("Forwarded %u bytes via datapath to pod %d for req_id=%u",
-                                      data_len, dst_pod_id, req_id);
-                    /* Clear DMA buffer region after forwarding to prevent stale data on wrap-around */
-                    memset(data, 0, data_len);
-                } else {
-                    DOCA_LOG_ERR("DMA completed: dst_pod=%d not found", dst_pod_id);
-                }
+            if (comp_queue_enqueue(&objs->comp_queue, &entry) != 0) {
+                DOCA_LOG_ERR("Completion queue full, dropping req_id=%u (src=%d, dst=%d)",
+                             req_id, src_pod_id, dst_pod_id);
+                free(entry.data);
             } else {
-                /* Echo mode: same pod or single-pod testing */
-                sw_descriptor_t echo_desc;
-                memset(&echo_desc, 0, sizeof(echo_desc));
-                echo_desc.header_buf_slot = -1;
-                echo_desc.body_buf_slot = -1;
-                echo_desc.body_len = data_len;
-                echo_desc.req_id = req_id;
-                echo_desc.flags = OP_RESPONSE;
-                echo_desc.valid = 1;
-
-                doca_error_t echo_result = DOCA_ERROR_NOT_FOUND;
-                if (src_pod && src_pod->connection) {
-                    echo_result = server_send_rx_data_to(objs,
-                        src_pod->connection,
-                        &echo_desc, sizeof(sw_descriptor_t),
-                        data,
-                        data_len);
-                }
-                if (echo_result != DOCA_SUCCESS)
-                    DOCA_LOG_ERR("Echo back failed for req_id=%u: %s",
-                                 req_id, doca_error_get_descr(echo_result));
-                /* Clear DMA buffer region after echo to prevent stale data on wrap-around */
-                memset(data, 0, data_len);
+                DOCA_LOG_INFO("Enqueued completion: req_id=%u src=%d dst=%d len=%u",
+                              req_id, src_pod_id, dst_pod_id, payload_len);
             }
             break;
         }
@@ -196,19 +154,29 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     objs->recv_msg_cnt++;
 
 resubmit_recv_task:
-    int resubmit_retry = 0;
-    do {
-        result = doca_task_submit(task);
-        if (result == DOCA_ERROR_AGAIN) {
-            doca_pe_progress(objs->consumer_pe);
-            resubmit_retry++;
-        }
-    } while (result == DOCA_ERROR_AGAIN && resubmit_retry < 1000);
+    {
+        static uint64_t resubmit_ok = 0, resubmit_fail = 0;
+        int resubmit_retry = 0;
+        do {
+            result = doca_task_submit(task);
+            if (result == DOCA_ERROR_AGAIN) {
+                doca_pe_progress(objs->consumer_pe);
+                resubmit_retry++;
+            }
+        } while (result == DOCA_ERROR_AGAIN && resubmit_retry < 1000);
 
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("DPA MsgQ receive callback failed: Failed to resubmit receive task after %d retries - %s",
-                     resubmit_retry, doca_error_get_name(result));
-        doca_task_free(task);
+        if (result != DOCA_SUCCESS) {
+            resubmit_fail++;
+            DOCA_LOG_ERR("DPA MsgQ recv resubmit FAILED #%lu (retries=%d): %s",
+                         resubmit_fail, resubmit_retry, doca_error_get_name(result));
+            doca_task_free(task);
+        } else {
+            resubmit_ok++;
+            if (resubmit_retry > 0 || (resubmit_ok % 100 == 0)) {
+                DOCA_LOG_INFO("DPA MsgQ recv resubmit OK #%lu (retries=%d, fails=%lu)",
+                              resubmit_ok, resubmit_retry, resubmit_fail);
+            }
+        }
     }
 }
 
@@ -225,10 +193,14 @@ static void dmesh_doca_dpa_msgq_recv_error_cb(struct doca_comch_consumer_task_po
 {
 	(void)task_user_data;
 	(void)ctx_user_data;
-
-    DOCA_LOG_ERR("DPA MsgQ recv error callback entered");
+	static uint64_t recv_err_count = 0;
+	recv_err_count++;
 
 	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
+	doca_error_t status = doca_task_get_status(task);
+
+	DOCA_LOG_ERR("DPA MsgQ recv ERROR callback #%lu: status=%s(%d)",
+	             recv_err_count, doca_error_get_descr(status), (int)status);
 
 	doca_task_free(task);
 }

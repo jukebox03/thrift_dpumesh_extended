@@ -19,6 +19,51 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 
 #define MAX_CONSUMERS 16
 
+/* Deferred completion queue — DPU only.
+ * Consumer callback enqueues; main loop drains.
+ * Single-threaded (same DPU worker), so no lock needed. */
+#define DPU_COMP_QUEUE_SIZE 2048
+
+typedef struct {
+    int32_t  src_pod_id;
+    int32_t  dst_pod_id;
+    uint32_t req_id;
+    uint32_t length;
+    int8_t   flags;
+    uint8_t *data;       /* heap-allocated copy of DMA payload */
+} dpu_comp_entry_t;
+
+typedef struct {
+    dpu_comp_entry_t entries[DPU_COMP_QUEUE_SIZE];
+    uint32_t head;  /* dequeue index */
+    uint32_t tail;  /* enqueue index */
+} dpu_comp_queue_t;
+
+static inline int comp_queue_full(const dpu_comp_queue_t *q) {
+    return ((q->tail + 1) % DPU_COMP_QUEUE_SIZE) == q->head;
+}
+
+static inline int comp_queue_empty(const dpu_comp_queue_t *q) {
+    return q->head == q->tail;
+}
+
+static inline int comp_queue_enqueue(dpu_comp_queue_t *q, const dpu_comp_entry_t *e) {
+    if (comp_queue_full(q)) return -1;
+    q->entries[q->tail] = *e;
+    q->tail = (q->tail + 1) % DPU_COMP_QUEUE_SIZE;
+    return 0;
+}
+
+static inline dpu_comp_entry_t *comp_queue_peek(dpu_comp_queue_t *q) {
+    if (comp_queue_empty(q)) return NULL;
+    return &q->entries[q->head];
+}
+
+static inline void comp_queue_dequeue(dpu_comp_queue_t *q) {
+    if (!comp_queue_empty(q))
+        q->head = (q->head + 1) % DPU_COMP_QUEUE_SIZE;
+}
+
 /* Per-pod state (DPU only) */
 struct pod_state {
     struct doca_comch_connection *connection;
@@ -111,6 +156,9 @@ struct objects {
     struct pod_state pods[MAX_PODS];
     int num_pods;
     pthread_mutex_t pods_lock;
+
+    /* Deferred completion queue (DPU only) */
+    dpu_comp_queue_t comp_queue;
 };
 
 void
