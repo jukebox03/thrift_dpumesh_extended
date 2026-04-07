@@ -142,12 +142,6 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
     doca_dpa_dev_comch_consumer_completion_t consumer_comp = thread_arg->dpa_consumer_comp;
     uint32_t num_msgs = 0;
 
-    /* Arm FIRST, then drain — standard CQ notification pattern.
-     * If a completion arrives between arm and drain, it will fire
-     * the notification and wake the thread after reschedule.
-     * If we drain-then-arm, a completion arriving in that gap is lost. */
-    doca_dpa_dev_comch_consumer_completion_request_notification(consumer_comp);
-
     while (doca_dpa_dev_comch_consumer_get_completion(consumer_comp, &completion) != 0) {
         msg = (struct comch_msg *)doca_dpa_dev_comch_consumer_get_completion_imm(completion, &msg_size);
         if (msg == NULL)
@@ -534,54 +528,20 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
                           thread_arg->dpa_async_ops,
                           thread_arg->dpa_async_ops_comp);
 
-    /* Arm completion notification once before the first drain cycle. */
-    doca_dpa_dev_comch_consumer_completion_request_notification(thread_arg->dpa_consumer_comp);
-    DOCA_DPA_DEV_LOG_INFO("completion notification armed (consumer_id=%u)\n",
+    DOCA_DPA_DEV_LOG_INFO("entering polling loop (consumer_id=%u)\n",
                           thread_arg->dpu_consumer_id);
 
-    /* Handle the trigger message from DPU consumer first */
-    handle_msgs(thread_arg);
-
-    /* Event loop: process all pending work, then yield until next doorbell */
+    /* Pure polling loop — no thread_reschedule().
+     * DOCA DPA notification events are edge-triggered and lost if the
+     * thread is running when they fire, creating an unavoidable race
+     * window between request_notification() and thread_reschedule().
+     * Polling eliminates this entirely: the DPA core continuously checks
+     * the ring buffer for valid descriptors and the comch CQ for control
+     * messages (ADD_RING, etc.). */
     while (1) {
+        handle_msgs(thread_arg);
         drain_all_rings(thread_arg);
-
-        /* Free any remaining producer send + async_ops DMA slots before going idle */
         drain_producer_completions(thread_arg);
         drain_async_ops_completions(thread_arg);
-
-        /* Final check: handle_msgs arms notification then drains.
-         * If a doorbell arrived between drain_all_rings exit and here,
-         * we catch it now instead of sleeping through it. */
-        handle_msgs(thread_arg);
-
-        /* Spin-poll rings before sleeping.
-         * thread_reschedule() restarts the function from the top, so any
-         * notification event that fired while we were running is lost
-         * (DOCA DPA events are edge-triggered). Spin-polling the ring
-         * buffer directly catches descriptors whose doorbell notification
-         * was consumed during execution. */
-        {
-            uint32_t nr = thread_arg->num_rings;
-            int spin_found = 0;
-            for (uint32_t spin = 0; spin < 100000; spin++) {
-                for (uint32_t r = 0; r < nr; r++) {
-                    __dpa_thread_window_read_inv();
-                    if (process_one_desc(thread_arg, r))
-                        spin_found++;
-                }
-                if (spin_found > 0)
-                    break;
-            }
-            if (spin_found > 0) {
-                drain_producer_completions(thread_arg);
-                drain_async_ops_completions(thread_arg);
-                continue;  /* found late work — loop back to drain_all_rings */
-            }
-        }
-
-        DOCA_DPA_DEV_LOG_INFO("idle, rescheduling (num_rings=%u)\n",
-                              thread_arg->num_rings);
-        doca_dpa_dev_thread_reschedule();
     }
 }
