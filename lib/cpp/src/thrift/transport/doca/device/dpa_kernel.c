@@ -50,14 +50,6 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             if (dma_msg->dpa_producer)
                 producer = dma_msg->dpa_producer;
 
-            DOCA_DPA_DEV_LOG_INFO("Received DMA REQ msg from host: producer=0x%lx, src_mmap=%u, dst_mmap=%u, src_addr=0x%lx, dst_addr=0x%lx, length=%u\n",
-                                producer,
-                                dma_msg->src_mmap,
-                                 dma_msg->dst_mmap,
-                                 dma_msg->src_addr,
-                                 dma_msg->dst_addr,
-                                 dma_msg->length);
-
             if (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id)) {
                 DOCA_DPA_DEV_LOG_INFO("Host consumer is empty, cannot send DMA completion\n");
                 break;
@@ -116,16 +108,8 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             }
             break;
         }
-        case COMCH_MSG_TYPE_NEW_DESC: {
-            /* Doorbell: just a wake-up signal, poll_desc_rings() handles DMA */
-            struct comch_new_desc_msg *nd = (struct comch_new_desc_msg *)&msg->new_desc_msg;
-            DOCA_DPA_DEV_LOG_INFO("NEW_DESC doorbell: pod=%d req_id=%u size=%u dst=%d\n",
-                                  nd->src_pod_id, nd->req_id, nd->size, nd->dst_pod_id);
-            break;
-        }
+        case COMCH_MSG_TYPE_NEW_DESC:
         case COMCH_MSG_TYPE_TRIGGER:
-            /* No-op: just waking up the thread via completion event */
-            DOCA_DPA_DEV_LOG_INFO("Trigger received\n");
             break;
         default:
             DOCA_DPA_DEV_LOG_INFO("Unknown msg type received from host: %d\n", msg->type);
@@ -268,10 +252,6 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         return 1;
     }
 
-    DOCA_DPA_DEV_LOG_INFO("FOUND valid desc: ring=%u slot=%u req_id=%u size=%u dst_pod=%d addr=0x%lx\n",
-                          r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->size,
-                          desc->dst_pod_id, desc->addr);
-
     {
         uint64_t src_addr = desc->addr;
         uint64_t src_len = (uint64_t)desc->size;
@@ -319,14 +299,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                 return 0;
             }
         }
-        if (empty_wait_loops > 0) {
-            DOCA_DPA_DEV_LOG_INFO("Consumer credits available: ring=%u ring_pod=%d slot=%u req_id=%u waited_loops=%u\n",
-                                  r,
-                                  ring->pod_id,
-                                  thread_arg->desc_idx[r],
-                                  (uint32_t)desc->idx,
-                                  empty_wait_loops);
-        }
+        (void)empty_wait_loops;
     }
 
     /* Check if descriptor fits in DPU buffer at all */
@@ -355,24 +328,6 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     comp.src_pod_id = ring->pod_id;
     comp.dst_pod_id = desc->dst_pod_id;
     comp.flags = desc->flags;
-
-    DOCA_DPA_DEV_LOG_INFO("DMA completion msg prepared: req_id=%u src_pod=%d dst_pod=%d pos=%u len=%u flags=0x%x\n",
-                          comp.req_id,
-                          comp.src_pod_id,
-                          comp.dst_pod_id,
-                          comp.pos,
-                          comp.length,
-                          (unsigned int)(uint8_t)comp.flags);
-
-    DOCA_DPA_DEV_LOG_INFO("DMA copy args: producer=0x%lx producer_comp=0x%lx consumer_id=%u dst_mmap=%u dst_addr=0x%lx src_mmap=%u src_addr=0x%lx len=%u\n",
-                          producer,
-                          thread_arg->dpa_producer_comp,
-                          dpu_consumer_id,
-                          ring->dpu_mmap,
-                          ring->dpu_addr + thread_arg->pos[r],
-                          ring->host_mmap,
-                          desc->addr,
-                          desc->size);
 
     /* DMA: Host buffer → DPU local buffer via post_memcpy.
      * Split into DPA_MEMCPY_CHUNK_MAX chunks — post_memcpy has a HW size limit.
@@ -416,17 +371,10 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         sizeof(struct comch_dma_comp_msg),
         DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
-    DOCA_DPA_DEV_LOG_INFO("DMA+notify submitted: ring=%u slot=%u req_id=%u size=%u chunks=%u\n",
-                          r, thread_arg->desc_idx[r], (uint32_t)desc->idx, desc->size,
-                          (desc->size + DPA_MEMCPY_CHUNK_MAX - 1) / DPA_MEMCPY_CHUNK_MAX);
-
     thread_arg->pos[r] += desc->size;
 
-    if (thread_arg->pos[r] >= ring->dpu_buf_size) {
-        DOCA_DPA_DEV_LOG_INFO("Ring buffer wrap-around: ring=%u pos=%u buf_size=%u\n",
-                              r, thread_arg->pos[r], ring->dpu_buf_size);
+    if (thread_arg->pos[r] >= ring->dpu_buf_size)
         thread_arg->pos[r] = 0;
-    }
 
     __dpa_thread_window_writeback();
     /* Clear descriptor fields first, then mark invalid last.
@@ -493,11 +441,9 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
             while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
                 wait++;
                 if (wait >= DPA_CONSUMER_WAIT_LOOPS) {
-                    DOCA_DPA_DEV_LOG_INFO("drain: consumer still empty after wait, total=%d\n", total);
                     break;
                 }
             }
-            DOCA_DPA_DEV_LOG_INFO("drain batch pause: %d descs processed, resuming\n", total);
             total = 0;  /* reset counter for next batch */
         }
     } while (found > 0);

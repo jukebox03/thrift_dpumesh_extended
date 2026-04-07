@@ -674,9 +674,8 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     __sync_synchronize();
     dma->valid = 1;
 
-    DOCA_LOG_INFO("ENQUEUE publish: req_id=%u ring_slot=%u tx_slot=%d len=%u dst_pod=%d flags=0x%x addr=0x%lx",
-                  desc->req_id, ring_slot, desc->body_buf_slot, desc->body_len,
-                  desc->dst_pod_id, (unsigned int)(uint8_t)desc->flags, (unsigned long)dma->addr);
+    DOCA_LOG_DBG("ENQUEUE: req_id=%u slot=%u len=%u",
+                 desc->req_id, ring_slot, desc->body_len);
 
     pthread_mutex_unlock(&ctx->ring_lock);
 
