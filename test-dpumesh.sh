@@ -170,11 +170,13 @@ build_gateway_image() {
     done
 
     # Build Docker image + import to containerd
+    # Prime sudo credential cache (avoids stdin conflict with docker save pipe)
+    echo "$HOST_PASS" | sudo -S true 2>/dev/null
     docker build \
         -f "$PROJ_ROOT/Dockerfile.gateway" \
         -t "$GATEWAY_IMAGE" "$PROJ_ROOT"
-    echo "$HOST_PASS" | sudo -S ctr -n k8s.io images rm "docker.io/$GATEWAY_IMAGE" 2>/dev/null || true
-    docker save "$GATEWAY_IMAGE" | echo "$HOST_PASS" | sudo -S ctr -n k8s.io images import -
+    sudo ctr -n k8s.io images rm "docker.io/$GATEWAY_IMAGE" 2>/dev/null || true
+    docker save "$GATEWAY_IMAGE" | sudo ctr -n k8s.io images import -
     docker image prune -f >/dev/null 2>&1 || true
     info "Gateway Docker image built and imported"
 }
