@@ -139,8 +139,14 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
     struct comch_msg *msg;
     uint32_t msg_size;
     doca_dpa_dev_comch_consumer_t consumer = thread_arg->dpa_consumer;
-	doca_dpa_dev_comch_consumer_completion_t consumer_comp = thread_arg->dpa_consumer_comp;
+    doca_dpa_dev_comch_consumer_completion_t consumer_comp = thread_arg->dpa_consumer_comp;
     uint32_t num_msgs = 0;
+
+    /* Arm FIRST, then drain — standard CQ notification pattern.
+     * If a completion arrives between arm and drain, it will fire
+     * the notification and wake the thread after reschedule.
+     * If we drain-then-arm, a completion arriving in that gap is lost. */
+    doca_dpa_dev_comch_consumer_completion_request_notification(consumer_comp);
 
     while (doca_dpa_dev_comch_consumer_get_completion(consumer_comp, &completion) != 0) {
         msg = (struct comch_msg *)doca_dpa_dev_comch_consumer_get_completion_imm(completion, &msg_size);
@@ -152,10 +158,8 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
 
     if (num_msgs != 0) {
         doca_dpa_dev_comch_consumer_completion_ack(consumer_comp, num_msgs);
-		doca_dpa_dev_comch_consumer_ack(consumer, num_msgs);
+        doca_dpa_dev_comch_consumer_ack(consumer, num_msgs);
     }
-    /* Always re-arm notification so next message wakes the thread */
-    doca_dpa_dev_comch_consumer_completion_request_notification(consumer_comp);
 }
 
 /*
@@ -546,9 +550,25 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
         drain_producer_completions(thread_arg);
         drain_async_ops_completions(thread_arg);
 
-        /* No more work — yield. Thread resumes on next completion event
-         * (NEW_DESC doorbell or ADD_RING from DPU). handle_msgs always
-         * re-arms notification, so the next message will wake us. */
+        /* Final check: handle_msgs arms notification then drains.
+         * If a doorbell arrived between drain_all_rings exit and here,
+         * we catch it now instead of sleeping through it. */
+        handle_msgs(thread_arg);
+
+        /* Re-check rings one more time after the final handle_msgs.
+         * If new descriptors were posted, process them instead of sleeping. */
+        {
+            uint32_t nr = thread_arg->num_rings;
+            int late = 0;
+            for (uint32_t r = 0; r < nr; r++) {
+                __dpa_thread_window_read_inv();
+                if (process_one_desc(thread_arg, r))
+                    late++;
+            }
+            if (late > 0)
+                continue;  /* found work — loop back to drain_all_rings */
+        }
+
         DOCA_DPA_DEV_LOG_INFO("idle, rescheduling (num_rings=%u)\n",
                               thread_arg->num_rings);
         doca_dpa_dev_thread_reschedule();
