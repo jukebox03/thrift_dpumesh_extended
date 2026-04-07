@@ -435,12 +435,21 @@ run_stress_test() {
 
     local threads="${1:-10}"
     local reqs="${2:-100}"
+    local msg_size="${3:-}"
 
     info "Gateway IP: $gw_ip:$GATEWAY_PORT"
-    info "Stress: $threads threads x $reqs requests = $((threads * reqs)) total"
+    if [ -n "$msg_size" ]; then
+        info "Stress: $threads threads x $reqs requests = $((threads * reqs)) total, msg_size=$msg_size"
+    else
+        info "Stress: $threads threads x $reqs requests = $((threads * reqs)) total"
+    fi
 
     if [ -f "$PROJ_ROOT/test_thrift.py" ]; then
-        python3 "$PROJ_ROOT/test_thrift.py" "$gw_ip" "$GATEWAY_PORT" stress "$threads" "$reqs"
+        if [ -n "$msg_size" ]; then
+            python3 "$PROJ_ROOT/test_thrift.py" "$gw_ip" "$GATEWAY_PORT" stress "$threads" "$reqs" "$msg_size"
+        else
+            python3 "$PROJ_ROOT/test_thrift.py" "$gw_ip" "$GATEWAY_PORT" stress "$threads" "$reqs"
+        fi
     else
         warn "test_thrift.py not found, skipping"
     fi
@@ -588,7 +597,7 @@ case "$CMD" in
         run_size_test
         ;;
     stress)
-        run_stress_test "${2:-10}" "${3:-100}"
+        run_stress_test "${2:-10}" "${3:-100}" "${4:-}"
         ;;
     logs)
         show_logs
@@ -612,7 +621,7 @@ case "$CMD" in
         echo "  restart  - Pods만: 순서대로 재시작 (Gateway → Service)"
         echo "  test     - test_thrift.py 실행"
         echo "  test-size - DMA 사이즈 경계 테스트 (59~1024B)"
-        echo "  stress [T] [N] - 고부하 스트레스 테스트 (T스레드 x N요청, 기본 10x100)"
+        echo "  stress [T] [N] [SIZE] - 고부하 스트레스 테스트 (T스레드 x N요청, SIZE=메시지크기 예: 8K,128K)"
         echo "  logs     - DPU + pod 로그 확인"
         echo "  status   - 전체 상태 확인"
         echo "  dpu-log  - DPU 로그 실시간 follow"

@@ -33,6 +33,10 @@ struct dpa_thread_arg {
 	uint32_t dpu_consumer_id; /* DPU-side comch consumer ID for DPA->DPU sends */
 	uint32_t _pad0;
 
+	/* Async ops for post_memcpy DMA (no size limit, replaces 128B-chunked dma_copy) */
+	uint64_t dpa_async_ops;      /* doca_dpa_dev_async_ops_t */
+	uint64_t dpa_async_ops_comp; /* doca_dpa_dev_completion_t — DMA completion events */
+
 	/* Ring array (per-pod) */
 	volatile uint32_t num_rings;
 	uint32_t _pad;

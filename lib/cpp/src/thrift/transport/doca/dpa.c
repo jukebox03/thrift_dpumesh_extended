@@ -725,6 +725,46 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
         return result;
     }
 
+    /* === async_ops completion context (DMA completion, separate from producer_comp) === */
+    result = doca_dpa_completion_create(dpa_thread->dpa, CC_DPA_MAX_MSG_NUM, &comch->async_ops_comp);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to create async_ops completion - %s",
+                doca_error_get_name(result));
+        return result;
+    }
+    result = doca_dpa_completion_set_thread(comch->async_ops_comp, dpa_thread->thread);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to set thread on async_ops completion - %s",
+                doca_error_get_name(result));
+        return result;
+    }
+    result = doca_dpa_completion_start(comch->async_ops_comp);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to start async_ops completion - %s",
+                doca_error_get_name(result));
+        return result;
+    }
+
+    /* === async_ops for post_memcpy (size-unlimited DMA) === */
+    result = doca_dpa_async_ops_create(dpa_thread->dpa, CC_DPA_MAX_MSG_NUM, 0, &comch->async_ops);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to create async_ops - %s",
+                doca_error_get_name(result));
+        return result;
+    }
+    result = doca_dpa_async_ops_attach(comch->async_ops, comch->async_ops_comp);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to attach async_ops to completion - %s",
+                doca_error_get_name(result));
+        return result;
+    }
+    result = doca_dpa_async_ops_start(comch->async_ops);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to start async_ops - %s",
+                doca_error_get_name(result));
+        return result;
+    }
+
     return DOCA_SUCCESS;
 }
 
@@ -788,9 +828,25 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         return result;
     }
 
-    DOCA_LOG_INFO("[PAIRCHK] fill_arg handles: send.consumer=%p recv.consumer=%p recv.producer=%p producer_comp=%p",
+    /* Get async_ops DPA handles */
+    doca_dpa_dev_async_ops_t dpa_async_ops;
+    uint64_t dpa_async_ops_comp_handle;
+
+    result = doca_dpa_async_ops_get_dpa_handle(comch->async_ops, &dpa_async_ops);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get async_ops DPA handle: %s", doca_error_get_name(result));
+        return result;
+    }
+    result = doca_dpa_completion_get_dpa_handle(comch->async_ops_comp, &dpa_async_ops_comp_handle);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get async_ops_comp DPA handle: %s", doca_error_get_name(result));
+        return result;
+    }
+
+    DOCA_LOG_INFO("[PAIRCHK] fill_arg handles: send.consumer=%p recv.consumer=%p recv.producer=%p producer_comp=%p async_ops=%p async_ops_comp=%p",
                   (void *)comch->send.consumer, (void *)comch->recv.consumer,
-                  (void *)comch->recv.producer, (void *)comch->producer_comp);
+                  (void *)comch->recv.producer, (void *)comch->producer_comp,
+                  (void *)comch->async_ops, (void *)comch->async_ops_comp);
 
     memset(arg, 0, sizeof(*arg));
     arg->dpa_consumer_comp = dpa_consumer_comp;
@@ -798,12 +854,17 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
     arg->dpa_consumer = dpa_consumer;
     arg->dpa_producer = dpa_producer;
     arg->dpu_consumer_id = dpu_consumer_id;
+    arg->dpa_async_ops = dpa_async_ops;
+    arg->dpa_async_ops_comp = dpa_async_ops_comp_handle;
     arg->num_rings = 0;  /* rings added dynamically via setup_pod_dma */
 
     DOCA_LOG_INFO("DPA thread arg: consumer_comp=0x%lx, producer_comp=0x%lx, consumer=0x%lx, producer=0x%lx, dpu_consumer_id=%u (send.consumer=%u recv.consumer=%u)",
         arg->dpa_consumer_comp, arg->dpa_producer_comp,
         arg->dpa_consumer, arg->dpa_producer, arg->dpu_consumer_id,
         send_consumer_id, recv_consumer_id);
+
+    DOCA_LOG_INFO("DPA thread arg: async_ops=0x%lx, async_ops_comp=0x%lx",
+        arg->dpa_async_ops, arg->dpa_async_ops_comp);
 
     DOCA_LOG_INFO("[PAIRCHK] fill_arg ids: send_consumer_id=%u recv_consumer_id=%u dpu_consumer_id=%u",
                   send_consumer_id, recv_consumer_id, dpu_consumer_id);

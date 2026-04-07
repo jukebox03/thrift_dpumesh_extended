@@ -41,6 +41,8 @@ struct dmesh_doca_dpa_msgq {
 struct dmesh_doca_dpa_comch {
 	struct dmesh_doca_dpa_msgq send;			      /**< MsgQ used to send message from DPU to DPA */
 	struct doca_dpa_completion *producer_comp;	      /**< The producer completion context used by DPA */
+	struct doca_dpa_async_ops *async_ops;		      /**< Async ops for post_memcpy DMA (no 128B limit) */
+	struct doca_dpa_completion *async_ops_comp;	      /**< DMA completion context (separate from producer_comp) */
 	struct dmesh_doca_dpa_msgq recv;			      /**< MsgQ used to receive message DPA */
 	struct doca_comch_consumer_completion *consumer_comp; /**< The consumer completion context used by DPA */
 };

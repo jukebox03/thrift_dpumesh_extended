@@ -116,7 +116,8 @@ def run_size_test(host, port):
     print(f"  DMA Size Boundary Test — {host}:{port}")
     print(f"{'='*60}")
 
-    targets = [59, 100, 126, 127, 128, 129, 130, 256, 512, 1024]
+    targets = [59, 100, 128, 256, 512, 1024, 2048, 4096, 8192,
+               16384, 32768, 65536, 131072]
     results = []
 
     for i, target in enumerate(targets):
@@ -150,13 +151,13 @@ def run_size_test(host, port):
 
     return fail_count == 0
 
-def stress_worker(host, port, thread_id, num_requests, results_list, timeout=10):
+def stress_worker(host, port, thread_id, num_requests, results_list, timeout=10, pad_bytes=0):
     """Send num_requests sequentially on one connection per request."""
     ok = 0
     fail = 0
     for i in range(num_requests):
         req_id = thread_id * 100000 + i
-        args = build_compose_unique_id_args(req_id=req_id)
+        args = build_compose_unique_id_args(req_id=req_id, pad_bytes=pad_bytes)
         frame = build_thrift_framed_call("ComposeUniqueId", args, seq_id=req_id % 65536)
         try:
             with socket.create_connection((host, port), timeout=timeout) as s:
@@ -182,12 +183,18 @@ def stress_worker(host, port, thread_id, num_requests, results_list, timeout=10)
     results_list[thread_id] = (ok, fail)
 
 
-def run_stress_test(host, port, num_threads, num_requests, duration_sec=0):
+def run_stress_test(host, port, num_threads, num_requests, pad_bytes=0):
     """High-load stress test: num_threads concurrent threads, each sending num_requests."""
     total_target = num_threads * num_requests
+    # Calculate actual frame size for display
+    sample_args = build_compose_unique_id_args(req_id=0, pad_bytes=pad_bytes)
+    sample_frame = build_thrift_framed_call("ComposeUniqueId", sample_args, seq_id=0)
+    frame_size = len(sample_frame)
+
     print(f"\n{'='*60}")
     print(f"  Stress Test — {host}:{port}")
     print(f"  {num_threads} threads x {num_requests} requests = {total_target} total")
+    print(f"  Message size: {frame_size} bytes (pad={pad_bytes})")
     print(f"{'='*60}\n")
 
     results_list = [None] * num_threads
@@ -196,7 +203,8 @@ def run_stress_test(host, port, num_threads, num_requests, duration_sec=0):
 
     for i in range(num_threads):
         t = threading.Thread(target=stress_worker,
-                             args=(host, port, i, num_requests, results_list))
+                             args=(host, port, i, num_requests, results_list),
+                             kwargs={'pad_bytes': pad_bytes})
         threads.append(t)
         t.start()
 
@@ -211,11 +219,13 @@ def run_stress_test(host, port, num_threads, num_requests, duration_sec=0):
     print(f"  Stress Test Results")
     print(f"{'='*60}")
     print(f"  Threads:    {num_threads}")
+    print(f"  Msg size:   {frame_size} bytes")
     print(f"  Succeeded:  {total_ok}/{total_target}")
     print(f"  Failed:     {total_fail}/{total_target}")
     print(f"  Duration:   {elapsed:.2f}s")
     if elapsed > 0:
         print(f"  Throughput: {total_ok / elapsed:.1f} req/s")
+        print(f"  Bandwidth:  {total_ok * frame_size / elapsed / 1024 / 1024:.1f} MB/s")
     print(f"  Success rate: {total_ok * 100 / max(total_target, 1):.1f}%")
 
     if total_fail > 0:
@@ -227,11 +237,21 @@ def run_stress_test(host, port, num_threads, num_requests, duration_sec=0):
     return total_fail == 0
 
 
+def parse_size_str(s):
+    """Parse size string like '128K', '1M', '4096' into bytes."""
+    s = s.strip().upper()
+    if s.endswith('K') or s.endswith('KB'):
+        return int(s.rstrip('KB')) * 1024
+    elif s.endswith('M') or s.endswith('MB'):
+        return int(s.rstrip('MB')) * 1024 * 1024
+    return int(s)
+
+
 def main():
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <host> [port] [num_threads|size|stress]")
-        print(f"       {sys.argv[0]} <host> [port] size              — DMA size boundary test")
-        print(f"       {sys.argv[0]} <host> [port] stress [T] [N]    — stress test (T threads x N reqs)")
+        print(f"       {sys.argv[0]} <host> [port] size                       — DMA size boundary test")
+        print(f"       {sys.argv[0]} <host> [port] stress [T] [N] [SIZE]      — stress test (T threads x N reqs, SIZE=msg size e.g. 8K, 128K)")
         sys.exit(1)
 
     host = sys.argv[1]
@@ -246,7 +266,10 @@ def main():
     if len(sys.argv) > 3 and sys.argv[3] == "stress":
         num_threads = int(sys.argv[4]) if len(sys.argv) > 4 else 10
         num_requests = int(sys.argv[5]) if len(sys.argv) > 5 else 100
-        ok = run_stress_test(host, port, num_threads, num_requests)
+        msg_size = parse_size_str(sys.argv[6]) if len(sys.argv) > 6 else 0
+        # Convert target frame size to pad_bytes
+        pad = calc_pad_for_target(msg_size) if msg_size > 0 else 0
+        ok = run_stress_test(host, port, num_threads, num_requests, pad_bytes=pad)
         sys.exit(0 if ok else 1)
 
     num_threads = int(sys.argv[3]) if len(sys.argv) > 3 else 1
