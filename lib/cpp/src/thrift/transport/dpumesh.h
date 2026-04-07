@@ -114,7 +114,13 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
 int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
                           sw_descriptor_t *resp, int timeout_ms);
 
-/* Cancel a pending entry (e.g. on error path). */
+/* Associate a TX slot with a pending request (call after successful enqueue).
+ * On timeout, the TX slot is deferred until DPA finishes processing. */
+void dpumesh_pending_attach_tx(dpumesh_ctx_t *ctx, uint32_t req_id, int tx_slot);
+
+/* Cancel a pending entry (e.g. on error path).
+ * If TX is attached and DPA may still be using it, defers cleanup
+ * until the response arrives (state -2 → rx_data_hook frees TX). */
 void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
 
 #ifdef __cplusplus

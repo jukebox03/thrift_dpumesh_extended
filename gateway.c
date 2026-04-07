@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -162,25 +163,25 @@ static void *handle_connection(void *arg)
                recv_len, inet_ntoa(ca->client_addr.sin_addr),
                ntohs(ca->client_addr.sin_port));
 
-        /* Allocate req_id and register pending */
         uint32_t req_id = dpumesh_alloc_req_id(g_ctx);
+
+        /* Allocate TX slot first — needed before register so attach_tx works */
+        int tx_slot = dpumesh_tx_alloc(g_ctx);
+        if (tx_slot < 0) {
+            fprintf(stderr, "[gateway] TX pool full\n");
+            send_thrift_exception(client_fd, recv_buf, recv_len, "DPUmesh busy");
+            continue;
+        }
 
         rc = dpumesh_register_pending(g_ctx, req_id);
         if (rc < 0) {
             fprintf(stderr, "[gateway] register_pending failed for req_id=%u\n", req_id);
+            dpumesh_tx_free(g_ctx, tx_slot);
             send_thrift_exception(client_fd, recv_buf, recv_len, "DPUmesh busy");
             continue;
         }
 
-        /* Allocate TX slot and copy data */
-        int tx_slot = dpumesh_tx_alloc(g_ctx);
-        if (tx_slot < 0) {
-            fprintf(stderr, "[gateway] TX pool full\n");
-            dpumesh_cancel_pending(g_ctx, req_id);
-            send_thrift_exception(client_fd, recv_buf, recv_len, "DPUmesh busy");
-            continue;
-        }
-
+        /* Copy data into TX buffer */
         uint8_t *tx_buf = dpumesh_tx_buf(g_ctx, tx_slot);
         memcpy(tx_buf, recv_buf, recv_len);
 
@@ -210,6 +211,10 @@ static void *handle_connection(void *arg)
             continue;
         }
 
+        /* TX slot is now in the ring — DPA may DMA from it.
+         * Attach to pending so deferred cleanup works on timeout. */
+        dpumesh_pending_attach_tx(g_ctx, req_id, tx_slot);
+
         printf("[gateway] Forwarded req_id=%u (%zd bytes), waiting for response...\n",
                req_id, recv_len);
 
@@ -218,13 +223,14 @@ static void *handle_connection(void *arg)
         rc = dpumesh_wait_response(g_ctx, req_id, &resp, RESPONSE_TIMEOUT);
         if (rc < 0) {
             fprintf(stderr, "[gateway] Response timeout for req_id=%u\n", req_id);
-            dpumesh_tx_free(g_ctx, tx_slot);
+            /* TX slot cleanup is deferred — wait_response set state=-2,
+             * rx_data_hook will free TX when DPA finishes. */
             dpumesh_cancel_pending(g_ctx, req_id);
             send_thrift_exception(client_fd, recv_buf, recv_len, "DPUmesh timeout");
             continue;
         }
 
-        /* Free TX slot — DMA copy is done since response arrived */
+        /* Response arrived — DPA is done with TX buffer, safe to free */
         dpumesh_tx_free(g_ctx, tx_slot);
 
         /* Send response back to TCP client */
@@ -252,6 +258,8 @@ int main(void)
     struct sockaddr_in addr;
 
     printf("=== DPUmesh TCP Gateway ===\n");
+
+    signal(SIGPIPE, SIG_IGN);
 
     /* Initialize DPUmesh */
     printf("[gateway] Initializing DPUmesh...\n");

@@ -58,7 +58,8 @@ typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     sw_descriptor_t desc;
-    volatile int state;   /* -1=unused, 0=waiting, 1=arrived */
+    volatile int state;   /* -1=unused, -2=cancelled(tx deferred), 0=waiting, 1=arrived */
+    int tx_slot;          /* TX buffer slot owned by this request, -1 if none */
 } dpumesh_pending_t;
 
 typedef struct {
@@ -82,8 +83,6 @@ struct dpumesh_ctx {
     pthread_mutex_t ring_lock;  /* Serializes get_next_dma_desc + descriptor fill + valid=1 */
     doca_dpa_dev_mmap_t dpa_mmap_handle;  /* DPA handle for local mmap (used in TX descriptors) */
 
-    /* Doorbell pool (matching dma_ring size) for async comch sends */
-    struct dmesh_new_desc_msg *doorbell_pool;
 
     /* Persistent buffers for initial registration to avoid stack UAF */
     struct dmesh_register_msg reg_msg;
@@ -317,6 +316,17 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
             p->desc = desc;
             p->state = 1;
             pthread_cond_signal(&p->cond);
+        } else if (p->state == -2) {
+            /* Cancelled request — DPA finished, now safe to free TX + RX */
+            if (p->tx_slot >= 0) {
+                dpumesh_tx_free(ctx, p->tx_slot);
+                p->tx_slot = -1;
+            }
+            pthread_mutex_lock(&ctx->rx_slot_lock);
+            ctx->rx_slot_bitmap[slot] = 0;
+            pthread_mutex_unlock(&ctx->rx_slot_lock);
+            p->state = -1;
+            pthread_cond_broadcast(&p->cond);
         } else {
             DOCA_LOG_ERR("RX_DATA: OP_RESPONSE for req_id=%u but no waiter (state=%d)",
                          desc.req_id, p->state);
@@ -472,9 +482,6 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     if (init_control_path(ctx) != DOCA_SUCCESS) goto fail;
     if (init_datapath(ctx) != DOCA_SUCCESS) goto fail;
 
-    ctx->doorbell_pool = (struct dmesh_new_desc_msg *)calloc(DMA_RING_SIZE, sizeof(struct dmesh_new_desc_msg));
-    if (!ctx->doorbell_pool) goto fail;
-
     ctx->slot_bitmap = (uint8_t *)calloc(ctx->num_slots, 1);
     if (!ctx->slot_bitmap) goto fail;
     pthread_mutex_init(&ctx->slot_lock, NULL);
@@ -499,6 +506,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         pthread_mutex_init(&ctx->pending[i].lock, NULL);
         pthread_cond_init(&ctx->pending[i].cond, NULL);
         ctx->pending[i].state = -1;
+        ctx->pending[i].tx_slot = -1;
     }
 
     pthread_mutex_init(&ctx->tx_inflight_lock, NULL);
@@ -551,8 +559,6 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
         tx_inflight_cleanup(ctx);
         pthread_mutex_destroy(&ctx->tx_inflight_lock);
     }
-
-    if (ctx->doorbell_pool) free(ctx->doorbell_pool);
 
     free(ctx);
 }
@@ -678,11 +684,6 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
                  desc->req_id, ring_slot, desc->body_len);
 
     pthread_mutex_unlock(&ctx->ring_lock);
-
-    /* No doorbell needed — DPA polls ring buffer directly for valid descriptors.
-     * This eliminates the comch round-trip and the edge-triggered notification
-     * race that caused DPA stalls under load. */
-
     return 0;
 }
 
@@ -796,9 +797,19 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
     }
 
     p->state = 0;
+    p->tx_slot = -1;
     memset(&p->desc, 0, sizeof(p->desc));
     pthread_mutex_unlock(&p->lock);
     return 0;
+}
+
+void dpumesh_pending_attach_tx(dpumesh_ctx_t *ctx, uint32_t req_id, int tx_slot) {
+    uint32_t idx = req_id % MAX_PENDING;
+    dpumesh_pending_t *p = &ctx->pending[idx];
+
+    pthread_mutex_lock(&p->lock);
+    p->tx_slot = tx_slot;
+    pthread_mutex_unlock(&p->lock);
 }
 
 int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
@@ -831,7 +842,8 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
                 /* Check if response arrived during timeout boundary */
                 if (p->state == 1)
                     break; /* fall through to success path below */
-                p->state = -1;
+                /* DPA may still hold the TX buffer — defer cleanup */
+                p->state = (p->tx_slot >= 0) ? -2 : -1;
                 pthread_cond_broadcast(&p->cond);
                 pthread_mutex_unlock(&p->lock);
                 return -1;
@@ -841,13 +853,15 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
 
     if (p->state == 1) {
         *resp = p->desc;
+        p->tx_slot = -1;  /* caller takes TX ownership */
         p->state = -1;
         pthread_cond_broadcast(&p->cond);
         pthread_mutex_unlock(&p->lock);
         return 0;
     }
 
-    p->state = -1;
+    /* DPA may still hold the TX buffer — defer cleanup */
+    p->state = (p->tx_slot >= 0) ? -2 : -1;
     pthread_cond_broadcast(&p->cond);
     pthread_mutex_unlock(&p->lock);
     return -1;
@@ -859,14 +873,25 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
 
     pthread_mutex_lock(&p->lock);
     if (p->state == 1) {
-        /* Response arrived but was never consumed -- free the RX slot to prevent leak */
+        /* Response arrived but was never consumed — free RX + TX */
         if (p->desc.body_buf_slot >= 0) {
             pthread_mutex_lock(&ctx->rx_slot_lock);
             ctx->rx_slot_bitmap[p->desc.body_buf_slot] = 0;
             pthread_mutex_unlock(&ctx->rx_slot_lock);
         }
+        if (p->tx_slot >= 0) {
+            dpumesh_tx_free(ctx, p->tx_slot);
+            p->tx_slot = -1;
+        }
+        p->state = -1;
+    } else if (p->state == 0 && p->tx_slot >= 0) {
+        /* DPA may still DMA from TX buffer — defer TX free until response arrives */
+        p->state = -2;
+    } else if (p->state == -2) {
+        /* Already deferred — wait for rx_data_hook to clean up */
+    } else {
+        p->state = -1;
     }
-    p->state = -1;
     pthread_cond_broadcast(&p->cond);
     pthread_mutex_unlock(&p->lock);
 }

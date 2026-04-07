@@ -14,14 +14,13 @@ enum msg_direction {
 };
 
 enum dmesh_msg_type {
-    DMESH_MSG_EXPORT_DESC = 1,
-    DMESH_MSG_EXPORT_DPA_COMP = 2,
-    DMESH_MSG_RX_DATA = 3,
-    DMESH_MSG_REGISTER = 4,      /* Host→DPU: register pod_id */
-    DMESH_MSG_CONSUMER_ID = 5,   /* DPU→Host: consumer ID reply */
-    DMESH_MSG_TX_ACK = 6,        /* DPU→Host: DMA completed, TX slot can be freed */
-    DMESH_MSG_NEW_DESC = 7,      /* Host→DPU: new descriptor published (doorbell) */
-    DMESH_MSG_POD_CONSUMER_ID = 8, /* Host→DPU: advertise host datapath consumer ID */
+    DMESH_MSG_EXPORT_DESC,
+    DMESH_MSG_EXPORT_DPA_COMP,
+    DMESH_MSG_RX_DATA,
+    DMESH_MSG_REGISTER,          /* Host→DPU: register pod_id */
+    DMESH_MSG_CONSUMER_ID,       /* DPU→Host: consumer ID reply */
+    DMESH_MSG_TX_ACK,            /* DPU→Host: DMA completed, TX slot can be freed */
+    DMESH_MSG_POD_CONSUMER_ID,   /* Host→DPU: advertise host datapath consumer ID */
 };
 
 /* DPU→Host: tell the client what consumer ID to use for producer */
@@ -86,16 +85,7 @@ struct dmesh_tx_ack_msg {
     int32_t dst_pod_id;
 };
 
-/* Host→DPU: new descriptor doorbell */
-struct dmesh_new_desc_msg {
-    enum dmesh_msg_type type;   /* = DMESH_MSG_NEW_DESC */
-    int32_t  src_pod_id;
-    uint64_t addr;              /* host DMA buffer address */
-    uint32_t size;              /* payload length */
-    uint32_t req_id;
-    int32_t  dst_pod_id;
-    int8_t   flags;
-};
+
 
 struct dmesh_comch_msg {
     enum dmesh_msg_type type;

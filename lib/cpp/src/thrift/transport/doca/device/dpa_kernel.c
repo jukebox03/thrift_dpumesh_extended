@@ -108,7 +108,6 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             }
             break;
         }
-        case COMCH_MSG_TYPE_NEW_DESC:
         case COMCH_MSG_TYPE_TRIGGER:
             break;
         default:

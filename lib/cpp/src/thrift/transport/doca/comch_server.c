@@ -209,49 +209,6 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 		break;
 	}
 
-	case DMESH_MSG_NEW_DESC: {
-#ifdef DOCA_ARCH_DPU
-		/* Host doorbell: forward descriptor info to DPA via DPU→DPA comch msgq */
-		struct dmesh_new_desc_msg *nd = (struct dmesh_new_desc_msg *)recv_buffer;
-		struct pod_state *pod = find_pod_by_connection(objs, comch_connection);
-		if (!pod) {
-			DOCA_LOG_ERR("NEW_DESC: no pod found for connection");
-			break;
-		}
-
-		DOCA_LOG_INFO("NEW_DESC received: pod_id=%d req_id=%u size=%u dst=%d addr=0x%lx",
-		              pod->pod_id, nd->req_id, nd->size, nd->dst_pod_id,
-		              (unsigned long)nd->addr);
-
-		struct comch_msg dpa_msg;
-		memset(&dpa_msg, 0, sizeof(dpa_msg));
-		dpa_msg.type = COMCH_MSG_TYPE_NEW_DESC;
-		dpa_msg.new_desc_msg.type = COMCH_MSG_TYPE_NEW_DESC;
-		dpa_msg.new_desc_msg.src_pod_id = pod->pod_id;
-		dpa_msg.new_desc_msg.addr = nd->addr;
-		dpa_msg.new_desc_msg.size = nd->size;
-		dpa_msg.new_desc_msg.req_id = nd->req_id;
-		dpa_msg.new_desc_msg.dst_pod_id = nd->dst_pod_id;
-		dpa_msg.new_desc_msg.flags = nd->flags;
-
-		if (objs->dpa_comch) {
-			result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
-			                                   &dpa_msg, sizeof(dpa_msg));
-			if (result != DOCA_SUCCESS) {
-				DOCA_LOG_ERR("NEW_DESC: forward to DPA failed: %s",
-				             doca_error_get_descr(result));
-			} else {
-				DOCA_LOG_INFO("NEW_DESC: forwarded to DPA OK");
-			}
-		} else {
-			DOCA_LOG_ERR("NEW_DESC: DPA comch not initialized");
-		}
-#else
-		DOCA_LOG_WARN("NEW_DESC received on host side (ignored)");
-#endif
-		break;
-	}
-
 	case DMESH_MSG_POD_CONSUMER_ID: {
 		struct dmesh_pod_consumer_id_msg *cid = (struct dmesh_pod_consumer_id_msg *)recv_buffer;
 		if (msg_len < sizeof(struct dmesh_pod_consumer_id_msg)) {
