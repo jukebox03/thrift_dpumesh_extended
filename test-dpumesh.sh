@@ -38,6 +38,9 @@ DPU_BUILD="$DPU_DOCA/build"
 BUILD_DOCA="$PROJ_ROOT/build-doca"
 GATEWAY_PORT=9091
 DPU_LOG="/tmp/dpumesh_dpu_test.log"
+DOCA_LIB_DIR="/opt/mellanox/doca/lib/x86_64-linux-gnu"
+FLEXIO_LIB_DIR="/opt/mellanox/flexio/lib"
+GATEWAY_IMAGE="social-network/dpumesh-gateway:latest"
 
 info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
@@ -121,6 +124,59 @@ build_host() {
         err "libthrift.so.0.12.0 not found after build!"
         exit 1
     fi
+}
+
+### Gateway 이미지 빌드 ###
+build_gateway_image() {
+    step "=== Building gateway binary + Docker image ==="
+
+    # Build gateway binary
+    local THRIFT_LINK_LIB="-lthriftd"
+    if [ ! -e "$BUILD_DOCA/lib/libthriftd.so" ] && [ ! -e "$BUILD_DOCA/lib/libthriftd.a" ]; then
+        THRIFT_LINK_LIB="-lthrift"
+    fi
+    gcc -o "$PROJ_ROOT/gateway" "$PROJ_ROOT/gateway.c" \
+        -I"$PROJ_ROOT/lib/cpp/src" \
+        -L"$BUILD_DOCA/lib" \
+        -L"$DOCA_LIB_DIR" \
+        $THRIFT_LINK_LIB -lpthread -ldoca_common -ldoca_comch \
+        -Wl,-rpath,/usr/local/lib -Wl,-rpath,"$DOCA_LIB_DIR"
+    info "Gateway binary built"
+
+    # Install thrift libs for Docker context
+    rm -rf "$PROJ_ROOT/thrift-install"
+    (cd "$BUILD_DOCA" && make install DESTDIR="$PROJ_ROOT/thrift-install")
+    local THRIFT_LIB_DIR="$PROJ_ROOT/thrift-install/usr/local/lib"
+    for f in "$THRIFT_LIB_DIR"/lib*d.so; do
+        [ -f "$f" ] || continue
+        ln -sf "$(basename "$f")" "$THRIFT_LIB_DIR/$(basename "$f" | sed 's/d\.so$/.so/')"
+    done
+    for f in "$THRIFT_LIB_DIR"/lib*d.so.0.12.0; do
+        [ -f "$f" ] || continue
+        ln -sf "$(basename "$f")" "$THRIFT_LIB_DIR/$(basename "$f" | sed 's/d\.so\.0\.12\.0$/.so.0.12.0/')"
+    done
+
+    # Collect DOCA runtime libs
+    rm -rf "$PROJ_ROOT/doca-libs"
+    mkdir -p "$PROJ_ROOT/doca-libs"
+    for lib in \
+        "$DOCA_LIB_DIR"/libdoca_common.so* \
+        "$DOCA_LIB_DIR"/libdoca_comch.so* \
+        "$DOCA_LIB_DIR"/libdoca_dpa.so* \
+        "$FLEXIO_LIB_DIR"/libflexio.so* \
+        /lib/x86_64-linux-gnu/libmlx5.so* \
+        /lib/x86_64-linux-gnu/libibverbs.so*; do
+        [ -e "$lib" ] && cp -a "$lib" "$PROJ_ROOT/doca-libs/"
+    done
+
+    # Build Docker image + import to containerd
+    docker build \
+        -f "$PROJ_ROOT/Dockerfile.gateway" \
+        -t "$GATEWAY_IMAGE" "$PROJ_ROOT"
+    echo "$HOST_PASS" | sudo -S ctr -n k8s.io images rm "docker.io/$GATEWAY_IMAGE" 2>/dev/null || true
+    docker save "$GATEWAY_IMAGE" | echo "$HOST_PASS" | sudo -S ctr -n k8s.io images import -
+    docker image prune -f >/dev/null 2>&1 || true
+    info "Gateway Docker image built and imported"
 }
 
 ### DPU 프로세스 관리 ###
@@ -562,6 +618,7 @@ case "$CMD" in
         sync_sources
         build_dpu
         build_host
+        build_gateway_image
         start_dpu
         start_gateway
         start_service

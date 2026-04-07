@@ -568,15 +568,26 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx) {
  * ==================================================================== */
 
 int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
-    pthread_mutex_lock(&ctx->slot_lock);
-    for (int i = 0; i < ctx->num_slots; i++) {
-        if (ctx->slot_bitmap[i] == 0) {
-            ctx->slot_bitmap[i] = 1;
-            pthread_mutex_unlock(&ctx->slot_lock);
-            return i;
+    const int max_retry = 1000;
+    struct timespec backoff = {0, 10000}; /* 10us initial */
+
+    for (int retry = 0; retry < max_retry; retry++) {
+        pthread_mutex_lock(&ctx->slot_lock);
+        for (int i = 0; i < ctx->num_slots; i++) {
+            if (ctx->slot_bitmap[i] == 0) {
+                ctx->slot_bitmap[i] = 1;
+                pthread_mutex_unlock(&ctx->slot_lock);
+                return i;
+            }
         }
+        pthread_mutex_unlock(&ctx->slot_lock);
+
+        if (retry == 0) continue;  /* first miss: immediate retry */
+        nanosleep(&backoff, NULL);
+        if (backoff.tv_nsec < 1000000)  /* cap at 1ms */
+            backoff.tv_nsec *= 2;
     }
-    pthread_mutex_unlock(&ctx->slot_lock);
+    DOCA_LOG_ERR("TX alloc failed: all %d slots busy after %d retries", ctx->num_slots, max_retry);
     return -1;
 }
 
