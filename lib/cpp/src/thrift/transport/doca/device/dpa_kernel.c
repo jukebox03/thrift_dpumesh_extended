@@ -555,18 +555,29 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
          * we catch it now instead of sleeping through it. */
         handle_msgs(thread_arg);
 
-        /* Re-check rings one more time after the final handle_msgs.
-         * If new descriptors were posted, process them instead of sleeping. */
+        /* Spin-poll rings before sleeping.
+         * thread_reschedule() restarts the function from the top, so any
+         * notification event that fired while we were running is lost
+         * (DOCA DPA events are edge-triggered). Spin-polling the ring
+         * buffer directly catches descriptors whose doorbell notification
+         * was consumed during execution. */
         {
             uint32_t nr = thread_arg->num_rings;
-            int late = 0;
-            for (uint32_t r = 0; r < nr; r++) {
-                __dpa_thread_window_read_inv();
-                if (process_one_desc(thread_arg, r))
-                    late++;
+            int spin_found = 0;
+            for (uint32_t spin = 0; spin < 100000; spin++) {
+                for (uint32_t r = 0; r < nr; r++) {
+                    __dpa_thread_window_read_inv();
+                    if (process_one_desc(thread_arg, r))
+                        spin_found++;
+                }
+                if (spin_found > 0)
+                    break;
             }
-            if (late > 0)
-                continue;  /* found work — loop back to drain_all_rings */
+            if (spin_found > 0) {
+                drain_producer_completions(thread_arg);
+                drain_async_ops_completions(thread_arg);
+                continue;  /* found late work — loop back to drain_all_rings */
+            }
         }
 
         DOCA_DPA_DEV_LOG_INFO("idle, rescheduling (num_rings=%u)\n",
