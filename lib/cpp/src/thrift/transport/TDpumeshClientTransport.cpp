@@ -102,6 +102,10 @@ void TDpumeshClientTransport::flush() {
         throw_exception("DPUmesh client TX SQ full", -1);
     }
 
+    /* TX slot is now in the ring — DPA may DMA from it.
+     * Attach to pending so deferred cleanup works on timeout. */
+    dpumesh_pending_attach_tx(ctx_, req_id_, tx_slot);
+
     tx_slot_ = tx_slot;  /* freed in cleanup_response() after DMA completes */
     write_buf_.clear();
     /* Response will be fetched on first read() call */
@@ -122,6 +126,10 @@ uint32_t TDpumeshClientTransport::read(uint8_t *buf, uint32_t len) {
         pending_registered_ = false;
 
         if (rc != 0) {
+            /* TX slot cleanup is deferred — wait_response set state=-2,
+             * rx_data_hook will free TX when DPA finishes. */
+            dpumesh_cancel_pending(ctx_, req_id_);
+            tx_slot_ = -1;  /* ownership transferred to deferred cleanup */
             throw_exception("DPUmesh client response timeout for req_id=" + std::to_string(req_id_), rc);
         }
 
