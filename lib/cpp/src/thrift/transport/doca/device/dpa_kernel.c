@@ -20,6 +20,9 @@
  * tune this value based on experimentation. */
 #define DPA_MEMCPY_CHUNK_MAX  (128 * 1024)
 
+/* Max DMA size for doca_dpa_dev_comch_producer_dma_copy (HW limit: 8192 bytes) */
+#define DPA_DMA_COPY_MAX  8192
+
 /* Forward declarations */
 static void drain_async_ops_completions(struct dpa_thread_arg *thread_arg);
 static int wait_one_dma_completion(struct dpa_thread_arg *thread_arg);
@@ -55,41 +58,45 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                 break;
             }
 
-            /* DMA via post_memcpy (chunked) + notify via post_send_imm_only */
+            /* Chunked DMA via dma_copy (max 8KB per call).
+             * Intermediate chunks: DMA_CHUNK type (consumer ignores).
+             * Final chunk: sends actual immediate data. */
             {
                 uint32_t total = dma_msg->length;
                 uint32_t offset = 0;
-                int dma_ok = 1;
+                enum comch_msg_type chunk_type = COMCH_MSG_TYPE_DMA_CHUNK;
 
                 while (offset < total) {
                     uint32_t chunk = total - offset;
-                    if (chunk > DPA_MEMCPY_CHUNK_MAX)
-                        chunk = DPA_MEMCPY_CHUNK_MAX;
+                    if (chunk > DPA_DMA_COPY_MAX)
+                        chunk = DPA_DMA_COPY_MAX;
 
-                    doca_dpa_dev_post_memcpy(
-                        thread_arg->dpa_async_ops,
-                        dma_msg->dst_mmap,
-                        dma_msg->dst_addr + offset,
-                        dma_msg->src_mmap,
-                        dma_msg->src_addr + offset,
-                        chunk,
-                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-
-                    if (!wait_one_dma_completion(thread_arg)) {
-                        DOCA_DPA_DEV_LOG_INFO("DMA_REQ: DMA timeout at offset=%u\n", offset);
-                        dma_ok = 0;
-                        break;
+                    if (offset + chunk >= total) {
+                        /* Final chunk: send with real immediate data */
+                        doca_dpa_dev_comch_producer_dma_copy(producer,
+                                                dpu_consumer_id,
+                                                dma_msg->dst_mmap,
+                                                dma_msg->dst_addr + offset,
+                                                dma_msg->src_mmap,
+                                                dma_msg->src_addr + offset,
+                                                chunk,
+                                                (const uint8_t *)"test_dma_imm",
+                                                sizeof("test_dma_imm"),
+                                                DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+                    } else {
+                        /* Intermediate chunk: DMA_CHUNK marker (consumer ignores) */
+                        doca_dpa_dev_comch_producer_dma_copy(producer,
+                                                dpu_consumer_id,
+                                                dma_msg->dst_mmap,
+                                                dma_msg->dst_addr + offset,
+                                                dma_msg->src_mmap,
+                                                dma_msg->src_addr + offset,
+                                                chunk,
+                                                (const uint8_t *)&chunk_type,
+                                                sizeof(chunk_type),
+                                                DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
                     }
                     offset += chunk;
-                }
-
-                if (dma_ok) {
-                    doca_dpa_dev_comch_producer_post_send_imm_only(
-                        producer,
-                        dpu_consumer_id,
-                        (const uint8_t *)"test_dma_imm",
-                        sizeof("test_dma_imm"),
-                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
                 }
             }
             break;
@@ -328,47 +335,47 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     comp.dst_pod_id = desc->dst_pod_id;
     comp.flags = desc->flags;
 
-    /* DMA: Host buffer → DPU local buffer via post_memcpy.
-     * Split into DPA_MEMCPY_CHUNK_MAX chunks — post_memcpy has a HW size limit.
-     * Each chunk: post_memcpy + wait for completion.
-     * After all chunks land, notify DPU consumer with post_send_imm_only. */
+    /* Chunked DMA via dma_copy (max 8KB per call).
+     * Intermediate chunks: DMA_CHUNK type (consumer ignores).
+     * Final chunk: real comch_dma_comp_msg (consumer processes). */
     {
         uint32_t total = desc->size;
         uint32_t offset = 0;
+        enum comch_msg_type chunk_type = COMCH_MSG_TYPE_DMA_CHUNK;
 
         while (offset < total) {
             uint32_t chunk = total - offset;
-            if (chunk > DPA_MEMCPY_CHUNK_MAX)
-                chunk = DPA_MEMCPY_CHUNK_MAX;
+            if (chunk > DPA_DMA_COPY_MAX)
+                chunk = DPA_DMA_COPY_MAX;
 
-            doca_dpa_dev_post_memcpy(
-                thread_arg->dpa_async_ops,
-                ring->dpu_mmap,
-                ring->dpu_addr + thread_arg->pos[r] + offset,
-                ring->host_mmap,
-                desc->addr + offset,
-                chunk,
-                DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-
-            if (!wait_one_dma_completion(thread_arg)) {
-                DOCA_DPA_DEV_LOG_INFO("DMA timeout at offset=%u (ring=%u req_id=%u)\n",
-                                      offset, r, (uint32_t)desc->idx);
-                desc->valid = 0;
-                __dpa_thread_window_writeback();
-                thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
-                return 1;
+            if (offset + chunk >= total) {
+                /* Final chunk: send real completion message */
+                doca_dpa_dev_comch_producer_dma_copy(producer,
+                                            dpu_consumer_id,
+                                            ring->dpu_mmap,
+                                            ring->dpu_addr + thread_arg->pos[r] + offset,
+                                            ring->host_mmap,
+                                            desc->addr + offset,
+                                            chunk,
+                                            (uint8_t *)&comp,
+                                            sizeof(struct comch_dma_comp_msg),
+                                            DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+            } else {
+                /* Intermediate chunk: DMA_CHUNK marker (consumer ignores) */
+                doca_dpa_dev_comch_producer_dma_copy(producer,
+                                            dpu_consumer_id,
+                                            ring->dpu_mmap,
+                                            ring->dpu_addr + thread_arg->pos[r] + offset,
+                                            ring->host_mmap,
+                                            desc->addr + offset,
+                                            chunk,
+                                            (uint8_t *)&chunk_type,
+                                            sizeof(chunk_type),
+                                            DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
             }
             offset += chunk;
         }
     }
-
-    /* All DMA chunks landed — notify DPU consumer (immediate data only, max 32B) */
-    doca_dpa_dev_comch_producer_post_send_imm_only(
-        producer,
-        dpu_consumer_id,
-        (const uint8_t *)&comp,
-        sizeof(struct comch_dma_comp_msg),
-        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
     thread_arg->pos[r] += desc->size;
 
