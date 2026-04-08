@@ -21,9 +21,9 @@
 #define DPA_MEMCPY_CHUNK_MAX  (128 * 1024)
 
 /* Max DMA size for doca_dpa_dev_comch_producer_dma_copy.
- * HW may silently corrupt data past ~128 bytes per single dma_copy call.
- * Use small chunks and rely on chunked transfer loop. */
-#define DPA_DMA_COPY_MAX  128
+ * HW supports up to 8KB per single call with 128B-aligned addresses.
+ * Verified via DPUMesh_doca byte-level verification test. */
+#define DPA_DMA_COPY_MAX  8192
 
 /* Forward declarations */
 static void drain_producer_completions(struct dpa_thread_arg *thread_arg);

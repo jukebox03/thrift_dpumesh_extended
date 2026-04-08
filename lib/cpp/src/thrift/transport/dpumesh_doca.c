@@ -842,8 +842,12 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
                 /* Check if response arrived during timeout boundary */
                 if (p->state == 1)
                     break; /* fall through to success path below */
-                /* DPA may still hold the TX buffer — defer cleanup */
-                p->state = (p->tx_slot >= 0) ? -2 : -1;
+                /* Force-free TX slot to prevent permanent stall */
+                if (p->tx_slot >= 0) {
+                    dpumesh_tx_free(ctx, p->tx_slot);
+                    p->tx_slot = -1;
+                }
+                p->state = -1;
                 pthread_cond_broadcast(&p->cond);
                 pthread_mutex_unlock(&p->lock);
                 return -1;
@@ -860,8 +864,12 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
         return 0;
     }
 
-    /* DPA may still hold the TX buffer — defer cleanup */
-    p->state = (p->tx_slot >= 0) ? -2 : -1;
+    /* Force-free TX slot to prevent permanent stall */
+    if (p->tx_slot >= 0) {
+        dpumesh_tx_free(ctx, p->tx_slot);
+        p->tx_slot = -1;
+    }
+    p->state = -1;
     pthread_cond_broadcast(&p->cond);
     pthread_mutex_unlock(&p->lock);
     return -1;
@@ -884,11 +892,13 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
             p->tx_slot = -1;
         }
         p->state = -1;
-    } else if (p->state == 0 && p->tx_slot >= 0) {
-        /* DPA may still DMA from TX buffer — defer TX free until response arrives */
-        p->state = -2;
-    } else if (p->state == -2) {
-        /* Already deferred — wait for rx_data_hook to clean up */
+    } else if (p->state == 0 || p->state == -2) {
+        /* Force-free TX slot — leaving it locked permanently stalls the system */
+        if (p->tx_slot >= 0) {
+            dpumesh_tx_free(ctx, p->tx_slot);
+            p->tx_slot = -1;
+        }
+        p->state = -1;
     } else {
         p->state = -1;
     }
