@@ -21,9 +21,10 @@
 #define DPA_MEMCPY_CHUNK_MAX  (128 * 1024)
 
 /* Max DMA size for doca_dpa_dev_comch_producer_dma_copy.
- * dma_copy requires 128B-aligned src/dst addresses. Chunk size must also
- * be 128B-aligned so that offset increments maintain alignment. */
-#define DPA_DMA_COPY_MAX  8192
+ * HW constraints: 128B-aligned src/dst addresses AND max 512B per call.
+ * (128B/256B/512B verified CLEAN; 1024B+ causes DPA stuck even when aligned.)
+ * Chunk size must be 128B-aligned so offset increments maintain alignment. */
+#define DPA_DMA_COPY_MAX  512
 
 /* dma_copy HW requires 128-byte aligned source and destination addresses.
  * Round sizes up to maintain alignment when advancing buffer positions. */
