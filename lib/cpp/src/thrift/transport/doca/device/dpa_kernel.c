@@ -439,9 +439,11 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
 
     /* Clear descriptor and advance ring index.
      * On abort: don't advance pos (partial DMA data is abandoned in DPU buffer).
-     * No final completion sent, so host will timeout — better than corrupt data. */
+     * No final completion sent, so host will timeout — better than corrupt data.
+     * Round up pos to 128B boundary — dma_copy requires 128B-aligned addresses. */
     if (!aborted) {
         thread_arg->pos[r] += desc->size;
+        thread_arg->pos[r] = (thread_arg->pos[r] + 127) & ~(uint32_t)127;
         if (thread_arg->pos[r] >= ring->dpu_buf_size)
             thread_arg->pos[r] = 0;
     }
