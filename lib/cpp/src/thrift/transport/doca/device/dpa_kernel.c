@@ -21,9 +21,14 @@
 #define DPA_MEMCPY_CHUNK_MAX  (128 * 1024)
 
 /* Max DMA size for doca_dpa_dev_comch_producer_dma_copy.
- * HW may silently corrupt data past ~128 bytes per single dma_copy call.
- * Use small chunks and rely on chunked transfer loop. */
-#define DPA_DMA_COPY_MAX  128
+ * dma_copy requires 128B-aligned src/dst addresses. Chunk size must also
+ * be 128B-aligned so that offset increments maintain alignment. */
+#define DPA_DMA_COPY_MAX  8192
+
+/* dma_copy HW requires 128-byte aligned source and destination addresses.
+ * Round sizes up to maintain alignment when advancing buffer positions. */
+#define DMA_ADDR_ALIGN     128
+#define DMA_ALIGN_UP(x)   (((x) + DMA_ADDR_ALIGN - 1) & ~(DMA_ADDR_ALIGN - 1))
 
 /* Forward declarations */
 static void drain_producer_completions(struct dpa_thread_arg *thread_arg);
@@ -347,8 +352,9 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         return 1;
     }
 
-    /* Wrap around if DMA would exceed DPU buffer boundary */
-    if (thread_arg->pos[r] + desc->size > ring->dpu_buf_size)
+    /* Wrap around if DMA would exceed DPU buffer boundary.
+     * Use aligned size so the next pos stays 128B-aligned for dma_copy. */
+    if (thread_arg->pos[r] + DMA_ALIGN_UP(desc->size) > ring->dpu_buf_size)
         thread_arg->pos[r] = 0;
 
     /* Build completion message with routing info.
@@ -439,9 +445,10 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
 
     /* Clear descriptor and advance ring index.
      * On abort: don't advance pos (partial DMA data is abandoned in DPU buffer).
-     * No final completion sent, so host will timeout — better than corrupt data. */
+     * No final completion sent, so host will timeout — better than corrupt data.
+     * Advance by aligned size so next pos stays 128B-aligned for dma_copy. */
     if (!aborted) {
-        thread_arg->pos[r] += desc->size;
+        thread_arg->pos[r] += DMA_ALIGN_UP(desc->size);
         if (thread_arg->pos[r] >= ring->dpu_buf_size)
             thread_arg->pos[r] = 0;
     }
