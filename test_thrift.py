@@ -237,6 +237,137 @@ def run_stress_test(host, port, num_threads, num_requests, pad_bytes=0):
     return total_fail == 0
 
 
+def build_compose_unique_id_args_2entry(first_val_len):
+    """Builds args with 2 carrier map entries.
+    Entry 1: key='k', value='V'*first_val_len (variable size)
+    Entry 2: key='x', value='y' (fixed, structural bytes must survive DMA)
+    This ensures structural Thrift bytes (type/length fields) are placed
+    at different offsets depending on first_val_len."""
+    f1 = struct.pack('>bHq', T_I64, 1, 9999)
+    f2 = struct.pack('>bHi', T_I32, 2, 1)
+
+    # Map header: 2 entries
+    map_hdr = struct.pack('>bHbbI', T_MAP, 3, T_STRING, T_STRING, 2)
+    # Entry 1
+    key1 = b'k'
+    val1 = b'V' * first_val_len
+    e1 = struct.pack('>I', len(key1)) + key1 + struct.pack('>I', len(val1)) + val1
+    # Entry 2 (small, structural bytes must be correct)
+    key2 = b'x'
+    val2 = b'y'
+    e2 = struct.pack('>I', len(key2)) + key2 + struct.pack('>I', len(val2)) + val2
+    stop = struct.pack('>b', T_STOP)
+    return f1 + f2 + map_hdr + e1 + e2 + stop
+
+
+def run_boundary_test(host, port):
+    """Binary search for exact DMA boundary using 2-entry carrier maps.
+    Entry 2's structural bytes move past the boundary as entry 1 grows."""
+    print(f"\n{'='*60}")
+    print(f"  DMA Boundary Test (2-entry carrier map) — {host}:{port}")
+    print(f"{'='*60}")
+
+    # First: compare single-entry vs 2-entry at same size (~140B)
+    print(f"\n  --- Control: single-entry padding vs 2-entry at ~140B ---")
+
+    # Single entry 140B (padding, should pass if padding theory correct)
+    pad = calc_pad_for_target(140)
+    args_single = build_compose_unique_id_args(req_id=8000, pad_bytes=pad)
+    frame_single = build_thrift_framed_call("ComposeUniqueId", args_single, seq_id=100)
+    ok_s, sz_s = send_sized_request(host, port, 140, seq_id=100, timeout=10)
+    print(f"  Single-entry 140B: {'PASS' if ok_s else 'FAIL'} (actual={sz_s}B)")
+    time.sleep(0.3)
+
+    # 2-entry ~140B (first_val_len chosen so frame ≈ 140B)
+    # frame = 78 + first_val_len, so first_val_len = 62 → frame = 140B
+    args_2e = build_compose_unique_id_args_2entry(first_val_len=62)
+    frame_2e = build_thrift_framed_call("ComposeUniqueId", args_2e, seq_id=101)
+    actual_2e = len(frame_2e)
+    try:
+        with socket.create_connection((host, port), timeout=10) as s:
+            s.sendall(frame_2e)
+            resp = b""
+            while len(resp) < 4:
+                chunk = s.recv(4 - len(resp))
+                if not chunk: break
+                resp += chunk
+            if len(resp) == 4:
+                rlen = struct.unpack('>I', resp)[0]
+                rpay = b""
+                while len(rpay) < rlen:
+                    chunk = s.recv(rlen - len(rpay))
+                    if not chunk: break
+                    rpay += chunk
+                ok_2e = True
+            else:
+                ok_2e = False
+    except:
+        ok_2e = False
+    print(f"  2-entry   {actual_2e}B: {'PASS' if ok_2e else 'FAIL'}")
+    time.sleep(0.3)
+
+    # Sweep: 2-entry maps with increasing first_val_len
+    # frame = 78 + first_val_len
+    # entry2 key_len starts at frame byte 67 + first_val_len
+    print(f"\n  --- Sweep: 2-entry frames from 80B to 200B ---")
+    print(f"  (entry2 structural bytes move past DMA boundary)")
+    last_pass = 0
+    first_fail = 0
+    results = []
+
+    for fvl in list(range(0, 130, 2)):  # frame = 78 to 208 in 2B steps
+        args = build_compose_unique_id_args_2entry(first_val_len=fvl)
+        frame = build_thrift_framed_call("ComposeUniqueId", args, seq_id=200+fvl)
+        fsz = len(frame)
+        entry2_offset = 67 + fvl  # frame byte where entry2 key_len starts
+        try:
+            with socket.create_connection((host, port), timeout=10) as s:
+                s.sendall(frame)
+                resp = b""
+                while len(resp) < 4:
+                    chunk = s.recv(4 - len(resp))
+                    if not chunk: break
+                    resp += chunk
+                if len(resp) == 4:
+                    rlen = struct.unpack('>I', resp)[0]
+                    rpay = b""
+                    while len(rpay) < rlen:
+                        chunk = s.recv(rlen - len(rpay))
+                        if not chunk: break
+                        rpay += chunk
+                    ok = True
+                else:
+                    ok = False
+        except:
+            ok = False
+        status = "PASS" if ok else "FAIL"
+        results.append((fsz, entry2_offset, ok))
+        print(f"  [{status}] frame={fsz:4d}B  entry2_at_byte={entry2_offset:4d}")
+        if ok:
+            last_pass = fsz
+        elif first_fail == 0:
+            first_fail = fsz
+        time.sleep(0.2)
+
+        # Stop after 5 consecutive failures
+        recent_fails = sum(1 for _, _, o in results[-5:] if not o)
+        if recent_fails >= 5:
+            print(f"  (stopping after 5 consecutive failures)")
+            break
+
+    print(f"\n  --- Summary ---")
+    if last_pass and first_fail:
+        print(f"  Last PASS: {last_pass}B")
+        print(f"  First FAIL: {first_fail}B")
+        print(f"  >>> DMA boundary between {last_pass}B and {first_fail}B")
+    elif first_fail == 0:
+        print(f"  All passed! No DMA boundary found in range.")
+    else:
+        print(f"  First failure at {first_fail}B")
+
+    return first_fail == 0
+
+
 def parse_size_str(s):
     """Parse size string like '128K', '1M', '4096' into bytes."""
     s = s.strip().upper()
@@ -260,6 +391,11 @@ def main():
     # "size" mode: run size boundary test
     if len(sys.argv) > 3 and sys.argv[3] == "size":
         ok = run_size_test(host, port)
+        sys.exit(0 if ok else 1)
+
+    # "boundary" mode: 2-entry carrier map DMA boundary test
+    if len(sys.argv) > 3 and sys.argv[3] == "boundary":
+        ok = run_boundary_test(host, port)
         sys.exit(0 if ok else 1)
 
     # "stress" mode: high-load stress test

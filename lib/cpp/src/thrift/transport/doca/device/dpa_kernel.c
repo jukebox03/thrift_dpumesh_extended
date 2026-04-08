@@ -20,8 +20,10 @@
  * tune this value based on experimentation. */
 #define DPA_MEMCPY_CHUNK_MAX  (128 * 1024)
 
-/* Max DMA size for doca_dpa_dev_comch_producer_dma_copy (HW limit: 8192 bytes) */
-#define DPA_DMA_COPY_MAX  8192
+/* Max DMA size for doca_dpa_dev_comch_producer_dma_copy.
+ * HW may silently corrupt data past ~128 bytes per single dma_copy call.
+ * Use small chunks and rely on chunked transfer loop. */
+#define DPA_DMA_COPY_MAX  128
 
 /* Forward declarations */
 static void drain_producer_completions(struct dpa_thread_arg *thread_arg);
@@ -59,14 +61,16 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                 break;
             }
 
-            /* Chunked DMA via dma_copy (max 8KB per call).
+            /* Chunked DMA via dma_copy (max 128B per call).
              * Each dma_copy consumes one producer slot + one consumer recv task.
              * Intermediate chunks: DMA_CHUNK type (consumer ignores).
-             * Final chunk: sends actual immediate data. */
+             * Final chunk: sends actual immediate data.
+             * On consumer timeout, abort to avoid sending corrupt partial data. */
             {
                 uint32_t total = dma_msg->length;
                 uint32_t offset = 0;
                 int num_chunks = 0;
+                int aborted = 0;
                 enum comch_msg_type chunk_type = COMCH_MSG_TYPE_DMA_CHUNK;
 
                 while (offset < total) {
@@ -76,14 +80,21 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
 
                     /* Between chunks: free producer slots and wait for consumer */
                     if (num_chunks > 0) {
-                        drain_producer_completions(thread_arg);
+                        if ((num_chunks % 64) == 0)
+                            drain_producer_completions(thread_arg);
 
                         uint32_t wait = 0;
                         while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
                             wait++;
-                            if (wait >= DPA_CONSUMER_WAIT_LOOPS)
+                            if (wait >= DPA_CONSUMER_WAIT_LOOPS) {
+                                DOCA_DPA_DEV_LOG_INFO("DMA_REQ chunk consumer timeout — aborting (chunks=%d/%u)\n",
+                                                      num_chunks, (total + DPA_DMA_COPY_MAX - 1) / DPA_DMA_COPY_MAX);
+                                aborted = 1;
                                 break;
+                            }
                         }
+                        if (aborted)
+                            break;
                     }
 
                     if (offset + chunk >= total) {
@@ -351,13 +362,16 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     comp.dst_pod_id = desc->dst_pod_id;
     comp.flags = desc->flags;
 
-    /* Chunked DMA via dma_copy (max 8KB per call).
+    /* Chunked DMA via dma_copy (max 128B per call).
      * Each dma_copy consumes one producer send slot AND one consumer recv task.
      * Intermediate chunks: DMA_CHUNK type (consumer ignores but resubmits task).
      * Final chunk: real comch_dma_comp_msg (consumer processes).
      * Between chunks: drain producer completions and verify consumer availability
-     * to prevent silent slot exhaustion. */
+     * to prevent silent slot exhaustion.
+     * On consumer timeout: abort transfer — no final completion sent, host will
+     * timeout. This prevents sending corrupt partial data to the DPU worker. */
     int num_chunks = 0;
+    int aborted = 0;
     {
         uint32_t total = desc->size;
         uint32_t offset = 0;
@@ -372,18 +386,25 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
              * the DPU consumer has recv tasks available. Without this,
              * rapid-fire chunks exhaust both resources and dma_copy silently fails. */
             if (num_chunks > 0) {
-                drain_producer_completions(thread_arg);
+                /* Periodic producer drain every 64 chunks to prevent
+                 * producer slot exhaustion on large transfers */
+                if ((num_chunks % 64) == 0)
+                    drain_producer_completions(thread_arg);
 
                 uint32_t wait = 0;
                 while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
                     wait++;
                     if (wait >= DPA_CONSUMER_WAIT_LOOPS) {
-                        DOCA_DPA_DEV_LOG_INFO("DMA chunk consumer timeout (ring=%u chunks_sent=%d/%u)\n",
+                        DOCA_DPA_DEV_LOG_INFO("DMA chunk consumer timeout — aborting (ring=%u chunks=%d/%u req_id=%u)\n",
                                               r, num_chunks,
-                                              (total + DPA_DMA_COPY_MAX - 1) / DPA_DMA_COPY_MAX);
+                                              (total + DPA_DMA_COPY_MAX - 1) / DPA_DMA_COPY_MAX,
+                                              (uint32_t)desc->idx);
+                        aborted = 1;
                         break;
                     }
                 }
+                if (aborted)
+                    break;
             }
 
             if (offset + chunk >= total) {
@@ -416,16 +437,16 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         }
     }
 
-    thread_arg->pos[r] += desc->size;
-
-    if (thread_arg->pos[r] >= ring->dpu_buf_size)
-        thread_arg->pos[r] = 0;
+    /* Clear descriptor and advance ring index.
+     * On abort: don't advance pos (partial DMA data is abandoned in DPU buffer).
+     * No final completion sent, so host will timeout — better than corrupt data. */
+    if (!aborted) {
+        thread_arg->pos[r] += desc->size;
+        if (thread_arg->pos[r] >= ring->dpu_buf_size)
+            thread_arg->pos[r] = 0;
+    }
 
     __dpa_thread_window_writeback();
-    /* Clear descriptor fields first, then mark invalid last.
-     * valid=0 signals the host that this slot is free to write.
-     * If we clear valid first, the host may start writing new data
-     * while we're still zeroing fields — causing corruption under load. */
     desc->mmap = 0;
     desc->addr = 0;
     desc->size = 0;
@@ -437,7 +458,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     __dpa_thread_window_writeback();
 
     thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
-    return num_chunks;  /* number of dma_copy calls, not just 0/1 */
+    return num_chunks;  /* count all chunks sent (including before abort) for batch tracking */
 }
 
 /*
@@ -446,7 +467,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
  *
  * DPA_DRAIN_BATCH_LIMIT tracks dma_copy calls (not descriptors) because each
  * dma_copy consumes one producer slot + one consumer recv task. A single
- * descriptor >8KB generates multiple dma_copy calls via chunking.
+ * descriptor >128B generates multiple dma_copy calls via chunking.
  */
 static int drain_all_rings(struct dpa_thread_arg *thread_arg)
 {
