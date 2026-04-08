@@ -258,6 +258,13 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     if (!desc->valid)
         return 0;
 
+    DOCA_DPA_DEV_LOG_INFO("DESC FOUND: ring=%u slot=%u valid=%u size=%u addr=0x%lx idx=%u dst_mmap=0x%lx src_mmap=0x%lx dst_addr=0x%lx pos=%u\n",
+                          r, thread_arg->desc_idx[r], desc->valid, desc->size,
+                          desc->addr, (uint32_t)desc->idx,
+                          ring->dpu_mmap, ring->host_mmap,
+                          ring->dpu_addr + thread_arg->pos[r],
+                          thread_arg->pos[r]);
+
     if (ring->dpu_mmap == 0) {
         DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Protection Error]: invalid dst mmap handle (ring=%u slot=%u req_id=%u dpu_mmap=0)\n",
                               r, thread_arg->desc_idx[r], (uint32_t)desc->idx);
@@ -432,10 +439,15 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                             sizeof(chunk_type),
                                             DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
             }
+            DOCA_DPA_DEV_LOG_INFO("DMA_COPY done: ring=%u chunk=%u offset=%u/%u num_chunks=%d\n",
+                                  r, chunk, offset, total, num_chunks + 1);
             offset += chunk;
             num_chunks++;
         }
     }
+
+    DOCA_DPA_DEV_LOG_INFO("DESC DONE: ring=%u slot=%u chunks=%d aborted=%d\n",
+                          r, thread_arg->desc_idx[r], num_chunks, aborted);
 
     /* Clear descriptor and advance ring index.
      * On abort: don't advance pos (partial DMA data is abandoned in DPU buffer).
