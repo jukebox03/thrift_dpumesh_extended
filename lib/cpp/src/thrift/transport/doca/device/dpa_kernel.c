@@ -24,6 +24,7 @@
 #define DPA_DMA_COPY_MAX  8192
 
 /* Forward declarations */
+static void drain_producer_completions(struct dpa_thread_arg *thread_arg);
 static void drain_async_ops_completions(struct dpa_thread_arg *thread_arg);
 static int wait_one_dma_completion(struct dpa_thread_arg *thread_arg);
 
@@ -59,17 +60,31 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             }
 
             /* Chunked DMA via dma_copy (max 8KB per call).
+             * Each dma_copy consumes one producer slot + one consumer recv task.
              * Intermediate chunks: DMA_CHUNK type (consumer ignores).
              * Final chunk: sends actual immediate data. */
             {
                 uint32_t total = dma_msg->length;
                 uint32_t offset = 0;
+                int num_chunks = 0;
                 enum comch_msg_type chunk_type = COMCH_MSG_TYPE_DMA_CHUNK;
 
                 while (offset < total) {
                     uint32_t chunk = total - offset;
                     if (chunk > DPA_DMA_COPY_MAX)
                         chunk = DPA_DMA_COPY_MAX;
+
+                    /* Between chunks: free producer slots and wait for consumer */
+                    if (num_chunks > 0) {
+                        drain_producer_completions(thread_arg);
+
+                        uint32_t wait = 0;
+                        while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
+                            wait++;
+                            if (wait >= DPA_CONSUMER_WAIT_LOOPS)
+                                break;
+                        }
+                    }
 
                     if (offset + chunk >= total) {
                         /* Final chunk: send with real immediate data */
@@ -97,6 +112,7 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                                                 DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
                     }
                     offset += chunk;
+                    num_chunks++;
                 }
             }
             break;
@@ -336,8 +352,12 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     comp.flags = desc->flags;
 
     /* Chunked DMA via dma_copy (max 8KB per call).
-     * Intermediate chunks: DMA_CHUNK type (consumer ignores).
-     * Final chunk: real comch_dma_comp_msg (consumer processes). */
+     * Each dma_copy consumes one producer send slot AND one consumer recv task.
+     * Intermediate chunks: DMA_CHUNK type (consumer ignores but resubmits task).
+     * Final chunk: real comch_dma_comp_msg (consumer processes).
+     * Between chunks: drain producer completions and verify consumer availability
+     * to prevent silent slot exhaustion. */
+    int num_chunks = 0;
     {
         uint32_t total = desc->size;
         uint32_t offset = 0;
@@ -347,6 +367,24 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
             uint32_t chunk = total - offset;
             if (chunk > DPA_DMA_COPY_MAX)
                 chunk = DPA_DMA_COPY_MAX;
+
+            /* Before each subsequent chunk, free producer slots and ensure
+             * the DPU consumer has recv tasks available. Without this,
+             * rapid-fire chunks exhaust both resources and dma_copy silently fails. */
+            if (num_chunks > 0) {
+                drain_producer_completions(thread_arg);
+
+                uint32_t wait = 0;
+                while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
+                    wait++;
+                    if (wait >= DPA_CONSUMER_WAIT_LOOPS) {
+                        DOCA_DPA_DEV_LOG_INFO("DMA chunk consumer timeout (ring=%u chunks_sent=%d/%u)\n",
+                                              r, num_chunks,
+                                              (total + DPA_DMA_COPY_MAX - 1) / DPA_DMA_COPY_MAX);
+                        break;
+                    }
+                }
+            }
 
             if (offset + chunk >= total) {
                 /* Final chunk: send real completion message */
@@ -374,6 +412,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                             DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
             }
             offset += chunk;
+            num_chunks++;
         }
     }
 
@@ -398,18 +437,22 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     __dpa_thread_window_writeback();
 
     thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
-    return 1;
+    return num_chunks;  /* number of dma_copy calls, not just 0/1 */
 }
 
 /*
  * Drain all valid descriptors across all rings.
- * Returns total number of descriptors processed.
+ * Returns total number of dma_copy calls issued.
+ *
+ * DPA_DRAIN_BATCH_LIMIT tracks dma_copy calls (not descriptors) because each
+ * dma_copy consumes one producer slot + one consumer recv task. A single
+ * descriptor >8KB generates multiple dma_copy calls via chunking.
  */
 static int drain_all_rings(struct dpa_thread_arg *thread_arg)
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
     uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
-    int total = 0;
+    int total_dma_calls = 0;
     int found;
 
     do {
@@ -422,15 +465,17 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
 
         uint32_t nr = thread_arg->num_rings;
         for (uint32_t r = 0; r < nr; r++) {
-            if (process_one_desc(thread_arg, r))
+            int chunks = process_one_desc(thread_arg, r);
+            if (chunks > 0) {
                 found++;
+                total_dma_calls += chunks;
+            }
         }
-        total += found;
 
-        /* After DPA_DRAIN_BATCH_LIMIT completions sent, the DPU consumer's
+        /* After DPA_DRAIN_BATCH_LIMIT dma_copy calls, the DPU consumer's
          * recv tasks may be nearly exhausted. Pause and wait for the DPU to
          * process callbacks and resubmit tasks before continuing. */
-        if (total >= DPA_DRAIN_BATCH_LIMIT) {
+        if (total_dma_calls >= DPA_DRAIN_BATCH_LIMIT) {
             /* Drain producer + async_ops completions to free slots before pause */
             drain_producer_completions(thread_arg);
             drain_async_ops_completions(thread_arg);
@@ -450,11 +495,11 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
                     break;
                 }
             }
-            total = 0;  /* reset counter for next batch */
+            total_dma_calls = 0;  /* reset counter for next batch */
         }
     } while (found > 0);
 
-    return total;
+    return total_dma_calls;
 }
 
 __dpa_global__ void hello_world(uint64_t arg)
