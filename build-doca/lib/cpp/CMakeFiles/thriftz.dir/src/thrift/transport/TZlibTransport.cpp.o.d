@@ -1,5 +1,5 @@
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TZlibTransport.cpp \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TZlibTransport.cpp \
  /usr/include/stdc-predef.h /usr/include/c++/11/cassert \
  /usr/include/x86_64-linux-gnu/c++/11/bits/c++config.h \
  /usr/include/x86_64-linux-gnu/c++/11/bits/os_defines.h \
@@ -71,16 +71,16 @@ lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o: \
  /usr/include/c++/11/bits/stl_construct.h /usr/include/c++/11/new \
  /usr/include/c++/11/bits/exception.h \
  /usr/include/c++/11/bits/uniform_int_dist.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TZlibTransport.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransport.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/Thrift.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/PlatformSocket.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TZlibTransport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/Thrift.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/PlatformSocket.h \
  /usr/include/errno.h /usr/include/x86_64-linux-gnu/bits/errno.h \
  /usr/include/linux/errno.h /usr/include/x86_64-linux-gnu/asm/errno.h \
  /usr/include/asm-generic/errno.h /usr/include/asm-generic/errno-base.h \
  /usr/include/x86_64-linux-gnu/bits/types/error_t.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/thrift-config.h \
- /home/jukebox/thrift_dpumesh_extended/build-doca/thrift/config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/thrift-config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/thrift/config.h \
  /usr/include/stdio.h /usr/lib/gcc/x86_64-linux-gnu/11/include/stdarg.h \
  /usr/include/x86_64-linux-gnu/bits/types/__fpos_t.h \
  /usr/include/x86_64-linux-gnu/bits/types/__mbstate_t.h \
@@ -217,9 +217,9 @@ lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o: \
  /usr/include/boost/type_traits/is_abstract.hpp \
  /usr/include/boost/type_traits/add_lvalue_reference.hpp \
  /usr/include/boost/type_traits/add_reference.hpp \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/TLogging.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/TOutput.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/stdcxx.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/TLogging.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/TOutput.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/stdcxx.h \
  /usr/include/c++/11/functional /usr/include/c++/11/bits/refwrap.h \
  /usr/include/c++/11/bits/std_function.h /usr/include/c++/11/memory \
  /usr/include/c++/11/bits/stl_raw_storage_iter.h \
@@ -232,7 +232,7 @@ lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o: \
  /usr/include/c++/11/bits/atomic_base.h \
  /usr/include/c++/11/bits/atomic_lockfree_defines.h \
  /usr/include/c++/11/backward/auto_ptr.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransportException.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransportException.h \
  /usr/include/boost/numeric/conversion/cast.hpp \
  /usr/include/boost/type.hpp \
  /usr/include/boost/numeric/conversion/converter.hpp \
@@ -395,8 +395,8 @@ lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o: \
  /usr/include/boost/numeric/conversion/detail/numeric_cast_traits.hpp \
  /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_common.hpp \
  /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_long_long.hpp \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TVirtualTransport.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/TToString.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TVirtualTransport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/TToString.h \
  /usr/include/c++/11/sstream /usr/include/c++/11/istream \
  /usr/include/c++/11/ios /usr/include/c++/11/bits/ios_base.h \
  /usr/include/c++/11/bits/locale_classes.h \

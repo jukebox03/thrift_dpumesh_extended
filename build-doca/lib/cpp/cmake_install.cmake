@@ -1,4 +1,4 @@
-# Install script for directory: /home/jukebox/thrift_dpumesh_extended/lib/cpp
+# Install script for directory: /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -49,7 +49,7 @@ if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_
          FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthrift.so.0.12.0"
          RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu")
   endif()
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE SHARED_LIBRARY FILES "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/libthrift.so.0.12.0")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE SHARED_LIBRARY FILES "/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/libthrift.so.0.12.0")
   if(EXISTS "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthrift.so.0.12.0" AND
      NOT IS_SYMLINK "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthrift.so.0.12.0")
     file(RPATH_CHANGE
@@ -69,7 +69,7 @@ if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_
          FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthrift.so"
          RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu")
   endif()
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE SHARED_LIBRARY FILES "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/libthrift.so")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE SHARED_LIBRARY FILES "/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/libthrift.so")
   if(EXISTS "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthrift.so" AND
      NOT IS_SYMLINK "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthrift.so")
     file(RPATH_CHANGE
@@ -83,7 +83,7 @@ if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_
 endif()
 
 if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE STATIC_LIBRARY FILES "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/libthrift.a")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE STATIC_LIBRARY FILES "/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/libthrift.a")
 endif()
 
 if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
@@ -93,12 +93,12 @@ if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_
          FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftnb.so.0.12.0"
          RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu")
   endif()
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE SHARED_LIBRARY FILES "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/libthriftnb.so.0.12.0")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE SHARED_LIBRARY FILES "/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/libthriftnb.so.0.12.0")
   if(EXISTS "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftnb.so.0.12.0" AND
      NOT IS_SYMLINK "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftnb.so.0.12.0")
     file(RPATH_CHANGE
          FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftnb.so.0.12.0"
-         OLD_RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu:/home/jukebox/thrift_dpumesh_extended/build-doca/lib:"
+         OLD_RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu:/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib:"
          NEW_RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu")
     if(CMAKE_INSTALL_DO_STRIP)
       execute_process(COMMAND "/usr/bin/strip" "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftnb.so.0.12.0")
@@ -113,12 +113,12 @@ if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_
          FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftnb.so"
          RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu")
   endif()
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE SHARED_LIBRARY FILES "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/libthriftnb.so")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE SHARED_LIBRARY FILES "/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/libthriftnb.so")
   if(EXISTS "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftnb.so" AND
      NOT IS_SYMLINK "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftnb.so")
     file(RPATH_CHANGE
          FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftnb.so"
-         OLD_RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu:/home/jukebox/thrift_dpumesh_extended/build-doca/lib:"
+         OLD_RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu:/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib:"
          NEW_RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu")
     if(CMAKE_INSTALL_DO_STRIP)
       execute_process(COMMAND "/usr/bin/strip" "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftnb.so")
@@ -127,7 +127,7 @@ if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_
 endif()
 
 if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE STATIC_LIBRARY FILES "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/libthriftnb.a")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE STATIC_LIBRARY FILES "/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/libthriftnb.a")
 endif()
 
 if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
@@ -137,12 +137,12 @@ if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_
          FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftz.so.0.12.0"
          RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu")
   endif()
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE SHARED_LIBRARY FILES "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/libthriftz.so.0.12.0")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE SHARED_LIBRARY FILES "/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/libthriftz.so.0.12.0")
   if(EXISTS "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftz.so.0.12.0" AND
      NOT IS_SYMLINK "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftz.so.0.12.0")
     file(RPATH_CHANGE
          FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftz.so.0.12.0"
-         OLD_RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu:/home/jukebox/thrift_dpumesh_extended/build-doca/lib:"
+         OLD_RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu:/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib:"
          NEW_RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu")
     if(CMAKE_INSTALL_DO_STRIP)
       execute_process(COMMAND "/usr/bin/strip" "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftz.so.0.12.0")
@@ -157,12 +157,12 @@ if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_
          FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftz.so"
          RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu")
   endif()
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE SHARED_LIBRARY FILES "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/libthriftz.so")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE SHARED_LIBRARY FILES "/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/libthriftz.so")
   if(EXISTS "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftz.so" AND
      NOT IS_SYMLINK "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftz.so")
     file(RPATH_CHANGE
          FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftz.so"
-         OLD_RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu:/home/jukebox/thrift_dpumesh_extended/build-doca/lib:"
+         OLD_RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu:/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib:"
          NEW_RPATH "/opt/mellanox/doca/lib/x86_64-linux-gnu")
     if(CMAKE_INSTALL_DO_STRIP)
       execute_process(COMMAND "/usr/bin/strip" "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libthriftz.so")
@@ -171,14 +171,14 @@ if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_
 endif()
 
 if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE STATIC_LIBRARY FILES "/home/jukebox/thrift_dpumesh_extended/build-doca/lib/libthriftz.a")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE STATIC_LIBRARY FILES "/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/libthriftz.a")
 endif()
 
 if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/include" TYPE DIRECTORY FILES "/home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift" FILES_MATCHING REGEX "/[^/]*\\.h$" REGEX "/[^/]*\\.tcc$")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/include" TYPE DIRECTORY FILES "/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift" FILES_MATCHING REGEX "/[^/]*\\.h$" REGEX "/[^/]*\\.tcc$")
 endif()
 
 if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/include" TYPE DIRECTORY FILES "/home/jukebox/thrift_dpumesh_extended/build-doca/thrift" FILES_MATCHING REGEX "/[^/]*\\.h$")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/include" TYPE DIRECTORY FILES "/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/thrift" FILES_MATCHING REGEX "/[^/]*\\.h$")
 endif()
 

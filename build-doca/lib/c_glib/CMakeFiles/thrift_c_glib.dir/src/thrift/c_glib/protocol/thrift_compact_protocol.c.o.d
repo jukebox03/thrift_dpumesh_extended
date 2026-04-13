@@ -1,5 +1,5 @@
 lib/c_glib/CMakeFiles/thrift_c_glib.dir/src/thrift/c_glib/protocol/thrift_compact_protocol.c.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_compact_protocol.c \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_compact_protocol.c \
  /usr/include/stdc-predef.h /usr/include/string.h \
  /usr/include/x86_64-linux-gnu/bits/libc-header-start.h \
  /usr/include/features.h /usr/include/features-time64.h \
@@ -26,7 +26,7 @@ lib/c_glib/CMakeFiles/thrift_c_glib.dir/src/thrift/c_glib/protocol/thrift_compac
  /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
  /usr/include/x86_64-linux-gnu/bits/floatn.h \
  /usr/include/x86_64-linux-gnu/bits/floatn-common.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/thrift.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/thrift.h \
  /usr/include/glib-2.0/glib.h /usr/include/glib-2.0/glib/galloca.h \
  /usr/include/glib-2.0/glib/gtypes.h \
  /usr/lib/x86_64-linux-gnu/glib-2.0/include/glibconfig.h \
@@ -165,7 +165,7 @@ lib/c_glib/CMakeFiles/thrift_c_glib.dir/src/thrift/c_glib/protocol/thrift_compac
  /usr/include/x86_64-linux-gnu/bits/setjmp.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
  /usr/include/glib-2.0/glib/glib-autocleanups.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_protocol.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_protocol.h \
  /usr/include/glib-2.0/glib-object.h \
  /usr/include/glib-2.0/gobject/gbinding.h \
  /usr/include/glib-2.0/gobject/gobject.h \
@@ -188,6 +188,6 @@ lib/c_glib/CMakeFiles/thrift_c_glib.dir/src/thrift/c_glib/protocol/thrift_compac
  /usr/include/glib-2.0/gobject/gvaluearray.h \
  /usr/include/glib-2.0/gobject/gvaluetypes.h \
  /usr/include/glib-2.0/gobject/gobject-autocleanups.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_compact_protocol.h \
- /home/jukebox/thrift_dpumesh_extended/build-doca/thrift/config.h
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_compact_protocol.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/thrift/config.h

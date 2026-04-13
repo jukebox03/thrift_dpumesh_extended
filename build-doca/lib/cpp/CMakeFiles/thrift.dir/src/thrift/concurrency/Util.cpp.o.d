@@ -1,10 +1,10 @@
 lib/cpp/CMakeFiles/thrift.dir/src/thrift/concurrency/Util.cpp.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/concurrency/Util.cpp \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/concurrency/Util.cpp \
  /usr/include/stdc-predef.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/thrift-config.h \
- /home/jukebox/thrift_dpumesh_extended/build-doca/thrift/config.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/Thrift.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/PlatformSocket.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/thrift-config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/thrift/config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/Thrift.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/PlatformSocket.h \
  /usr/include/errno.h /usr/include/features.h \
  /usr/include/features-time64.h \
  /usr/include/x86_64-linux-gnu/bits/wordsize.h \
@@ -211,7 +211,7 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/concurrency/Util.cpp.o: \
  /usr/include/boost/type_traits/is_abstract.hpp \
  /usr/include/boost/type_traits/add_lvalue_reference.hpp \
  /usr/include/boost/type_traits/add_reference.hpp \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/TLogging.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/TOutput.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/concurrency/Util.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/TLogging.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/TOutput.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/concurrency/Util.h \
  /usr/include/x86_64-linux-gnu/sys/time.h

@@ -1,5 +1,5 @@
 lib/c_glib/CMakeFiles/thrift_c_glib.dir/src/thrift/c_glib/protocol/thrift_stored_message_protocol.c.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_stored_message_protocol.c \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_stored_message_protocol.c \
  /usr/include/stdc-predef.h /usr/include/string.h \
  /usr/include/x86_64-linux-gnu/bits/libc-header-start.h \
  /usr/include/features.h /usr/include/features-time64.h \
@@ -186,8 +186,8 @@ lib/c_glib/CMakeFiles/thrift_c_glib.dir/src/thrift/c_glib/protocol/thrift_stored
  /usr/include/glib-2.0/gobject/gvaluearray.h \
  /usr/include/glib-2.0/gobject/gvaluetypes.h \
  /usr/include/glib-2.0/gobject/gobject-autocleanups.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/thrift.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_protocol.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_protocol_decorator.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_stored_message_protocol.h
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/thrift.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_protocol.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_protocol_decorator.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/protocol/thrift_stored_message_protocol.h

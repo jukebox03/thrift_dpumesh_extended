@@ -53,10 +53,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /home/jukebox/thrift_dpumesh_extended
+CMAKE_SOURCE_DIR = /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/jukebox/thrift_dpumesh_extended/build-doca
+CMAKE_BINARY_DIR = /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca
 
 # Include any dependencies generated for this target.
 include lib/cpp/CMakeFiles/thriftz.dir/depend.make
@@ -72,44 +72,44 @@ include lib/cpp/CMakeFiles/thriftz.dir/flags.make
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o: lib/cpp/CMakeFiles/thriftz.dir/flags.make
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o: ../lib/cpp/src/thrift/transport/TZlibTransport.cpp
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o: lib/cpp/CMakeFiles/thriftz.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o -MF CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o.d -o CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TZlibTransport.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o"
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o -MF CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o.d -o CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TZlibTransport.cpp
 
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.i"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TZlibTransport.cpp > CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.i
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TZlibTransport.cpp > CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.i
 
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.s"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TZlibTransport.cpp -o CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.s
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TZlibTransport.cpp -o CMakeFiles/thriftz.dir/src/thrift/transport/TZlibTransport.cpp.s
 
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.o: lib/cpp/CMakeFiles/thriftz.dir/flags.make
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.o: ../lib/cpp/src/thrift/protocol/THeaderProtocol.cpp
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.o: lib/cpp/CMakeFiles/thriftz.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object lib/cpp/CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.o"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.o -MF CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.o.d -o CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/THeaderProtocol.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object lib/cpp/CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.o"
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.o -MF CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.o.d -o CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/THeaderProtocol.cpp
 
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.i"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/THeaderProtocol.cpp > CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.i
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/THeaderProtocol.cpp > CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.i
 
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.s"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/THeaderProtocol.cpp -o CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.s
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/THeaderProtocol.cpp -o CMakeFiles/thriftz.dir/src/thrift/protocol/THeaderProtocol.cpp.s
 
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.o: lib/cpp/CMakeFiles/thriftz.dir/flags.make
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.o: ../lib/cpp/src/thrift/transport/THeaderTransport.cpp
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.o: lib/cpp/CMakeFiles/thriftz.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CXX object lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.o"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.o -MF CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.o.d -o CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/THeaderTransport.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CXX object lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.o"
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.o -MF CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.o.d -o CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/THeaderTransport.cpp
 
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.i"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/THeaderTransport.cpp > CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.i
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/THeaderTransport.cpp > CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.i
 
 lib/cpp/CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.s"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/THeaderTransport.cpp -o CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.s
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/THeaderTransport.cpp -o CMakeFiles/thriftz.dir/src/thrift/transport/THeaderTransport.cpp.s
 
 # Object files for target thriftz
 thriftz_OBJECTS = \
@@ -131,9 +131,9 @@ lib/libthriftz.so.0.12.0: lib/libthrift.so.0.12.0
 lib/libthriftz.so.0.12.0: /usr/lib/x86_64-linux-gnu/libssl.so
 lib/libthriftz.so.0.12.0: /usr/lib/x86_64-linux-gnu/libcrypto.so
 lib/libthriftz.so.0.12.0: lib/cpp/CMakeFiles/thriftz.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/jukebox/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Linking CXX shared library ../libthriftz.so"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && $(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/thriftz.dir/link.txt --verbose=$(VERBOSE)
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && $(CMAKE_COMMAND) -E cmake_symlink_library ../libthriftz.so.0.12.0 ../libthriftz.so.0.12.0 ../libthriftz.so
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Linking CXX shared library ../libthriftz.so"
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && $(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/thriftz.dir/link.txt --verbose=$(VERBOSE)
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && $(CMAKE_COMMAND) -E cmake_symlink_library ../libthriftz.so.0.12.0 ../libthriftz.so.0.12.0 ../libthriftz.so
 
 lib/libthriftz.so: lib/libthriftz.so.0.12.0
 	@$(CMAKE_COMMAND) -E touch_nocreate lib/libthriftz.so
@@ -143,10 +143,10 @@ lib/cpp/CMakeFiles/thriftz.dir/build: lib/libthriftz.so
 .PHONY : lib/cpp/CMakeFiles/thriftz.dir/build
 
 lib/cpp/CMakeFiles/thriftz.dir/clean:
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && $(CMAKE_COMMAND) -P CMakeFiles/thriftz.dir/cmake_clean.cmake
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && $(CMAKE_COMMAND) -P CMakeFiles/thriftz.dir/cmake_clean.cmake
 .PHONY : lib/cpp/CMakeFiles/thriftz.dir/clean
 
 lib/cpp/CMakeFiles/thriftz.dir/depend:
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /home/jukebox/thrift_dpumesh_extended /home/jukebox/thrift_dpumesh_extended/lib/cpp /home/jukebox/thrift_dpumesh_extended/build-doca /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp/CMakeFiles/thriftz.dir/DependInfo.cmake --color=$(COLOR)
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp/CMakeFiles/thriftz.dir/DependInfo.cmake --color=$(COLOR)
 .PHONY : lib/cpp/CMakeFiles/thriftz.dir/depend
 

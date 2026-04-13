@@ -1,8 +1,8 @@
 lib/cpp/CMakeFiles/thrift.dir/src/thrift/server/TServer.cpp.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/server/TServer.cpp \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/server/TServer.cpp \
  /usr/include/stdc-predef.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/thrift-config.h \
- /home/jukebox/thrift_dpumesh_extended/build-doca/thrift/config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/thrift-config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/thrift/config.h \
  /usr/include/x86_64-linux-gnu/sys/time.h /usr/include/features.h \
  /usr/include/features-time64.h \
  /usr/include/x86_64-linux-gnu/bits/wordsize.h \

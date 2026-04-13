@@ -1,5 +1,5 @@
 lib/c_glib/CMakeFiles/thrift_c_glib.dir/src/thrift/c_glib/transport/thrift_fd_transport.c.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_fd_transport.c \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_fd_transport.c \
  /usr/include/stdc-predef.h /usr/include/errno.h /usr/include/features.h \
  /usr/include/features-time64.h \
  /usr/include/x86_64-linux-gnu/bits/wordsize.h \
@@ -175,8 +175,8 @@ lib/c_glib/CMakeFiles/thrift_c_glib.dir/src/thrift/c_glib/transport/thrift_fd_tr
  /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
  /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
  /usr/include/x86_64-linux-gnu/sys/stat.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/thrift.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/thrift.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport.h \
  /usr/include/glib-2.0/glib-object.h \
  /usr/include/glib-2.0/gobject/gbinding.h \
  /usr/include/glib-2.0/gobject/gobject.h \
@@ -199,5 +199,5 @@ lib/c_glib/CMakeFiles/thrift_c_glib.dir/src/thrift/c_glib/transport/thrift_fd_tr
  /usr/include/glib-2.0/gobject/gvaluearray.h \
  /usr/include/glib-2.0/gobject/gvaluetypes.h \
  /usr/include/glib-2.0/gobject/gobject-autocleanups.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_fd_transport.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport.h
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_fd_transport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport.h

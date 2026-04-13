@@ -25,6 +25,13 @@
  * Verified via DPUMesh_doca byte-level verification test. */
 #define DPA_DMA_COPY_MAX  8192
 
+/* Alignment requirements for doca_dpa_dev_comch_producer_dma_copy:
+ * - Source and destination addresses: 64B aligned
+ *   (ensured by CACHE_ALIGN=128 buffer allocation + 128B-aligned offsets)
+ * - Transfer size per call: 128B aligned, max 8KB */
+#define DMA_COPY_SIZE_ALIGN  128
+#define ALIGN_UP_128(x)  (((x) + (DMA_COPY_SIZE_ALIGN - 1)) & ~(uint32_t)(DMA_COPY_SIZE_ALIGN - 1))
+
 /* Forward declarations */
 static void drain_producer_completions(struct dpa_thread_arg *thread_arg);
 static void drain_async_ops_completions(struct dpa_thread_arg *thread_arg);
@@ -61,7 +68,7 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                 break;
             }
 
-            /* Chunked DMA via dma_copy (max 128B per call).
+            /* Chunked DMA via dma_copy (max 8KB per call, 128B-aligned size).
              * Each dma_copy consumes one producer slot + one consumer recv task.
              * Intermediate chunks: DMA_CHUNK type (consumer ignores).
              * Final chunk: sends actual immediate data.
@@ -74,9 +81,12 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                 enum comch_msg_type chunk_type = COMCH_MSG_TYPE_DMA_CHUNK;
 
                 while (offset < total) {
-                    uint32_t chunk = total - offset;
+                    uint32_t remaining = total - offset;
+                    uint32_t chunk = remaining;
                     if (chunk > DPA_DMA_COPY_MAX)
                         chunk = DPA_DMA_COPY_MAX;
+                    /* Round up to 128B — dma_copy requires 128B-aligned transfer size */
+                    chunk = ALIGN_UP_128(chunk);
 
                     /* Between chunks: free producer slots and wait for consumer */
                     if (num_chunks > 0) {
@@ -97,7 +107,7 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                             break;
                     }
 
-                    if (offset + chunk >= total) {
+                    if (remaining <= chunk) {
                         /* Final chunk: send with real immediate data */
                         doca_dpa_dev_comch_producer_dma_copy(producer,
                                                 dpu_consumer_id,
@@ -329,33 +339,41 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
             }
 
             if (empty_wait_loops >= DMA_DIAG_EMPTY_WAIT_FAIL_LOOPS) {
-                DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Receiver Not Ready]: timeout waiting consumer credits (ring=%u ring_pod=%d slot=%u req_id=%u consumer_id=%u loops=%u). Will retry later.\n",
+                DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Receiver Not Ready]: timeout waiting consumer credits (ring=%u ring_pod=%d slot=%u req_id=%u consumer_id=%u loops=%u). Dropping descriptor.\n",
                                       r,
                                       ring->pod_id,
                                       thread_arg->desc_idx[r],
                                       (uint32_t)desc->idx,
                                       dpu_consumer_id,
                                       empty_wait_loops);
-                return 0;
+                /* Clear descriptor to unblock ring slot */
+                desc->valid = 0;
+                __dpa_thread_window_writeback();
+                thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
+                return 1;
             }
         }
         (void)empty_wait_loops;
     }
 
-    /* Check if descriptor fits in DPU buffer at all */
-    if (desc->size > ring->dpu_buf_size) {
+    /* Compute 128B-aligned total — dma_copy requires 128B-aligned transfer sizes,
+     * so the actual space consumed in the DPU buffer is the rounded-up total. */
+    uint32_t padded_total = ALIGN_UP_128(desc->size);
+
+    /* Check if padded descriptor fits in DPU buffer at all */
+    if (padded_total > ring->dpu_buf_size) {
         DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Length Error]: requested length exceeds DPU destination buffer\n");
-        DOCA_DPA_DEV_LOG_INFO("Descriptor too large for DPU buffer: ring=%u slot=%u req_id=%u size=%u dpu_buf_size=%u\n",
+        DOCA_DPA_DEV_LOG_INFO("Descriptor too large for DPU buffer: ring=%u slot=%u req_id=%u size=%u padded=%u dpu_buf_size=%u\n",
                               r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
-                              desc->size, ring->dpu_buf_size);
+                              desc->size, padded_total, ring->dpu_buf_size);
         desc->valid = 0;
         __dpa_thread_window_writeback();
         thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
         return 1;
     }
 
-    /* Wrap around if DMA would exceed DPU buffer boundary */
-    if (thread_arg->pos[r] + desc->size > ring->dpu_buf_size)
+    /* Wrap around if padded DMA would exceed DPU buffer boundary */
+    if (thread_arg->pos[r] + padded_total > ring->dpu_buf_size)
         thread_arg->pos[r] = 0;
 
     /* Build completion message with routing info.
@@ -369,7 +387,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     comp.dst_pod_id = desc->dst_pod_id;
     comp.flags = desc->flags;
 
-    /* Chunked DMA via dma_copy (max 128B per call).
+    /* Chunked DMA via dma_copy (max 8KB per call, 128B-aligned size).
      * Each dma_copy consumes one producer send slot AND one consumer recv task.
      * Intermediate chunks: DMA_CHUNK type (consumer ignores but resubmits task).
      * Final chunk: real comch_dma_comp_msg (consumer processes).
@@ -385,9 +403,15 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         enum comch_msg_type chunk_type = COMCH_MSG_TYPE_DMA_CHUNK;
 
         while (offset < total) {
-            uint32_t chunk = total - offset;
+            uint32_t remaining = total - offset;
+            uint32_t chunk = remaining;
             if (chunk > DPA_DMA_COPY_MAX)
                 chunk = DPA_DMA_COPY_MAX;
+            /* Round up to 128B — dma_copy requires 128B-aligned transfer size.
+             * The extra padding bytes are harmless: source buffer has room
+             * (slot_size is 128B-aligned), and receiver uses comp.length for
+             * actual data size. */
+            chunk = ALIGN_UP_128(chunk);
 
             /* Before each subsequent chunk, free producer slots and ensure
              * the DPU consumer has recv tasks available. Without this,
@@ -414,7 +438,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                     break;
             }
 
-            if (offset + chunk >= total) {
+            if (remaining <= chunk) {
                 /* Final chunk: send real completion message */
                 doca_dpa_dev_comch_producer_dma_copy(producer,
                                             dpu_consumer_id,
@@ -439,7 +463,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                             sizeof(chunk_type),
                                             DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
             }
-            DOCA_DPA_DEV_LOG_INFO("DMA_COPY done: ring=%u chunk=%u offset=%u/%u num_chunks=%d\n",
+            DOCA_DPA_DEV_LOG_INFO("DMA_COPY done: ring=%u chunk=%u(aligned) offset=%u/%u num_chunks=%d\n",
                                   r, chunk, offset, total, num_chunks + 1);
             offset += chunk;
             num_chunks++;
@@ -452,10 +476,10 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     /* Clear descriptor and advance ring index.
      * On abort: don't advance pos (partial DMA data is abandoned in DPU buffer).
      * No final completion sent, so host will timeout — better than corrupt data.
-     * Round up pos to 128B boundary — dma_copy requires 128B-aligned addresses. */
+     * Advance pos by padded_total (128B-aligned) to keep DPU buffer positions
+     * aligned for subsequent dma_copy calls. */
     if (!aborted) {
-        thread_arg->pos[r] += desc->size;
-        thread_arg->pos[r] = (thread_arg->pos[r] + 127) & ~(uint32_t)127;
+        thread_arg->pos[r] += padded_total;
         if (thread_arg->pos[r] >= ring->dpu_buf_size)
             thread_arg->pos[r] = 0;
     }

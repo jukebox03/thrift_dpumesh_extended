@@ -1,7 +1,7 @@
 lib/cpp/CMakeFiles/thriftnb_static.dir/src/thrift/async/TEvhttpClientChannel.cpp.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/async/TEvhttpClientChannel.cpp \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/async/TEvhttpClientChannel.cpp \
  /usr/include/stdc-predef.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/async/TEvhttpClientChannel.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/async/TEvhttpClientChannel.h \
  /usr/include/c++/11/queue /usr/include/c++/11/deque \
  /usr/include/c++/11/bits/stl_algobase.h \
  /usr/include/x86_64-linux-gnu/c++/11/bits/c++config.h \
@@ -137,7 +137,7 @@ lib/cpp/CMakeFiles/thriftnb_static.dir/src/thrift/async/TEvhttpClientChannel.cpp
  /usr/include/c++/11/bits/charconv.h \
  /usr/include/c++/11/bits/basic_string.tcc /usr/include/c++/11/utility \
  /usr/include/c++/11/bits/stl_relops.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/stdcxx.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/stdcxx.h \
  /usr/include/boost/config.hpp /usr/include/boost/config/user.hpp \
  /usr/include/boost/config/detail/select_compiler_config.hpp \
  /usr/include/boost/config/compiler/gcc.hpp /usr/include/c++/11/cstddef \
@@ -176,11 +176,11 @@ lib/cpp/CMakeFiles/thriftnb_static.dir/src/thrift/async/TEvhttpClientChannel.cpp
  /usr/include/c++/11/bits/atomic_base.h \
  /usr/include/c++/11/bits/atomic_lockfree_defines.h \
  /usr/include/c++/11/backward/auto_ptr.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/async/TAsyncChannel.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/Thrift.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/PlatformSocket.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/thrift-config.h \
- /home/jukebox/thrift_dpumesh_extended/build-doca/thrift/config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/async/TAsyncChannel.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/Thrift.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/PlatformSocket.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/thrift-config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/thrift/config.h \
  /usr/include/assert.h /usr/include/netinet/in.h \
  /usr/include/x86_64-linux-gnu/sys/socket.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h \
@@ -233,8 +233,8 @@ lib/cpp/CMakeFiles/thriftnb_static.dir/src/thrift/async/TEvhttpClientChannel.cpp
  /usr/include/boost/type_traits/is_abstract.hpp \
  /usr/include/boost/type_traits/add_lvalue_reference.hpp \
  /usr/include/boost/type_traits/add_reference.hpp \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/TLogging.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/TOutput.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/TLogging.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/TOutput.h \
  /usr/include/evhttp.h /usr/include/event.h \
  /usr/include/event2/event-config.h \
  /usr/include/x86_64-linux-gnu/sys/time.h /usr/include/evutil.h \
@@ -253,7 +253,7 @@ lib/cpp/CMakeFiles/thriftnb_static.dir/src/thrift/async/TEvhttpClientChannel.cpp
  /usr/include/event2/bufferevent_compat.h /usr/include/event2/tag.h \
  /usr/include/event2/tag_compat.h /usr/include/event2/http.h \
  /usr/include/event2/http_struct.h /usr/include/event2/http_compat.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TBufferTransports.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TBufferTransports.h \
  /usr/include/c++/11/cstring /usr/include/string.h /usr/include/strings.h \
  /usr/include/c++/11/limits /usr/include/boost/scoped_array.hpp \
  /usr/include/boost/smart_ptr/scoped_array.hpp \
@@ -262,8 +262,8 @@ lib/cpp/CMakeFiles/thriftnb_static.dir/src/thrift/async/TEvhttpClientChannel.cpp
  /usr/include/boost/smart_ptr/detail/sp_nullptr_t.hpp \
  /usr/include/boost/smart_ptr/detail/sp_noexcept.hpp \
  /usr/include/boost/smart_ptr/detail/operator_bool.hpp \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransport.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransportException.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransportException.h \
  /usr/include/boost/numeric/conversion/cast.hpp \
  /usr/include/boost/type.hpp \
  /usr/include/boost/numeric/conversion/converter.hpp \
@@ -426,8 +426,8 @@ lib/cpp/CMakeFiles/thriftnb_static.dir/src/thrift/async/TEvhttpClientChannel.cpp
  /usr/include/boost/numeric/conversion/detail/numeric_cast_traits.hpp \
  /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_common.hpp \
  /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_long_long.hpp \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TVirtualTransport.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TProtocolException.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TVirtualTransport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TProtocolException.h \
  /usr/include/c++/11/iostream /usr/include/c++/11/ostream \
  /usr/include/c++/11/ios /usr/include/c++/11/bits/ios_base.h \
  /usr/include/c++/11/bits/locale_classes.h \

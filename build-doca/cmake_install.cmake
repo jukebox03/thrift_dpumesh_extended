@@ -1,4 +1,4 @@
-# Install script for directory: /home/jukebox/thrift_dpumesh_extended
+# Install script for directory: /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -44,9 +44,8 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for each subdirectory.
-  include("/home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp/cmake_install.cmake")
-  include("/home/jukebox/thrift_dpumesh_extended/build-doca/lib/c_glib/cmake_install.cmake")
-  include("/home/jukebox/thrift_dpumesh_extended/build-doca/lib/py/cmake_install.cmake")
+  include("/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp/cmake_install.cmake")
+  include("/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/c_glib/cmake_install.cmake")
 
 endif()
 
@@ -58,5 +57,5 @@ endif()
 
 string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
-file(WRITE "/home/jukebox/thrift_dpumesh_extended/build-doca/${CMAKE_INSTALL_MANIFEST}"
+file(WRITE "/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/${CMAKE_INSTALL_MANIFEST}"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")

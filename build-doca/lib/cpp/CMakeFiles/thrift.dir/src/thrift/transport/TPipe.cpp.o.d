@@ -1,7 +1,7 @@
 lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/TPipe.cpp.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TPipe.cpp \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TPipe.cpp \
  /usr/include/stdc-predef.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransportException.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransportException.h \
  /usr/include/boost/numeric/conversion/cast.hpp \
  /usr/include/boost/detail/workaround.hpp \
  /usr/include/boost/config/workaround.hpp /usr/include/boost/config.hpp \
@@ -317,10 +317,10 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/TPipe.cpp.o: \
  /usr/include/x86_64-linux-gnu/bits/types/error_t.h \
  /usr/include/c++/11/bits/charconv.h \
  /usr/include/c++/11/bits/basic_string.tcc \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/Thrift.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/PlatformSocket.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/thrift-config.h \
- /home/jukebox/thrift_dpumesh_extended/build-doca/thrift/config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/Thrift.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/PlatformSocket.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/thrift-config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/thrift/config.h \
  /usr/include/assert.h /usr/include/netinet/in.h \
  /usr/include/x86_64-linux-gnu/sys/socket.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h \
@@ -375,11 +375,11 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/TPipe.cpp.o: \
  /usr/include/boost/type_traits/is_abstract.hpp \
  /usr/include/boost/type_traits/add_lvalue_reference.hpp \
  /usr/include/boost/type_traits/add_reference.hpp \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/TLogging.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/TOutput.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TPipe.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransport.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/stdcxx.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/TLogging.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/TOutput.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TPipe.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/stdcxx.h \
  /usr/include/c++/11/memory /usr/include/c++/11/bits/stl_tempbuf.h \
  /usr/include/c++/11/bits/stl_raw_storage_iter.h \
  /usr/include/c++/11/bits/align.h /usr/include/c++/11/bit \
@@ -391,13 +391,13 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/TPipe.cpp.o: \
  /usr/include/c++/11/bits/atomic_base.h \
  /usr/include/c++/11/bits/atomic_lockfree_defines.h \
  /usr/include/c++/11/backward/auto_ptr.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TVirtualTransport.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TSocket.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TServerSocket.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/concurrency/Mutex.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TVirtualTransport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TSocket.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TServerSocket.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/concurrency/Mutex.h \
  /usr/include/boost/noncopyable.hpp \
  /usr/include/boost/core/noncopyable.hpp \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TServerTransport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TServerTransport.h \
  /usr/include/netdb.h /usr/include/rpc/netdb.h \
  /usr/include/x86_64-linux-gnu/bits/types/sigevent_t.h \
  /usr/include/x86_64-linux-gnu/bits/types/__sigval_t.h \

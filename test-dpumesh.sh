@@ -29,9 +29,10 @@ fi
 
 ### 설정 ###
 NS="test-dpumesh"
-PROJ_ROOT="$HOME/thrift_dpumesh_extended"
+PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRANSPORT_SRC="$PROJ_ROOT/lib/cpp/src/thrift/transport"
 DOCA_SRC="$TRANSPORT_SRC/doca"
+# DPU 쪽 경로 (DPU의 ~/thrift_dpumesh_extended/ 에 배포)
 DPU_TRANSPORT="thrift_dpumesh_extended/lib/cpp/src/thrift/transport"
 DPU_DOCA="$DPU_TRANSPORT/doca"
 DPU_BUILD="$DPU_DOCA/build"
@@ -109,6 +110,28 @@ build_dpu() {
 ### Host libthrift 빌드 ###
 build_host() {
     step "=== Building host libthrift.so ==="
+
+    # CMake 캐시 경로 불일치 시 자동 재설정
+    if [ -f "$BUILD_DOCA/CMakeCache.txt" ]; then
+        local cached_dir
+        cached_dir=$(grep '^CMAKE_HOME_DIRECTORY:' "$BUILD_DOCA/CMakeCache.txt" 2>/dev/null | cut -d= -f2)
+        if [ -n "$cached_dir" ] && [ "$cached_dir" != "$PROJ_ROOT" ]; then
+            warn "CMake cache path mismatch (cached: $cached_dir, actual: $PROJ_ROOT)"
+            info "Clearing stale cache and re-running cmake..."
+            rm -f "$BUILD_DOCA/CMakeCache.txt"
+            rm -rf "$BUILD_DOCA/CMakeFiles"
+            (cd "$BUILD_DOCA" && cmake "$PROJ_ROOT" -DWITH_DOCA=ON -DWITH_CPP=ON -DWITH_C_GLIB=ON \
+                -DWITH_SHARED_LIB=ON -DWITH_STATIC_LIB=ON -DWITH_LIBEVENT=ON -DWITH_OPENSSL=ON -DWITH_ZLIB=ON \
+                -DBUILD_COMPILER=OFF -DBUILD_TESTING=OFF -DBUILD_TUTORIALS=OFF -DBUILD_EXAMPLES=OFF \
+                -DWITH_JAVA=OFF -DWITH_PYTHON=OFF -DWITH_HASKELL=OFF)
+        fi
+    elif [ ! -f "$BUILD_DOCA/Makefile" ]; then
+        info "No build system found, running cmake..."
+        mkdir -p "$BUILD_DOCA"
+        (cd "$BUILD_DOCA" && cmake "$PROJ_ROOT" -DWITH_DOCA=ON -DWITH_CPP=ON -DWITH_C_GLIB=ON \
+            -DWITH_SHARED_LIB=ON -DWITH_STATIC_LIB=ON -DWITH_LIBEVENT=ON -DWITH_OPENSSL=ON -DWITH_ZLIB=ON)
+    fi
+
     local build_out
     build_out=$(cd "$BUILD_DOCA" && make -j"$(nproc)" 2>&1)
     if [ $? -ne 0 ]; then
@@ -196,7 +219,7 @@ start_dpu() {
     info "Launching dpumesh_dpu..."
     ssh "$DPU_HOST" "cat > /tmp/start_dpu.sh << 'LAUNCHER'
 #!/bin/bash
-screen -dmS dpumesh bash -c \"cd /home/jukebox/$DPU_BUILD && ./dpumesh_dpu $DPU_PCI -l 60 > $DPU_LOG 2>&1\"
+screen -dmS dpumesh bash -c \"cd /home/jukebox/$DPU_BUILD && ./dpumesh_dpu $DPU_PCI -l 20 > $DPU_LOG 2>&1\"
 sleep 2
 pgrep -f 'dpumesh_dpu.*03:00' || echo NO_PID
 LAUNCHER
@@ -212,14 +235,26 @@ chmod +x /tmp/start_dpu.sh"
     fi
     info "dpumesh_dpu running (PID: $pid)"
 
-    # DPU 안정화 대기 — pods: 0 로그 확인
+    # DPU 안정화 대기 — 프로세스 실행 확인 + 로그 체크
     info "Waiting for DPU to stabilize..."
     local attempts=0
     while [ $attempts -lt 15 ]; do
         local log_line
         log_line=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -3 $DPU_LOG" 2>&1 | grep -v '^\[sudo\]' || true)
+        # INFO 로그 레벨이면 "pods: 0" 확인, ERR 레벨이면 프로세스 존재만 확인
         if echo "$log_line" | grep -q "pods: 0"; then
             info "DPU ready (pods: 0, waiting for connections)"
+            return 0
+        fi
+        if echo "$log_line" | grep -q "elapsed:"; then
+            info "DPU ready (main loop running)"
+            return 0
+        fi
+        # 프로세스가 살아있고 로그가 최근 것이면 OK
+        local dpu_alive
+        dpu_alive=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S pgrep -f 'dpumesh_dpu.*03:00'" 2>&1 | grep -v '^\[sudo\]' | head -1 || true)
+        if [ -n "$dpu_alive" ] && [ "$attempts" -ge 5 ]; then
+            info "DPU ready (PID: $dpu_alive, log level may suppress INFO)"
             return 0
         fi
         sleep 1
@@ -478,6 +513,38 @@ run_test() {
     fi
 }
 
+### wrk2-style throughput 테스트 ###
+run_throughput_test() {
+    step "=== Running Throughput Test (wrk2-style) ==="
+    sleep 3
+
+    local gw_ip
+    gw_ip=$(kubectl get pod -n "$NS" -l app=dpumesh-gateway -o jsonpath='{.items[0].status.podIP}' 2>/dev/null || true)
+    if [ -z "$gw_ip" ]; then
+        err "Gateway pod not found"
+        kubectl get pods -n "$NS"
+        return 1
+    fi
+
+    local rps="${1:-100}"
+    local duration="${2:-10}"
+    local msg_size="${3:-}"
+    local threads="${4:-}"
+
+    info "Gateway IP: $gw_ip:$GATEWAY_PORT"
+    info "Throughput test: ${rps} RPS, ${duration}s duration"
+    [ -n "$msg_size" ] && info "Message size: $msg_size"
+
+    if [ -f "$PROJ_ROOT/test_thrift.py" ]; then
+        local cmd="python3 $PROJ_ROOT/test_thrift.py $gw_ip $GATEWAY_PORT throughput $rps $duration"
+        [ -n "$msg_size" ] && cmd="$cmd $msg_size"
+        [ -n "$threads" ] && cmd="$cmd $threads"
+        $cmd
+    else
+        warn "test_thrift.py not found, skipping"
+    fi
+}
+
 ### 고부하 스트레스 테스트 ###
 run_stress_test() {
     step "=== Running Stress Test ==="
@@ -658,6 +725,9 @@ case "$CMD" in
     stress)
         run_stress_test "${2:-10}" "${3:-100}" "${4:-}"
         ;;
+    throughput)
+        run_throughput_test "${2:-100}" "${3:-10}" "${4:-}" "${5:-}"
+        ;;
     logs)
         show_logs
         ;;
@@ -671,7 +741,7 @@ case "$CMD" in
         cleanup
         ;;
     *)
-        echo "Usage: $0 {deploy|dpu|host|restart|test|test-size|stress|logs|status|cleanup|dpu-log}"
+        echo "Usage: $0 {deploy|dpu|host|restart|test|test-size|stress|throughput|logs|status|cleanup|dpu-log}"
         echo ""
         echo "Commands:"
         echo "  deploy   - 전체: sync + build(DPU+Host) + 순서대로 시작 + test"
@@ -681,6 +751,7 @@ case "$CMD" in
         echo "  test     - test_thrift.py 실행"
         echo "  test-size - DMA 사이즈 경계 테스트 (59~1024B)"
         echo "  stress [T] [N] [SIZE] - 고부하 스트레스 테스트 (T스레드 x N요청, SIZE=메시지크기 예: 8K,128K)"
+        echo "  throughput [RPS] [DUR] [SIZE] [T] - wrk2-style 정률 부하 테스트 (coordinated omission 보정)"
         echo "  logs     - DPU + pod 로그 확인"
         echo "  status   - 전체 상태 확인"
         echo "  dpu-log  - DPU 로그 실시간 follow"

@@ -53,10 +53,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /home/jukebox/thrift_dpumesh_extended
+CMAKE_SOURCE_DIR = /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/jukebox/thrift_dpumesh_extended/build-doca
+CMAKE_BINARY_DIR = /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca
 
 # Include any dependencies generated for this target.
 include lib/cpp/CMakeFiles/dpumesh_dpu.dir/depend.make
@@ -72,44 +72,44 @@ include lib/cpp/CMakeFiles/dpumesh_dpu.dir/flags.make
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.o: lib/cpp/CMakeFiles/dpumesh_dpu.dir/flags.make
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.o: ../lib/cpp/src/thrift/transport/doca/dpu_main.c
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.o: lib/cpp/CMakeFiles/dpumesh_dpu.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building C object lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.o"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.o -MF CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.o.d -o CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_main.c
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building C object lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.o"
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.o -MF CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.o.d -o CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_main.c
 
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing C source to CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.i"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_main.c > CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.i
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_main.c > CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.i
 
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling C source to assembly CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.s"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_main.c -o CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.s
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_main.c -o CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_main.c.s
 
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o: lib/cpp/CMakeFiles/dpumesh_dpu.dir/flags.make
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o: ../lib/cpp/src/thrift/transport/doca/dpu_worker.c
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o: lib/cpp/CMakeFiles/dpumesh_dpu.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building C object lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o -MF CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o.d -o CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.c
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building C object lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o"
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o -MF CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o.d -o CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.c
 
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing C source to CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.i"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.c > CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.i
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.c > CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.i
 
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling C source to assembly CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.s"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.c -o CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.s
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.c -o CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.s
 
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.o: lib/cpp/CMakeFiles/dpumesh_dpu.dir/flags.make
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.o: ../lib/cpp/src/thrift/transport/doca/config.c
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.o: lib/cpp/CMakeFiles/dpumesh_dpu.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building C object lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.o"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.o -MF CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.o.d -o CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.o -c /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/config.c
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building C object lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.o"
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.o -MF CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.o.d -o CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/config.c
 
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing C source to CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.i"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/config.c > CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.i
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/config.c > CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.i
 
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling C source to assembly CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.s"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/config.c -o CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.s
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/config.c -o CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.s
 
 # Object files for target dpumesh_dpu
 dpumesh_dpu_OBJECTS = \
@@ -129,18 +129,18 @@ bin/dpumesh_dpu: /usr/lib/x86_64-linux-gnu/libssl.so
 bin/dpumesh_dpu: /usr/lib/x86_64-linux-gnu/libcrypto.so
 bin/dpumesh_dpu: ../lib/cpp/src/thrift/transport/doca/device/dpa_program.a
 bin/dpumesh_dpu: lib/cpp/CMakeFiles/dpumesh_dpu.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/jukebox/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Linking C executable ../../bin/dpumesh_dpu"
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && $(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/dpumesh_dpu.dir/link.txt --verbose=$(VERBOSE)
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Linking C executable ../../bin/dpumesh_dpu"
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && $(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/dpumesh_dpu.dir/link.txt --verbose=$(VERBOSE)
 
 # Rule to build all files generated by this target.
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/build: bin/dpumesh_dpu
 .PHONY : lib/cpp/CMakeFiles/dpumesh_dpu.dir/build
 
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/clean:
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp && $(CMAKE_COMMAND) -P CMakeFiles/dpumesh_dpu.dir/cmake_clean.cmake
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && $(CMAKE_COMMAND) -P CMakeFiles/dpumesh_dpu.dir/cmake_clean.cmake
 .PHONY : lib/cpp/CMakeFiles/dpumesh_dpu.dir/clean
 
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/depend:
-	cd /home/jukebox/thrift_dpumesh_extended/build-doca && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /home/jukebox/thrift_dpumesh_extended /home/jukebox/thrift_dpumesh_extended/lib/cpp /home/jukebox/thrift_dpumesh_extended/build-doca /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp /home/jukebox/thrift_dpumesh_extended/build-doca/lib/cpp/CMakeFiles/dpumesh_dpu.dir/DependInfo.cmake --color=$(COLOR)
+	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp/CMakeFiles/dpumesh_dpu.dir/DependInfo.cmake --color=$(COLOR)
 .PHONY : lib/cpp/CMakeFiles/dpumesh_dpu.dir/depend
 

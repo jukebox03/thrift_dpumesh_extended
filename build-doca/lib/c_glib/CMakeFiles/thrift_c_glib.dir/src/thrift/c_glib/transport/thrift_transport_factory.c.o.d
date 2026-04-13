@@ -1,7 +1,7 @@
 lib/c_glib/CMakeFiles/thrift_c_glib.dir/src/thrift/c_glib/transport/thrift_transport_factory.c.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport_factory.c \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport_factory.c \
  /usr/include/stdc-predef.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/thrift.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/thrift.h \
  /usr/include/glib-2.0/glib.h /usr/include/glib-2.0/glib/galloca.h \
  /usr/include/glib-2.0/glib/gtypes.h \
  /usr/lib/x86_64-linux-gnu/glib-2.0/include/glibconfig.h \
@@ -159,7 +159,7 @@ lib/c_glib/CMakeFiles/thrift_c_glib.dir/src/thrift/c_glib/transport/thrift_trans
  /usr/include/x86_64-linux-gnu/bits/setjmp.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
  /usr/include/glib-2.0/glib/glib-autocleanups.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport_factory.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport_factory.h \
  /usr/include/glib-2.0/glib-object.h \
  /usr/include/glib-2.0/gobject/gbinding.h \
  /usr/include/glib-2.0/gobject/gobject.h \
@@ -182,4 +182,4 @@ lib/c_glib/CMakeFiles/thrift_c_glib.dir/src/thrift/c_glib/transport/thrift_trans
  /usr/include/glib-2.0/gobject/gvaluearray.h \
  /usr/include/glib-2.0/gobject/gvaluetypes.h \
  /usr/include/glib-2.0/gobject/gobject-autocleanups.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport.h
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/transport/thrift_transport.h

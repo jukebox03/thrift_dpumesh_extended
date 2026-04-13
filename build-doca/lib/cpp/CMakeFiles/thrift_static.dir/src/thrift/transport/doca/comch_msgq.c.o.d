@@ -1,7 +1,7 @@
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.c \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.c \
  /usr/include/stdc-predef.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.h \
  /opt/mellanox/doca/include/doca_comch.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stddef.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdint.h /usr/include/stdint.h \

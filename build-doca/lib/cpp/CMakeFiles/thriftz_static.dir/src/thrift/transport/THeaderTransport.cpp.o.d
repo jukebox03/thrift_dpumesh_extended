@@ -1,7 +1,7 @@
 lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/THeaderTransport.cpp \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/THeaderTransport.cpp \
  /usr/include/stdc-predef.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/THeaderTransport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/THeaderTransport.h \
  /usr/include/c++/11/bitset /usr/include/c++/11/string \
  /usr/include/x86_64-linux-gnu/c++/11/bits/c++config.h \
  /usr/include/x86_64-linux-gnu/c++/11/bits/os_defines.h \
@@ -169,7 +169,7 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.
  /usr/include/boost/smart_ptr/detail/sp_noexcept.hpp \
  /usr/include/boost/config/workaround.hpp \
  /usr/include/boost/smart_ptr/detail/operator_bool.hpp \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/stdcxx.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/stdcxx.h \
  /usr/include/boost/version.hpp /usr/include/c++/11/functional \
  /usr/include/c++/11/bits/refwrap.h \
  /usr/include/c++/11/bits/std_function.h /usr/include/c++/11/memory \
@@ -185,14 +185,14 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.
  /usr/include/c++/11/bits/atomic_base.h \
  /usr/include/c++/11/bits/atomic_lockfree_defines.h \
  /usr/include/c++/11/backward/auto_ptr.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TProtocolTypes.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TBufferTransports.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TProtocolTypes.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TBufferTransports.h \
  /usr/include/c++/11/cstring /usr/include/string.h /usr/include/strings.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransport.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/Thrift.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/PlatformSocket.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/thrift-config.h \
- /home/jukebox/thrift_dpumesh_extended/build-doca/thrift/config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/Thrift.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/PlatformSocket.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/thrift-config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/thrift/config.h \
  /usr/include/netinet/in.h /usr/include/x86_64-linux-gnu/sys/socket.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h \
  /usr/include/x86_64-linux-gnu/bits/socket.h \
@@ -240,9 +240,9 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.
  /usr/include/boost/type_traits/is_abstract.hpp \
  /usr/include/boost/type_traits/add_lvalue_reference.hpp \
  /usr/include/boost/type_traits/add_reference.hpp \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/TLogging.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/TOutput.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransportException.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/TLogging.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/TOutput.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TTransportException.h \
  /usr/include/boost/numeric/conversion/cast.hpp \
  /usr/include/boost/type.hpp \
  /usr/include/boost/numeric/conversion/converter.hpp \
@@ -405,11 +405,11 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.
  /usr/include/boost/numeric/conversion/detail/numeric_cast_traits.hpp \
  /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_common.hpp \
  /usr/include/boost/numeric/conversion/detail/preprocessed/numeric_cast_traits_long_long.hpp \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TVirtualTransport.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/TApplicationException.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TBinaryProtocol.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TProtocol.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TProtocolException.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TVirtualTransport.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/TApplicationException.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TBinaryProtocol.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TProtocol.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TProtocolException.h \
  /usr/include/c++/11/climits \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/limits.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/syslimits.h \
@@ -444,11 +444,11 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.
  /usr/include/x86_64-linux-gnu/bits/param.h /usr/include/linux/param.h \
  /usr/include/x86_64-linux-gnu/asm/param.h \
  /usr/include/asm-generic/param.h /usr/include/byteswap.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TVirtualProtocol.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TBinaryProtocol.tcc \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TCompactProtocol.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TVirtualProtocol.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TBinaryProtocol.tcc \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TCompactProtocol.h \
  /usr/include/c++/11/stack /usr/include/c++/11/deque \
  /usr/include/c++/11/bits/stl_deque.h /usr/include/c++/11/bits/deque.tcc \
  /usr/include/c++/11/bits/stl_stack.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TCompactProtocol.tcc \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/protocol/TCompactProtocol.tcc \
  /usr/include/zlib.h /usr/include/zconf.h

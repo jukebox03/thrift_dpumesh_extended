@@ -1,5 +1,5 @@
 lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/common.c.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/common.c \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/common.c \
  /usr/include/stdc-predef.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdint.h /usr/include/stdint.h \
  /usr/include/x86_64-linux-gnu/bits/libc-header-start.h \
@@ -75,5 +75,5 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/common.c.o: \
  /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
  /opt/mellanox/doca/include/doca_mmap.h \
  /opt/mellanox/doca/include/doca_pe.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/common.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/common.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h

@@ -4,7 +4,7 @@
 # compile C with /usr/bin/cc
 C_DEFINES = -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS
 
-C_INCLUDES = -I/home/jukebox/thrift_dpumesh_extended/build-doca/lib/c_glib -I/home/jukebox/thrift_dpumesh_extended/lib/c_glib -I/home/jukebox/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dpumesh_extended/lib/c_glib/src -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include
+C_INCLUDES = -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/c_glib -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include
 
 C_FLAGS = 
 

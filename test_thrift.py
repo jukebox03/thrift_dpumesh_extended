@@ -237,6 +237,175 @@ def run_stress_test(host, port, num_threads, num_requests, pad_bytes=0):
     return total_fail == 0
 
 
+# ---------------------------------------------------------------------------
+# Throughput mode — wrk2-style constant-rate load generator
+# ---------------------------------------------------------------------------
+
+def _recv_exact(s, n):
+    """Receive exactly n bytes from socket."""
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("connection closed")
+        buf += chunk
+    return buf
+
+
+def throughput_worker(host, port, thread_id, schedule, results_queue,
+                      frame, timeout=10):
+    """Each thread owns a persistent connection and fires requests at scheduled times.
+    schedule: list of absolute timestamps (time.monotonic based) when to send.
+    results_queue: list to append (scheduled_time, actual_send_time, rtt, ok) tuples.
+    Coordinated omission: latency = response_time - scheduled_time (not send_time).
+    """
+    local_results = []
+    sock = None
+
+    def ensure_conn():
+        nonlocal sock
+        if sock is not None:
+            return
+        sock = socket.create_connection((host, port), timeout=timeout)
+
+    for sched_ts in schedule:
+        # Wait until scheduled time
+        now = time.monotonic()
+        if sched_ts > now:
+            time.sleep(sched_ts - now)
+
+        send_ts = time.monotonic()
+        ok = False
+        try:
+            ensure_conn()
+            sock.sendall(frame)
+            resp_len_bytes = _recv_exact(sock, 4)
+            resp_len = struct.unpack('>I', resp_len_bytes)[0]
+            _recv_exact(sock, resp_len)
+            ok = True
+        except Exception:
+            # Reconnect on next attempt
+            if sock:
+                try: sock.close()
+                except: pass
+                sock = None
+        rtt = time.monotonic() - send_ts
+        # Coordinated-omission corrected latency: from scheduled time
+        corrected_latency = time.monotonic() - sched_ts
+        local_results.append((corrected_latency, rtt, ok))
+
+    if sock:
+        try: sock.close()
+        except: pass
+
+    results_queue[thread_id] = local_results
+
+
+def run_throughput_test(host, port, target_rps, duration_sec, pad_bytes=0,
+                        num_threads=None):
+    """wrk2-style constant-rate throughput test.
+    - Distributes requests evenly across threads
+    - Measures coordinated-omission corrected latency
+    - Reports percentile histogram
+    """
+    if num_threads is None:
+        # Auto: 1 thread per 50 RPS, min 1, max 256
+        num_threads = max(1, min(256, target_rps // 50 + 1))
+
+    total_requests = target_rps * duration_sec
+    interval = 1.0 / target_rps if target_rps > 0 else 1.0
+
+    # Build frame once
+    pad = pad_bytes
+    args = build_compose_unique_id_args(req_id=0, pad_bytes=pad)
+    frame = build_thrift_framed_call("ComposeUniqueId", args, seq_id=0)
+    frame_size = len(frame)
+
+    print(f"\n{'='*60}")
+    print(f"  Throughput Test (wrk2-style) — {host}:{port}")
+    print(f"{'='*60}")
+    print(f"  Target RPS:   {target_rps}")
+    print(f"  Duration:     {duration_sec}s")
+    print(f"  Threads:      {num_threads}")
+    print(f"  Total reqs:   {total_requests}")
+    print(f"  Msg size:     {frame_size} bytes (pad={pad})")
+    print(f"{'='*60}\n")
+
+    # Build per-thread schedules (interleaved assignment)
+    base_time = time.monotonic() + 0.5  # 500ms warmup
+    schedules = [[] for _ in range(num_threads)]
+    for i in range(total_requests):
+        t = base_time + i * interval
+        schedules[i % num_threads].append(t)
+
+    results_queue = [None] * num_threads
+    threads = []
+
+    for i in range(num_threads):
+        t = threading.Thread(target=throughput_worker,
+                             args=(host, port, i, schedules[i], results_queue,
+                                   frame))
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    # Aggregate results
+    all_latencies = []  # coordinated-omission corrected
+    all_rtts = []       # raw RTT
+    ok_count = 0
+    fail_count = 0
+
+    for thread_results in results_queue:
+        if not thread_results:
+            continue
+        for corrected, rtt, ok in thread_results:
+            if ok:
+                all_latencies.append(corrected * 1000)  # ms
+                all_rtts.append(rtt * 1000)              # ms
+                ok_count += 1
+            else:
+                fail_count += 1
+
+    actual_duration = duration_sec
+    actual_rps = ok_count / actual_duration if actual_duration > 0 else 0
+
+    print(f"{'='*60}")
+    print(f"  Results")
+    print(f"{'='*60}")
+    print(f"  Requests:     {ok_count} OK, {fail_count} failed "
+          f"({ok_count * 100 / max(ok_count + fail_count, 1):.1f}%)")
+    print(f"  Actual RPS:   {actual_rps:.1f}")
+    print(f"  Bandwidth:    {ok_count * frame_size / actual_duration / 1024 / 1024:.2f} MB/s")
+
+    if all_latencies:
+        all_latencies.sort()
+        all_rtts.sort()
+        n = len(all_latencies)
+
+        def pct(arr, p):
+            idx = min(int(len(arr) * p / 100), len(arr) - 1)
+            return arr[idx]
+
+        print(f"\n  Latency (corrected for coordinated omission):")
+        print(f"    Avg:    {sum(all_latencies) / n:.2f} ms")
+        print(f"    P50:    {pct(all_latencies, 50):.2f} ms")
+        print(f"    P95:    {pct(all_latencies, 95):.2f} ms")
+        print(f"    P99:    {pct(all_latencies, 99):.2f} ms")
+        print(f"    Max:    {all_latencies[-1]:.2f} ms")
+
+        print(f"\n  Raw RTT (uncorrected):")
+        print(f"    Avg:    {sum(all_rtts) / n:.2f} ms")
+        print(f"    P50:    {pct(all_rtts, 50):.2f} ms")
+        print(f"    P95:    {pct(all_rtts, 95):.2f} ms")
+        print(f"    P99:    {pct(all_rtts, 99):.2f} ms")
+        print(f"    Max:    {all_rtts[-1]:.2f} ms")
+
+    print(f"{'='*60}")
+    return fail_count == 0
+
+
 def build_compose_unique_id_args_2entry(first_val_len):
     """Builds args with 2 carrier map entries.
     Entry 1: key='k', value='V'*first_val_len (variable size)
@@ -380,9 +549,10 @@ def parse_size_str(s):
 
 def main():
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <host> [port] [num_threads|size|stress]")
-        print(f"       {sys.argv[0]} <host> [port] size                       — DMA size boundary test")
-        print(f"       {sys.argv[0]} <host> [port] stress [T] [N] [SIZE]      — stress test (T threads x N reqs, SIZE=msg size e.g. 8K, 128K)")
+        print(f"Usage: {sys.argv[0]} <host> [port] [num_threads|size|stress|throughput]")
+        print(f"       {sys.argv[0]} <host> [port] size                              — DMA size boundary test")
+        print(f"       {sys.argv[0]} <host> [port] stress [T] [N] [SIZE]             — stress test (T threads x N reqs)")
+        print(f"       {sys.argv[0]} <host> [port] throughput [RPS] [DUR] [SIZE] [T]  — wrk2-style constant-rate test")
         sys.exit(1)
 
     host = sys.argv[1]
@@ -406,6 +576,17 @@ def main():
         # Convert target frame size to pad_bytes
         pad = calc_pad_for_target(msg_size) if msg_size > 0 else 0
         ok = run_stress_test(host, port, num_threads, num_requests, pad_bytes=pad)
+        sys.exit(0 if ok else 1)
+
+    # "throughput" mode: wrk2-style constant-rate load test
+    if len(sys.argv) > 3 and sys.argv[3] == "throughput":
+        rps = int(sys.argv[4]) if len(sys.argv) > 4 else 100
+        duration = int(sys.argv[5]) if len(sys.argv) > 5 else 10
+        msg_size = parse_size_str(sys.argv[6]) if len(sys.argv) > 6 else 0
+        threads = int(sys.argv[7]) if len(sys.argv) > 7 else None
+        pad = calc_pad_for_target(msg_size) if msg_size > 0 else 0
+        ok = run_throughput_test(host, port, rps, duration, pad_bytes=pad,
+                                num_threads=threads)
         sys.exit(0 if ok else 1)
 
     num_threads = int(sys.argv[3]) if len(sys.argv) > 3 else 1

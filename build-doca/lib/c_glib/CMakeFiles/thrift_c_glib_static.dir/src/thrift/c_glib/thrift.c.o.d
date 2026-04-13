@@ -1,7 +1,7 @@
 lib/c_glib/CMakeFiles/thrift_c_glib_static.dir/src/thrift/c_glib/thrift.c.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/thrift.c \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/thrift.c \
  /usr/include/stdc-predef.h \
- /home/jukebox/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/thrift.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/c_glib/src/thrift/c_glib/thrift.h \
  /usr/include/glib-2.0/glib.h /usr/include/glib-2.0/glib/galloca.h \
  /usr/include/glib-2.0/glib/gtypes.h \
  /usr/lib/x86_64-linux-gnu/glib-2.0/include/glibconfig.h \

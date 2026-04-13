@@ -10,7 +10,7 @@
 #include <doca_error.h>
 #include <stdbool.h>
 
-#define CACHE_ALIGN 64 /* Cache line alignment for performance */
+#define CACHE_ALIGN 128 /* dma_copy requires 128B-aligned addresses */
 
 enum buf_inv_type {
 	BUF_INV_TYPE_INVENTORY = 0,
