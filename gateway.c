@@ -230,8 +230,8 @@ static void *handle_connection(void *arg)
             continue;
         }
 
-        /* Response arrived — DPA is done with TX buffer, safe to free */
-        dpumesh_tx_free(g_ctx, tx_slot);
+        /* TX slot already freed by dpumesh_wait_response() on success
+         * (attached via dpumesh_pending_attach_tx, released when response arrives). */
 
         /* Send response back to TCP client */
         if (resp.body_buf_slot >= 0 && resp.body_len > 0) {

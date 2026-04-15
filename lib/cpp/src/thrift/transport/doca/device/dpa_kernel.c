@@ -64,7 +64,6 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                 producer = dma_msg->dpa_producer;
 
             if (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id)) {
-                DOCA_DPA_DEV_LOG_INFO("Host consumer is empty, cannot send DMA completion\n");
                 break;
             }
 
@@ -98,7 +97,7 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                             wait++;
                             if (wait >= DPA_CONSUMER_WAIT_LOOPS) {
                                 DOCA_DPA_DEV_LOG_INFO("DMA_REQ chunk consumer timeout — aborting (chunks=%d/%u)\n",
-                                                      num_chunks, (total + DPA_DMA_COPY_MAX - 1) / DPA_DMA_COPY_MAX);
+                                                     num_chunks, (total + DPA_DMA_COPY_MAX - 1) / DPA_DMA_COPY_MAX);
                                 aborted = 1;
                                 break;
                             }
@@ -143,10 +142,10 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             if (thread_arg->num_rings < MAX_DPA_RINGS) {
                 thread_arg->rings[thread_arg->num_rings] = add_msg->ring;
                 DOCA_DPA_DEV_LOG_INFO("ADD_RING received: pod_id=%d, buf_arr_size=%u\n",
-                                      add_msg->ring.pod_id, add_msg->ring.buf_arr_size);
+                                     add_msg->ring.pod_id, add_msg->ring.buf_arr_size);
                 thread_arg->num_rings++;
                 DOCA_DPA_DEV_LOG_INFO("Added ring: pod_id=%d, num_rings=%u\n",
-                                      add_msg->ring.pod_id, thread_arg->num_rings);
+                                     add_msg->ring.pod_id, thread_arg->num_rings);
             } else {
                 DOCA_DPA_DEV_LOG_INFO("Ring add failed: too many rings=%u\n", thread_arg->num_rings);
             }
@@ -268,16 +267,9 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     if (!desc->valid)
         return 0;
 
-    DOCA_DPA_DEV_LOG_INFO("DESC FOUND: ring=%u slot=%u valid=%u size=%u addr=0x%lx idx=%u dst_mmap=0x%lx src_mmap=0x%lx dst_addr=0x%lx pos=%u\n",
-                          r, thread_arg->desc_idx[r], desc->valid, desc->size,
-                          desc->addr, (uint32_t)desc->idx,
-                          ring->dpu_mmap, ring->host_mmap,
-                          ring->dpu_addr + thread_arg->pos[r],
-                          thread_arg->pos[r]);
-
     if (ring->dpu_mmap == 0) {
         DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Protection Error]: invalid dst mmap handle (ring=%u slot=%u req_id=%u dpu_mmap=0)\n",
-                              r, thread_arg->desc_idx[r], (uint32_t)desc->idx);
+                             r, thread_arg->desc_idx[r], (uint32_t)desc->idx);
         desc->valid = 0;
         __dpa_thread_window_writeback();
         thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
@@ -286,7 +278,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
 
     if (ring->host_mmap == 0) {
         DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Remote Access Error]: invalid src mmap handle (ring=%u slot=%u req_id=%u host_mmap=0)\n",
-                              r, thread_arg->desc_idx[r], (uint32_t)desc->idx);
+                             r, thread_arg->desc_idx[r], (uint32_t)desc->idx);
         desc->valid = 0;
         __dpa_thread_window_writeback();
         thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
@@ -295,7 +287,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
 
     if (desc->size == 0) {
         DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Length Error]: zero-length descriptor (ring=%u slot=%u req_id=%u)\n",
-                              r, thread_arg->desc_idx[r], (uint32_t)desc->idx);
+                             r, thread_arg->desc_idx[r], (uint32_t)desc->idx);
         desc->valid = 0;
         __dpa_thread_window_writeback();
         thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
@@ -314,8 +306,8 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
             src_addr < host_base || src_end > host_end) {
             DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Remote Access Error]: src out of host mmap range\n");
             DOCA_DPA_DEV_LOG_INFO("Descriptor source out of host range: ring=%u slot=%u req_id=%u src=[0x%lx..0x%lx) host=[0x%lx..0x%lx) len=%u\n",
-                                  r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
-                                  src_addr, src_end, host_base, host_end, desc->size);
+                                 r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
+                                 src_addr, src_end, host_base, host_end, desc->size);
             desc->valid = 0;
             __dpa_thread_window_writeback();
             thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
@@ -327,25 +319,14 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         uint32_t empty_wait_loops = 0;
         while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
             empty_wait_loops++;
-            if ((empty_wait_loops % DMA_DIAG_EMPTY_WAIT_WARN_LOOPS) == 0) {
-                DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Receiver Not Ready]: consumer has no posted recv tasks/credits yet (ring=%u ring_pod=%d slot=%u req_id=%u consumer_id=%u loops=%u producer=0x%lx)\n",
-                                      r,
-                                      ring->pod_id,
-                                      thread_arg->desc_idx[r],
-                                      (uint32_t)desc->idx,
-                                      dpu_consumer_id,
-                                      empty_wait_loops,
-                                      producer);
-            }
-
             if (empty_wait_loops >= DMA_DIAG_EMPTY_WAIT_FAIL_LOOPS) {
                 DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Receiver Not Ready]: timeout waiting consumer credits (ring=%u ring_pod=%d slot=%u req_id=%u consumer_id=%u loops=%u). Dropping descriptor.\n",
-                                      r,
-                                      ring->pod_id,
-                                      thread_arg->desc_idx[r],
-                                      (uint32_t)desc->idx,
-                                      dpu_consumer_id,
-                                      empty_wait_loops);
+                                     r,
+                                     ring->pod_id,
+                                     thread_arg->desc_idx[r],
+                                     (uint32_t)desc->idx,
+                                     dpu_consumer_id,
+                                     empty_wait_loops);
                 /* Clear descriptor to unblock ring slot */
                 desc->valid = 0;
                 __dpa_thread_window_writeback();
@@ -364,8 +345,8 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     if (padded_total > ring->dpu_buf_size) {
         DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Length Error]: requested length exceeds DPU destination buffer\n");
         DOCA_DPA_DEV_LOG_INFO("Descriptor too large for DPU buffer: ring=%u slot=%u req_id=%u size=%u padded=%u dpu_buf_size=%u\n",
-                              r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
-                              desc->size, padded_total, ring->dpu_buf_size);
+                             r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
+                             desc->size, padded_total, ring->dpu_buf_size);
         desc->valid = 0;
         __dpa_thread_window_writeback();
         thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
@@ -402,6 +383,11 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         uint32_t offset = 0;
         enum comch_msg_type chunk_type = COMCH_MSG_TYPE_DMA_CHUNK;
 
+        /* Drain producer slots before starting chunked transfer to ensure
+         * we have capacity. Without this, back-to-back descriptors can
+         * start with an already-depleted producer. */
+        drain_producer_completions(thread_arg);
+
         while (offset < total) {
             uint32_t remaining = total - offset;
             uint32_t chunk = remaining;
@@ -417,9 +403,11 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
              * the DPU consumer has recv tasks available. Without this,
              * rapid-fire chunks exhaust both resources and dma_copy silently fails. */
             if (num_chunks > 0) {
-                /* Periodic producer drain every 64 chunks to prevent
-                 * producer slot exhaustion on large transfers */
-                if ((num_chunks % 64) == 0)
+                /* Drain producer every 8 chunks to prevent slot exhaustion.
+                 * Each dma_copy consumes one producer slot — with 8KB chunks,
+                 * a 1MB transfer needs ~128 calls. Draining every 8 keeps
+                 * the producer well below capacity at all times. */
+                if ((num_chunks % 8) == 0)
                     drain_producer_completions(thread_arg);
 
                 uint32_t wait = 0;
@@ -427,9 +415,9 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                     wait++;
                     if (wait >= DPA_CONSUMER_WAIT_LOOPS) {
                         DOCA_DPA_DEV_LOG_INFO("DMA chunk consumer timeout — aborting (ring=%u chunks=%d/%u req_id=%u)\n",
-                                              r, num_chunks,
-                                              (total + DPA_DMA_COPY_MAX - 1) / DPA_DMA_COPY_MAX,
-                                              (uint32_t)desc->idx);
+                                             r, num_chunks,
+                                             (total + DPA_DMA_COPY_MAX - 1) / DPA_DMA_COPY_MAX,
+                                             (uint32_t)desc->idx);
                         aborted = 1;
                         break;
                     }
@@ -439,7 +427,11 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
             }
 
             if (remaining <= chunk) {
-                /* Final chunk: send real completion message */
+                /* Final chunk carries the real completion message.
+                 * Drain producer first — if no slot is available, dma_copy
+                 * silently fails and the DPU never receives the completion,
+                 * causing a permanent recv:0/s stall. */
+                drain_producer_completions(thread_arg);
                 doca_dpa_dev_comch_producer_dma_copy(producer,
                                             dpu_consumer_id,
                                             ring->dpu_mmap,
@@ -463,15 +455,10 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                             sizeof(chunk_type),
                                             DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
             }
-            DOCA_DPA_DEV_LOG_INFO("DMA_COPY done: ring=%u chunk=%u(aligned) offset=%u/%u num_chunks=%d\n",
-                                  r, chunk, offset, total, num_chunks + 1);
             offset += chunk;
             num_chunks++;
         }
     }
-
-    DOCA_DPA_DEV_LOG_INFO("DESC DONE: ring=%u slot=%u chunks=%d aborted=%d\n",
-                          r, thread_arg->desc_idx[r], num_chunks, aborted);
 
     /* Clear descriptor and advance ring index.
      * On abort: don't advance pos (partial DMA data is abandoned in DPU buffer).
@@ -575,17 +562,17 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
 
     DOCA_DPA_DEV_LOG_INFO("[PAIRCHK] run_dma_manager arg: consumer_comp=0x%lx producer_comp=0x%lx consumer=0x%lx producer=0x%lx consumer_id=%u num_rings=%u async_ops=0x%lx async_ops_comp=0x%lx\n",
-                          thread_arg->dpa_consumer_comp,
-                          thread_arg->dpa_producer_comp,
-                          thread_arg->dpa_consumer,
-                          thread_arg->dpa_producer,
-                          thread_arg->dpu_consumer_id,
-                          thread_arg->num_rings,
-                          thread_arg->dpa_async_ops,
-                          thread_arg->dpa_async_ops_comp);
+                         thread_arg->dpa_consumer_comp,
+                         thread_arg->dpa_producer_comp,
+                         thread_arg->dpa_consumer,
+                         thread_arg->dpa_producer,
+                         thread_arg->dpu_consumer_id,
+                         thread_arg->num_rings,
+                         thread_arg->dpa_async_ops,
+                         thread_arg->dpa_async_ops_comp);
 
     DOCA_DPA_DEV_LOG_INFO("entering polling loop (consumer_id=%u)\n",
-                          thread_arg->dpu_consumer_id);
+                         thread_arg->dpu_consumer_id);
 
     /* Pure polling loop — no thread_reschedule().
      * DOCA DPA notification events are edge-triggered and lost if the

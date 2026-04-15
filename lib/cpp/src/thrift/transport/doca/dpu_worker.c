@@ -222,7 +222,7 @@ run_dpu_worker(struct objects *objs)
         }
 
         /* Drain deferred completion queue (TX_ACK + data forward) */
-        process_completion_queue(objs, 256);
+        process_completion_queue(objs, 32);
 
         clock_gettime(CLOCK_MONOTONIC, &now);
         elapsed = (now.tv_sec - last.tv_sec) +

@@ -60,6 +60,12 @@ void TDpumeshClientTransport::flush() {
     /* Clean up any previous response state */
     cleanup_response();
 
+    /* Cancel any previous pending entry to prevent slot leak on re-flush */
+    if (pending_registered_) {
+        dpumesh_cancel_pending(ctx_, req_id_);
+        pending_registered_ = false;
+    }
+
     /* Check slot size limit */
     check_slot_size(write_buf_.size());
 
@@ -102,7 +108,10 @@ void TDpumeshClientTransport::flush() {
         throw_exception("DPUmesh client TX SQ full", -1);
     }
 
-    tx_slot_ = tx_slot;  /* freed in cleanup_response() after DMA completes */
+    /* Transfer TX slot ownership to C layer pending entry so that
+     * timeout/cancel handlers can free it if this transport is abandoned. */
+    dpumesh_pending_attach_tx(ctx_, req_id_, tx_slot);
+    tx_slot_ = -1;  /* C layer owns TX slot now */
     write_buf_.clear();
     /* Response will be fetched on first read() call */
 }

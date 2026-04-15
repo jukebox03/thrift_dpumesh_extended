@@ -121,6 +121,7 @@ struct dpumesh_ctx {
     dpumesh_tx_inflight_t tx_inflight[MAX_TX_INFLIGHT];
     pthread_mutex_t tx_inflight_lock;
     int tx_inflight_lock_ready;
+
 };
 
 /* ====================================================================
@@ -537,6 +538,30 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
         pthread_join(ctx->pe_tid, NULL);
     }
 
+    /* Free resources BEFORE destroying locks they depend on.
+     * tx_inflight_cleanup and pending cleanup call dpumesh_tx_free/rx_free
+     * which acquire slot_lock/rx_slot_lock. */
+    if (ctx->tx_inflight_lock_ready) {
+        tx_inflight_cleanup(ctx);
+        pthread_mutex_destroy(&ctx->tx_inflight_lock);
+    }
+
+    for (int i = 0; i < MAX_PENDING; i++) {
+        dpumesh_pending_t *p = &ctx->pending[i];
+        pthread_mutex_lock(&p->lock);
+        if (p->state == 1 && p->desc.body_buf_slot >= 0) {
+            dpumesh_rx_free(ctx, p->desc.body_buf_slot);
+        }
+        if (p->tx_slot >= 0) {
+            dpumesh_tx_free(ctx, p->tx_slot);
+            p->tx_slot = -1;
+        }
+        p->state = -1;
+        pthread_mutex_unlock(&p->lock);
+        pthread_mutex_destroy(&p->lock);
+        pthread_cond_destroy(&p->cond);
+    }
+
     cleanup_objects(&ctx->doca_objs);
 
     pthread_mutex_destroy(&ctx->ring_lock);
@@ -549,16 +574,6 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
     pthread_mutex_destroy(&ctx->rx_lock);
     pthread_cond_destroy(&ctx->rx_cond);
     pthread_cond_destroy(&ctx->rx_not_full);
-
-    for (int i = 0; i < MAX_PENDING; i++) {
-        pthread_mutex_destroy(&ctx->pending[i].lock);
-        pthread_cond_destroy(&ctx->pending[i].cond);
-    }
-
-    if (ctx->tx_inflight_lock_ready) {
-        tx_inflight_cleanup(ctx);
-        pthread_mutex_destroy(&ctx->tx_inflight_lock);
-    }
 
     free(ctx);
 }
@@ -857,7 +872,12 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
 
     if (p->state == 1) {
         *resp = p->desc;
-        p->tx_slot = -1;  /* caller takes TX ownership */
+        /* Response arrived = DPA finished reading TX buffer. Free TX now
+         * to return the slot to the pool ASAP under high load. */
+        if (p->tx_slot >= 0) {
+            dpumesh_tx_free(ctx, p->tx_slot);
+            p->tx_slot = -1;
+        }
         p->state = -1;
         pthread_cond_broadcast(&p->cond);
         pthread_mutex_unlock(&p->lock);
@@ -893,7 +913,6 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
         }
         p->state = -1;
     } else if (p->state == 0 || p->state == -2) {
-        /* Force-free TX slot — leaving it locked permanently stalls the system */
         if (p->tx_slot >= 0) {
             dpumesh_tx_free(ctx, p->tx_slot);
             p->tx_slot = -1;

@@ -321,6 +321,11 @@ init_dpa_objects(struct objects *objs)
         goto destroy_dpa;
     }
 
+    result = doca_dpa_set_log_level(objs->dpa_thread->dpa, DOCA_DPA_DEV_LOG_LEVEL_ERROR);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_WARN("Failed to set DPA log level: %s", doca_error_get_name(result));
+    }
+
     result = doca_dpa_start(objs->dpa_thread->dpa);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start DOCA DPA with error = %s", doca_error_get_name(result));
