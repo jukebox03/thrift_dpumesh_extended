@@ -124,14 +124,18 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 		break;
 
 	case DMESH_MSG_TX_ACK:
-		if (msg_len < sizeof(struct dmesh_tx_ack_msg)) {
-			DOCA_LOG_ERR("Received invalid TX_ACK message: len=%u < expected=%zu",
-				     msg_len, sizeof(struct dmesh_tx_ack_msg));
-			return;
-		}
+		/* Forward DMA consumed by DPU — sender can free TX buffer slot */
 		DOCA_LOG_INFO("Client received DMESH_MSG_TX_ACK len=%u", msg_len);
-		if (objs->tx_ack_hook)
-			objs->tx_ack_hook(objs->tx_ack_hook_ctx, recv_buffer, msg_len);
+		if (objs->rx_data_hook)
+			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
+		break;
+
+	case DMESH_MSG_DMA_COMPLETION:
+		/* Reverse DMA (DPU→CPU) completion: data is already in Host RX DMA buffer.
+		 * The notification carries comch_dma_comp_msg in desc[64] with pos/length. */
+		DOCA_LOG_INFO("Client received DMESH_MSG_DMA_COMPLETION len=%u", msg_len);
+		if (objs->rx_data_hook)
+			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
 
 	case DMESH_MSG_CONSUMER_ID: {

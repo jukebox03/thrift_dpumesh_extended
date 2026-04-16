@@ -51,9 +51,6 @@ static void cleanup_ctx(struct dpumesh_ctx *ctx);
 /* Pending response table for client-side request/response matching */
 #define MAX_PENDING 4096
 
-/* Inflight TX table for ACK-based slot release (server response path) */
-#define MAX_TX_INFLIGHT 2048
-
 typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t cond;
@@ -61,13 +58,6 @@ typedef struct {
     volatile int state;   /* -1=unused, -2=cancelled(tx deferred), 0=waiting, 1=arrived */
     int tx_slot;          /* TX buffer slot owned by this request, -1 if none */
 } dpumesh_pending_t;
-
-typedef struct {
-    uint32_t req_id;
-    int32_t dst_pod_id;
-    int slot;
-    int in_use;
-} dpumesh_tx_inflight_t;
 
 struct dpumesh_ctx {
     char app_name[64];
@@ -78,11 +68,22 @@ struct dpumesh_ctx {
     int  max_descriptors;
     /* DOCA objects */
     struct objects doca_objs;
-    void *dma_buffer;
+    void *dma_buffer;          /* Host TX buffer (PCI mmap, CPU→DPU source) */
     struct dma_ring *dma_ring;
     pthread_mutex_t ring_lock;  /* Serializes get_next_dma_desc + descriptor fill + valid=1 */
     doca_dpa_dev_mmap_t dpa_mmap_handle;  /* DPA handle for local mmap (used in TX descriptors) */
 
+    /* Host RX buffer (PCI mmap, DPU→CPU destination) */
+    void *rx_dma_buffer;
+    struct doca_mmap *rx_dma_mmap;
+    size_t rx_dma_buf_size;
+
+    /* Flow control state (Host as sender of CPU→DPU) */
+    uint32_t fc_tx_producer_head;
+    uint32_t fc_tx_last_consumer_tail;  /* last known DPU RX consumption */
+
+    /* Flow control state (Host as receiver of DPU→CPU) */
+    uint32_t fc_rx_consumer_tail;
 
     /* Persistent buffers for initial registration to avoid stack UAF */
     struct dmesh_register_msg reg_msg;
@@ -117,10 +118,11 @@ struct dpumesh_ctx {
     dpumesh_pending_t pending[MAX_PENDING];
     atomic_uint_fast32_t next_req_id;
 
-    /* TX inflight table for ACK-based release */
-    dpumesh_tx_inflight_t tx_inflight[MAX_TX_INFLIGHT];
-    pthread_mutex_t tx_inflight_lock;
-    int tx_inflight_lock_ready;
+    /* Deferred TX slot free: ring_slot → tx_slot mapping.
+     * When DPA processes a ring descriptor (clears valid=0) and the slot is
+     * reused by get_next_dma_desc, the associated TX slot can be freed.
+     * -1 means no TX slot to free for that ring slot. */
+    int ring_tx_slot_map[DMA_RING_SIZE];
 
 };
 
@@ -140,9 +142,6 @@ static void *pe_progress_fn(void *arg) {
 
         if (ctx->doca_objs.consumer_pe)
             progressed += doca_pe_progress(ctx->doca_objs.consumer_pe);
-
-        if (ctx->doca_objs.producer_pe)
-            progressed += doca_pe_progress(ctx->doca_objs.producer_pe);
 
         if (progressed == 0)
             nanosleep(&ts, &ts);
@@ -167,120 +166,187 @@ static int rx_slot_alloc(dpumesh_ctx_t *ctx) {
     return -1;
 }
 
-static int tx_inflight_register(dpumesh_ctx_t *ctx, uint32_t req_id,
-                                int32_t dst_pod_id, int slot)
+
+/*
+ * Deliver a fully parsed descriptor to the pending table or RX queue.
+ * Common path for both comch-based RX_DATA and DMA-based DMA_COMPLETION.
+ */
+static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int slot)
 {
-    int retries = 0;
-    const int max_retries = 50;
-    struct timespec backoff = {0, 100000}; /* 100µs */
+    if (desc->flags & OP_RESPONSE) {
+        uint32_t idx = desc->req_id % MAX_PENDING;
+        dpumesh_pending_t *p = &ctx->pending[idx];
+        pthread_mutex_lock(&p->lock);
+        if (p->state == 0) {
+            p->desc = *desc;
+            p->state = 1;
+            pthread_cond_signal(&p->cond);
+        } else if (p->state == -2) {
+            /* Cancelled request — DPA finished, now safe to free TX + RX */
+            if (p->tx_slot >= 0) {
+                dpumesh_tx_free(ctx, p->tx_slot);
+                p->tx_slot = -1;
+            }
+            pthread_mutex_lock(&ctx->rx_slot_lock);
+            ctx->rx_slot_bitmap[slot] = 0;
+            pthread_mutex_unlock(&ctx->rx_slot_lock);
+            p->state = -1;
+            pthread_cond_broadcast(&p->cond);
+        } else {
+            DOCA_LOG_ERR("RX deliver: OP_RESPONSE for req_id=%u but no waiter (state=%d)",
+                         desc->req_id, p->state);
+            pthread_mutex_lock(&ctx->rx_slot_lock);
+            ctx->rx_slot_bitmap[slot] = 0;
+            pthread_mutex_unlock(&ctx->rx_slot_lock);
+        }
+        pthread_mutex_unlock(&p->lock);
+    } else {
+        pthread_mutex_lock(&ctx->rx_lock);
 
-retry:
-    {
-        int free_idx = -1;
+        /* Backpressure: wait briefly for space instead of dropping immediately */
+        if (ctx->rx_count >= RX_QUEUE_SIZE) {
+            struct timespec bp_ts;
+            clock_gettime(CLOCK_REALTIME, &bp_ts);
+            bp_ts.tv_nsec += 50000000L; /* 50ms wait budget */
+            if (bp_ts.tv_nsec >= 1000000000L) {
+                bp_ts.tv_sec++;
+                bp_ts.tv_nsec -= 1000000000L;
+            }
 
-        pthread_mutex_lock(&ctx->tx_inflight_lock);
-        for (int i = 0; i < MAX_TX_INFLIGHT; i++) {
-            if (ctx->tx_inflight[i].in_use) {
-                if (ctx->tx_inflight[i].req_id == req_id &&
-                    ctx->tx_inflight[i].dst_pod_id == dst_pod_id) {
-                    pthread_mutex_unlock(&ctx->tx_inflight_lock);
-                    DOCA_LOG_ERR("TX inflight duplicate req_id=%u dst_pod=%d",
-                                 req_id, dst_pod_id);
-                    return -1;
+            while (ctx->rx_count >= RX_QUEUE_SIZE) {
+                int bp_rc = pthread_cond_timedwait(&ctx->rx_not_full, &ctx->rx_lock, &bp_ts);
+                if (bp_rc != 0) {
+                    pthread_mutex_unlock(&ctx->rx_lock);
+                    DOCA_LOG_ERR("RX deliver: queue full after backpressure wait, dropping");
+                    pthread_mutex_lock(&ctx->rx_slot_lock);
+                    ctx->rx_slot_bitmap[slot] = 0;
+                    pthread_mutex_unlock(&ctx->rx_slot_lock);
+                    return;
                 }
-            } else if (free_idx < 0) {
-                free_idx = i;
             }
         }
 
-        if (free_idx >= 0) {
-            ctx->tx_inflight[free_idx].req_id = req_id;
-            ctx->tx_inflight[free_idx].dst_pod_id = dst_pod_id;
-            ctx->tx_inflight[free_idx].slot = slot;
-            ctx->tx_inflight[free_idx].in_use = 1;
-            pthread_mutex_unlock(&ctx->tx_inflight_lock);
-            DOCA_LOG_INFO("TX inflight registered: req_id=%u dst_pod=%d slot=%d idx=%d",
-                          req_id, dst_pod_id, slot, free_idx);
-            return 0;
-        }
-
-        pthread_mutex_unlock(&ctx->tx_inflight_lock);
+        ctx->rx_queue[ctx->rx_tail] = *desc;
+        ctx->rx_tail = (ctx->rx_tail + 1) % RX_QUEUE_SIZE;
+        ctx->rx_count++;
+        pthread_cond_signal(&ctx->rx_cond);
+        pthread_mutex_unlock(&ctx->rx_lock);
     }
-
-    if (retries < max_retries) {
-        nanosleep(&backoff, NULL);
-        retries++;
-        goto retry;
-    }
-
-    DOCA_LOG_ERR("TX inflight table full after %d retries for req_id=%u dst_pod=%d",
-                 max_retries, req_id, dst_pod_id);
-    return -1;
-}
-
-static int pending_is_waiting(dpumesh_ctx_t *ctx, uint32_t req_id)
-{
-    uint32_t idx = req_id % MAX_PENDING;
-    dpumesh_pending_t *p = &ctx->pending[idx];
-    int waiting;
-
-    pthread_mutex_lock(&p->lock);
-    waiting = (p->state == 0);
-    pthread_mutex_unlock(&p->lock);
-    return waiting;
-}
-
-static void tx_inflight_ack_hook(void *hook_ctx, const uint8_t *data, uint32_t len)
-{
-    dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)hook_ctx;
-    const struct dmesh_tx_ack_msg *ack = (const struct dmesh_tx_ack_msg *)data;
-
-    if (len < sizeof(struct dmesh_tx_ack_msg)) {
-        DOCA_LOG_ERR("TX_ACK: invalid len=%u", len);
-        return;
-    }
-
-    pthread_mutex_lock(&ctx->tx_inflight_lock);
-    for (int i = 0; i < MAX_TX_INFLIGHT; i++) {
-        if (!ctx->tx_inflight[i].in_use)
-            continue;
-        if (ctx->tx_inflight[i].req_id == ack->req_id &&
-            ctx->tx_inflight[i].dst_pod_id == ack->dst_pod_id) {
-            int slot = ctx->tx_inflight[i].slot;
-            ctx->tx_inflight[i].in_use = 0;
-            pthread_mutex_unlock(&ctx->tx_inflight_lock);
-            dpumesh_tx_free(ctx, slot);
-            DOCA_LOG_INFO("TX_ACK matched inflight: req_id=%u dst_pod=%d slot=%d idx=%d",
-                          ack->req_id, ack->dst_pod_id, slot, i);
-            return;
-        }
-    }
-    pthread_mutex_unlock(&ctx->tx_inflight_lock);
-
-    if (pending_is_waiting(ctx, ack->req_id)) {
-        DOCA_LOG_INFO("TX_ACK without inflight (expected request path): req_id=%u dst_pod=%d",
-                      ack->req_id, ack->dst_pod_id);
-    } else {
-        DOCA_LOG_WARN("TX_ACK orphan: no inflight/pending entry for req_id=%u dst_pod=%d",
-                      ack->req_id, ack->dst_pod_id);
-    }
-}
-
-static void tx_inflight_cleanup(dpumesh_ctx_t *ctx)
-{
-    pthread_mutex_lock(&ctx->tx_inflight_lock);
-    for (int i = 0; i < MAX_TX_INFLIGHT; i++) {
-        if (ctx->tx_inflight[i].in_use) {
-            int slot = ctx->tx_inflight[i].slot;
-            ctx->tx_inflight[i].in_use = 0;
-            dpumesh_tx_free(ctx, slot);
-        }
-    }
-    pthread_mutex_unlock(&ctx->tx_inflight_lock);
 }
 
 static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)hook_ctx;
+    const struct dmesh_comch_msg *comch_msg = (const struct dmesh_comch_msg *)data;
+
+    if (comch_msg->type == DMESH_MSG_TX_ACK) {
+        /* === TX_ACK: forward DMA consumed, free sender's TX slot ===
+         * DPU ARM sends this when CPU→DPU DMA completes — data copied
+         * to DPU buffer, Host TX slot can be freed immediately. */
+        struct dmesh_tx_ack_msg ack;
+        if (len < sizeof(ack)) {
+            DOCA_LOG_ERR("TX_ACK: too short (len=%u need=%zu)", len, sizeof(ack));
+            return;
+        }
+        memcpy(&ack, data, sizeof(ack));
+
+        uint32_t idx = ack.req_id % MAX_PENDING;
+        dpumesh_pending_t *p = &ctx->pending[idx];
+        pthread_mutex_lock(&p->lock);
+        if (p->state == 0 && p->tx_slot >= 0) {
+            /* Request still waiting for response — free TX slot early */
+            dpumesh_tx_free(ctx, p->tx_slot);
+            p->tx_slot = -1;
+        }
+        pthread_mutex_unlock(&p->lock);
+
+        DOCA_LOG_INFO("TX_ACK: freed TX slot for req_id=%u", ack.req_id);
+        return;
+    }
+
+    if (comch_msg->type == DMESH_MSG_DMA_COMPLETION) {
+        /* === Reverse DMA path (DPU→CPU) ===
+         * DPU ARM forwards this after DPA completes DMA from DPU TX buffer
+         * to Host RX buffer. Data is already at rx_dma_buffer[pos].
+         * Layout at pos: fc_header(8B) + sw_descriptor(64B) + body(N). */
+        struct dmesh_dma_completion_msg comp;
+        if (len < sizeof(comp)) {
+            DOCA_LOG_ERR("DMA_COMPLETION: too short (len=%u need=%zu)", len, sizeof(comp));
+            return;
+        }
+        memcpy(&comp, data, sizeof(comp));
+
+        uint32_t pos = comp.pos;
+        uint32_t dma_len = comp.length;
+
+        if (!ctx->rx_dma_buffer || pos + dma_len > ctx->rx_dma_buf_size) {
+            DOCA_LOG_ERR("DMA_COMPLETION: invalid pos=%u len=%u buf_size=%zu",
+                         pos, dma_len, ctx->rx_dma_buf_size);
+            return;
+        }
+
+        uint8_t *buf = (uint8_t *)ctx->rx_dma_buffer + pos;
+
+        /* Parse fc_header */
+        if (dma_len < sizeof(struct fc_header)) {
+            DOCA_LOG_ERR("DMA_COMPLETION: too short for fc_header (len=%u)", dma_len);
+            return;
+        }
+        struct fc_header *hdr = (struct fc_header *)buf;
+
+        /* Update flow control: DPU told us how much of our TX buffer it consumed.
+         * Ignore values >= DPU_BUFFER_SIZE — the DPU's first response may
+         * piggyback an uninitialized rx_consumer_tail before any data is consumed. */
+        if (hdr->consumer_tail < DPU_BUFFER_SIZE)
+            ctx->fc_tx_last_consumer_tail = hdr->consumer_tail;
+
+        uint32_t payload_len = hdr->payload_len;
+        if (sizeof(struct fc_header) + payload_len > dma_len) {
+            DOCA_LOG_ERR("DMA_COMPLETION: payload_len=%u exceeds dma_len=%u", payload_len, dma_len);
+            return;
+        }
+
+        /* Parse sw_descriptor after fc_header */
+        uint8_t *payload = buf + sizeof(struct fc_header);
+        if (payload_len < sizeof(sw_descriptor_t)) {
+            DOCA_LOG_ERR("DMA_COMPLETION: payload too short for descriptor (len=%u)", payload_len);
+            return;
+        }
+
+        sw_descriptor_t desc;
+        memcpy(&desc, payload, sizeof(desc));
+
+        uint32_t body_len = payload_len - sizeof(sw_descriptor_t);
+        uint8_t *body = payload + sizeof(sw_descriptor_t);
+
+        /* Zero-copy: allocate RX slot and copy body from DMA buffer.
+         * TODO: true zero-copy with buffer offset tracking (Phase 5b). */
+        int slot = rx_slot_alloc(ctx);
+        if (slot < 0) {
+            DOCA_LOG_ERR("DMA_COMPLETION: no free RX slots");
+            return;
+        }
+        uint8_t *dst = (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
+        if (body_len > 0)
+            memcpy(dst, body, body_len);
+
+        desc.body_buf_slot = slot;
+        desc.body_len = body_len;
+
+        /* Advance RX consumer tail for flow control */
+        uint32_t padded = (dma_len + 127) & ~(uint32_t)127;
+        ctx->fc_rx_consumer_tail = pos + padded;
+        if (ctx->fc_rx_consumer_tail >= (uint32_t)ctx->rx_dma_buf_size)
+            ctx->fc_rx_consumer_tail = 0;
+
+        DOCA_LOG_INFO("DMA_COMPLETION: pos=%u len=%u req_id=%u flags=0x%x slot=%d body=%u fc_tail=%u",
+                      pos, dma_len, desc.req_id, (unsigned)(uint8_t)desc.flags,
+                      slot, body_len, hdr->consumer_tail);
+
+        rx_deliver_desc(ctx, &desc, slot);
+        return;
+    }
+
+    /* === Legacy comch data path (DMESH_MSG_RX_DATA) === */
     const struct dmesh_rx_data_msg *msg = (const struct dmesh_rx_data_msg *)data;
 
     DOCA_LOG_INFO("rx_data_hook ENTER: len=%u body_len=%u sizeof_hdr=%zu",
@@ -309,65 +375,7 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
                   desc.req_id, (unsigned)(uint8_t)desc.flags, desc.dst_pod_id, desc.src_pod_id,
                   slot, desc.body_len);
 
-    if (desc.flags & OP_RESPONSE) {
-        uint32_t idx = desc.req_id % MAX_PENDING;
-        dpumesh_pending_t *p = &ctx->pending[idx];
-        pthread_mutex_lock(&p->lock);
-        if (p->state == 0) {
-            p->desc = desc;
-            p->state = 1;
-            pthread_cond_signal(&p->cond);
-        } else if (p->state == -2) {
-            /* Cancelled request — DPA finished, now safe to free TX + RX */
-            if (p->tx_slot >= 0) {
-                dpumesh_tx_free(ctx, p->tx_slot);
-                p->tx_slot = -1;
-            }
-            pthread_mutex_lock(&ctx->rx_slot_lock);
-            ctx->rx_slot_bitmap[slot] = 0;
-            pthread_mutex_unlock(&ctx->rx_slot_lock);
-            p->state = -1;
-            pthread_cond_broadcast(&p->cond);
-        } else {
-            DOCA_LOG_ERR("RX_DATA: OP_RESPONSE for req_id=%u but no waiter (state=%d)",
-                         desc.req_id, p->state);
-            pthread_mutex_lock(&ctx->rx_slot_lock);
-            ctx->rx_slot_bitmap[slot] = 0;
-            pthread_mutex_unlock(&ctx->rx_slot_lock);
-        }
-        pthread_mutex_unlock(&p->lock);
-    } else {
-        pthread_mutex_lock(&ctx->rx_lock);
-
-        /* Backpressure: wait briefly for space instead of dropping immediately */
-        if (ctx->rx_count >= RX_QUEUE_SIZE) {
-            struct timespec bp_ts;
-            clock_gettime(CLOCK_REALTIME, &bp_ts);
-            bp_ts.tv_nsec += 50000000L; /* 50ms wait budget */
-            if (bp_ts.tv_nsec >= 1000000000L) {
-                bp_ts.tv_sec++;
-                bp_ts.tv_nsec -= 1000000000L;
-            }
-
-            while (ctx->rx_count >= RX_QUEUE_SIZE) {
-                int bp_rc = pthread_cond_timedwait(&ctx->rx_not_full, &ctx->rx_lock, &bp_ts);
-                if (bp_rc != 0) {
-                    pthread_mutex_unlock(&ctx->rx_lock);
-                    DOCA_LOG_ERR("RX_DATA: RX queue full after backpressure wait, dropping message");
-                    pthread_mutex_lock(&ctx->rx_slot_lock);
-                    ctx->rx_slot_bitmap[slot] = 0;
-                    pthread_mutex_unlock(&ctx->rx_slot_lock);
-                    return;
-                }
-            }
-        }
-
-        ctx->rx_queue[ctx->rx_tail] = desc;
-        ctx->rx_tail = (ctx->rx_tail + 1) % RX_QUEUE_SIZE;
-        ctx->rx_count++;
-        pthread_cond_signal(&ctx->rx_cond);
-        pthread_mutex_unlock(&ctx->rx_lock);
-    }
+    rx_deliver_desc(ctx, &desc, slot);
 }
 
 static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, const char *app_name, int worker_num) {
@@ -448,8 +456,8 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
         client_send_msg(&ctx->doca_objs, (const char *)&ctx->pod_cid_msg, sizeof(ctx->pod_cid_msg));
     }
 
-    result = init_comch_datapath_producer(&ctx->doca_objs);
-    if (result != DOCA_SUCCESS) return result;
+    /* NOTE: init_comch_datapath_producer() removed — CPU→DPU uses DMA ring,
+     * DPU→CPU uses reverse DMA. comch datapath producer no longer needed. */
 
     result = setup_dma_ring(&ctx->doca_objs, DMA_RING_SIZE);
     if (result != DOCA_SUCCESS) return result;
@@ -469,7 +477,30 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
                                    DMA_BUFFER, HOST_TO_DPU);
     if (result != DOCA_SUCCESS) return result;
 
-    return doca_mmap_dev_get_dpa_handle(ctx->doca_objs.local_mmap, ctx->doca_objs.dev, &ctx->dpa_mmap_handle);
+    result = doca_mmap_dev_get_dpa_handle(ctx->doca_objs.local_mmap, ctx->doca_objs.dev, &ctx->dpa_mmap_handle);
+    if (result != DOCA_SUCCESS) return result;
+
+    /* Allocate Host RX DMA buffer (PCI mmap, DPA writes DPU→CPU data here) */
+    ctx->rx_dma_buf_size = buf_size;
+    result = alloc_buffer_and_set_mmap(&ctx->rx_dma_mmap,
+                                       ctx->doca_objs.dev,
+                                       &ctx->rx_dma_buffer,
+                                       ctx->rx_dma_buf_size,
+                                       DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to allocate Host RX DMA buffer: %s", doca_err_str(result));
+        return result;
+    }
+
+    /* Export Host RX buffer to DPU so DPA can get mmap handle for reverse DMA */
+    result = export_mmap_to_remote(&ctx->doca_objs, ctx->rx_dma_mmap,
+                                   ctx->rx_dma_buffer, ctx->rx_dma_buf_size,
+                                   DMA_HOST_RX_BUFFER, HOST_TO_DPU);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_WARN("Failed to export Host RX buffer to DPU: %s", doca_err_str(result));
+    }
+
+    return DOCA_SUCCESS;
 }
 
 int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
@@ -488,7 +519,9 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     pthread_mutex_init(&ctx->slot_lock, NULL);
     pthread_mutex_init(&ctx->ring_lock, NULL);
 
-    ctx->rx_buffer = calloc(1, (size_t)ctx->num_slots * ctx->slot_size);
+    /* RX buffer is now PCI mmap (rx_dma_buffer) allocated in init_datapath.
+     * Point rx_buffer to it for backward compatibility with dpumesh_rx_buf(). */
+    ctx->rx_buffer = ctx->rx_dma_buffer;
     if (!ctx->rx_buffer) goto fail;
     ctx->rx_slot_bitmap = (uint8_t *)calloc(ctx->num_slots, 1);
     if (!ctx->rx_slot_bitmap) goto fail;
@@ -510,12 +543,12 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         ctx->pending[i].tx_slot = -1;
     }
 
-    pthread_mutex_init(&ctx->tx_inflight_lock, NULL);
-    ctx->tx_inflight_lock_ready = 1;
+    /* Initialize ring_tx_slot_map for deferred TX slot free */
+    for (int i = 0; i < DMA_RING_SIZE; i++)
+        ctx->ring_tx_slot_map[i] = -1;
+
     ctx->doca_objs.rx_data_hook = rx_data_hook;
     ctx->doca_objs.rx_hook_ctx = ctx;
-    ctx->doca_objs.tx_ack_hook = tx_inflight_ack_hook;
-    ctx->doca_objs.tx_ack_hook_ctx = ctx;
 
     ctx->pe_running = 1;
     if (pthread_create(&ctx->pe_tid, NULL, pe_progress_fn, ctx) != 0) goto fail;
@@ -539,11 +572,15 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
     }
 
     /* Free resources BEFORE destroying locks they depend on.
-     * tx_inflight_cleanup and pending cleanup call dpumesh_tx_free/rx_free
-     * which acquire slot_lock/rx_slot_lock. */
-    if (ctx->tx_inflight_lock_ready) {
-        tx_inflight_cleanup(ctx);
-        pthread_mutex_destroy(&ctx->tx_inflight_lock);
+     * Pending cleanup calls dpumesh_tx_free/rx_free which acquire
+     * slot_lock/rx_slot_lock. */
+
+    /* Deferred TX slot free: free any remaining mapped TX slots */
+    for (int i = 0; i < DMA_RING_SIZE; i++) {
+        if (ctx->ring_tx_slot_map[i] >= 0) {
+            dpumesh_tx_free(ctx, ctx->ring_tx_slot_map[i]);
+            ctx->ring_tx_slot_map[i] = -1;
+        }
     }
 
     for (int i = 0; i < MAX_PENDING; i++) {
@@ -570,7 +607,7 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
 
     pthread_mutex_destroy(&ctx->rx_slot_lock);
     if (ctx->rx_slot_bitmap) free(ctx->rx_slot_bitmap);
-    if (ctx->rx_buffer) free(ctx->rx_buffer);
+    /* rx_buffer points to rx_dma_buffer (PCI mmap), freed by cleanup_objects */
     pthread_mutex_destroy(&ctx->rx_lock);
     pthread_cond_destroy(&ctx->rx_cond);
     pthread_cond_destroy(&ctx->rx_not_full);
@@ -588,6 +625,31 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx) {
  * TX functions
  * ==================================================================== */
 
+/*
+ * Reclaim TX slots from completed ring descriptors (valid=0).
+ * OP_RESPONSE TX slots are deferred in ring_tx_slot_map until ring reuse.
+ * This function proactively frees them to prevent deadlock when tx_alloc
+ * can't find free slots and dpumesh_enqueue can't be called to recycle them.
+ * Caller must NOT hold slot_lock (this function acquires ring_lock then slot_lock).
+ */
+static int reclaim_ring_tx_slots(dpumesh_ctx_t *ctx) {
+    int freed = 0;
+    pthread_mutex_lock(&ctx->ring_lock);
+    for (int i = 0; i < DMA_RING_SIZE; i++) {
+        if (ctx->ring_tx_slot_map[i] >= 0) {
+            struct dma_desc *d = &ctx->dma_ring->descs[i];
+            __sync_synchronize();
+            if (!d->valid) {
+                dpumesh_tx_free(ctx, ctx->ring_tx_slot_map[i]);
+                ctx->ring_tx_slot_map[i] = -1;
+                freed++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&ctx->ring_lock);
+    return freed;
+}
+
 int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
     const int max_retry = 1000;
     struct timespec backoff = {0, 10000}; /* 10us initial */
@@ -603,6 +665,13 @@ int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
         }
         pthread_mutex_unlock(&ctx->slot_lock);
 
+        /* Reclaim TX slots from completed ring descriptors to break
+         * the deadlock: tx_alloc waits for free slots, but slots are
+         * only freed inside dpumesh_enqueue which can't run until
+         * tx_alloc returns. */
+        if (reclaim_ring_tx_slots(ctx) > 0)
+            continue;  /* freed some — retry immediately */
+
         if (retry == 0) continue;  /* first miss: immediate retry */
         nanosleep(&backoff, NULL);
         if (backoff.tv_nsec < 1000000)  /* cap at 1ms */
@@ -614,14 +683,15 @@ int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
 
 uint8_t *dpumesh_tx_buf(dpumesh_ctx_t *ctx, int slot) {
     if (slot < 0 || slot >= ctx->num_slots) return NULL;
-    return (uint8_t *)ctx->dma_buffer + ((size_t)slot * ctx->slot_size);
+    /* Reserve fc_header space at the beginning of each slot.
+     * Caller writes body starting after the header area. */
+    return (uint8_t *)ctx->dma_buffer + ((size_t)slot * ctx->slot_size)
+           + sizeof(struct fc_header);
 }
 
 void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
     if (slot < 0 || slot >= ctx->num_slots) return;
-    /* Clear TX buffer before releasing slot to prevent stale data */
-    uint8_t *buf = (uint8_t *)ctx->dma_buffer + ((size_t)slot * ctx->slot_size);
-    memset(buf, 0, ctx->slot_size);
+    /* Flow control ensures no stale read — no memset needed */
     pthread_mutex_lock(&ctx->slot_lock);
     ctx->slot_bitmap[slot] = 0;
     pthread_mutex_unlock(&ctx->slot_lock);
@@ -642,14 +712,57 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
         return -1;
     }
 
-    if (desc->body_len > (uint32_t)ctx->slot_size) {
-        DOCA_LOG_ERR("ENQUEUE rejected: body_len=%u exceeds slot_size=%d",
-                     desc->body_len, ctx->slot_size);
+    if (desc->body_len > (uint32_t)(ctx->slot_size - (int)sizeof(struct fc_header))) {
+        DOCA_LOG_ERR("ENQUEUE rejected: body_len=%u exceeds usable slot_size=%d (slot=%d - fc_header=%zu)",
+                     desc->body_len, (int)(ctx->slot_size - sizeof(struct fc_header)),
+                     ctx->slot_size, sizeof(struct fc_header));
         return -1;
     }
 
     /* Lock ring access: serializes get_next_dma_desc + descriptor fill + valid=1 */
     pthread_mutex_lock(&ctx->ring_lock);
+
+    /* Flow control: ensure DPU RX buffer has space for this transfer.
+     * fc_tx_producer_head mirrors the DPA's pos[ring_idx] advancement.
+     * fc_tx_last_consumer_tail is piggybacked from DPU via reverse DMA fc_header.
+     * Without this check, the DPA overwrites unconsumed data in the DPU buffer
+     * under high load, causing data corruption or silent drops. */
+    {
+        uint32_t dma_size = (uint32_t)(sizeof(struct fc_header) + desc->body_len);
+        uint32_t padded_len = (dma_size + 127) & ~(uint32_t)127;
+        uint32_t buf_size = DPU_BUFFER_SIZE;
+        int fc_retry = 0;
+        const int max_fc_retry = 10000;
+        struct timespec fc_backoff = {0, 10000}; /* 10µs initial */
+
+        while (1) {
+            uint32_t head = ctx->fc_tx_producer_head;
+            uint32_t tail = ctx->fc_tx_last_consumer_tail;
+            uint32_t used = (head >= tail) ? (head - tail) : (buf_size - tail + head);
+            uint32_t available = buf_size - used;
+
+            if (padded_len <= available) {
+                /* Check contiguous space: wrap-around wastes gap at end */
+                if (head + padded_len <= buf_size)
+                    break;  /* fits without wrap */
+                if (padded_len <= tail)
+                    break;  /* fits after wrap to 0 */
+            }
+
+            if (++fc_retry >= max_fc_retry) {
+                pthread_mutex_unlock(&ctx->ring_lock);
+                DOCA_LOG_ERR("ENQUEUE: DPU buffer full after %d retries "
+                             "(head=%u tail=%u need=%u avail=%u)",
+                             max_fc_retry, head, tail, padded_len, available);
+                return -1;
+            }
+            /* Release lock while waiting — PE thread updates fc_tx_last_consumer_tail */
+            pthread_mutex_unlock(&ctx->ring_lock);
+            nanosleep(&fc_backoff, NULL);
+            if (fc_backoff.tv_nsec < 1000000) fc_backoff.tv_nsec *= 2;
+            pthread_mutex_lock(&ctx->ring_lock);
+        }
+    }
 
     /* Retry with exponential backoff if DMA ring is temporarily full */
     {
@@ -676,18 +789,34 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
 
     ring_slot = (uint32_t)(dma - ctx->dma_ring->descs);
 
-    /* tx_inflight_register has its own lock, safe to call under ring_lock */
-    if ((desc->flags & OP_RESPONSE) &&
-        tx_inflight_register(ctx, desc->req_id, desc->dst_pod_id,
-                             desc->body_buf_slot) != 0) {
-        pthread_mutex_unlock(&ctx->ring_lock);
-        return -1;
+    /* Deferred TX slot free: if this ring slot previously held data for
+     * an OP_RESPONSE, the DPA has now cleared valid=0 (get_next_dma_desc
+     * checked), so the old TX slot is safe to free. */
+    if (ctx->ring_tx_slot_map[ring_slot] >= 0) {
+        dpumesh_tx_free(ctx, ctx->ring_tx_slot_map[ring_slot]);
+        ctx->ring_tx_slot_map[ring_slot] = -1;
+    }
+
+    /* Track TX slot for OP_RESPONSE — freed when ring slot is reused.
+     * For OP_REQUEST, pending table handles TX slot lifetime. */
+    if (desc->flags & OP_RESPONSE) {
+        ctx->ring_tx_slot_map[ring_slot] = desc->body_buf_slot;
+    }
+
+    /* Write fc_header at slot base (before body data).
+     * Body was written by caller at base + sizeof(fc_header). */
+    {
+        uint8_t *slot_base = (uint8_t *)ctx->dma_buffer +
+                             ((size_t)desc->body_buf_slot * ctx->slot_size);
+        struct fc_header *hdr = (struct fc_header *)slot_base;
+        hdr->consumer_tail = ctx->fc_rx_consumer_tail;
+        hdr->payload_len = desc->body_len;
     }
 
     dma->mmap = ctx->dpa_mmap_handle;
     dma->addr = (uint64_t)ctx->dma_buffer +
                 ((size_t)desc->body_buf_slot * ctx->slot_size);
-    dma->size = desc->body_len;
+    dma->size = sizeof(struct fc_header) + desc->body_len;
     dma->idx  = desc->req_id;
     dma->dst_pod_id = desc->dst_pod_id;
     dma->flags = desc->flags;
@@ -695,8 +824,22 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     __sync_synchronize();
     dma->valid = 1;
 
-    DOCA_LOG_DBG("ENQUEUE: req_id=%u slot=%u len=%u",
-                 desc->req_id, ring_slot, desc->body_len);
+    /* Advance DPU buffer producer head — mirrors DPA's pos advancement.
+     * DPA: if (pos + padded > buf_size) pos = 0; pos += padded;
+     *       if (pos >= buf_size) pos = 0; */
+    {
+        uint32_t dma_size = (uint32_t)(sizeof(struct fc_header) + desc->body_len);
+        uint32_t padded_len = (dma_size + 127) & ~(uint32_t)127;
+        if (ctx->fc_tx_producer_head + padded_len > DPU_BUFFER_SIZE)
+            ctx->fc_tx_producer_head = 0;
+        ctx->fc_tx_producer_head += padded_len;
+        if (ctx->fc_tx_producer_head >= DPU_BUFFER_SIZE)
+            ctx->fc_tx_producer_head = 0;
+    }
+
+    DOCA_LOG_DBG("ENQUEUE: req_id=%u slot=%u len=%u fc_head=%u fc_tail=%u",
+                 desc->req_id, ring_slot, desc->body_len,
+                 ctx->fc_tx_producer_head, ctx->fc_tx_last_consumer_tail);
 
     pthread_mutex_unlock(&ctx->ring_lock);
     return 0;
@@ -751,9 +894,7 @@ uint8_t *dpumesh_rx_buf(dpumesh_ctx_t *ctx, int slot) {
 
 void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot) {
     if (slot < 0 || slot >= ctx->num_slots) return;
-    /* Clear RX buffer before releasing slot to prevent stale data */
-    uint8_t *buf = (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
-    memset(buf, 0, ctx->slot_size);
+    /* Flow control ensures no overwrite of unconsumed data — no memset needed */
     pthread_mutex_lock(&ctx->rx_slot_lock);
     ctx->rx_slot_bitmap[slot] = 0;
     pthread_mutex_unlock(&ctx->rx_slot_lock);

@@ -12,7 +12,6 @@
 #include "dpa_common.h"
 #include "comch_common.h"
 #include "dpu_worker.h"
-#include "comch_server.h"
 #include "comch_producer.h"
 #include "comch_consumer.h"
 #include "../dpumesh.h"
@@ -106,36 +105,51 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                 DOCA_LOG_ERR("DMA completed but src_pod %d not found or no buffer", src_pod_id);
                 break;
             }
-            uint32_t payload_len = comp_msg->length;
+            uint32_t raw_len = comp_msg->length;
 
-            DOCA_LOG_INFO("DMA completed: src_pod=%d, dst_pod=%d, req_id=%u, pos=%u, len=%u",
-                          src_pod_id, dst_pod_id, req_id, comp_msg->pos, payload_len);
+            /* Parse fc_header from the beginning of DMA'd data.
+             * Layout: [fc_header(8B)] [body(N)] */
+            uint32_t payload_len = raw_len;
+            uint32_t body_offset = comp_msg->pos;
+            if (raw_len >= sizeof(struct fc_header)) {
+                struct fc_header *hdr = (struct fc_header *)payload_src;
+                /* Update flow control: Host told us how much of our TX buffer
+                 * (DPU→CPU direction) it has consumed. */
+                if (src_pod)
+                    src_pod->tx_last_consumer_tail = hdr->consumer_tail;
+                payload_len = hdr->payload_len;
+                body_offset = comp_msg->pos + sizeof(struct fc_header);
+            }
 
-            /* --- Deferred completion: enqueue instead of blocking send --- */
+            DOCA_LOG_INFO("DMA completed: src_pod=%d, dst_pod=%d, req_id=%u, pos=%u, raw_len=%u, body_len=%u",
+                          src_pod_id, dst_pod_id, req_id, comp_msg->pos, raw_len, payload_len);
+
+            /* Enqueue for deferred processing in main loop.
+             * TX_ACK + reverse DMA routing handled there — never send
+             * from inside this callback (re-entrant PE corruption risk). */
             dpu_comp_entry_t entry;
+            entry.entry_type = COMP_ENTRY_FORWARD;
             entry.src_pod_id = src_pod_id;
             entry.dst_pod_id = dst_pod_id;
             entry.req_id = req_id;
             entry.length = payload_len;
             entry.flags = comp_msg->flags;
 
-            /* Heap-copy the DMA payload so main loop can send it later */
-            entry.data = (uint8_t *)malloc(payload_len);
-            if (entry.data) {
-                memcpy(entry.data, payload_src, payload_len);
-            } else {
-                DOCA_LOG_ERR("malloc(%u) failed for comp queue entry req_id=%u",
-                             payload_len, req_id);
-                break;
+            /* Zero-copy: record buffer offset (after fc_header) instead of heap-copying.
+             * Flow control guarantees DPA won't overwrite until consumer_tail advances. */
+            entry.buf_offset = body_offset;
+            entry.pod_idx = -1; /* will be resolved by pod lookup */
+            for (int pi = 0; pi < objs->num_pods; pi++) {
+                if (objs->pods[pi].pod_id == src_pod_id) {
+                    entry.pod_idx = pi;
+                    break;
+                }
             }
-
-            /* Clear DMA buffer region immediately to prevent stale data on wrap-around */
-            memset(payload_src, 0, payload_len);
 
             if (comp_queue_enqueue(&objs->comp_queue, &entry) != 0) {
                 DOCA_LOG_ERR("Completion queue full, dropping req_id=%u (src=%d, dst=%d)",
                              req_id, src_pod_id, dst_pod_id);
-                free(entry.data);
+                /* zero-copy: no heap data to free */
             } else {
                 DOCA_LOG_INFO("Enqueued completion: req_id=%u src=%d dst=%d len=%u",
                               req_id, src_pod_id, dst_pod_id, payload_len);
@@ -145,6 +159,37 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
         case COMCH_MSG_TYPE_DMA_CHUNK:
             /* Intermediate DMA chunk landed — no action needed, just resubmit recv */
             break;
+        case COMCH_MSG_TYPE_REV_DMA_COMPLETED: {
+            /* Reverse DMA completed (DPU→CPU): DPA has DMA'd data from DPU TX
+             * buffer to Host RX buffer. Enqueue for DPU worker to forward
+             * completion notification to the destination Host pod via comch. */
+            if (data_len < sizeof(struct comch_dma_comp_msg)) {
+                DOCA_LOG_ERR("REV_DMA_COMPLETED too short (len=%u, need=%zu)",
+                             data_len, sizeof(struct comch_dma_comp_msg));
+                break;
+            }
+            struct comch_dma_comp_msg *rev_comp = (struct comch_dma_comp_msg *)raw;
+
+            dpu_comp_entry_t rev_entry;
+            rev_entry.entry_type = COMP_ENTRY_REV_NOTIFY;
+            rev_entry.src_pod_id = rev_comp->src_pod_id;
+            rev_entry.dst_pod_id = rev_comp->dst_pod_id;
+            rev_entry.req_id = rev_comp->req_id;
+            rev_entry.length = rev_comp->length;
+            rev_entry.flags = rev_comp->flags;
+            rev_entry.buf_offset = rev_comp->pos;  /* position in Host RX buffer */
+            rev_entry.pod_idx = -1;
+
+            if (comp_queue_enqueue(&objs->comp_queue, &rev_entry) != 0) {
+                DOCA_LOG_ERR("Completion queue full, dropping REV_DMA req_id=%u",
+                             rev_comp->req_id);
+            } else {
+                DOCA_LOG_INFO("Enqueued REV_DMA completion: req_id=%u src=%d dst=%d len=%u pos=%u",
+                              rev_comp->req_id, rev_comp->src_pod_id,
+                              rev_comp->dst_pod_id, rev_comp->length, rev_comp->pos);
+            }
+            break;
+        }
         case COMCH_MSG_TYPE_TRIGGER:
             DOCA_LOG_INFO("DPA MsgQ recv callback ping received (type=%u)",
                           (unsigned int)msg_type);
@@ -157,28 +202,16 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     objs->recv_msg_cnt++;
 
 resubmit_recv_task:
-    {
-        static uint64_t resubmit_ok = 0, resubmit_fail = 0;
-        int resubmit_retry = 0;
-        do {
-            result = doca_task_submit(task);
-            if (result == DOCA_ERROR_AGAIN) {
-                doca_pe_progress(objs->consumer_pe);
-                resubmit_retry++;
-            }
-        } while (result == DOCA_ERROR_AGAIN && resubmit_retry < 1000);
-
+    /* Backpressure: if comp_queue is nearly full, defer recv task resubmission.
+     * DPA will see consumer_empty and naturally pause, giving DPU time to drain.
+     * Main loop resubmits when queue drops below BP_LOW. */
+    if (comp_queue_usage(&objs->comp_queue) >= COMP_QUEUE_BP_HIGH &&
+        objs->num_deferred_recv < MAX_DEFERRED_RECV) {
+        objs->deferred_recv[objs->num_deferred_recv++] = task;
+    } else {
+        result = doca_task_submit(task);
         if (result != DOCA_SUCCESS) {
-            resubmit_fail++;
-            DOCA_LOG_ERR("DPA MsgQ recv resubmit FAILED #%lu (retries=%d): %s",
-                         resubmit_fail, resubmit_retry, doca_error_get_name(result));
-            doca_task_free(task);
-        } else {
-            resubmit_ok++;
-            if (resubmit_retry > 0 || (resubmit_ok % 100 == 0)) {
-                DOCA_LOG_INFO("DPA MsgQ recv resubmit OK #%lu (retries=%d, fails=%lu)",
-                              resubmit_ok, resubmit_retry, resubmit_fail);
-            }
+            DOCA_LOG_ERR("DPA MsgQ recv resubmit failed (unexpected): %s", doca_error_get_name(result));
         }
     }
 }
@@ -205,7 +238,11 @@ static void dmesh_doca_dpa_msgq_recv_error_cb(struct doca_comch_consumer_task_po
 	DOCA_LOG_ERR("DPA MsgQ recv ERROR callback #%lu: status=%s(%d)",
 	             recv_err_count, doca_error_get_descr(status), (int)status);
 
-	doca_task_free(task);
+	/* Resubmit to keep the recv task alive — do not free. */
+	doca_error_t resubmit = doca_task_submit(task);
+	if (resubmit != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("DPA MsgQ recv resubmit after error failed: %s", doca_error_get_name(resubmit));
+	}
 }
 /*
  * Callback invoked once a message is sent to DPA successfully
@@ -733,46 +770,6 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
         return result;
     }
 
-    /* === async_ops completion context (DMA completion, separate from producer_comp) === */
-    result = doca_dpa_completion_create(dpa_thread->dpa, CC_DPA_MAX_MSG_NUM, &comch->async_ops_comp);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create async_ops completion - %s",
-                doca_error_get_name(result));
-        return result;
-    }
-    result = doca_dpa_completion_set_thread(comch->async_ops_comp, dpa_thread->thread);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to set thread on async_ops completion - %s",
-                doca_error_get_name(result));
-        return result;
-    }
-    result = doca_dpa_completion_start(comch->async_ops_comp);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to start async_ops completion - %s",
-                doca_error_get_name(result));
-        return result;
-    }
-
-    /* === async_ops for post_memcpy (size-unlimited DMA) === */
-    result = doca_dpa_async_ops_create(dpa_thread->dpa, CC_DPA_MAX_MSG_NUM, 0, &comch->async_ops);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create async_ops - %s",
-                doca_error_get_name(result));
-        return result;
-    }
-    result = doca_dpa_async_ops_attach(comch->async_ops, comch->async_ops_comp);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to attach async_ops to completion - %s",
-                doca_error_get_name(result));
-        return result;
-    }
-    result = doca_dpa_async_ops_start(comch->async_ops);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to start async_ops - %s",
-                doca_error_get_name(result));
-        return result;
-    }
-
     return DOCA_SUCCESS;
 }
 
@@ -836,25 +833,9 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         return result;
     }
 
-    /* Get async_ops DPA handles */
-    doca_dpa_dev_async_ops_t dpa_async_ops;
-    uint64_t dpa_async_ops_comp_handle;
-
-    result = doca_dpa_async_ops_get_dpa_handle(comch->async_ops, &dpa_async_ops);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get async_ops DPA handle: %s", doca_error_get_name(result));
-        return result;
-    }
-    result = doca_dpa_completion_get_dpa_handle(comch->async_ops_comp, &dpa_async_ops_comp_handle);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get async_ops_comp DPA handle: %s", doca_error_get_name(result));
-        return result;
-    }
-
-    DOCA_LOG_INFO("[PAIRCHK] fill_arg handles: send.consumer=%p recv.consumer=%p recv.producer=%p producer_comp=%p async_ops=%p async_ops_comp=%p",
+    DOCA_LOG_INFO("[PAIRCHK] fill_arg handles: send.consumer=%p recv.consumer=%p recv.producer=%p producer_comp=%p",
                   (void *)comch->send.consumer, (void *)comch->recv.consumer,
-                  (void *)comch->recv.producer, (void *)comch->producer_comp,
-                  (void *)comch->async_ops, (void *)comch->async_ops_comp);
+                  (void *)comch->recv.producer, (void *)comch->producer_comp);
 
     memset(arg, 0, sizeof(*arg));
     arg->dpa_consumer_comp = dpa_consumer_comp;
@@ -862,17 +843,12 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
     arg->dpa_consumer = dpa_consumer;
     arg->dpa_producer = dpa_producer;
     arg->dpu_consumer_id = dpu_consumer_id;
-    arg->dpa_async_ops = dpa_async_ops;
-    arg->dpa_async_ops_comp = dpa_async_ops_comp_handle;
     arg->num_rings = 0;  /* rings added dynamically via setup_pod_dma */
 
     DOCA_LOG_INFO("DPA thread arg: consumer_comp=0x%lx, producer_comp=0x%lx, consumer=0x%lx, producer=0x%lx, dpu_consumer_id=%u (send.consumer=%u recv.consumer=%u)",
         arg->dpa_consumer_comp, arg->dpa_producer_comp,
         arg->dpa_consumer, arg->dpa_producer, arg->dpu_consumer_id,
         send_consumer_id, recv_consumer_id);
-
-    DOCA_LOG_INFO("DPA thread arg: async_ops=0x%lx, async_ops_comp=0x%lx",
-        arg->dpa_async_ops, arg->dpa_async_ops_comp);
 
     DOCA_LOG_INFO("[PAIRCHK] fill_arg ids: send_consumer_id=%u recv_consumer_id=%u dpu_consumer_id=%u",
                   send_consumer_id, recv_consumer_id, dpu_consumer_id);
@@ -1104,8 +1080,6 @@ destroy_buf_arr:
 #include "dma.h"
 #include "comch_common.h"
 
-#define DPU_BUFFER_SIZE (1024 * 1024)
-
 /*
  * Fill ring info for a specific pod.
  */
@@ -1181,6 +1155,7 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
                      pod->pod_id, doca_error_get_descr(result));
         return result;
     }
+    pod->dma_buf_size = DPU_BUFFER_SIZE;
 
     /* 3. Export local DMA buffer mmap back to Host */
     result = export_mmap_to_remote(objs, pod->local_mmap, pod->dma_buffer,
@@ -1277,7 +1252,150 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         DOCA_LOG_INFO("Sent ADD_RING msg to DPA for pod_id=%d", pod->pod_id);
     }
 
+    /* === Reverse direction (DPU→CPU) setup === */
+
+    /* 7. Allocate DPU TX buffer for reverse direction */
+    result = alloc_buffer_and_set_mmap(&pod->tx_mmap, objs->dev,
+                                       &pod->tx_buffer, DPU_BUFFER_SIZE,
+                                       DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("setup_pod_dma: alloc TX buffer failed for pod %d: %s",
+                     pod->pod_id, doca_error_get_descr(result));
+        return result;
+    }
+    pod->tx_buf_size = DPU_BUFFER_SIZE;
+
+    /* 8. Create DPU→CPU descriptor ring */
+    result = setup_dpu_tx_ring(objs->dev, DMA_RING_SIZE,
+                               &pod->tx_ring, &pod->tx_ring_mmap);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("setup_pod_dma: TX ring failed for pod %d: %s",
+                     pod->pod_id, doca_error_get_descr(result));
+        return result;
+    }
+
+    /* 9. Create buf_arr for reverse ring */
+    result = setup_dpa_buf_array_pod(objs, DMA_RING_SIZE, pod->tx_ring_mmap, &pod->tx_buf_arr);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("setup_pod_dma: TX buf_arr failed for pod %d: %s",
+                     pod->pod_id, doca_error_get_descr(result));
+        return result;
+    }
+
+    /* 10. Fill reverse ring info and send ADD_REV_RING to DPA */
+    {
+        struct dpa_ring_info rev_ring_info;
+        doca_dpa_dev_buf_arr_t dpa_buf_arr;
+        doca_dpa_dev_mmap_t dpu_tx_mmap_h, host_rx_mmap_h;
+
+        result = doca_buf_arr_get_dpa_handle(pod->tx_buf_arr, &dpa_buf_arr);
+        if (result != DOCA_SUCCESS) return result;
+
+        result = doca_mmap_dev_get_dpa_handle(pod->tx_mmap, objs->dev, &dpu_tx_mmap_h);
+        if (result != DOCA_SUCCESS) return result;
+
+        /* Use Host RX mmap if available */
+        host_rx_mmap_h = 0;
+        if (pod->host_rx_mmap) {
+            result = doca_mmap_dev_get_dpa_handle(pod->host_rx_mmap, objs->dev, &host_rx_mmap_h);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_WARN("setup_pod_dma: host_rx_mmap DPA handle failed: %s",
+                              doca_error_get_descr(result));
+            }
+        }
+
+        rev_ring_info.buf_arr = dpa_buf_arr;
+        rev_ring_info.buf_arr_size = DMA_RING_SIZE;
+        /* For reverse: dpu=source (TX), host=destination (RX) */
+        rev_ring_info.dpu_mmap = dpu_tx_mmap_h;
+        rev_ring_info.dpu_addr = (uint64_t)pod->tx_buffer;
+        rev_ring_info.dpu_buf_size = DPU_BUFFER_SIZE;
+        rev_ring_info.host_mmap = host_rx_mmap_h;
+        rev_ring_info.host_addr = (uint64_t)pod->host_rx_addr;
+        rev_ring_info.host_buf_size = (uint32_t)pod->host_rx_buf_size;
+        rev_ring_info.pod_id = pod->pod_id;
+
+        struct comch_add_rev_ring_msg rev_msg;
+        memset(&rev_msg, 0, sizeof(rev_msg));
+        rev_msg.type = COMCH_MSG_TYPE_ADD_REV_RING;
+        rev_msg.ring = rev_ring_info;
+
+        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+                                           &rev_msg, sizeof(rev_msg));
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_WARN("setup_pod_dma: send ADD_REV_RING failed: %s",
+                          doca_error_get_descr(result));
+        } else {
+            DOCA_LOG_INFO("Sent ADD_REV_RING to DPA for pod_id=%d", pod->pod_id);
+        }
+    }
+
+    /* Initialize flow control state */
+    pod->rx_consumer_tail = 0;
+    pod->tx_producer_head = 0;
+    pod->tx_last_consumer_tail = 0;
+
     pod->dma_ready = 1;
     return DOCA_SUCCESS;
 }
+
+/*
+ * Update the DPA reverse ring's host_rx_mmap after it arrives late.
+ * Sends ADD_REV_RING with updated host mmap handle so DPA can
+ * actually perform DPU→CPU DMA (previously host_mmap was 0).
+ */
+doca_error_t
+update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod)
+{
+    doca_error_t result;
+
+    if (!pod->host_rx_mmap || !pod->tx_buf_arr) {
+        DOCA_LOG_WARN("update_rev_ring_host_rx: missing mmap or buf_arr for pod %d", pod->pod_id);
+        return DOCA_ERROR_NOT_FOUND;
+    }
+
+    struct dpa_ring_info rev_ring_info;
+    doca_dpa_dev_buf_arr_t dpa_buf_arr;
+    doca_dpa_dev_mmap_t dpu_tx_mmap_h, host_rx_mmap_h;
+
+    result = doca_buf_arr_get_dpa_handle(pod->tx_buf_arr, &dpa_buf_arr);
+    if (result != DOCA_SUCCESS) return result;
+
+    result = doca_mmap_dev_get_dpa_handle(pod->tx_mmap, objs->dev, &dpu_tx_mmap_h);
+    if (result != DOCA_SUCCESS) return result;
+
+    result = doca_mmap_dev_get_dpa_handle(pod->host_rx_mmap, objs->dev, &host_rx_mmap_h);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("update_rev_ring_host_rx: host_rx_mmap DPA handle failed: %s",
+                      doca_error_get_descr(result));
+        return result;
+    }
+
+    rev_ring_info.buf_arr = dpa_buf_arr;
+    rev_ring_info.buf_arr_size = DMA_RING_SIZE;
+    rev_ring_info.dpu_mmap = dpu_tx_mmap_h;
+    rev_ring_info.dpu_addr = (uint64_t)pod->tx_buffer;
+    rev_ring_info.dpu_buf_size = DPU_BUFFER_SIZE;
+    rev_ring_info.host_mmap = host_rx_mmap_h;
+    rev_ring_info.host_addr = (uint64_t)pod->host_rx_addr;
+    rev_ring_info.host_buf_size = (uint32_t)pod->host_rx_buf_size;
+    rev_ring_info.pod_id = pod->pod_id;
+
+    struct comch_add_rev_ring_msg rev_msg;
+    memset(&rev_msg, 0, sizeof(rev_msg));
+    rev_msg.type = COMCH_MSG_TYPE_ADD_REV_RING;
+    rev_msg.ring = rev_ring_info;
+
+    result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+                                       &rev_msg, sizeof(rev_msg));
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("update_rev_ring_host_rx: send ADD_REV_RING failed: %s",
+                      doca_error_get_descr(result));
+        return result;
+    }
+
+    DOCA_LOG_INFO("Updated DPA reverse ring with Host RX mmap for pod %d", pod->pod_id);
+    return DOCA_SUCCESS;
+}
+
 #endif /* DOCA_ARCH_DPU */

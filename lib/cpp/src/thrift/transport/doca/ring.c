@@ -5,6 +5,7 @@
 #include "dpa_common.h"
 #include "object.h"
 #include "buffer.h"
+#include "dma.h"
 #include "comch_common.h"
 
 DOCA_LOG_REGISTER(RING);
@@ -49,6 +50,37 @@ int setup_dma_ring(struct objects *objs, size_t size)
         destroy_mmap_and_free_buffer(ring->mmap, ring->descs);
         return result;
     }
+    return 0;
+}
+
+int setup_dpu_tx_ring(struct doca_dev *dev, size_t size,
+                      struct dma_ring **out_ring, struct doca_mmap **out_mmap)
+{
+    doca_error_t result;
+    struct dma_ring *ring;
+
+    ring = (struct dma_ring *)malloc(sizeof(struct dma_ring));
+    if (!ring) return DOCA_ERROR_NO_MEMORY;
+
+    ring->size = size;
+    ring->head = 0;
+    ring->tail = 0;
+    ring->descs = NULL;
+
+    result = alloc_buffer_and_set_mmap(&ring->mmap, dev,
+                           (void **)&ring->descs,
+                           ring->size * sizeof(struct dma_desc),
+                           DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to allocate DPU TX ring: %s", doca_error_get_descr(result));
+        free(ring);
+        return result;
+    }
+
+    memset(ring->descs, 0, ring->size * sizeof(struct dma_desc));
+
+    *out_ring = ring;
+    *out_mmap = ring->mmap;
     return 0;
 }
 

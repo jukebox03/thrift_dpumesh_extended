@@ -228,13 +228,11 @@ static void consumer_recv_task_comp_cb(struct doca_comch_consumer_task_post_recv
 	}
 
 	if (recv_msg_len > 0 && objs->rx_data_hook != NULL) {
-		if (recv_msg_len < sizeof(struct dmesh_rx_data_msg)) {
-			DOCA_LOG_ERR("Datapath payload too small: len=%zu header=%zu",
-				     recv_msg_len, sizeof(struct dmesh_rx_data_msg));
-		} else {
-			DOCA_LOG_INFO("Datapath RX received: len=%zu, dispatching to rx_data_hook", recv_msg_len);
-			objs->rx_data_hook(objs->rx_hook_ctx, (const uint8_t *)recv_msg, (uint32_t)recv_msg_len);
-		}
+		/* Dispatch all received data to rx_data_hook. It handles both:
+		 * - Large comch messages (dmesh_rx_data_msg, ≥72B) from DPU control path
+		 * - Small DMA completion notifications (comch_dma_comp_msg, ≤32B) from DPA dma_copy */
+		DOCA_LOG_INFO("Datapath RX received: len=%zu, dispatching to rx_data_hook", recv_msg_len);
+		objs->rx_data_hook(objs->rx_hook_ctx, (const uint8_t *)recv_msg, (uint32_t)recv_msg_len);
 	}
 
 	// DOCA_LOG_INFO("Received message number: %d", i);

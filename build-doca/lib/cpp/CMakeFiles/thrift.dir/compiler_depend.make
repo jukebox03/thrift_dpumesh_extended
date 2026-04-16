@@ -21100,8 +21100,7 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_server.c.o: ../lib
   /usr/include/x86_64-linux-gnu/bits/types/FILE.h \
   /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
   /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
-  /opt/mellanox/doca/include/doca_comch_producer.h \
-  ../lib/cpp/src/thrift/transport/doca/comch_producer.h
+  /opt/mellanox/doca/include/doca_comch_producer.h
 
 lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/common.c.o: ../lib/cpp/src/thrift/transport/doca/common.c \
   /usr/include/stdc-predef.h \
@@ -21680,6 +21679,7 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/ring.c.o: ../lib/cpp/src
   /opt/mellanox/doca/include/doca_buf.h \
   /opt/mellanox/doca/include/doca_buf_pool.h \
   /opt/mellanox/doca/include/doca_buf_inventory.h \
+  ../lib/cpp/src/thrift/transport/doca/dma.h \
   ../lib/cpp/src/thrift/transport/doca/comch_common.h
 
 lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/dpumesh_doca.c.o: ../lib/cpp/src/thrift/transport/dpumesh_doca.c \

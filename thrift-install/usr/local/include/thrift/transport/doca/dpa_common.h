@@ -25,27 +25,36 @@ struct dpa_ring_info {
 } __attribute__((__packed__, aligned(8)));
 
 struct dpa_thread_arg {
-	/* Shared comch msgq handles */
+	/* Shared comch msgq handles (CPU→DPU direction: DPA sends completions to DPU) */
 	uint64_t dpa_consumer_comp;
 	uint64_t dpa_producer_comp;
 	uint64_t dpa_producer;
 	uint64_t dpa_consumer;
 	uint32_t dpu_consumer_id; /* DPU-side comch consumer ID for DPA->DPU sends */
-	uint32_t _pad0;
+	uint32_t producer_slots_inflight; /* number of producer send slots currently in use */
 
-	/* Async ops for post_memcpy DMA (no size limit, replaces 128B-chunked dma_copy) */
-	uint64_t dpa_async_ops;      /* doca_dpa_dev_async_ops_t */
-	uint64_t dpa_async_ops_comp; /* doca_dpa_dev_completion_t — DMA completion events */
-
-	/* Ring array (per-pod) */
+	/* Forward rings (CPU→DPU, per-pod) */
 	volatile uint32_t num_rings;
-	uint32_t _pad;
+	uint32_t _pad2;
 	struct dpa_ring_info rings[MAX_DPA_RINGS];
-
-	/* Per-ring state (persistent across reschedule) */
 	uint32_t desc_idx[MAX_DPA_RINGS];
 	uint32_t pos[MAX_DPA_RINGS];
+
+	/* Reverse rings (DPU→CPU, per-pod) */
+	volatile uint32_t num_rev_rings;
+	uint32_t _pad3;
+	struct dpa_ring_info rev_rings[MAX_DPA_RINGS];
+	uint32_t rev_desc_idx[MAX_DPA_RINGS];
+	uint32_t rev_pos[MAX_DPA_RINGS];
 } __attribute__((__packed__, aligned(8)));
+
+/* ====== Flow-control message header ======
+ * Prepended to every DMA payload by the sender.
+ * DPA copies it verbatim; the receiver parses it. */
+struct fc_header {
+	uint32_t consumer_tail;  /* sender's RX buffer consumption position */
+	uint32_t payload_len;    /* actual payload length after this header */
+} __attribute__((__packed__));
 
 /* ====== Comch message types (DPU ↔ DPA) ====== */
 
@@ -55,6 +64,8 @@ enum comch_msg_type {
 	COMCH_MSG_TYPE_ADD_RING = 3,
 	COMCH_MSG_TYPE_TRIGGER = 4,   /* DPU→DPA: wake up thread (no payload) */
 	COMCH_MSG_TYPE_DMA_CHUNK = 5, /* DPA→DPU: intermediate DMA chunk landed (no action needed) */
+	COMCH_MSG_TYPE_ADD_REV_RING = 6, /* DPU→DPA: add reverse (DPU→CPU) ring */
+	COMCH_MSG_TYPE_REV_DMA_COMPLETED = 7, /* DPA→DPU: reverse DMA completed (DPU→CPU) */
 };
 
 struct comch_dma_comp_msg {
@@ -90,6 +101,12 @@ struct comch_add_ring_msg {
 	struct dpa_ring_info ring;
 } __attribute__((__packed__, aligned(8)));
 
+struct comch_add_rev_ring_msg {
+	enum comch_msg_type type;
+	uint32_t _pad;
+	struct dpa_ring_info ring;
+} __attribute__((__packed__, aligned(8)));
+
 struct comch_msg {
 	enum comch_msg_type type;
 	union
@@ -97,6 +114,7 @@ struct comch_msg {
 		struct comch_dma_req_msg dma_req_msg;
 		struct comch_dma_comp_msg dma_comp_msg;
 		struct comch_add_ring_msg add_ring_msg;
+		struct comch_add_rev_ring_msg add_rev_ring_msg;
 	};
 } __attribute__((__packed__, aligned(4)));
 

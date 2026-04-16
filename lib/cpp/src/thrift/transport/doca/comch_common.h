@@ -19,8 +19,9 @@ enum dmesh_msg_type {
     DMESH_MSG_RX_DATA,
     DMESH_MSG_REGISTER,          /* Host→DPU: register pod_id */
     DMESH_MSG_CONSUMER_ID,       /* DPU→Host: consumer ID reply */
-    DMESH_MSG_TX_ACK,            /* DPU→Host: DMA completed, TX slot can be freed */
+    DMESH_MSG_TX_ACK,            /* DPU→Host: forward DMA consumed, sender can free TX slot */
     DMESH_MSG_POD_CONSUMER_ID,   /* Host→DPU: advertise host datapath consumer ID */
+    DMESH_MSG_DMA_COMPLETION,    /* DPU→Host: reverse DMA completed, data in Host RX buffer */
 };
 
 /* DPU→Host: tell the client what consumer ID to use for producer */
@@ -32,6 +33,7 @@ struct dmesh_consumer_id_msg {
 enum mmap_type {
     DMA_BUFFER = 1,
     DMA_RING = 2,
+    DMA_HOST_RX_BUFFER = 3, /* Host RX buffer for DPU→CPU reverse DMA */
 };
 
 struct dmesh_mmap_msg {
@@ -78,11 +80,22 @@ struct dmesh_pod_consumer_id_msg {
     uint32_t consumer_id;
 };
 
-/* DPU→Host: ACK for Host TX completion (keyed by req_id + dst_pod_id) */
+/* DPU→Host: ACK for forward DMA (CPU→DPU) completion — sender can free TX slot */
 struct dmesh_tx_ack_msg {
     enum dmesh_msg_type type;   /* = DMESH_MSG_TX_ACK */
     uint32_t req_id;
     int32_t dst_pod_id;
+};
+
+/* DPU→Host: reverse DMA (DPU→CPU) completion — data landed in Host RX buffer */
+struct dmesh_dma_completion_msg {
+    enum dmesh_msg_type type;   /* = DMESH_MSG_DMA_COMPLETION */
+    uint32_t pos;               /* offset in Host RX DMA buffer */
+    uint32_t length;            /* DMA'd data length (fc_header + payload) */
+    uint32_t req_id;
+    int32_t src_pod_id;
+    int32_t dst_pod_id;
+    int8_t flags;
 };
 
 

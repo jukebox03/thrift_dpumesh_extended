@@ -21,22 +21,4 @@ struct comch_producer_cb_config {
 
 struct objects;
 
-doca_error_t
-init_comch_datapath_producer(struct objects *objs);
-
-doca_error_t
-init_comch_datapath_producer_for_connection(struct objects *objs,
-											struct doca_comch_connection *connection,
-											struct local_mem_bufs **producer_mem,
-											struct doca_comch_producer **producer,
-											struct doca_pe **producer_pe);
-
-doca_error_t
-comch_datapath_send_payload(struct doca_comch_producer *producer,
-							struct local_mem_bufs *producer_mem,
-							uint32_t remote_consumer_id,
-							const void *payload,
-							uint32_t payload_len,
-							struct doca_pe *pe);
-
 #endif /* COMCH_PRODUCER_H */

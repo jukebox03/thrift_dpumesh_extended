@@ -22,15 +22,20 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 /* Deferred completion queue — DPU only.
  * Consumer callback enqueues; main loop drains.
  * Single-threaded (same DPU worker), so no lock needed. */
-#define DPU_COMP_QUEUE_SIZE 2048
+#define DPU_COMP_QUEUE_SIZE 4096
+
+#define COMP_ENTRY_FORWARD     0  /* Forward DMA completed (CPU→DPU), needs TX_ACK + reverse route */
+#define COMP_ENTRY_REV_NOTIFY  1  /* Reverse DMA completed (DPU→CPU), needs Host notification */
 
 typedef struct {
+    uint8_t  entry_type;   /* COMP_ENTRY_FORWARD or COMP_ENTRY_REV_NOTIFY */
     int32_t  src_pod_id;
     int32_t  dst_pod_id;
     uint32_t req_id;
     uint32_t length;
     int8_t   flags;
-    uint8_t *data;       /* heap-allocated copy of DMA payload */
+    uint32_t buf_offset;   /* FORWARD: offset in pod's RX DMA buffer; REV_NOTIFY: pos in Host RX buf */
+    int32_t  pod_idx;      /* FORWARD: index into pods[]; REV_NOTIFY: unused (-1) */
 } dpu_comp_entry_t;
 
 typedef struct {
@@ -64,6 +69,20 @@ static inline void comp_queue_dequeue(dpu_comp_queue_t *q) {
         q->head = (q->head + 1) % DPU_COMP_QUEUE_SIZE;
 }
 
+static inline uint32_t comp_queue_usage(const dpu_comp_queue_t *q) {
+    if (q->tail >= q->head)
+        return q->tail - q->head;
+    return DPU_COMP_QUEUE_SIZE - q->head + q->tail;
+}
+
+/* Backpressure threshold: defer recv task resubmission when queue
+ * exceeds this fraction (3/4) to slow DPA inflow. */
+#define COMP_QUEUE_BP_HIGH  (DPU_COMP_QUEUE_SIZE * 3 / 4)
+#define COMP_QUEUE_BP_LOW   (DPU_COMP_QUEUE_SIZE / 2)
+
+/* Max deferred recv tasks (one per CC_DPA_MAX_MSG_NUM) */
+#define MAX_DEFERRED_RECV  1024
+
 /* Per-pod state (DPU only) */
 struct pod_state {
     struct doca_comch_connection *connection;
@@ -73,23 +92,45 @@ struct pod_state {
     int dma_ready;          /* 1 = both mmaps arrived, DPA ring added */
     uint32_t remote_consumer_id; /* Host datapath consumer ID (for DPU->Host payload) */
 
-    /* Per-pod mmap (Host에서 export) */
+    /* Per-pod mmap (Host에서 export, CPU→DPU forward direction) */
     struct doca_mmap *ring_mmap;
-    struct doca_mmap *remote_mmap;
+    struct doca_mmap *remote_mmap;   /* Host TX buffer mmap */
     void *remote_addr;
     size_t remote_buf_size;
 
-    /* Per-pod DPA buffer array (ring에 매핑) */
+    /* Per-pod DPA buffer array (forward ring에 매핑) */
     struct doca_buf_arr *buf_arr;
 
-    /* Per-pod local DMA buffer (DPU working buffer) */
+    /* Per-pod RX DMA buffer (DPU receives CPU→DPU data here) */
     struct doca_mmap *local_mmap;
     void *dma_buffer;
+    size_t dma_buf_size;
 
-    /* Per-pod datapath sender (DPU -> Host pod) */
-    struct local_mem_bufs *producer_mem;
-    struct doca_comch_producer *producer;
-    struct doca_pe *producer_pe;
+    /* === Reverse direction (DPU→CPU) === */
+
+    /* DPU TX buffer (DPU writes data here for DPA to DMA to Host) */
+    struct doca_mmap *tx_mmap;
+    void *tx_buffer;
+    size_t tx_buf_size;
+
+    /* DPU→CPU descriptor ring */
+    struct dma_ring *tx_ring;
+    struct doca_mmap *tx_ring_mmap;
+    struct doca_buf_arr *tx_buf_arr;
+
+    /* Host RX buffer mmap (exported from Host, DPA DMAs into this) */
+    struct doca_mmap *host_rx_mmap;
+    void *host_rx_addr;
+    size_t host_rx_buf_size;
+
+    /* === Flow control state === */
+
+    /* As receiver (CPU→DPU): tracks consumption of RX DMA buffer */
+    uint32_t rx_consumer_tail;
+
+    /* As sender (DPU→CPU): tracks production into TX buffer */
+    uint32_t tx_producer_head;
+    uint32_t tx_last_consumer_tail; /* last known Host RX consumption from received header */
 };
 
 struct objects {
@@ -148,10 +189,6 @@ struct objects {
     void (*rx_data_hook)(void *hook_ctx, const uint8_t *data, uint32_t len);
     void *rx_hook_ctx;
 
-    /* TX ACK hook (comch control path → dpumesh_ctx) */
-    void (*tx_ack_hook)(void *hook_ctx, const uint8_t *data, uint32_t len);
-    void *tx_ack_hook_ctx;
-
     /* Multi-pod table (DPU only) */
     struct pod_state pods[MAX_PODS];
     int num_pods;
@@ -159,7 +196,28 @@ struct objects {
 
     /* Deferred completion queue (DPU only) */
     dpu_comp_queue_t comp_queue;
+
+    /* Backpressure: deferred consumer recv tasks (DPU only).
+     * When comp_queue is nearly full, consumer callbacks defer recv task
+     * resubmission here. DPA sees consumer_empty and pauses. Main loop
+     * resubmits when queue drains below BP_LOW. */
+    struct doca_task *deferred_recv[MAX_DEFERRED_RECV];
+    int num_deferred_recv;
 };
+
+/* Progress both PEs: control-path PE + consumer PE.
+ * consumer_pe must be progressed here to resubmit DPA recv tasks during
+ * server_send_msg_to_conn retry loops. Without this, DPA exhausts consumer
+ * credits and permanently stalls under load.
+ * Safe because server_send_msg_to_conn is only called from:
+ *   - process_completion_queue (main loop, not inside any callback)
+ *   - server_message_recv_callback (pe callback, not consumer_pe callback)
+ * So consumer_pe is never re-entered. */
+static inline void progress_all_pes(struct objects *objs) {
+    doca_pe_progress(objs->pe);
+    if (objs->consumer_pe)
+        doca_pe_progress(objs->consumer_pe);
+}
 
 void
 cleanup_objects(struct objects *objs);

@@ -219,7 +219,7 @@ start_dpu() {
     info "Launching dpumesh_dpu..."
     ssh "$DPU_HOST" "cat > /tmp/start_dpu.sh << 'LAUNCHER'
 #!/bin/bash
-screen -dmS dpumesh bash -c \"cd /home/jukebox/$DPU_BUILD && ./dpumesh_dpu $DPU_PCI -l 20 > $DPU_LOG 2>&1\"
+screen -dmS dpumesh bash -c \"cd /home/jukebox/$DPU_BUILD && ./dpumesh_dpu $DPU_PCI -l 50 > $DPU_LOG 2>&1\"
 sleep 2
 pgrep -f 'dpumesh_dpu.*03:00' || echo NO_PID
 LAUNCHER

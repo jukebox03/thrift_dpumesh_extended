@@ -21,34 +21,11 @@
 #include <doca_comch_producer.h>
 
 /* Forward declaration — defined below server_message_recv_callback */
-static doca_error_t
-server_send_msg_to(struct objects *objs, struct doca_comch_connection *conn,
-                   const char *msg, size_t len);
-
-
-#include "comch_producer.h"
+doca_error_t
+server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn,
+                        const char *msg, size_t len);
 
 DOCA_LOG_REGISTER(COMCH_SERVER);
-
-static doca_error_t ensure_pod_datapath_sender(struct objects *objs, struct pod_state *pod)
-{
-	if (pod->producer != NULL && pod->producer_pe != NULL && pod->producer_mem != NULL)
-		return DOCA_SUCCESS;
-
-	DOCA_LOG_INFO("Initializing per-pod datapath sender: pod_id=%d", pod->pod_id);
-	doca_error_t result = init_comch_datapath_producer_for_connection(objs,
-								pod->connection,
-								&pod->producer_mem,
-								&pod->producer,
-								&pod->producer_pe);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to initialize datapath sender for pod_id=%d: %s",
-			     pod->pod_id, doca_error_get_name(result));
-	} else {
-		DOCA_LOG_INFO("Datapath sender initialized for pod_id=%d", pod->pod_id);
-	}
-	return result;
-}
 
 static void server_send_task_completion_callback(struct doca_comch_task_send *task,
 						 union doca_data task_user_data,
@@ -69,14 +46,14 @@ static void server_send_task_completion_err_callback(struct doca_comch_task_send
 						     union doca_data task_user_data,
 						     union doca_data ctx_user_data)
 {
-	struct objects *objs;
+	(void)ctx_user_data;
 	void *payload_copy = task_user_data.ptr;
 
-	objs = (struct objects *)ctx_user_data.ptr;
+	DOCA_LOG_ERR("Server send task failed: %s",
+		     doca_error_get_name(doca_task_get_status(doca_comch_task_send_as_task(task))));
 	if (payload_copy != NULL)
 		free(payload_copy);
 	doca_task_free(doca_comch_task_send_as_task(task));
-	(void)doca_ctx_stop(doca_comch_server_as_ctx(objs->cc_server));
 }
 
 /**
@@ -119,13 +96,13 @@ server_send_msg(struct objects *objs, const char *msg, size_t len)
 	do {
 		result = doca_task_submit(task_obj);
 		if (result == DOCA_ERROR_AGAIN) {
-			doca_pe_progress(objs->pe);
+			progress_all_pes(objs);
 			retry++;
 		}
 	} while (result == DOCA_ERROR_AGAIN && retry < 1000);
 
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to send server task with error = %s (retries=%d)", 
+		DOCA_LOG_ERR("Failed to send server task with error = %s (retries=%d)",
 		             doca_error_get_name(result), retry);
 		free(msg_copy);
 		doca_task_free(task_obj);
@@ -202,7 +179,7 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 			struct dmesh_consumer_id_msg reply;
 			reply.type = DMESH_MSG_CONSUMER_ID;
 			reply.consumer_id = cid;
-			server_send_msg_to(objs, comch_connection,
+			server_send_msg_to_conn(objs, comch_connection,
 			                   (const char *)&reply, sizeof(reply));
 			DOCA_LOG_INFO("Sent CONSUMER_ID=%u to pod_id=%d", cid, reg->pod_id);
 		}
@@ -495,25 +472,13 @@ export_dpa_comp_to_host(struct objects *objs)
 	return server_send_msg(objs, (const char *)&dpa_comp_msg, sizeof(dpa_comp_msg));
 }
 
-doca_error_t
-server_send_rx_data(struct objects *objs,
-                    const void *desc, uint32_t desc_len,
-                    const void *body, uint32_t body_len)
-{
-	if (objs->connection == NULL) {
-		DOCA_LOG_ERR("server_send_rx_data: no primary connection available");
-		return DOCA_ERROR_NOT_CONNECTED;
-	}
-	return server_send_rx_data_to(objs, objs->connection, desc, desc_len, body, body_len);
-}
-
 /* ====================================================================
- * Send RX data to a specific connection (for multi-pod routing)
+ * Send a raw message to a specific connection (comch control path)
  * ==================================================================== */
 
-static doca_error_t
-server_send_msg_to(struct objects *objs, struct doca_comch_connection *conn,
-                   const char *msg, size_t len)
+doca_error_t
+server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn,
+                        const char *msg, size_t len)
 {
 	doca_error_t result;
 	struct doca_comch_task_send *task;
@@ -523,15 +488,26 @@ server_send_msg_to(struct objects *objs, struct doca_comch_connection *conn,
 
 	msg_copy = malloc(len);
 	if (msg_copy == NULL) {
-		DOCA_LOG_ERR("server_send_msg_to: payload copy allocation failed");
+		DOCA_LOG_ERR("server_send_msg_to_conn: payload copy allocation failed");
 		return DOCA_ERROR_NO_MEMORY;
 	}
 	memcpy(msg_copy, msg, len);
 
-	result = doca_comch_server_task_send_alloc_init(objs->cc_server, conn,
+	/* Retry allocation — under high load (10000 sends/s) the send task pool
+	 * (CC_SEND_TASK_NUM=1024) can be temporarily exhausted. Progress PE to
+	 * free completed tasks before retrying. */
+	int alloc_retry = 0;
+	do {
+		result = doca_comch_server_task_send_alloc_init(objs->cc_server, conn,
 								msg_copy, len, &task);
+		if (result != DOCA_SUCCESS) {
+			progress_all_pes(objs);
+			alloc_retry++;
+		}
+	} while (result != DOCA_SUCCESS && alloc_retry < 1000);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("server_send_msg_to: alloc failed: %s", doca_error_get_name(result));
+		DOCA_LOG_ERR("server_send_msg_to_conn: alloc failed: %s (retries=%d)",
+		             doca_error_get_name(result), alloc_retry);
 		free(msg_copy);
 		return result;
 	}
@@ -544,13 +520,13 @@ server_send_msg_to(struct objects *objs, struct doca_comch_connection *conn,
 	do {
 		result = doca_task_submit(task_obj);
 		if (result == DOCA_ERROR_AGAIN) {
-			doca_pe_progress(objs->pe);
+			progress_all_pes(objs);
 			retry++;
 		}
 	} while (result == DOCA_ERROR_AGAIN && retry < 1000);
 
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("server_send_msg_to: submit failed: %s (retries=%d)", 
+		DOCA_LOG_ERR("server_send_msg_to_conn: submit failed: %s (retries=%d)",
 		             doca_error_get_name(result), retry);
 		free(msg_copy);
 		doca_task_free(task_obj);
@@ -558,72 +534,6 @@ server_send_msg_to(struct objects *objs, struct doca_comch_connection *conn,
 	}
 
 	return DOCA_SUCCESS;
-}
-
-doca_error_t
-server_send_rx_data_to(struct objects *objs,
-                       struct doca_comch_connection *conn,
-                       const void *desc, uint32_t desc_len,
-                       const void *body, uint32_t body_len)
-{
-	size_t total = sizeof(struct dmesh_rx_data_msg) + body_len;
-	doca_error_t result;
-
-	if (desc_len != 64) {
-		DOCA_LOG_ERR("server_send_rx_data_to: bad desc_len=%u", desc_len);
-		return DOCA_ERROR_INVALID_VALUE;
-	}
-
-	uint8_t *buf = (uint8_t *)malloc(total);
-	if (!buf)
-		return DOCA_ERROR_NO_MEMORY;
-
-	struct dmesh_rx_data_msg *msg = (struct dmesh_rx_data_msg *)buf;
-	msg->type = DMESH_MSG_RX_DATA;
-	memcpy(msg->desc, desc, 64);
-	msg->body_len = body_len;
-	if (body_len > 0)
-		memcpy(msg->body, body, body_len);
-
-	struct pod_state *pod = find_pod_by_connection(objs, conn);
-	DOCA_LOG_INFO(">>> [DEBUG] server_send_rx_data_to: total_len=%zu, pod=%p, pod_id=%d, remote_consumer_id=%u", 
-	             total, (void*)pod, pod ? pod->pod_id : -1, pod ? pod->remote_consumer_id : 0);
-
-	if (pod != NULL && pod->remote_consumer_id != 0) {
-		/* Data Path Ready */
-		result = ensure_pod_datapath_sender(objs, pod);
-		if (result == DOCA_SUCCESS) {
-			DOCA_LOG_INFO("Using Data Path for pod %d, len=%zu, consumer_id=%u", 
-			             pod->pod_id, total, pod->remote_consumer_id);
-			result = comch_datapath_send_payload(pod->producer,
-							     pod->producer_mem,
-							     pod->remote_consumer_id,
-							     buf,
-							     (uint32_t)total,
-							     pod->producer_pe);
-			if (result != DOCA_SUCCESS) {
-				DOCA_LOG_ERR("Data Path send failed for pod %d: %s. Falling back to Control Path.", 
-				             pod->pod_id, doca_error_get_name(result));
-				/* Fallback to control path if data path fails */
-				result = server_send_msg_to(objs, conn, (const char *)buf, total);
-			}
-		} else {
-			DOCA_LOG_WARN("Failed to ensure datapath sender for pod %d. Falling back to Control Path.", pod->pod_id);
-			result = server_send_msg_to(objs, conn, (const char *)buf, total);
-		}
-	} else {
-		/* Handshake not yet complete (remote_consumer_id is 0) */
-		if (pod) {
-			DOCA_LOG_INFO("Data Path NOT ready for pod %d (missing remote_consumer_id). Falling back to Control Path (len=%zu).", 
-			             pod->pod_id, total);
-		} else {
-			DOCA_LOG_INFO("Connection not associated with a pod. Using Control Path (len=%zu).", total);
-		}
-		result = server_send_msg_to(objs, conn, (const char *)buf, total);
-	}
-
-	free(buf);
-	return result;
 }
 
 doca_error_t
@@ -636,7 +546,7 @@ server_send_tx_ack_to(struct objects *objs,
 	ack.type = DMESH_MSG_TX_ACK;
 	ack.req_id = req_id;
 	ack.dst_pod_id = dst_pod_id;
-	return server_send_msg_to(objs, conn, (const char *)&ack, sizeof(ack));
+	return server_send_msg_to_conn(objs, conn, (const char *)&ack, sizeof(ack));
 }
 
 /* ====================================================================
@@ -659,9 +569,6 @@ pods_add_connection(struct objects *objs, struct doca_comch_connection *conn)
 	objs->pods[idx].app_name[0] = '\0';
 	objs->pods[idx].registered = 0;
 	objs->pods[idx].remote_consumer_id = 0;
-	objs->pods[idx].producer_mem = NULL;
-	objs->pods[idx].producer = NULL;
-	objs->pods[idx].producer_pe = NULL;
 	objs->num_pods++;
 	pthread_mutex_unlock(&objs->pods_lock);
 

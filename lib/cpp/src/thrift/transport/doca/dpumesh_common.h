@@ -23,4 +23,9 @@
 #define MAX_DPA_RINGS       8
 #define MAX_PODS            8
 
+/* DPU-side DMA buffer size per pod (shared by Host FC check and DPU allocation).
+ * Must be >= Host TX buffer (DPUMESH_NUM_SLOTS_DEFAULT * DPUMESH_SLOT_SIZE_DEFAULT)
+ * to avoid overrunning the DPU RX buffer under full load. */
+#define DPU_BUFFER_SIZE     (8 * 1024 * 1024)  /* 8MB */
+
 #endif /* DPUMESH_COMMON_H */

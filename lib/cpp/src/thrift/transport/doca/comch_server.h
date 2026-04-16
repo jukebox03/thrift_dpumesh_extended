@@ -55,18 +55,10 @@ server_send_msg(struct objects *objs, const char *msg, size_t len);
 doca_error_t
 export_dpa_comp_to_host(struct objects *objs);
 
-/* Send RX data from DPU to Host via comch control path (temporary path) */
+/* Send a raw message to a specific connection (comch control path) */
 doca_error_t
-server_send_rx_data(struct objects *objs,
-                    const void *desc, uint32_t desc_len,
-                    const void *body, uint32_t body_len);
-
-/* Send RX data to a specific connection (for multi-pod routing) */
-doca_error_t
-server_send_rx_data_to(struct objects *objs,
-                       struct doca_comch_connection *conn,
-                       const void *desc, uint32_t desc_len,
-                       const void *body, uint32_t body_len);
+server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn,
+                        const char *msg, size_t len);
 
 /* Send TX ACK to a specific host connection (req_id + dst_pod_id key). */
 doca_error_t
