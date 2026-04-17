@@ -203,27 +203,18 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
     } else {
         pthread_mutex_lock(&ctx->rx_lock);
 
-        /* Backpressure: wait briefly for space instead of dropping immediately */
+        /* No blocking in PE callback path: if the RX queue is full, drop
+         * immediately so we don't stall the PE thread. The DMA counter
+         * gating (fc_rx_consumer_tail) is the proper backpressure signal;
+         * blocking here while waiting for consumers starves other PE work
+         * and can deadlock under load. */
         if (ctx->rx_count >= RX_QUEUE_SIZE) {
-            struct timespec bp_ts;
-            clock_gettime(CLOCK_REALTIME, &bp_ts);
-            bp_ts.tv_nsec += 50000000L; /* 50ms wait budget */
-            if (bp_ts.tv_nsec >= 1000000000L) {
-                bp_ts.tv_sec++;
-                bp_ts.tv_nsec -= 1000000000L;
-            }
-
-            while (ctx->rx_count >= RX_QUEUE_SIZE) {
-                int bp_rc = pthread_cond_timedwait(&ctx->rx_not_full, &ctx->rx_lock, &bp_ts);
-                if (bp_rc != 0) {
-                    pthread_mutex_unlock(&ctx->rx_lock);
-                    DOCA_LOG_ERR("RX deliver: queue full after backpressure wait, dropping");
-                    pthread_mutex_lock(&ctx->rx_slot_lock);
-                    ctx->rx_slot_bitmap[slot] = 0;
-                    pthread_mutex_unlock(&ctx->rx_slot_lock);
-                    return;
-                }
-            }
+            pthread_mutex_unlock(&ctx->rx_lock);
+            DOCA_LOG_ERR("RX deliver: queue full, dropping req_id=%u", desc->req_id);
+            pthread_mutex_lock(&ctx->rx_slot_lock);
+            ctx->rx_slot_bitmap[slot] = 0;
+            pthread_mutex_unlock(&ctx->rx_slot_lock);
+            return;
         }
 
         ctx->rx_queue[ctx->rx_tail] = *desc;
@@ -234,6 +225,119 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
     }
 }
 
+/*
+ * Parse + deliver one DMA-reverse entry at rx_dma_buffer[pos] whose total DMA
+ * length is dma_len. On success delivers the descriptor via rx_deliver_desc
+ * and clears sw_descriptor.valid in the buffer so a future scan cannot
+ * re-process a stale copy after the buffer wraps. Returns 0 on success, -1
+ * if the entry is malformed or can't be delivered. Caller is responsible for
+ * advancing fc_rx_consumer_tail — this function only touches the single
+ * entry's bytes.
+ */
+static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_len) {
+    if (!ctx->rx_dma_buffer || pos + dma_len > ctx->rx_dma_buf_size) {
+        DOCA_LOG_ERR("process_rx_dma_entry: bounds fail pos=%u len=%u buf=%zu",
+                     pos, dma_len, ctx->rx_dma_buf_size);
+        return -1;
+    }
+    uint8_t *buf = (uint8_t *)ctx->rx_dma_buffer + pos;
+
+    if (dma_len < sizeof(struct fc_header)) return -1;
+    struct fc_header *hdr = (struct fc_header *)buf;
+    uint32_t payload_len = hdr->payload_len;
+    if (sizeof(struct fc_header) + payload_len > dma_len) return -1;
+
+    uint8_t *payload = buf + sizeof(struct fc_header);
+    if (payload_len < sizeof(sw_descriptor_t)) return -1;
+
+    sw_descriptor_t desc;
+    memcpy(&desc, payload, sizeof(desc));
+
+    /* Clear valid byte in the buffer so a later scan can distinguish a
+     * fresh DPU-written entry (valid=1) from a stale already-processed one
+     * after the producer wraps past this offset. */
+    ((sw_descriptor_t *)payload)->valid = 0;
+
+    uint32_t body_len = payload_len - sizeof(sw_descriptor_t);
+    uint8_t *body = payload + sizeof(sw_descriptor_t);
+
+    int slot = rx_slot_alloc(ctx);
+    if (slot < 0) {
+        DOCA_LOG_ERR("process_rx_dma_entry: no free RX slots, dropping req_id=%u", desc.req_id);
+        return -1;
+    }
+    uint8_t *dst = (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
+    if (body_len > 0)
+        memcpy(dst, body, body_len);
+
+    desc.body_buf_slot = slot;
+    desc.body_len = body_len;
+
+    rx_deliver_desc(ctx, &desc, slot);
+    return 0;
+}
+
+/*
+ * Recovery scan: when a DMA_COMPLETION arrives at end_pos but our
+ * fc_rx_consumer_tail is still at start_pos < end_pos (mod buffer wrap),
+ * a previous notification was lost. The DPU has already DMA'd entries into
+ * the gap and they sit in the RX buffer with sw_descriptor.valid == 1. We
+ * walk the gap, processing each valid entry, using the size declared in its
+ * own fc_header.payload_len to know how far to step. Stops as soon as we hit
+ * a slot where valid != 1 or the header looks bogus, since any further
+ * stepping would be guessing.
+ */
+static void scan_and_recover_rx_gap(dpumesh_ctx_t *ctx, uint32_t start_pos, uint32_t end_pos) {
+    uint32_t buf_size = (uint32_t)ctx->rx_dma_buf_size;
+    if (buf_size == 0) return;
+    uint32_t scan_pos = start_pos;
+    /* Safety: limit iterations to the number of 128-byte slots in the buffer */
+    uint32_t max_iter = buf_size / 128 + 1;
+
+    int recovered = 0;
+    while (scan_pos != end_pos && max_iter-- > 0) {
+        if (scan_pos + sizeof(struct fc_header) + sizeof(sw_descriptor_t) > buf_size) {
+            DOCA_LOG_WARN("scan_and_recover: scan_pos=%u too close to end for header+desc", scan_pos);
+            break;
+        }
+        uint8_t *buf = (uint8_t *)ctx->rx_dma_buffer + scan_pos;
+        struct fc_header *hdr = (struct fc_header *)buf;
+        sw_descriptor_t *sdesc = (sw_descriptor_t *)(buf + sizeof(struct fc_header));
+
+        if (sdesc->valid != 1) {
+            DOCA_LOG_WARN("scan_and_recover: no valid entry at pos=%u (valid=%d) — stop",
+                          scan_pos, (int)sdesc->valid);
+            break;
+        }
+        uint32_t payload_len = hdr->payload_len;
+        uint32_t max_payload = (uint32_t)ctx->slot_size; /* conservative upper bound */
+        if (payload_len < sizeof(sw_descriptor_t) || payload_len > max_payload) {
+            DOCA_LOG_WARN("scan_and_recover: bad payload_len=%u at pos=%u — stop",
+                          payload_len, scan_pos);
+            break;
+        }
+        uint32_t dma_len = (uint32_t)sizeof(struct fc_header) + payload_len;
+        if (scan_pos + dma_len > buf_size) {
+            DOCA_LOG_WARN("scan_and_recover: entry at pos=%u overflows buffer (dma_len=%u)",
+                          scan_pos, dma_len);
+            break;
+        }
+
+        DOCA_LOG_WARN("scan_and_recover: recovering lost entry at pos=%u req_id=%u dma_len=%u",
+                      scan_pos, sdesc->req_id, dma_len);
+        if (process_rx_dma_entry(ctx, scan_pos, dma_len) == 0)
+            recovered++;
+
+        uint32_t padded = (dma_len + 127) & ~(uint32_t)127;
+        scan_pos += padded;
+        if (scan_pos >= buf_size) scan_pos = 0;
+    }
+
+    if (recovered > 0)
+        DOCA_LOG_WARN("scan_and_recover: recovered %d lost entries (start=%u end=%u)",
+                      recovered, start_pos, end_pos);
+}
+
 static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)hook_ctx;
     const struct dmesh_comch_msg *comch_msg = (const struct dmesh_comch_msg *)data;
@@ -241,7 +345,9 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
     if (comch_msg->type == DMESH_MSG_TX_ACK) {
         /* === TX_ACK: forward DMA consumed, free sender's TX slot ===
          * DPU ARM sends this when CPU→DPU DMA completes — data copied
-         * to DPU buffer, Host TX slot can be freed immediately. */
+         * to DPU buffer, Host TX slot can be freed immediately.
+         * ack.consumer_tail piggybacks DPU's rx_consumer_tail so we can
+         * refresh the flow-control window even on an idle link. */
         struct dmesh_tx_ack_msg ack;
         if (len < sizeof(ack)) {
             DOCA_LOG_ERR("TX_ACK: too short (len=%u need=%zu)", len, sizeof(ack));
@@ -249,17 +355,30 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         }
         memcpy(&ack, data, sizeof(ack));
 
+        /* Refresh flow-control window from piggybacked tail. Ignore bogus
+         * values (first ACK before any real consumption may still be 0
+         * which is fine; only guard against out-of-range). */
+        if (ack.consumer_tail < DPU_BUFFER_SIZE)
+            ctx->fc_tx_last_consumer_tail = ack.consumer_tail;
+
         uint32_t idx = ack.req_id % MAX_PENDING;
         dpumesh_pending_t *p = &ctx->pending[idx];
         pthread_mutex_lock(&p->lock);
-        if (p->state == 0 && p->tx_slot >= 0) {
-            /* Request still waiting for response — free TX slot early */
+        if ((p->state == 0 || p->state == -2) && p->tx_slot >= 0) {
+            /* state 0: request still waiting — free TX slot early.
+             * state -2: wait_response gave up on timeout but deferred the TX
+             *           free until DPA finished the forward DMA; this ACK
+             *           confirms that, so we can release the slot now. */
             dpumesh_tx_free(ctx, p->tx_slot);
             p->tx_slot = -1;
+            if (p->state == -2) {
+                p->state = -1;
+                pthread_cond_broadcast(&p->cond);
+            }
         }
         pthread_mutex_unlock(&p->lock);
 
-        DOCA_LOG_INFO("TX_ACK: freed TX slot for req_id=%u", ack.req_id);
+        DOCA_LOG_INFO("TX_ACK: freed TX slot for req_id=%u tail=%u", ack.req_id, ack.consumer_tail);
         return;
     }
 
@@ -283,14 +402,12 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
                          pos, dma_len, ctx->rx_dma_buf_size);
             return;
         }
-
-        uint8_t *buf = (uint8_t *)ctx->rx_dma_buffer + pos;
-
-        /* Parse fc_header */
         if (dma_len < sizeof(struct fc_header)) {
             DOCA_LOG_ERR("DMA_COMPLETION: too short for fc_header (len=%u)", dma_len);
             return;
         }
+
+        uint8_t *buf = (uint8_t *)ctx->rx_dma_buffer + pos;
         struct fc_header *hdr = (struct fc_header *)buf;
 
         /* Update flow control: DPU told us how much of our TX buffer it consumed.
@@ -299,50 +416,45 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         if (hdr->consumer_tail < DPU_BUFFER_SIZE)
             ctx->fc_tx_last_consumer_tail = hdr->consumer_tail;
 
-        uint32_t payload_len = hdr->payload_len;
-        if (sizeof(struct fc_header) + payload_len > dma_len) {
-            DOCA_LOG_ERR("DMA_COMPLETION: payload_len=%u exceeds dma_len=%u", payload_len, dma_len);
-            return;
+        /* Snapshot the old tail BEFORE advancing — we need it to detect a gap
+         * caused by a lost comch DMA_COMPLETION. The DPU writes reverse-DMA
+         * entries into the RX buffer in order, but the control-path notification
+         * can occasionally be dropped; when that happens the host's tail lags
+         * the producer by one or more entries and requests stall until a later
+         * notification lets us catch up. */
+        uint32_t old_tail = ctx->fc_rx_consumer_tail;
+
+        /* Gap recovery FIRST, then process the current entry — both copy data
+         * out of rx_dma_buffer into rx_buffer slots. We must complete these
+         * copies BEFORE advancing fc_rx_consumer_tail, otherwise DPU can
+         * treat pos..pos+padded as free and overwrite it with new reverse-DMA
+         * data while we are still reading. Seen as Thrift "Frame size has
+         * negative value" / "Received an oversized frame" at wrap boundaries. */
+        if (old_tail != pos) {
+            DOCA_LOG_WARN("DMA_COMPLETION: gap detected (old_tail=%u, pos=%u) — scanning for lost entries",
+                          old_tail, pos);
+            scan_and_recover_rx_gap(ctx, old_tail, pos);
         }
 
-        /* Parse sw_descriptor after fc_header */
-        uint8_t *payload = buf + sizeof(struct fc_header);
-        if (payload_len < sizeof(sw_descriptor_t)) {
-            DOCA_LOG_ERR("DMA_COMPLETION: payload too short for descriptor (len=%u)", payload_len);
-            return;
+        int proc_rc = process_rx_dma_entry(ctx, pos, dma_len);
+        if (proc_rc != 0) {
+            DOCA_LOG_WARN("DMA_COMPLETION: process_rx_dma_entry failed at pos=%u len=%u — advancing tail to avoid DPU wedge",
+                          pos, dma_len);
         }
 
-        sw_descriptor_t desc;
-        memcpy(&desc, payload, sizeof(desc));
-
-        uint32_t body_len = payload_len - sizeof(sw_descriptor_t);
-        uint8_t *body = payload + sizeof(sw_descriptor_t);
-
-        /* Zero-copy: allocate RX slot and copy body from DMA buffer.
-         * TODO: true zero-copy with buffer offset tracking (Phase 5b). */
-        int slot = rx_slot_alloc(ctx);
-        if (slot < 0) {
-            DOCA_LOG_ERR("DMA_COMPLETION: no free RX slots");
-            return;
-        }
-        uint8_t *dst = (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
-        if (body_len > 0)
-            memcpy(dst, body, body_len);
-
-        desc.body_buf_slot = slot;
-        desc.body_len = body_len;
-
-        /* Advance RX consumer tail for flow control */
+        /* Now safe to release this region back to the DPU. We ALWAYS advance
+         * the tail here (even if process returned -1) — the DPU does not
+         * distinguish "delivered" vs "dropped at app layer"; it only needs
+         * to know the region is reusable, and failing to advance would
+         * permanently wedge DPU→Host flow. The copy-out happened inside
+         * process_rx_dma_entry before this point, so advancing is safe. */
         uint32_t padded = (dma_len + 127) & ~(uint32_t)127;
         ctx->fc_rx_consumer_tail = pos + padded;
         if (ctx->fc_rx_consumer_tail >= (uint32_t)ctx->rx_dma_buf_size)
             ctx->fc_rx_consumer_tail = 0;
 
-        DOCA_LOG_INFO("DMA_COMPLETION: pos=%u len=%u req_id=%u flags=0x%x slot=%d body=%u fc_tail=%u",
-                      pos, dma_len, desc.req_id, (unsigned)(uint8_t)desc.flags,
-                      slot, body_len, hdr->consumer_tail);
-
-        rx_deliver_desc(ctx, &desc, slot);
+        DOCA_LOG_INFO("DMA_COMPLETION: pos=%u len=%u fc_tail=%u new_rx_tail=%u",
+                      pos, dma_len, hdr->consumer_tail, ctx->fc_rx_consumer_tail);
         return;
     }
 
@@ -519,10 +631,16 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     pthread_mutex_init(&ctx->slot_lock, NULL);
     pthread_mutex_init(&ctx->ring_lock, NULL);
 
-    /* RX buffer is now PCI mmap (rx_dma_buffer) allocated in init_datapath.
-     * Point rx_buffer to it for backward compatibility with dpumesh_rx_buf(). */
-    ctx->rx_buffer = ctx->rx_dma_buffer;
-    if (!ctx->rx_buffer) goto fail;
+    /* rx_buffer is the STAGING area for delivered messages — must be separate
+     * from rx_dma_buffer (the DMA landing zone). If they share memory, the
+     * DPU can overwrite a slot's contents after the consumer_tail advance
+     * releases that region for reuse, corrupting in-flight messages for
+     * the upper layer (seen as "Frame size has negative value" near wrap). */
+    {
+        size_t rx_buf_bytes = (size_t)ctx->num_slots * ctx->slot_size;
+        ctx->rx_buffer = calloc(1, rx_buf_bytes);
+        if (!ctx->rx_buffer) goto fail;
+    }
     ctx->rx_slot_bitmap = (uint8_t *)calloc(ctx->num_slots, 1);
     if (!ctx->rx_slot_bitmap) goto fail;
     pthread_mutex_init(&ctx->rx_slot_lock, NULL);
@@ -599,6 +717,17 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
         pthread_cond_destroy(&p->cond);
     }
 
+    /* Destroy DMA landing-zone mmap + buffer (Host RX DMA buffer).
+     * Must happen before cleanup_objects destroys the device. */
+    if (ctx->rx_dma_mmap) {
+        doca_mmap_destroy(ctx->rx_dma_mmap);
+        ctx->rx_dma_mmap = NULL;
+    }
+    if (ctx->rx_dma_buffer) {
+        free(ctx->rx_dma_buffer);
+        ctx->rx_dma_buffer = NULL;
+    }
+
     cleanup_objects(&ctx->doca_objs);
 
     pthread_mutex_destroy(&ctx->ring_lock);
@@ -607,7 +736,10 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
 
     pthread_mutex_destroy(&ctx->rx_slot_lock);
     if (ctx->rx_slot_bitmap) free(ctx->rx_slot_bitmap);
-    /* rx_buffer points to rx_dma_buffer (PCI mmap), freed by cleanup_objects */
+    if (ctx->rx_buffer) {
+        free(ctx->rx_buffer);
+        ctx->rx_buffer = NULL;
+    }
     pthread_mutex_destroy(&ctx->rx_lock);
     pthread_cond_destroy(&ctx->rx_cond);
     pthread_cond_destroy(&ctx->rx_not_full);
@@ -944,6 +1076,21 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
         while (p->state != -1) {
             int rc = pthread_cond_timedwait(&p->cond, &p->lock, &wait_ts);
             if (rc != 0) {
+                /* Stuck. If the previous request is in state -2 (timed out,
+                 * TX deferred), the DPU owes us a TX_ACK — if it has not
+                 * arrived after (wait_response timeout + 2s), the link is
+                 * effectively dead. Reclaim the slot to keep the pending
+                 * table from wedging the whole gateway; the late TX_ACK
+                 * (if ever) will find state=-1 and no-op. */
+                if (p->state == -2) {
+                    if (p->tx_slot >= 0) {
+                        dpumesh_tx_free(ctx, p->tx_slot);
+                        p->tx_slot = -1;
+                    }
+                    DOCA_LOG_WARN("Pending slot %u reclaimed after -2 timeout (req_id=%u)",
+                                  idx, req_id);
+                    break;  /* fall through to claim the slot */
+                }
                 pthread_mutex_unlock(&p->lock);
                 DOCA_LOG_ERR("Pending slot collision: req_id=%u idx=%u stuck state=%d",
                              req_id, idx, p->state);
@@ -998,12 +1145,13 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
                 /* Check if response arrived during timeout boundary */
                 if (p->state == 1)
                     break; /* fall through to success path below */
-                /* Force-free TX slot to prevent permanent stall */
-                if (p->tx_slot >= 0) {
-                    dpumesh_tx_free(ctx, p->tx_slot);
-                    p->tx_slot = -1;
-                }
-                p->state = -1;
+                /* Timeout: do NOT force-free the TX slot. The DPA may still
+                 * be reading from it; freeing now risks corrupting whatever
+                 * request recycles that slot next. Defer the free to the
+                 * TX_ACK handler (state=-2 → handler frees + sets -1).
+                 * If a late response arrives first, the RX path handles it
+                 * under state=-2 as well. */
+                p->state = -2;
                 pthread_cond_broadcast(&p->cond);
                 pthread_mutex_unlock(&p->lock);
                 return -1;
@@ -1025,13 +1173,16 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
         return 0;
     }
 
-    /* Force-free TX slot to prevent permanent stall */
-    if (p->tx_slot >= 0) {
-        dpumesh_tx_free(ctx, p->tx_slot);
-        p->tx_slot = -1;
+    /* Unreachable in practice — state left the wait loop without being 1
+     * only via the timeout/-2 branch above. Clear the slot defensively. */
+    if (p->state != -2) {
+        if (p->tx_slot >= 0) {
+            dpumesh_tx_free(ctx, p->tx_slot);
+            p->tx_slot = -1;
+        }
+        p->state = -1;
+        pthread_cond_broadcast(&p->cond);
     }
-    p->state = -1;
-    pthread_cond_broadcast(&p->cond);
     pthread_mutex_unlock(&p->lock);
     return -1;
 }
@@ -1053,15 +1204,25 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
             p->tx_slot = -1;
         }
         p->state = -1;
-    } else if (p->state == 0 || p->state == -2) {
+        pthread_cond_broadcast(&p->cond);
+    } else if (p->state == 0) {
+        /* In-flight, no timeout yet — caller gave up; free TX now.
+         * (No DPA-in-progress risk because 0 means DPA hasn't had a chance
+         * to signal completion, i.e. request was cancelled pre-enqueue
+         * path or immediately after enqueue failure.) */
         if (p->tx_slot >= 0) {
             dpumesh_tx_free(ctx, p->tx_slot);
             p->tx_slot = -1;
         }
         p->state = -1;
+        pthread_cond_broadcast(&p->cond);
+    } else if (p->state == -2) {
+        /* Timeout path: wait_response already deferred the TX free.
+         * Do NOT force-free here — DPA may still be reading from the slot.
+         * The TX_ACK handler (or a late response) will release it and
+         * transition state -2 → -1. Leaving state=-2 preserves that. */
     } else {
-        p->state = -1;
+        /* state == -1, already clean — nothing to do. */
     }
-    pthread_cond_broadcast(&p->cond);
     pthread_mutex_unlock(&p->lock);
 }

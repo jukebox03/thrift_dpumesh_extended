@@ -60,12 +60,15 @@ doca_error_t
 server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn,
                         const char *msg, size_t len);
 
-/* Send TX ACK to a specific host connection (req_id + dst_pod_id key). */
+/* Send TX ACK to a specific host connection (req_id + dst_pod_id key).
+ * consumer_tail piggybacks the pod's current rx_consumer_tail so the Host
+ * can refresh its flow-control window even when no reverse DMA is in flight. */
 doca_error_t
 server_send_tx_ack_to(struct objects *objs,
 					  struct doca_comch_connection *conn,
 					  uint32_t req_id,
-					  int32_t dst_pod_id);
+					  int32_t dst_pod_id,
+					  uint32_t consumer_tail);
 
 /* Find a pod by pod_id. Returns NULL if not found. */
 struct pod_state *

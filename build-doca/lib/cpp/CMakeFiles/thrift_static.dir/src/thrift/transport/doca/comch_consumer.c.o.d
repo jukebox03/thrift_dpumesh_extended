@@ -77,6 +77,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.
  /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
  /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
  /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
+ /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
  /opt/mellanox/doca/include/doca_dev.h \
  /opt/mellanox/doca/include/doca_pe.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \

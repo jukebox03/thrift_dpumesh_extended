@@ -20565,6 +20565,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.o:
   /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
+  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
   /opt/mellanox/doca/include/doca_pe.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
   ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
@@ -20670,6 +20671,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o:
   /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
+  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
   /opt/mellanox/doca/include/doca_dev.h \
   /opt/mellanox/doca/include/doca_pe.h \
   /opt/mellanox/doca/include/doca_comch.h \
@@ -20773,6 +20775,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.
   /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
+  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
   /opt/mellanox/doca/include/doca_dev.h \
   /opt/mellanox/doca/include/doca_pe.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
@@ -20964,6 +20967,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_producer.c.
   /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
+  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
   /opt/mellanox/doca/include/doca_dev.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
@@ -21081,6 +21085,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o:
   /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
+  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
   /opt/mellanox/doca/include/doca_pe.h \
   ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/dpa.h \
@@ -21315,6 +21320,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dma.c.o: ../lib/c
   /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
+  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
   /opt/mellanox/doca/include/doca_pe.h \
   /opt/mellanox/doca/include/doca_comch.h \
   /opt/mellanox/doca/include/doca_ctx.h \
@@ -21432,6 +21438,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o: ../lib/c
   /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
+  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
   /opt/mellanox/doca/include/doca_dev.h \
   /opt/mellanox/doca/include/doca_comch.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
@@ -21509,6 +21516,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o: ../li
   /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
+  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
   /opt/mellanox/doca/include/doca_dev.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdint.h \
   /usr/include/stdint.h \
@@ -21669,6 +21677,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o: ../lib/
   /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
+  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
   /opt/mellanox/doca/include/doca_dev.h \
   /opt/mellanox/doca/include/doca_pe.h \
   /opt/mellanox/doca/include/doca_comch.h \
@@ -21811,8 +21820,6 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: ../l
   ../lib/cpp/src/thrift/transport/doca/dpa_common.h
 
 
-/usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h:
-
 ../lib/cpp/src/thrift/transport/doca/ring.c:
 
 ../lib/cpp/src/thrift/transport/doca/ring.h:
@@ -21836,6 +21843,8 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: ../l
 ../lib/cpp/src/thrift/transport/doca/comch_msgq.c:
 
 /opt/mellanox/doca/include/doca_buf_array.h:
+
+/usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h:
 
 ../lib/cpp/src/thrift/transport/doca/object.h:
 

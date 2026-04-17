@@ -35,7 +35,7 @@ static void client_send_task_completion_callback(struct doca_comch_task_send *ta
 	void *payload_copy = task_user_data.ptr;
 
 	objs = (struct objects *)(ctx_user_data.ptr);
-	(void)objs;
+	doca_pool_release(&objs->send_tasks_in_flight);
 
 	DOCA_LOG_INFO("Client task sent successfully");
 	if (payload_copy != NULL)
@@ -58,7 +58,7 @@ static void client_send_task_completion_err_callback(struct doca_comch_task_send
 	void *payload_copy = task_user_data.ptr;
 
 	objs = (struct objects *)(ctx_user_data.ptr);
-	(void)objs;
+	doca_pool_release(&objs->send_tasks_in_flight);
 	if (payload_copy != NULL)
 		free(payload_copy);
 	doca_task_free(doca_comch_task_send_as_task(task));
@@ -171,9 +171,23 @@ doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
 	union doca_data task_user_data;
 	struct doca_task *task_obj;
 
+	/* Capacity check: gate on our mirror of DOCA's send pool.
+	 * Client calls are init-only (REGISTER, POD_CONSUMER_ID) and rare, so
+	 * it's safe to progress PE while waiting for room. */
+	int acq_retry = 0;
+	while (!doca_pool_try_acquire(&objs->send_tasks_in_flight, objs->send_tasks_max)) {
+		if (objs->pe)
+			doca_pe_progress(objs->pe);
+		if (++acq_retry > 10000) {
+			DOCA_LOG_ERR("client_send_msg: send pool full after %d PE progresses", acq_retry);
+			return DOCA_ERROR_AGAIN;
+		}
+	}
+
 	msg_copy = malloc(len);
 	if (msg_copy == NULL) {
 		DOCA_LOG_ERR("Failed to allocate client payload copy");
+		doca_pool_release(&objs->send_tasks_in_flight);
 		return DOCA_ERROR_NO_MEMORY;
 	}
 	memcpy(msg_copy, msg, len);
@@ -185,6 +199,7 @@ doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
 							&task);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to allocate client task with error = %s", doca_error_get_name(result));
+		doca_pool_release(&objs->send_tasks_in_flight);
 		free(msg_copy);
 		return result;
 	}
@@ -193,20 +208,10 @@ doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
 	task_user_data.ptr = msg_copy;
 	doca_task_set_user_data(task_obj, task_user_data);
 
-	/* Retry with PE progress if task queue is temporarily full */
-	{
-		int retry = 0;
-		do {
-			result = doca_task_submit(task_obj);
-			if (result == DOCA_ERROR_AGAIN) {
-				if (objs->pe)
-					doca_pe_progress(objs->pe);
-				retry++;
-			}
-		} while (result == DOCA_ERROR_AGAIN && retry < 1000);
-	}
+	result = doca_task_submit(task_obj);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to send client task with error = %s", doca_error_get_name(result));
+		doca_pool_release(&objs->send_tasks_in_flight);
 		free(msg_copy);
 		doca_task_free(task_obj);
 		return result;
@@ -227,8 +232,11 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 		.tv_nsec = SLEEP_IN_NANOS,
 	};
 
+    /* Prime task-pool counters before anything that can submit. */
+    objects_init_task_pools(objs);
+
     result = doca_pe_create(&(objs->pe));
-    if (result != DOCA_SUCCESS) {   
+    if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed creating pe with error = %s", doca_error_get_name(result));
         return result;
     }
@@ -300,7 +308,14 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 		goto destroy_client;
 	}
 
-	result = doca_comch_client_set_recv_queue_size(objs->cc_client, CC_RECV_QUEUE_SIZE);
+	{
+		uint32_t desired_rq = max_rq_size;
+		if (desired_rq < CC_RECV_QUEUE_SIZE) desired_rq = CC_RECV_QUEUE_SIZE;
+		result = doca_comch_client_set_recv_queue_size(objs->cc_client, desired_rq);
+		if (result == DOCA_SUCCESS) {
+			DOCA_LOG_INFO("CC client recv queue size set to %u (cap=%u)", desired_rq, max_rq_size);
+		}
+	}
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to set msg size property with error = %s", doca_error_get_name(result));
 		goto destroy_client;

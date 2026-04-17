@@ -2,6 +2,7 @@
 #define OBJECT_H_
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <doca_dev.h>
 #include <doca_pe.h>
 #include <doca_comch.h>
@@ -82,6 +83,23 @@ static inline uint32_t comp_queue_usage(const dpu_comp_queue_t *q) {
 
 /* Max deferred recv tasks (one per CC_DPA_MAX_MSG_NUM) */
 #define MAX_DEFERRED_RECV  1024
+
+/* ====== DOCA task pool capacity tracking (check-first model) ======
+ * DOCA does not expose in-flight task counts, so we mirror them at
+ * submit/completion boundaries. Submits are gated on our counter rather
+ * than relying on DOCA_ERROR_AGAIN + retry loop (which can block PE threads).
+ *
+ * TASK_POOL_MARGIN: safety headroom below max to absorb counter races.
+ * Increment-then-check means we may briefly exceed max by the number of
+ * concurrent submitters; margin covers that.
+ *
+ * MAX_CONSUMER_RETRY: fallback stash size for the rare case a gated submit
+ * still fails (e.g. transient state during ctx restart). Drained from the
+ * main PE loop.
+ */
+#define TASK_POOL_MARGIN 8
+#define MAX_CONSUMER_RETRY 256
+
 
 /* Per-pod state (DPU only) */
 struct pod_state {
@@ -203,7 +221,51 @@ struct objects {
      * resubmits when queue drains below BP_LOW. */
     struct doca_task *deferred_recv[MAX_DEFERRED_RECV];
     int num_deferred_recv;
+
+    /* ====== In-flight counters for DOCA task pools ======
+     * Mirror DOCA's internal task pool usage so submits can be gated
+     * BEFORE calling doca_task_submit, avoiding DOCA_ERROR_AGAIN entirely.
+     * Counters are atomic because completions fire in PE threads while
+     * submits may come from other threads (e.g. host thrift workers). */
+    atomic_int send_tasks_in_flight;   /* comch send task pool (server or client) */
+    int        send_tasks_max;          /* CC_SEND_TASK_NUM */
+    atomic_int recv_tasks_in_flight;   /* comch consumer post_recv task pool */
+    int        recv_tasks_max;          /* CC_DATA_PATH_TASK_NUM */
+
+    /* Rare-case retry list: consumer recv tasks whose gated submit still
+     * failed (e.g. transient ctx state). Drained from main PE loop. */
+    struct doca_task *consumer_retry[MAX_CONSUMER_RETRY];
+    int num_consumer_retry;
+    pthread_mutex_t consumer_retry_lock;
 };
+
+/* ====== Task-pool helpers ======
+ * Acquire/release a slot in an atomic in-flight counter. Acquire may fail
+ * (return 0) if the pool is full; caller must treat that like DOCA_ERROR_AGAIN
+ * and defer. These never sleep, never block, never call DOCA. */
+static inline int doca_pool_try_acquire(atomic_int *cnt, int max) {
+    int new_count = atomic_fetch_add(cnt, 1) + 1;
+    if (new_count > max - TASK_POOL_MARGIN) {
+        atomic_fetch_sub(cnt, 1);
+        return 0;
+    }
+    return 1;
+}
+/* Race-free variant for callers known to be single-threaded (e.g. recv
+ * completion → resubmit on the PE thread). Checks against the true pool
+ * max without the concurrent-submitter margin, so a bootstrap that filled
+ * the pool to `max` can round-trip every released slot back in. */
+static inline int doca_pool_try_acquire_exact(atomic_int *cnt, int max) {
+    int new_count = atomic_fetch_add(cnt, 1) + 1;
+    if (new_count > max) {
+        atomic_fetch_sub(cnt, 1);
+        return 0;
+    }
+    return 1;
+}
+static inline void doca_pool_release(atomic_int *cnt) {
+    atomic_fetch_sub(cnt, 1);
+}
 
 /* Progress both PEs: control-path PE + consumer PE.
  * consumer_pe must be progressed here to resubmit DPA recv tasks during
@@ -221,5 +283,15 @@ static inline void progress_all_pes(struct objects *objs) {
 
 void
 cleanup_objects(struct objects *objs);
+
+/* Prime task-pool counters (call once from control-path init). */
+void
+objects_init_task_pools(struct objects *objs);
+
+/* Drain consumer_retry list: try gated-submit each stashed task.
+ * Safe to call from any thread that progresses the consumer PE.
+ * Returns number of tasks successfully submitted. */
+int
+objects_drain_consumer_retry(struct objects *objs);
 
 #endif // OBJECT_H_

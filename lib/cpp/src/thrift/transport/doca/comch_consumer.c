@@ -202,14 +202,15 @@ static void consumer_recv_task_comp_cb(struct doca_comch_consumer_task_post_recv
 	void *recv_msg;
 	struct doca_buf *buf;
 	doca_error_t result;
-	struct timespec ts = {
-		.tv_nsec = SLEEP_IN_NANOS,
-	};
 
 	(void)task_user_data;
 
 	objs = (struct objects *)(ctx_user_data.ptr);
 	objs->recv_msg_cnt++;
+
+	/* Task just completed → it's leaving DOCA's in-flight pool (we are about
+	 * to resubmit it, which re-enters the pool under capacity check). */
+	doca_pool_release(&objs->recv_tasks_in_flight);
 
 	buf = doca_comch_consumer_task_post_recv_get_buf(task);
 
@@ -228,37 +229,48 @@ static void consumer_recv_task_comp_cb(struct doca_comch_consumer_task_post_recv
 	}
 
 	if (recv_msg_len > 0 && objs->rx_data_hook != NULL) {
-		/* Dispatch all received data to rx_data_hook. It handles both:
-		 * - Large comch messages (dmesh_rx_data_msg, ≥72B) from DPU control path
-		 * - Small DMA completion notifications (comch_dma_comp_msg, ≤32B) from DPA dma_copy */
 		DOCA_LOG_INFO("Datapath RX received: len=%zu, dispatching to rx_data_hook", recv_msg_len);
 		objs->rx_data_hook(objs->rx_hook_ctx, (const uint8_t *)recv_msg, (uint32_t)recv_msg_len);
 	}
 
-	// DOCA_LOG_INFO("Received message number: %d", i);
-	// DOCA_LOG_INFO("Message received: '%.*d'", (int)recv_msg_len, (char *)recv_msg);
-
-	/* reset data_len to receive data */
 	doca_buf_reset_data_len(buf);
 	struct doca_task *t = doca_comch_consumer_task_post_recv_as_task(task);
 
-	do {
-		result = doca_task_submit(t);
-		if (result == DOCA_ERROR_AGAIN) {
-			nanosleep(&ts, &ts);
-		}
-	} while (result == DOCA_ERROR_AGAIN);
+	/* Gate resubmit on our own counter — NO infinite retry loop, never
+	 * block the PE thread. If the gated submit somehow still fails, stash
+	 * the task in consumer_retry[] and let the main PE loop drain it.
+	 *
+	 * Use the _exact variant: this callback (and drain_consumer_retry) run
+	 * only on the PE thread, so there is no concurrent-submitter race. The
+	 * TASK_POOL_MARGIN headroom would otherwise reject every resubmit once
+	 * bootstrap filled the pool to `max`, permanently starving recv. */
+	if (!doca_pool_try_acquire_exact(&objs->recv_tasks_in_flight, objs->recv_tasks_max))
+		goto stash;
+	result = doca_task_submit(t);
+	if (result == DOCA_SUCCESS)
+		return;
 
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to re-submit recv task with error = %s", doca_error_get_name(result));
-		goto err_out;
+	/* Rare: capacity had room but submit still failed. Release our count
+	 * and stash for later. */
+	doca_pool_release(&objs->recv_tasks_in_flight);
+	DOCA_LOG_WARN("Recv resubmit gated-submit failed: %s; stashing",
+	              doca_error_get_name(result));
+
+stash:
+	pthread_mutex_lock(&objs->consumer_retry_lock);
+	if (objs->num_consumer_retry < MAX_CONSUMER_RETRY) {
+		objs->consumer_retry[objs->num_consumer_retry++] = t;
+		pthread_mutex_unlock(&objs->consumer_retry_lock);
+		return;
 	}
-	return;
+	pthread_mutex_unlock(&objs->consumer_retry_lock);
+	DOCA_LOG_ERR("consumer_retry full (%d); dropping recv task — capacity bug",
+	             MAX_CONSUMER_RETRY);
+	/* fall through to err_out; this really shouldn't happen */
 
 err_out:
 	(void)doca_buf_dec_refcount(buf, NULL);
 	doca_task_free(doca_comch_consumer_task_post_recv_as_task(task));
-	// (void)doca_ctx_stop(doca_comch_consumer_as_ctx(objs->consumer));
 }
 
 /**
@@ -278,6 +290,9 @@ static void consumer_recv_task_comp_err_cb(struct doca_comch_consumer_task_post_
 	(void)task_user_data;
 
 	objs = (struct objects *)(ctx_user_data.ptr);
+	/* Task is leaving the pool regardless of error status. */
+	doca_pool_release(&objs->recv_tasks_in_flight);
+
 	objs->consumer_result = doca_task_get_status(doca_comch_consumer_task_post_recv_as_task(task));
 	DOCA_LOG_ERR("Consumer failed to recv message with error = %s (non-fatal, continuing)",
 		     doca_error_get_name(objs->consumer_result));
@@ -294,7 +309,7 @@ static void consumer_recv_task_comp_err_cb(struct doca_comch_consumer_task_post_
  * @data_path [in]: CC data path resources
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t prepare_consumer_tasks(struct doca_comch_consumer *consumer, struct local_mem_bufs *cmem)
+static doca_error_t prepare_consumer_tasks(struct objects *objs, struct doca_comch_consumer *consumer, struct local_mem_bufs *cmem)
 {
 	struct doca_comch_consumer_task_post_recv *consumer_task;
 	struct doca_buf *buf;
@@ -315,11 +330,17 @@ static doca_error_t prepare_consumer_tasks(struct doca_comch_consumer *consumer,
 		}
 		task_obj = doca_comch_consumer_task_post_recv_as_task(consumer_task);
 
+		/* Bootstrap: fill the pool up to max. TASK_POOL_MARGIN is meant for
+		 * runtime concurrent-submitter races, not the single-threaded init
+		 * loop — using the gated helper here would cap us short of max and
+		 * break the consumer startup handshake. */
+		atomic_fetch_add(&objs->recv_tasks_in_flight, 1);
 		result = doca_task_submit(task_obj);
 		if (result != DOCA_SUCCESS) {
+			atomic_fetch_sub(&objs->recv_tasks_in_flight, 1);
 			(void)doca_buf_dec_refcount(buf, NULL);
 			doca_task_free(task_obj);
-			DOCA_LOG_ERR("Failed submitting send task with error = %s", doca_error_get_name(result));
+			DOCA_LOG_ERR("Failed submitting recv task with error = %s", doca_error_get_name(result));
 			return result;
 		}
 	}
@@ -364,7 +385,7 @@ static void consumer_state_changed_cb(const union doca_data user_data,
 		break;
 	case DOCA_CTX_STATE_RUNNING:
 		DOCA_LOG_INFO("CC consumer context is running, pref_state:%d, Receiving message from producer, waiting finish", prev_state);
-		objs->consumer_result = prepare_consumer_tasks(objs->consumer, objs->consumer_mem);
+		objs->consumer_result = prepare_consumer_tasks(objs, objs->consumer, objs->consumer_mem);
 		if (objs->consumer_result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to submit consumer recv task with error = %s",
 				     doca_error_get_name(objs->consumer_result));
@@ -395,6 +416,9 @@ init_comch_datapath_consumer(struct objects *objs)
         .ctx_user_data = objs,
         .ctx_state_changed_cb = consumer_state_changed_cb
     };
+
+    /* Record the recv pool size for the capacity-gated submit path. */
+    objs->recv_tasks_max = CC_DATA_PATH_TASK_NUM;
 
     objs->consumer_mem = calloc(1, sizeof(struct local_mem_bufs));
     if (!objs->consumer_mem) {

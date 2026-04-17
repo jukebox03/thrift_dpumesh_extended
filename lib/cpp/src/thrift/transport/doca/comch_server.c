@@ -35,7 +35,7 @@ static void server_send_task_completion_callback(struct doca_comch_task_send *ta
 	void *payload_copy = task_user_data.ptr;
 
 	objs = (struct objects *)ctx_user_data.ptr;
-	(void)objs;
+	doca_pool_release(&objs->send_tasks_in_flight);
 	DOCA_LOG_INFO("Server task sent successfully");
 	if (payload_copy != NULL)
 		free(payload_copy);
@@ -46,9 +46,10 @@ static void server_send_task_completion_err_callback(struct doca_comch_task_send
 						     union doca_data task_user_data,
 						     union doca_data ctx_user_data)
 {
-	(void)ctx_user_data;
+	struct objects *objs = (struct objects *)ctx_user_data.ptr;
 	void *payload_copy = task_user_data.ptr;
 
+	doca_pool_release(&objs->send_tasks_in_flight);
 	DOCA_LOG_ERR("Server send task failed: %s",
 		     doca_error_get_name(doca_task_get_status(doca_comch_task_send_as_task(task))));
 	if (payload_copy != NULL)
@@ -73,9 +74,23 @@ server_send_msg(struct objects *objs, const char *msg, size_t len)
 	union doca_data task_user_data;
 	struct doca_task *task_obj;
 
+	/* Capacity check: gate on our mirror of DOCA's send pool so we never
+	 * trigger DOCA_ERROR_AGAIN. Caller treats AGAIN the same as us (retry
+	 * later). This path is init-only (export_dpa_comp_to_host), so we
+	 * progress PE while waiting to make room. */
+	int acq_retry = 0;
+	while (!doca_pool_try_acquire(&objs->send_tasks_in_flight, objs->send_tasks_max)) {
+		progress_all_pes(objs);
+		if (++acq_retry > 10000) {
+			DOCA_LOG_ERR("server_send_msg: send pool full after %d PE progresses", acq_retry);
+			return DOCA_ERROR_AGAIN;
+		}
+	}
+
 	msg_copy = malloc(len);
 	if (msg_copy == NULL) {
 		DOCA_LOG_ERR("Failed to allocate server payload copy");
+		doca_pool_release(&objs->send_tasks_in_flight);
 		return DOCA_ERROR_NO_MEMORY;
 	}
 	memcpy(msg_copy, msg, len);
@@ -84,6 +99,7 @@ server_send_msg(struct objects *objs, const char *msg, size_t len)
 								msg_copy, len, &task);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to allocate server task with error = %s", doca_error_get_name(result));
+		doca_pool_release(&objs->send_tasks_in_flight);
 		free(msg_copy);
 		return result;
 	}
@@ -92,18 +108,13 @@ server_send_msg(struct objects *objs, const char *msg, size_t len)
 	task_user_data.ptr = msg_copy;
 	doca_task_set_user_data(task_obj, task_user_data);
 
-	int retry = 0;
-	do {
-		result = doca_task_submit(task_obj);
-		if (result == DOCA_ERROR_AGAIN) {
-			progress_all_pes(objs);
-			retry++;
-		}
-	} while (result == DOCA_ERROR_AGAIN && retry < 1000);
-
+	result = doca_task_submit(task_obj);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to send server task with error = %s (retries=%d)",
-		             doca_error_get_name(result), retry);
+		/* With capacity gated ahead of time this should not happen, but
+		 * handle defensively — DOCA internal state can briefly refuse. */
+		DOCA_LOG_ERR("Failed to send server task with error = %s",
+		             doca_error_get_name(result));
+		doca_pool_release(&objs->send_tasks_in_flight);
 		free(msg_copy);
 		doca_task_free(task_obj);
 		return result;
@@ -310,6 +321,9 @@ init_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool 
 		.tv_nsec = SLEEP_IN_NANOS,
 	};
 
+	/* Prime task-pool counters before anything that can submit. */
+	objects_init_task_pools(objs);
+
 	/* create a progress engine */
     result = doca_pe_create(&(objs->pe));
     if (result != DOCA_SUCCESS) {
@@ -390,10 +404,16 @@ init_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool 
         goto destroy_server;
     }
 
-    result = doca_comch_server_set_recv_queue_size(objs->cc_server, CC_RECV_QUEUE_SIZE);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to set recv queue size with error = %s", doca_error_get_name(result));
-        goto destroy_server;
+    {
+        uint32_t desired_rq = max_rq_size;
+        if (desired_rq < CC_RECV_QUEUE_SIZE) desired_rq = CC_RECV_QUEUE_SIZE;
+        result = doca_comch_server_set_recv_queue_size(objs->cc_server, desired_rq);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to set recv queue size (%u) with error = %s",
+                         desired_rq, doca_error_get_name(result));
+            goto destroy_server;
+        }
+        DOCA_LOG_INFO("CC server recv queue size set to %u (cap=%u)", desired_rq, max_rq_size);
     }
 
     user_data.ptr = (void *)objs;
@@ -486,28 +506,27 @@ server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn
 	union doca_data task_user_data;
 	struct doca_task *task_obj;
 
+	/* Capacity check — gate on our mirror of DOCA's send pool.
+	 * If full, return DOCA_ERROR_AGAIN so the caller (process_completion_queue
+	 * or server_message_recv_callback) can retain the work and retry later.
+	 * NO retry loop here: PE re-entry from a callback is unsafe. */
+	if (!doca_pool_try_acquire(&objs->send_tasks_in_flight, objs->send_tasks_max))
+		return DOCA_ERROR_AGAIN;
+
 	msg_copy = malloc(len);
 	if (msg_copy == NULL) {
 		DOCA_LOG_ERR("server_send_msg_to_conn: payload copy allocation failed");
+		doca_pool_release(&objs->send_tasks_in_flight);
 		return DOCA_ERROR_NO_MEMORY;
 	}
 	memcpy(msg_copy, msg, len);
 
-	/* Retry allocation — under high load (10000 sends/s) the send task pool
-	 * (CC_SEND_TASK_NUM=1024) can be temporarily exhausted. Progress PE to
-	 * free completed tasks before retrying. */
-	int alloc_retry = 0;
-	do {
-		result = doca_comch_server_task_send_alloc_init(objs->cc_server, conn,
-								msg_copy, len, &task);
-		if (result != DOCA_SUCCESS) {
-			progress_all_pes(objs);
-			alloc_retry++;
-		}
-	} while (result != DOCA_SUCCESS && alloc_retry < 1000);
+	result = doca_comch_server_task_send_alloc_init(objs->cc_server, conn,
+							msg_copy, len, &task);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("server_send_msg_to_conn: alloc failed: %s (retries=%d)",
-		             doca_error_get_name(result), alloc_retry);
+		DOCA_LOG_ERR("server_send_msg_to_conn: alloc failed: %s",
+		             doca_error_get_name(result));
+		doca_pool_release(&objs->send_tasks_in_flight);
 		free(msg_copy);
 		return result;
 	}
@@ -516,18 +535,12 @@ server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn
 	task_user_data.ptr = msg_copy;
 	doca_task_set_user_data(task_obj, task_user_data);
 
-	int retry = 0;
-	do {
-		result = doca_task_submit(task_obj);
-		if (result == DOCA_ERROR_AGAIN) {
-			progress_all_pes(objs);
-			retry++;
-		}
-	} while (result == DOCA_ERROR_AGAIN && retry < 1000);
-
+	result = doca_task_submit(task_obj);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("server_send_msg_to_conn: submit failed: %s (retries=%d)",
-		             doca_error_get_name(result), retry);
+		/* Capacity gated ahead of time — should not hit this, but be safe */
+		DOCA_LOG_ERR("server_send_msg_to_conn: submit failed: %s",
+		             doca_error_get_name(result));
+		doca_pool_release(&objs->send_tasks_in_flight);
 		free(msg_copy);
 		doca_task_free(task_obj);
 		return result;
@@ -540,12 +553,14 @@ doca_error_t
 server_send_tx_ack_to(struct objects *objs,
                       struct doca_comch_connection *conn,
                       uint32_t req_id,
-                      int32_t dst_pod_id)
+                      int32_t dst_pod_id,
+                      uint32_t consumer_tail)
 {
 	struct dmesh_tx_ack_msg ack;
 	ack.type = DMESH_MSG_TX_ACK;
 	ack.req_id = req_id;
 	ack.dst_pod_id = dst_pod_id;
+	ack.consumer_tail = consumer_tail;
 	return server_send_msg_to_conn(objs, conn, (const char *)&ack, sizeof(ack));
 }
 

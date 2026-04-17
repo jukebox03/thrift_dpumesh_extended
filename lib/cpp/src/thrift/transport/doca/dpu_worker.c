@@ -147,6 +147,24 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
     struct pod_state *target_pod = echo_mode ? src_pod
                                              : find_pod_by_id(objs, dst_pod_id);
 
+    /* Advance consumer_tail FIRST so both reverse DMA and TX_ACK can
+     * piggyback the up-to-date value. Host uses this to refresh its
+     * fc_tx_last_consumer_tail window; under an idle load the TX_ACK
+     * may be the only channel carrying the update (no reverse DMA). */
+    uint32_t new_tail = 0;
+    int tail_advanced = 0;
+    if (entry->pod_idx >= 0 && entry->pod_idx < objs->num_pods) {
+        struct pod_state *p = &objs->pods[entry->pod_idx];
+        uint32_t dma_start = entry->buf_offset - (uint32_t)sizeof(struct fc_header);
+        uint32_t total_dma_len = (uint32_t)sizeof(struct fc_header) + payload_len;
+        uint32_t padded = (total_dma_len + 127) & ~(uint32_t)127;
+        new_tail = dma_start + padded;
+        if (new_tail >= p->dma_buf_size)
+            new_tail = 0;
+        p->rx_consumer_tail = new_tail;
+        tail_advanced = 1;
+    }
+
     if (target_pod && target_pod->tx_ring) {
         sw_descriptor_t fwd_desc;
         memset(&fwd_desc, 0, sizeof(fwd_desc));
@@ -182,31 +200,17 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
                      echo_mode ? src_pod_id : dst_pod_id);
     }
 
-    /* Send TX_ACK to sender so it can free its TX buffer slot immediately.
-     * This is sent via comch control path — safe because we're in the
-     * main loop (not inside a consumer callback). */
+    /* Send TX_ACK with the advanced tail so the Host refreshes its
+     * flow-control window even on an idle connection (no reverse DMA). */
     if (src_pod && src_pod->connection) {
+        uint32_t ack_tail = tail_advanced ? new_tail : (src_pod ? src_pod->rx_consumer_tail : 0);
         doca_error_t ack_result = server_send_tx_ack_to(objs, src_pod->connection,
-                                                         req_id, dst_pod_id);
+                                                         req_id, dst_pod_id, ack_tail);
         if (ack_result != DOCA_SUCCESS)
             DOCA_LOG_WARN("TX_ACK failed for req_id=%u to pod %d: %s",
                           req_id, src_pod_id, doca_error_get_descr(ack_result));
     }
 
-    /* Advance consumer_tail (zero-copy, no free needed).
-     * DPA writes [fc_header(8B) + payload(N)] padded to 128B alignment.
-     * buf_offset points AFTER fc_header, so subtract it to get DMA start pos.
-     * Use total DMA size (fc_header + payload) for correct padding. */
-    if (entry->pod_idx >= 0 && entry->pod_idx < objs->num_pods) {
-        struct pod_state *p = &objs->pods[entry->pod_idx];
-        uint32_t dma_start = entry->buf_offset - (uint32_t)sizeof(struct fc_header);
-        uint32_t total_dma_len = (uint32_t)sizeof(struct fc_header) + payload_len;
-        uint32_t padded = (total_dma_len + 127) & ~(uint32_t)127;
-        uint32_t new_tail = dma_start + padded;
-        if (new_tail >= p->dma_buf_size)
-            new_tail = 0;
-        p->rx_consumer_tail = new_tail;
-    }
     return 1;
 }
 
@@ -385,21 +389,40 @@ run_dpu_worker(struct objects *objs)
         process_completion_queue(objs, 128);
 
         /* Backpressure release: resubmit deferred recv tasks when queue
-         * drains below BP_LOW. This resumes DPA→DPU message flow. */
+         * drains below BP_LOW. This resumes DPA→DPU message flow.
+         * Gate each submit on recv task pool capacity; preserve un-submitted
+         * tasks by shifting them to the front instead of zeroing count. */
         if (objs->num_deferred_recv > 0 &&
             comp_queue_usage(&objs->comp_queue) < COMP_QUEUE_BP_LOW) {
+            int remaining = 0;
             int resubmitted = 0;
-            for (int i = 0; i < objs->num_deferred_recv; i++) {
-                doca_error_t rs = doca_task_submit(objs->deferred_recv[i]);
-                if (rs == DOCA_SUCCESS)
+            int original = objs->num_deferred_recv;
+            for (int i = 0; i < original; i++) {
+                struct doca_task *t = objs->deferred_recv[i];
+                /* _exact: main loop is the only resubmitter — no race */
+                if (!doca_pool_try_acquire_exact(&objs->recv_tasks_in_flight, objs->recv_tasks_max)) {
+                    objs->deferred_recv[remaining++] = t;
+                    continue;
+                }
+                doca_error_t rs = doca_task_submit(t);
+                if (rs == DOCA_SUCCESS) {
                     resubmitted++;
-                else
-                    DOCA_LOG_WARN("Deferred recv resubmit failed: %s", doca_error_get_descr(rs));
+                } else {
+                    doca_pool_release(&objs->recv_tasks_in_flight);
+                    objs->deferred_recv[remaining++] = t;
+                    DOCA_LOG_WARN("Deferred recv resubmit failed: %s; retaining",
+                                  doca_error_get_descr(rs));
+                }
             }
-            DOCA_LOG_INFO("Backpressure release: resubmitted %d/%d deferred recv tasks",
-                          resubmitted, objs->num_deferred_recv);
-            objs->num_deferred_recv = 0;
+            objs->num_deferred_recv = remaining;
+            if (resubmitted > 0)
+                DOCA_LOG_INFO("Backpressure release: resubmitted %d/%d deferred recv tasks (retained %d)",
+                              resubmitted, original, remaining);
         }
+
+        /* Drain any consumer_retry tasks that were stashed by the consumer
+         * completion callback when capacity was full. */
+        objects_drain_consumer_retry(objs);
 
         clock_gettime(CLOCK_MONOTONIC, &now);
         elapsed = (now.tv_sec - last.tv_sec) +

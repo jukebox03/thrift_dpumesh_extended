@@ -80,11 +80,15 @@ struct dmesh_pod_consumer_id_msg {
     uint32_t consumer_id;
 };
 
-/* DPU→Host: ACK for forward DMA (CPU→DPU) completion — sender can free TX slot */
+/* DPU→Host: ACK for forward DMA (CPU→DPU) completion — sender can free TX slot.
+ * consumer_tail piggybacks DPU's RX consumer position so the Host can
+ * advance fc_tx_last_consumer_tail even when no reverse DMA is flowing
+ * (idle-path flow-control window update, TCP-keepalive analogue). */
 struct dmesh_tx_ack_msg {
     enum dmesh_msg_type type;   /* = DMESH_MSG_TX_ACK */
     uint32_t req_id;
     int32_t dst_pod_id;
+    uint32_t consumer_tail;     /* DPU's rx_consumer_tail at ACK time */
 };
 
 /* DPU→Host: reverse DMA (DPU→CPU) completion — data landed in Host RX buffer */

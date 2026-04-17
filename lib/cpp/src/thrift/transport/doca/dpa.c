@@ -204,14 +204,23 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 resubmit_recv_task:
     /* Backpressure: if comp_queue is nearly full, defer recv task resubmission.
      * DPA will see consumer_empty and naturally pause, giving DPU time to drain.
-     * Main loop resubmits when queue drops below BP_LOW. */
+     * Main loop resubmits when queue drops below BP_LOW.
+     * If submit fails (e.g. transient state), also stash so the main loop retries
+     * rather than losing the task. */
     if (comp_queue_usage(&objs->comp_queue) >= COMP_QUEUE_BP_HIGH &&
         objs->num_deferred_recv < MAX_DEFERRED_RECV) {
         objs->deferred_recv[objs->num_deferred_recv++] = task;
     } else {
         result = doca_task_submit(task);
         if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("DPA MsgQ recv resubmit failed (unexpected): %s", doca_error_get_name(result));
+            if (objs->num_deferred_recv < MAX_DEFERRED_RECV) {
+                objs->deferred_recv[objs->num_deferred_recv++] = task;
+                DOCA_LOG_WARN("DPA MsgQ recv resubmit failed: %s; deferred",
+                              doca_error_get_name(result));
+            } else {
+                DOCA_LOG_ERR("DPA MsgQ recv resubmit failed and deferred list full: %s",
+                             doca_error_get_name(result));
+            }
         }
     }
 }
