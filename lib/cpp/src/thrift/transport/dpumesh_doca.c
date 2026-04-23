@@ -142,9 +142,6 @@ static void *pe_progress_fn(void *arg) {
 
         if (ctx->doca_objs.consumer_pe)
             progressed += doca_pe_progress(ctx->doca_objs.consumer_pe);
-
-        if (progressed == 0)
-            nanosleep(&ts, &ts);
     }
     return NULL;
 }
