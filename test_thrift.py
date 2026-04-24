@@ -582,7 +582,7 @@ def main():
     if len(sys.argv) > 3 and sys.argv[3] == "throughput":
         rps = int(sys.argv[4]) if len(sys.argv) > 4 else 100
         duration = int(sys.argv[5]) if len(sys.argv) > 5 else 10
-        msg_size = parse_size_str(sys.argv[6]) if len(sys.argv) > 6 else 0
+        msg_size = parse_size_str(sys.argv[6]) if len(sys.argv) > 6 else 8192
         threads = int(sys.argv[7]) if len(sys.argv) > 7 else None
         pad = calc_pad_for_target(msg_size) if msg_size > 0 else 0
         ok = run_throughput_test(host, port, rps, duration, pad_bytes=pad,
