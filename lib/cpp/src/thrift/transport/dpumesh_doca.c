@@ -82,12 +82,19 @@ struct dpumesh_ctx {
     struct doca_mmap *rx_dma_mmap;
     size_t rx_dma_buf_size;
 
-    /* Flow control state (Host as sender of CPU→DPU) */
+    /* Flow control state (Host as sender of CPU→DPU)
+     * fc_tx_producer_head: only mutated by workers under ring_lock — plain.
+     * fc_tx_last_consumer_tail: written by PE thread without ring_lock
+     *   (atomic store + brief lock no-op + broadcast outside lock); read by
+     *   workers in fc-wait loop inside ring_lock. Atomic for correctness. */
     uint32_t fc_tx_producer_head;
-    uint32_t fc_tx_last_consumer_tail;  /* last known DPU RX consumption */
+    _Atomic uint32_t fc_tx_last_consumer_tail;
 
-    /* Flow control state (Host as receiver of DPU→CPU) */
-    uint32_t fc_rx_consumer_tail;
+    /* Flow control state (Host as receiver of DPU→CPU)
+     * Written by PE thread (rx_data_hook DMA_COMPLETION); read by workers
+     * when emitting fc_header in dpumesh_enqueue. Atomic for safe lockless
+     * publication across PE↔worker boundary. */
+    _Atomic uint32_t fc_rx_consumer_tail;
 
     /* Persistent buffers for initial registration to avoid stack UAF */
     struct dmesh_register_msg reg_msg;
@@ -360,12 +367,19 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         /* Refresh flow-control window from piggybacked tail. Ignore bogus
          * values (first ACK before any real consumption may still be 0
          * which is fine; only guard against out-of-range).
-         * Wake any enqueue waiter blocked in the fc-wait loop on ring_lock. */
+         *
+         * Wake fc-waiters via lockless publish + brief lock no-op + broadcast.
+         * The empty critical section is required by cond_var semantics: it
+         * forces a happens-before with any worker mid-transition into
+         * cond_wait so the broadcast is not lost. The actual store is
+         * lockless so PE thread does not contend with workers on ring_lock
+         * for the data update — only for the wakeup pairing. */
         if (ack.consumer_tail < DPU_BUFFER_SIZE) {
+            atomic_store_explicit(&ctx->fc_tx_last_consumer_tail,
+                                  ack.consumer_tail, memory_order_release);
             pthread_mutex_lock(&ctx->ring_lock);
-            ctx->fc_tx_last_consumer_tail = ack.consumer_tail;
-            pthread_cond_broadcast(&ctx->fc_cond);
             pthread_mutex_unlock(&ctx->ring_lock);
+            pthread_cond_broadcast(&ctx->fc_cond);
         }
 
         uint32_t idx = ack.req_id % MAX_PENDING;
@@ -420,12 +434,13 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         /* Update flow control: DPU told us how much of our TX buffer it consumed.
          * Ignore values >= DPU_BUFFER_SIZE — the DPU's first response may
          * piggyback an uninitialized rx_consumer_tail before any data is consumed.
-         * Wake enqueue waiters blocked on fc_cond. */
+         * Same lockless publish + brief no-op + broadcast pattern as TX_ACK. */
         if (hdr->consumer_tail < DPU_BUFFER_SIZE) {
+            atomic_store_explicit(&ctx->fc_tx_last_consumer_tail,
+                                  hdr->consumer_tail, memory_order_release);
             pthread_mutex_lock(&ctx->ring_lock);
-            ctx->fc_tx_last_consumer_tail = hdr->consumer_tail;
-            pthread_cond_broadcast(&ctx->fc_cond);
             pthread_mutex_unlock(&ctx->ring_lock);
+            pthread_cond_broadcast(&ctx->fc_cond);
         }
 
         /* Snapshot the old tail BEFORE advancing — we need it to detect a gap
@@ -433,8 +448,11 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
          * entries into the RX buffer in order, but the control-path notification
          * can occasionally be dropped; when that happens the host's tail lags
          * the producer by one or more entries and requests stall until a later
-         * notification lets us catch up. */
-        uint32_t old_tail = ctx->fc_rx_consumer_tail;
+         * notification lets us catch up.
+         *
+         * Single-writer (PE thread) so relaxed load is sufficient here. */
+        uint32_t old_tail = atomic_load_explicit(&ctx->fc_rx_consumer_tail,
+                                                 memory_order_relaxed);
 
         /* Gap recovery FIRST, then process the current entry — both copy data
          * out of rx_dma_buffer into rx_buffer slots. We must complete these
@@ -459,14 +477,19 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
          * distinguish "delivered" vs "dropped at app layer"; it only needs
          * to know the region is reusable, and failing to advance would
          * permanently wedge DPU→Host flow. The copy-out happened inside
-         * process_rx_dma_entry before this point, so advancing is safe. */
+         * process_rx_dma_entry before this point, so advancing is safe.
+         *
+         * Release-ordered store: workers reading via acquire load see all
+         * preceding writes to the rx_dma_buffer region. */
         uint32_t padded = (dma_len + 127) & ~(uint32_t)127;
-        ctx->fc_rx_consumer_tail = pos + padded;
-        if (ctx->fc_rx_consumer_tail >= (uint32_t)ctx->rx_dma_buf_size)
-            ctx->fc_rx_consumer_tail = 0;
+        uint32_t new_rx_tail = pos + padded;
+        if (new_rx_tail >= (uint32_t)ctx->rx_dma_buf_size)
+            new_rx_tail = 0;
+        atomic_store_explicit(&ctx->fc_rx_consumer_tail, new_rx_tail,
+                              memory_order_release);
 
         DOCA_LOG_DBG("DMA_COMPLETION: pos=%u len=%u fc_tail=%u new_rx_tail=%u",
-                     pos, dma_len, hdr->consumer_tail, ctx->fc_rx_consumer_tail);
+                     pos, dma_len, hdr->consumer_tail, new_rx_tail);
         return;
     }
 
@@ -778,24 +801,33 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx) {
  * OP_RESPONSE TX slots are deferred in ring_tx_slot_map until ring reuse.
  * This function proactively frees them to prevent deadlock when tx_alloc
  * can't find free slots and dpumesh_enqueue can't be called to recycle them.
- * Caller must NOT hold slot_lock (this function acquires ring_lock then slot_lock).
+ * Caller must NOT hold slot_lock.
+ *
+ * Two-phase: collect freeable slot ids under ring_lock (cheap memory ops only),
+ * then release ring_lock and free them — tx_free takes slot_lock and we avoid
+ * nesting it under ring_lock.
  */
 static int reclaim_ring_tx_slots(dpumesh_ctx_t *ctx) {
-    int freed = 0;
+    int slots_to_free[DMA_RING_SIZE];
+    int n_to_free = 0;
+
     pthread_mutex_lock(&ctx->ring_lock);
     for (int i = 0; i < DMA_RING_SIZE; i++) {
         if (ctx->ring_tx_slot_map[i] >= 0) {
             struct dma_desc *d = &ctx->dma_ring->descs[i];
             __sync_synchronize();
             if (!d->valid) {
-                dpumesh_tx_free(ctx, ctx->ring_tx_slot_map[i]);
+                slots_to_free[n_to_free++] = ctx->ring_tx_slot_map[i];
                 ctx->ring_tx_slot_map[i] = -1;
-                freed++;
             }
         }
     }
     pthread_mutex_unlock(&ctx->ring_lock);
-    return freed;
+
+    for (int j = 0; j < n_to_free; j++)
+        dpumesh_tx_free(ctx, slots_to_free[j]);
+
+    return n_to_free;
 }
 
 int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
@@ -899,8 +931,9 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
         const int max_fc_retry = 10000;
 
         while (1) {
-            uint32_t head = ctx->fc_tx_producer_head;
-            uint32_t tail = ctx->fc_tx_last_consumer_tail;
+            uint32_t head = ctx->fc_tx_producer_head;  /* worker-only, under ring_lock */
+            uint32_t tail = atomic_load_explicit(&ctx->fc_tx_last_consumer_tail,
+                                                 memory_order_acquire);
             uint32_t used = (head >= tail) ? (head - tail) : (buf_size - tail + head);
             uint32_t available = buf_size - used;
 
@@ -959,25 +992,29 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
 
     /* Deferred TX slot free: if this ring slot previously held data for
      * an OP_RESPONSE, the DPA has now cleared valid=0 (get_next_dma_desc
-     * checked), so the old TX slot is safe to free. */
-    if (ctx->ring_tx_slot_map[ring_slot] >= 0) {
-        dpumesh_tx_free(ctx, ctx->ring_tx_slot_map[ring_slot]);
-        ctx->ring_tx_slot_map[ring_slot] = -1;
-    }
+     * checked), so the old TX slot is safe to free. Capture the slot id
+     * here but defer the actual dpumesh_tx_free() until AFTER ring_lock
+     * is released — tx_free takes slot_lock, and avoiding nested lock
+     * acquisition shortens ring_lock hold time. */
+    int prev_tx_slot = ctx->ring_tx_slot_map[ring_slot];
 
     /* Track TX slot for OP_RESPONSE — freed when ring slot is reused.
      * For OP_REQUEST, pending table handles TX slot lifetime. */
     if (desc->flags & OP_RESPONSE) {
         ctx->ring_tx_slot_map[ring_slot] = desc->body_buf_slot;
+    } else {
+        ctx->ring_tx_slot_map[ring_slot] = -1;
     }
 
     /* Write fc_header at slot base (before body data).
-     * Body was written by caller at base + sizeof(fc_header). */
+     * Body was written by caller at base + sizeof(fc_header).
+     * fc_rx_consumer_tail is updated lockless by PE thread — acquire load. */
     {
         uint8_t *slot_base = (uint8_t *)ctx->dma_buffer +
                              ((size_t)desc->body_buf_slot * ctx->slot_size);
         struct fc_header *hdr = (struct fc_header *)slot_base;
-        hdr->consumer_tail = ctx->fc_rx_consumer_tail;
+        hdr->consumer_tail = atomic_load_explicit(&ctx->fc_rx_consumer_tail,
+                                                  memory_order_acquire);
         hdr->payload_len = desc->body_len;
     }
 
@@ -1005,11 +1042,18 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
             ctx->fc_tx_producer_head = 0;
     }
 
-    DOCA_LOG_DBG("ENQUEUE: req_id=%u slot=%u len=%u fc_head=%u fc_tail=%u",
+    DOCA_LOG_DBG("ENQUEUE: req_id=%u slot=%u len=%u fc_head=%u",
                  desc->req_id, ring_slot, desc->body_len,
-                 ctx->fc_tx_producer_head, ctx->fc_tx_last_consumer_tail);
+                 ctx->fc_tx_producer_head);
 
     pthread_mutex_unlock(&ctx->ring_lock);
+
+    /* Free the previous occupant's TX slot OUTSIDE ring_lock to avoid
+     * nested slot_lock acquisition under ring_lock — keeps the ring_lock
+     * critical section shorter and reduces 32-worker contention. */
+    if (prev_tx_slot >= 0)
+        dpumesh_tx_free(ctx, prev_tx_slot);
+
     return 0;
 }
 
