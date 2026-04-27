@@ -109,8 +109,8 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *dst_pod,
     if (dst_pod->tx_producer_head >= buf_size)
         dst_pod->tx_producer_head = 0;
 
-    DOCA_LOG_INFO("dpu_enqueue_reverse_dma: pod=%d write_pos=%u total_len=%u padded=%u new_head=%u",
-                  dst_pod->pod_id, write_pos, total_len, padded_len, dst_pod->tx_producer_head);
+    DOCA_LOG_DBG("dpu_enqueue_reverse_dma: pod=%d write_pos=%u total_len=%u padded=%u new_head=%u",
+                 dst_pod->pod_id, write_pos, total_len, padded_len, dst_pod->tx_producer_head);
     return DOCA_SUCCESS;
 }
 
@@ -192,9 +192,9 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
                          echo_mode ? "Echo" : "Forward",
                          req_id, dst_pod_id, doca_error_get_descr(fwd_result));
         else
-            DOCA_LOG_INFO("%s %u bytes to pod %d for req_id=%u via reverse DMA",
-                          echo_mode ? "Echo" : "Forwarded",
-                          payload_len, echo_mode ? src_pod_id : dst_pod_id, req_id);
+            DOCA_LOG_DBG("%s %u bytes to pod %d for req_id=%u via reverse DMA",
+                         echo_mode ? "Echo" : "Forwarded",
+                         payload_len, echo_mode ? src_pod_id : dst_pod_id, req_id);
     } else {
         DOCA_LOG_ERR("DMA completed: target_pod=%d not found or TX ring not ready",
                      echo_mode ? src_pod_id : dst_pod_id);
@@ -254,8 +254,8 @@ process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
         return -1;
     }
 
-    DOCA_LOG_INFO("REV_NOTIFY: sent DMA_COMPLETION to pod %d (req_id=%u pos=%u len=%u)",
-                  target_id, entry->req_id, entry->buf_offset, entry->length);
+    DOCA_LOG_DBG("REV_NOTIFY: sent DMA_COMPLETION to pod %d (req_id=%u pos=%u len=%u)",
+                 target_id, entry->req_id, entry->buf_offset, entry->length);
     return 1;
 }
 

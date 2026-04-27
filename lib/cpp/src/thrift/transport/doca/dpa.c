@@ -56,20 +56,15 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 	struct objects *objs = ctx_user_data.ptr;
 	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
 
-    DOCA_LOG_INFO(">>> DPA MsgQ recv callback #%lu entered", recv_cb_count + 1);
-
     data_len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
 
-    DOCA_LOG_INFO("DPA MsgQ recv callback imm data length: %u", data_len);
     /* DPA sends comch_dma_comp_msg directly (<=32 bytes) rather than the full
      * comch_msg union, so read raw bytes and dispatch by the leading type field. */
     uint8_t *raw = (uint8_t *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
-
-    DOCA_LOG_INFO("DPA MsgQ recv callback imm data pointer: %p", (void *)raw);
     recv_cb_count++;
 
-    DOCA_LOG_INFO(">>> [CRITICAL] DPA MSQ RECV CALLBACK #%lu: imm_len=%u msg_ptr=%p",
-                  recv_cb_count, data_len, (void *)raw);
+    DOCA_LOG_DBG("DPA MsgQ recv callback #%lu: imm_len=%u msg_ptr=%p",
+                 recv_cb_count, data_len, (void *)raw);
 
     if (raw == NULL) {
         DOCA_LOG_ERR("DPA MsgQ recv callback entered with NULL imm data (len=%u)", data_len);
@@ -82,7 +77,7 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     }
 
     enum comch_msg_type msg_type = *(enum comch_msg_type *)raw;
-    DOCA_LOG_INFO("DPA MsgQ recv message type: %u", (unsigned int)msg_type);
+    DOCA_LOG_DBG("DPA MsgQ recv message type: %u", (unsigned int)msg_type);
 
     switch (msg_type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED: {
@@ -121,8 +116,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                 body_offset = comp_msg->pos + sizeof(struct fc_header);
             }
 
-            DOCA_LOG_INFO("DMA completed: src_pod=%d, dst_pod=%d, req_id=%u, pos=%u, raw_len=%u, body_len=%u",
-                          src_pod_id, dst_pod_id, req_id, comp_msg->pos, raw_len, payload_len);
+            DOCA_LOG_DBG("DMA completed: src_pod=%d, dst_pod=%d, req_id=%u, pos=%u, raw_len=%u, body_len=%u",
+                         src_pod_id, dst_pod_id, req_id, comp_msg->pos, raw_len, payload_len);
 
             /* Enqueue for deferred processing in main loop.
              * TX_ACK + reverse DMA routing handled there — never send
@@ -151,8 +146,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                              req_id, src_pod_id, dst_pod_id);
                 /* zero-copy: no heap data to free */
             } else {
-                DOCA_LOG_INFO("Enqueued completion: req_id=%u src=%d dst=%d len=%u",
-                              req_id, src_pod_id, dst_pod_id, payload_len);
+                DOCA_LOG_DBG("Enqueued completion: req_id=%u src=%d dst=%d len=%u",
+                             req_id, src_pod_id, dst_pod_id, payload_len);
             }
             break;
         }
@@ -184,15 +179,15 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                 DOCA_LOG_ERR("Completion queue full, dropping REV_DMA req_id=%u",
                              rev_comp->req_id);
             } else {
-                DOCA_LOG_INFO("Enqueued REV_DMA completion: req_id=%u src=%d dst=%d len=%u pos=%u",
-                              rev_comp->req_id, rev_comp->src_pod_id,
-                              rev_comp->dst_pod_id, rev_comp->length, rev_comp->pos);
+                DOCA_LOG_DBG("Enqueued REV_DMA completion: req_id=%u src=%d dst=%d len=%u pos=%u",
+                             rev_comp->req_id, rev_comp->src_pod_id,
+                             rev_comp->dst_pod_id, rev_comp->length, rev_comp->pos);
             }
             break;
         }
         case COMCH_MSG_TYPE_TRIGGER:
-            DOCA_LOG_INFO("DPA MsgQ recv callback ping received (type=%u)",
-                          (unsigned int)msg_type);
+            DOCA_LOG_DBG("DPA MsgQ recv callback ping received (type=%u)",
+                         (unsigned int)msg_type);
             break;
         default:
             DOCA_LOG_ERR("Received unknown message type: %u", msg_type);

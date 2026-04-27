@@ -36,7 +36,7 @@ static void server_send_task_completion_callback(struct doca_comch_task_send *ta
 
 	objs = (struct objects *)ctx_user_data.ptr;
 	doca_pool_release(&objs->send_tasks_in_flight);
-	DOCA_LOG_INFO("Server task sent successfully");
+	DOCA_LOG_DBG("Server task sent successfully");
 	if (payload_copy != NULL)
 		free(payload_copy);
 	doca_task_free(doca_comch_task_send_as_task(task));
@@ -160,7 +160,7 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 
 	comch_msg = (struct dmesh_comch_msg *)recv_buffer;
 
-	DOCA_LOG_INFO("Received message from client with type = %u", comch_msg->type);
+	DOCA_LOG_DBG("Received message from client with type = %u", comch_msg->type);
 	switch (comch_msg->type) {
 	case DMESH_MSG_EXPORT_DESC:
 

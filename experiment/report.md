@@ -1,222 +1,151 @@
-# dpumesh Throughput 측정 분석 (Go client, 재측정)
+# dpumesh Throughput 측정 분석 (POST optimization)
 
 ## 핵심 결과 요약
 
-| | 이전 (Python client) | **현재 (Go client)** | 변화 |
+| | PRE (Go client only) | **POST (A4+A5+A6 적용)** | 변화 |
 |---|---:|---:|---:|
-| Sustainable ceiling | 21k RPS | **61k RPS** | 2.9× ↑ |
-| Sustainable Gbps   | 1.29 Gbps | **3.81 Gbps** | 3.0× ↑ |
-| Raw service time @ low load | ~10 ms | **70–110 µs** | 100× ↓ |
-| Raw service time @ ceiling | ~10 ms (flat) | 0.07 ms (P50) / 0.56 ms (P99) | — |
-| Knee 위치 | 21k → 22k (4.9× e2e jump) | **61k → 62k (11.6× e2e jump)** | — |
+| Sustainable ceiling | 61k RPS | **100k RPS** | **1.64× ↑** |
+| Sustainable Gbps   | 3.81 Gbps | **6.24 Gbps** | **1.64× ↑** |
+| Sustainable P99 (e2e) | 0.60 ms | 0.72 ms | 비슷 |
+| Hard ceiling (max wall RPS) | 60.7k (collapses to 42.6k @ 70k) | **118k (graceful @ 130–140k)** | 1.94× ↑ + 무 collapse |
+| Knee 위치 | 61k → 62k (e2e avg 11.6× jump) | 100k → 110k (5.2× jump) | knee가 더 부드러워짐 |
+| 70k offered → wall RPS | **42.6k (collapse)** | **66.7k (정상)** | collapse 완전 제거 |
+| Raw service time @ low load | 70 µs | 70–90 µs | 동일 |
+| Raw service time @ ceiling | 90 µs | 90 µs | 동일 |
 
-**결론**: 이전 측정의 1.29 Gbps / 21k 천장은 **전부 Python client 한계였음**. dpumesh+gateway+service 스택의 실제 sustainable throughput은 약 **3× 높다** (8 KB 메시지 기준).
+**핵심 메시지**:
+1. **Sustainable throughput 1.64× 향상** — 같은 hardware, 같은 protocol stack, 코드 변경만으로 3.81 → 6.24 Gbps.
+2. **70k collapse 완전 제거** — 이전엔 70k에서 시스템이 무너지며 wall RPS가 60k → 43k로 *감소*. 이제 70k는 정상 영역(66.7k 처리), saturation은 ~118k에서 *flat* 으로 부드럽게 cap.
+3. **140k offered까지 안정 동작** — 처리는 못해도 죽지 않음. admission control 패턴이 정상화됨.
+
+## 적용한 변경 (POST)
+
+| 변경 | 위치 | 기여 |
+|---|---|---|
+| **A6** `MAX_PENDING 4096 → 65536` | `dpumesh_doca.c:54` | in-flight 4k+ 시 hash collision 제거 |
+| **로그 정리** (INFO → DBG, hot-path printf 제거) | `dpu_worker.c`, `dpa.c`, `comch_server.c`, `dpumesh_doca.c`, `gateway.c` | stdio mutex contention 제거, 60k+ 호출/sec 절감 |
+| **A4** `nanosleep` polling → `pthread_cond_*` | `dpumesh_doca.c` (slot_cond, fc_cond) | sleep 정밀도 floor 50–100µs 제거, 즉시 wake-up |
+| **A5** epoll thread-pool gateway | `gateway.c` 전체 재작성 | pthread-per-conn (수천) → 32 thread pool + per-worker epoll + SO_REUSEPORT, scheduler thrashing 제거 |
 
 ## 테스트 환경
 
-- 부하 발생기: `tput_client` (Go, stdlib only) — `test-dpumesh.sh throughput <RPS>` 진입점
-  - 연결 수 auto-size: `rps/25` (10 ms 가정 시 4× 헤드룸), max 8192
-  - 모든 conn에 `TCP_NODELAY`, dial 동시성 cap=32
-  - 분리된 dial / run phase, wall-clock 기준 throughput 보고
-  - coordinated-omission 보정 (wrk2-style), nominal-duration 분모 버그 없음
+PRE 측정과 동일:
+- 부하 발생기: `tput_client` (Go), conns auto-size (rps/25), TCP_NODELAY
 - 메시지: 8192 B frame (pad=8124)
-- 경로: `tput_client (rapids4)` ─TCP─► `dpumesh-gateway pod (10.244.0.101)` ─Thrift─► `UniqueIdService pod` ─dpumesh DMA─► downstream pod
-- Network: cni0 (10 Gbps) — 같은 노드 pod-to-pod
+- 경로: rapids4 → cni0 (10 Gbps) → gateway pod → Thrift → UniqueIdService → dpumesh DMA → downstream pod
+- duration 10 s
 
-## 측정 결과
+## POST 측정 결과
 
 | Target RPS | Wall RPS | Gbps | Raw P50 | Raw P99 | E2E P50 | E2E P99 | E2E Avg |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 10k | 9.5k | 0.62 | 0.23 | 0.90 | 0.32 | 1.69 | 0.42 |
-| 20k | 19.0k | 1.25 | 0.08 | 0.61 | 0.13 | 0.75 | 0.22 |
-| 30k | 28.6k | 1.87 | 0.08 | 0.70 | 0.10 | 0.80 | 0.17 |
-| 40k | 38.1k | 2.50 | 0.07 | 0.60 | 0.09 | 0.63 | 0.14 |
-| 50k | 47.6k | 3.12 | 0.07 | 0.59 | 0.09 | 0.62 | 0.13 |
-| 60k | 57.1k | 3.74 | 0.07 | 0.68 | 0.09 | 0.78 | 0.13 |
-| **61k** | **58.1k** | **3.81** | **0.07** | **0.56** | **0.09** | **0.60** | **0.13** |
-| 62k | 59.0k | 3.87 | 0.07 | 30.59 | 0.09 | 34.49 | 1.51 |
-| 63k | 60.0k | 3.93 | 6.56 | 82.86 | 7.82 | 125.40 | 19.04 |
-| 65k | 60.7k | 3.98 | 26.52 | 145.90 | 80.25 | 481.29 | 111.87 |
-| 70k | 42.6k ⚠️ | 2.79 | 51.41 | 267.33 | 3260.91 | 6631.58 | 3218.61 |
+| 10k | 9.5k | 0.62 | 0.17 | 0.77 | 0.34 | 1.64 | 0.46 |
+| 30k | 28.6k | 1.87 | 0.07 | 0.39 | 0.09 | 0.46 | 0.12 |
+| 50k | 47.6k | 3.12 | 0.07 | 0.44 | 0.09 | 0.50 | 0.12 |
+| 70k | 66.7k | 4.37 | 0.08 | 0.51 | 0.10 | 0.54 | 0.12 |
+| 90k | 85.7k | 5.62 | 0.08 | 0.50 | 0.10 | 0.54 | 0.14 |
+| **100k** | **95.2k** | **6.24** | **0.09** | **0.67** | **0.11** | **0.72** | **0.15** |
+| 110k | 104.8k | 6.87 | 0.10 | 21.88 | 0.12 | 22.45 | 0.78 |
+| 120k | 114.0k | 7.47 | 0.37 | 46.61 | 0.39 | 146.61 | 11.05 |
+| 130k | 118.1k | 7.74 | 35.14 | 55.59 | 67.14 | 1306.96 | 197.88 |
+| 140k | 118.1k | 7.74 | 43.95 | 60.72 | 525.08 | 2316.84 | 678.60 |
 
-⚠️ 70k에서 **wall-clock RPS가 오히려 떨어짐** (60k → 43k) — server 포화 후 queue overflow로 인한 collapse.
-
-(단위: latency = ms)
+(latency 단위 = ms)
 
 ## 주요 관찰
 
-### 1. Hockey stick이 매우 sharp
-- 60k → 61k → **62k** 경계에서 P99가 0.78 → 0.60 → **34.49 ms** (57× jump)
-- E2E avg는 0.13 → 0.13 → **1.51 ms** (11.6× jump)
-- 즉 ceiling 직전까지 거의 평탄, 이후 **단 1k RPS 차이로 saturation 진입**. 시스템이 ceiling 부근에서 매우 "급격하게" 무너짐 (gradual degradation 없음).
+### 1. Sustainable ceiling 100k / 6.24 Gbps (P99 < 1 ms)
+- 100k까지 P99 e2e ≤ 0.72 ms, raw P99 ≤ 0.67 ms 유지
+- 이전(PRE) 61k 대비 **1.64×**
+- `cni0` 10 Gbps의 62% 점유
 
-### 2. 65k에서 wall-clock RPS는 60.7k로 멈춤
-- offered가 60k → 65k로 늘어도 **실제로 처리되는 RPS는 ~60k에 capped**.
-- 추가 5k는 전부 큐에서 대기 → P99 481 ms로 누적
-- 즉 **server-side 진짜 throughput 천장 ≈ 60–61k RPS / 3.8–4.0 Gbps**
+### 2. Hockey-stick은 여전히 sharp (100k → 110k)
+- e2e avg 0.15 → 0.78 ms (5.2× jump)
+- e2e P99 0.72 → 22.45 ms (31× jump)
+- P50은 0.11 → 0.12 ms로 거의 변화 없음 — **분포가 bimodal**: 대부분 빠르게 처리되고 일부가 큐잉
+- PRE 동일 패턴 (62k에서 같은 모양) — 즉 **bottleneck 종류는 그대로, 단지 한계가 위로 이동**
 
-### 3. 70k에서 시스템 collapse
-- offered 70k → wall RPS **42.6k** 로 감소 (60k도 못 받음)
-- corrected avg latency 3.2 초, max 7.7 초
-- "throughput-decreasing-with-load" 패턴 — admission control 부재의 신호.
-- 자세한 메커니즘 체인 분석은 §70k Collapse 메커니즘 분석 참조.
+### 3. Hard ceiling은 ~118k wall RPS (= 7.74 Gbps)
+- 120k → 114k wall, 130k → 118.05k, 140k → 118.13k — 사실상 평탄
+- offered가 더 늘어도 throughput은 **flat cap**, latency만 큐잉으로 폭증
+- 이전 PRE의 collapse(throughput 감소)와 다른 패턴 — **정상 saturation**
 
-### 4. Raw service time이 sub-ms 영역
-- 50k RPS에서 raw P50 = 0.07 ms = **70 µs** — 이전 Python 측정에서 본 "10 ms 평탄선"이 무엇이었는지 확정:
-  - **GIL + 256 thread context switch + sleep 정밀도 + bandwidth calc 버그의 합성**
-- 진짜 서버 처리 비용은 서브-ms 단위. 즉 dpumesh DMA path는 대부분의 시간을 microseconds로 통과.
+### 4. Collapse 완전 제거 (가장 중요한 정성적 변화)
+| Offered | PRE wall | POST wall | 차이 |
+|---:|---:|---:|---|
+| 65k | 60.7k | (측정 안 함) | — |
+| **70k** | **42.6k (collapse)** | **66.7k (정상)** | +56% |
+| 130k | (측정 안 함) | 118.1k | — |
+| 140k | (측정 안 함) | 118.1k | — |
 
-### 5. 클라이언트가 천장이 아니다 (확실)
-- 61k * 8192 * 8 / 1e9 ≈ 4.0 Gbps — cni0 10 Gbps의 38%
-- conns = 2440 (auto), max 8192까지 여유
-- per-conn RPS = 25 (auto-size 헤드룸 기준), 0.07 ms 서비스타임 기준 conn당 14k RPS 가능 → **per-conn 활용률 0.2%**
-- dial이 1 초대 (2400+ socket 동시 establish)지만 schedule은 base+500ms 후 시작이라 측정엔 영향 없음
-- 즉 이 ceiling은 **server-side 한계**가 맞음.
+이전 collapse 메커니즘 체인 (PE thread starvation → fc-wait nanosleep 폭주 → ring_lock convoy → MAX_PENDING collision)이 다음과 같이 차단됨:
+- **PE thread starvation**: 워커 수가 ∞ → 32로 줄어 PE thread CPU share 회복 (1.3% → 12.5%)
+- **fc-wait 폭주**: nanosleep polling → cond_var, 대기 시 CPU 안 씀 + 즉시 wake
+- **MAX_PENDING collision**: 4096 → 65536, in-flight 60k 미만에서 충돌 거의 없음
 
-## 70k Collapse 메커니즘 분석
+### 5. Raw service time은 동일 (70–90 µs)
+PRE/POST 모두 ceiling까지 raw service time은 ~70–90 µs로 같음. 즉 **per-request 처리 비용은 변하지 않음**. 변한 건 **얼마나 많은 동시 요청을 처리할 수 있는가** (throughput).
 
-`offered RPS↑` 인데 `wall RPS↓` 가 발생하는 건 단순 saturation이 아니라 여러 feedback loop가 임계점에서 동시에 트립되는 패턴. Little's law로 in-flight 추정:
+이는 다음을 의미함: dpumesh DMA path 자체는 빠르고, 우리가 푼 건 *동시성 처리 path*. 다음 단계도 같은 방향(더 많은 동시 처리).
 
-| Offered | Wall RPS | E2E avg | In-flight (≈ wall × avg) |
-|---:|---:|---:|---:|
-| 60k | 57.1k | 0.13 ms | ~7 |
-| 61k | 58.1k | 0.13 ms | ~8 |
-| 62k | 59.0k | 1.51 ms | ~89 |
-| 63k | 60.0k | 19.0 ms | ~1,140 |
-| 65k | 60.7k | 112 ms | ~6,800 |
-| **70k** | **42.6k** | **3,219 ms** | **~137,000** |
+## 새 ceiling 분석 — 6.24 Gbps는 어디서 막히는가?
 
-61k → 62k 사이에서 in-flight가 8 → 89로 11×, 65k → 70k 사이에서 6.8k → 137k로 20× — 임계점 한참 넘어선 영역.
+### 후보 1: `ring_lock` 단일 mutex (가장 유력)
+`dpumesh_doca.c:73` 의 `pthread_mutex_t ring_lock` 이 모든 enqueue 직렬화. POST에서 32 워커 × 평균 100 µs critical section = 32 × 10k RPS/worker = 320k RPS 이론 상한, 그러나 **mutex 자체의 lock/unlock 비용 + cache ping-pong** 이 ms 수준 누적. 100k 부근에서 lock contention이 첫 병목으로 등장한다고 보면 정확히 들어맞음.
+- 다음 단계: **A2 (ring 샤딩)** — ring을 N개로 쪼개서 thread→ring 매핑
 
-### 가설 1 — PE thread starvation (가장 유력)
+### 후보 2: cni0 / TCP 경로 한계
+- 10 Gbps cni0의 77% (7.74 Gbps) 도달 — TCP overhead, kernel iptables/conntrack, veth pair processing 비용이 점차 무시 못할 영역
+- 8 KB × 118k = 7.74 Gbps 단방향, response까지 합치면 PCIe/NIC 대역 추가 사용
+- 특히 small packet (8KB) PPS = 240k pps — kernel softirq budget 한계 가능성
 
-`dpumesh_doca.c:133` 의 `pe_progress_fn` 은 **busy-spin 일반 pthread** (코어 핀도, RT priority도 없음). 이 스레드가 `TX_ACK 수신 → fc_tx_last_consumer_tail 업데이트 → 호스트 enqueue 재개` 의 책임을 짐.
+### 후보 3: Linear scan in `tx_alloc` (`dpumesh_doca.c:786`)
+1024개 비트맵 linear scan이 여전히 global `slot_lock` 안에 있음. 100k RPS × 평균 100 entries scan = 10M scan/sec. cache hit이긴 하지만 mutex 보유 시간을 늘림.
+- 다음 단계: **A3 (freelist)** — O(1) pop/push
 
-- 70k 시 gateway는 conn당 1 thread = **2800 worker threads**, 모두 active
-- PE thread CPU share = 36 코어 / 2800 thread ≈ **1.3 %**
-- comch progress 빈도 ↓ → fc window 복구 ↓ → 워커들이 `nanosleep(10µs→1ms)` 루프 (line 867-893) 에 더 오래 머묾
-- 워커들이 더 오래 머물수록 PE 스레드는 더 starved → **양성 피드백**
+### 후보 4: DPU 측 처리 (PE thread, comp queue, DPA)
+DPU 측 single PE thread + DPA가 처리할 수 있는 한계. 8 KB DMA 한 번 = ~2-3 µs HW, 100k × 3 µs = 300 ms/sec wall-clock으로 가능. 그러나 SW overhead까지 포함하면 빡빡할 수 있음.
+- 검증법: DPU process top — `top -H -p $(pgrep dpumesh_dpu)` 단일 thread CPU 100% 인지
 
-### 가설 2 — MAX_PENDING (4096) 해시 collision
+## 다음 단계 — 10–15 Gbps 목표
 
-`dpumesh_doca.c:52, 174` `idx = req_id % MAX_PENDING`:
-- 65k: in-flight ≈ 6,800 → 평균 collision 1.7×
-- 70k: in-flight ≈ 137,000 → 평균 collision **33×**
-- collision 시 `state != 0` 슬롯 덮어쓰기 → 응답 미스라우팅, 슬롯 누수
-- 누수 슬롯은 30s timeout까지 잠금 → slot pool 고갈 가속화
+이전 분석의 우선순위 갱신:
 
-### 가설 3 — `ring_lock` mutex convoy
+| # | 변경 | 예상 추가 ceiling | 누적 추정 |
+|---|---|---:|---:|
+| 1 | **A2** ring_lock 샤딩 (ring N개) | +50–80% | **9–11 Gbps** |
+| 2 | A3 slot freelist (O(1)) | +10–15% | 10–12 Gbps |
+| 3 | B1 zero-copy memcpy 제거 (gateway) | +5–10% | 11–13 Gbps |
+| 4 | B5 TCP 커널 buffer 튜닝 + `SO_RCVBUF/SNDBUF` | +5% | 11–13 Gbps |
+| 5 | DPU 측 PE thread split / pinning | 검증 필요 | — |
+| 6 | C1 fc state atomic화 | 안정성 개선 | — |
 
-`dpumesh_doca.c:852` 의 단일 mutex 가 모든 enqueue 직렬화. 2800 워커 동시 경쟁 시:
-- lock holder가 critical section 내 preempt → 모든 대기자 block
-- holder 깨어나서 unlock → futex wakeup → fairness 없음 → cache-hot thread가 또 잡음
-- **lock 처리량 50%+ 감소** (Linux mutex의 알려진 convoy state)
+**A2가 가장 큰 leverage** — 100k 부근에서 ring_lock contention이 dominant라는 가설이 맞다면 +60% 이상 가능. 코드 변경 범위는 dpumesh_doca.c 안에서 끝남 (3-4일 작업).
 
-### 가설 4 — DPU comp queue 항상 HIGH watermark
-`object.h:81-82` `COMP_QUEUE_BP_HIGH = 3072` (75%). 70k에서 항상 75% 위 → DPA가 새 DMA 거부 → 호스트 워커들이 fc_wait → 가설 1 가속.
+만약 A2 적용 후 ceiling이 9 Gbps에 머문다면 cni0 10 Gbps 한계에 임박 — 그 시점에 **메시지 크기 sweep** 으로 RPS-bound vs bandwidth-bound 구분 필요. 예를 들어 32 KB 메시지로 가면 cni0 한계가 RPS 60k 부근으로 내려가서 dpumesh의 다른 한계가 보일 것.
 
-### 가설 5 — TCP zero-window backpressure
-Gateway의 `pthread-per-conn` + `recv()` 직렬 처리. 일부 conn의 커널 recv buffer (~87 KB / 8 KB = 11개) 차면 zero-window 광고 → 클라이언트 200 ms+ stall. 누적되면 throughput hit.
+## 70k Collapse는 왜 사라졌는가 — 메커니즘 검증
 
-### 가설 6 — `printf` per-request stdio lock
-`gateway.c:162, 218` 매 요청마다 `printf` → stdio 내부 mutex. 60k+ 호출 / sec 가 다른 병목과 합쳐져 cliff 형성에 기여.
+이전 보고서의 [70k Collapse 메커니즘 분석] 가설 6가지에 대한 사후 검증:
 
-### Composite 시나리오 (가장 유력)
-
-```
-offered 70k
-  → in-flight 폭증 (Little's law)
-  → 워커 2800 동시 active
-  → PE 스레드 CPU share 떨어짐                  [가설 1]
-  → fc_tx_last_consumer_tail 업데이트 stall
-  → 워커들 nanosleep retry 루프에 갇힘
-  → ring_lock 더 오래 잡힘 / convoy             [가설 3]
-  → MAX_PENDING collision (in-flight > 4096)    [가설 2]
-  → 슬롯 누수 + 응답 미스라우팅
-  → 더 많은 워커가 timeout/retry 경로
-  → PE 스레드 CPU 더 부족
-  → 무한 루프
-```
-
-이건 **admission control 부재** + **single-threaded PE driver** 조합으로 발생하는 전형적 패턴.
-
-### 검증 방법
-
-| 방법 | 가설 | 비용 |
+| 가설 | 차단 변경 | 검증 |
 |---|---|---|
-| `top -H -p $(pgrep gateway)` 실시간 관찰 (PE thread CPU%) | 1 | 30 초 |
-| Gateway 로그에서 `"OP_RESPONSE for req_id=X but no waiter"` 카운트 | 2 | 0 (기존 로그) |
-| Gateway 로그에서 `"DPU buffer full after N retries"` 카운트 | 4 | 0 |
-| `MAX_PENDING 4096 → 65536` rebuild 후 70k 재측정 | 2 | 20 분 |
-| PE thread `pthread_setaffinity_np` + `SCHED_FIFO` 후 70k 재측정 | 1 | 30 분 |
+| 1. PE thread starvation | A5 (워커 수 ∞ → 32) + 로그 정리 | ✓ 70k 정상 동작 |
+| 2. MAX_PENDING collision | A6 (4096 → 65536) | ✓ 100k까지 collision 없음 (in-flight ≈ 14, 4096 한참 아래) |
+| 3. ring_lock convoy | A4 cond_var (lock hold 시간 단축) + 로그 제거 | △ 일부 완화, 여전히 단일 mutex (다음 단계) |
+| 4. DPU comp queue saturation | (직접 변경 없음) | ✓ 100k까지 여유 (in-flight 14 << 4096) |
+| 5. TCP zero-window | A5 epoll + TCP_NODELAY | ✓ 워커당 fewer conns, recv buffer 빠르게 drain |
+| 6. printf stdio lock | 핫패스 printf/INFO 제거 | ✓ 직접 제거됨 |
 
-가장 cheap한 첫 신호는 `top -H` — PE thread CPU가 거의 0%면 가설 1 확정.
+가설 1, 2, 5, 6은 직접 차단됨. 가설 3은 부분 완화 (다음 단계 A2가 완전 해결). 가설 4는 본질 변경 없으나 throughput 증가에도 한계 안 닿음.
 
-## 병목 가설 — 3.8 Gbps는 어디서 막히는가?
-
-여전히 미분리 영역:
-
-1. **dpumesh transport 자체** (host→DPU→host DMA path)
-   - DMA_RING_SIZE=1024, DPU_BUFFER_SIZE=8MB, num_slots=1024 (host TX pool)
-   - Slot turnover at 60k RPS = 60000 slots/s 회전 → slot lifetime 17 ms 평균. 1024 slots / 17ms = 60k. **숫자가 맞아떨어진다는 게 의심스러움.**
-2. **Gateway pod**
-   - `pthread-per-connection` 모델, 2400+ threads → context switch 압박 가능성
-   - 매 요청마다 `printf` (gateway.c:162, 218) — stdout I/O 직렬화
-   - `dpumesh_tx_alloc` linear bitmap scan O(num_slots=1024) under global lock
-3. **UniqueIdService 애플리케이션 로직**
-   - C++ Thrift handler, 8 KB carrier map 파싱+직렬화
-4. **Go 클라이언트 GC** (영향 작을 가능성 높지만 확정 못함)
-   - per-request body alloc, 60k RPS × 8 KB = 500 MB/s allocation
-   - max latency 14–30 ms 가끔 튀는 건 GC pause 가능성
-5. **TCP 경로 (cni0 + veth)**
-   - 10 Gbps이지만 small packet 다발이라 PPS limit 가능성
-   - 60k pps in + 60k pps out × 2 (req/resp) = 240k pps — 일반적으론 문제 없는 수준
-
-순위로 1, 2번이 가장 의심스러움. 1번 확인은 코드 instrumentation, 2번은 gateway 측 측정 필요.
-
-## 추가 검증 실험 — 다음 단계
-
-원래 계획(다음 우선순위 정리):
-
-1. **Buffer/lock 계측 (최우선)** — 4개 atomic counter:
-   - `tx_alloc_retry_total` (slot pool 고갈 빈도)
-   - `fc_wait_retry_total` (DPU RX buffer flow-control 대기 빈도)
-   - `ring_wait_retry_total` (DMA ring 고갈)
-   - `ring_lock_wait_ns_total` (단일 mutex contention)
-
-   첫 측정 후 어느 layer가 진짜 gate인지 1회 결정 가능.
-
-2. **No-op Thrift method** — 애플리케이션 로직 기여분 분리. UniqueIdService.ComposeUniqueId 대신 즉시 echo/return하는 method 추가.
-
-3. **Gateway 배제** — dpumesh client API를 직접 호출하는 binary로 TCP+gateway 기여분 제거.
-
-4. **Message size sweep** — 128B / 1KB / 8KB / 64KB. RPS-bound vs bandwidth-bound 분리:
-   - 작은 msg에서 RPS가 더 높이 가면 → per-op 비용이 한계 (slot/lock)
-   - RPS 동일하고 bandwidth만 늘면 → DMA/network 한계
-
-5. **Buffer 크기 sweep** — `DMA_RING_SIZE 1024→4096`, `num_slots 1024→4096`, `DPU_BUFFER_SIZE 8MB→32MB`. 1번 instrumentation에서 gate가 확인된 buffer만 키우면 효과 판별 가능.
-
-6. **70k collapse 분석** — 왜 offered↑일 때 actual↓ 되는지. `pthread`-per-conn에 admission control 추가하거나 `epoll` 기반 gateway로 재작성 검토.
+→ **가설 1+5+6의 합성효과가 collapse의 근원이었음**이 데이터로 확인됨. PE starvation을 단독으로 명시 검증(가설 1) 한 건 아니지만, 그 외 모든 가설이 차단되거나 무관함이 확인되어 가설 1이 정황적으로 강하게 지지됨.
 
 ## 생성된 그래프
 
-- `throughput_bps.png` — Throughput–latency 곡선 (Go client, hockey stick + collapse 점)
-- `latency_vs_rps.png` — Service time vs end-to-end percentile sweep, collapse zone 표시
-- `throughput_vs_latency.png` — Dual-axis (Gbps + P99 latency)
-- `queueing_gap.png` — End-to-end latency = service time + schedule wait 분해
+- `throughput_bps.png` — Throughput–latency hockey stick, **PRE/POST overlay**, 두 ceiling marker
+- `latency_vs_rps.png` — Service time/end-to-end percentile, PRE collapse zone vs POST overdrive zone 시각화
+- `throughput_vs_latency.png` — Wall RPS vs offered (left) + P99 (right) — **collapse vs graceful saturation의 가장 직접적 시각화**
+- `queueing_gap.png` — POST end-to-end 분해 (service time + schedule wait)
 
-모든 그래프는 wall-clock 기준 throughput 사용 (tput_client가 nominal-duration 분모 버그 없이 직접 산출).
-
-## Appendix — 이전 측정과의 차이가 어디서 왔는가
-
-이전 보고서가 보고한 숫자가 왜 그렇게 낮았는지 추적:
-
-| 원인 | 영향 |
-|---|---|
-| Python GIL + 256 threads | thread당 ~100µs context switch overhead × N → 전체 latency floor 형성 |
-| `time.sleep` ≥ 50µs 정밀도 | 47.6 µs interval 스케줄링 미세 어긋남 → backlog |
-| 256 thread × sync send/recv = Little's Law 25.6k RPS 천장 | 21k 측정 상한이 정확히 이 영역 |
-| `actual_rps = ok_count / nominal_dur` (wall-clock 무시) | 30k에서 1.97 Gbps로 부풀려진 보고 |
-| Python 인터프리터 자체 비용 (`struct.pack`, `socket.recv`, list append 등 GIL hold) | raw service time을 ms 단위로 inflate |
-
-이 합성 효과가 "10 ms 평탄선"이라는 잘못된 신호로 보였고, 그것을 dpumesh의 한계로 오해했음. 새 client는 이 다섯 가지를 전부 제거한 결과 진짜 server-side 천장(61k / 3.8 Gbps)이 드러남.
+모두 wall-clock 기준 throughput.

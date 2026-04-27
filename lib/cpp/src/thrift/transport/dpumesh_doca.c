@@ -48,8 +48,11 @@ static void cleanup_ctx(struct dpumesh_ctx *ctx);
 /* RX queue capacity */
 #define RX_QUEUE_SIZE 512
 
-/* Pending response table for client-side request/response matching */
-#define MAX_PENDING 4096
+/* Pending response table for client-side request/response matching.
+ * Indexed by req_id % MAX_PENDING. Must exceed expected in-flight requests
+ * to avoid hash collisions. Pure software array (host RAM only — no HW limit).
+ * 65536 entries × ~200B = ~13 MB. */
+#define MAX_PENDING 65536
 
 typedef struct {
     pthread_mutex_t lock;
@@ -71,6 +74,7 @@ struct dpumesh_ctx {
     void *dma_buffer;          /* Host TX buffer (PCI mmap, CPU→DPU source) */
     struct dma_ring *dma_ring;
     pthread_mutex_t ring_lock;  /* Serializes get_next_dma_desc + descriptor fill + valid=1 */
+    pthread_cond_t  fc_cond;    /* Signaled when fc_tx_last_consumer_tail advances (PE thread) */
     doca_dpa_dev_mmap_t dpa_mmap_handle;  /* DPA handle for local mmap (used in TX descriptors) */
 
     /* Host RX buffer (PCI mmap, DPU→CPU destination) */
@@ -92,6 +96,7 @@ struct dpumesh_ctx {
     /* TX slot management */
     uint8_t *slot_bitmap;
     pthread_mutex_t slot_lock;
+    pthread_cond_t  slot_cond;  /* Signaled when a TX slot is freed */
 
     /* RX buffer pool (independent from TX) */
     void *rx_buffer;
@@ -354,9 +359,14 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
 
         /* Refresh flow-control window from piggybacked tail. Ignore bogus
          * values (first ACK before any real consumption may still be 0
-         * which is fine; only guard against out-of-range). */
-        if (ack.consumer_tail < DPU_BUFFER_SIZE)
+         * which is fine; only guard against out-of-range).
+         * Wake any enqueue waiter blocked in the fc-wait loop on ring_lock. */
+        if (ack.consumer_tail < DPU_BUFFER_SIZE) {
+            pthread_mutex_lock(&ctx->ring_lock);
             ctx->fc_tx_last_consumer_tail = ack.consumer_tail;
+            pthread_cond_broadcast(&ctx->fc_cond);
+            pthread_mutex_unlock(&ctx->ring_lock);
+        }
 
         uint32_t idx = ack.req_id % MAX_PENDING;
         dpumesh_pending_t *p = &ctx->pending[idx];
@@ -375,7 +385,7 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         }
         pthread_mutex_unlock(&p->lock);
 
-        DOCA_LOG_INFO("TX_ACK: freed TX slot for req_id=%u tail=%u", ack.req_id, ack.consumer_tail);
+        DOCA_LOG_DBG("TX_ACK: freed TX slot for req_id=%u tail=%u", ack.req_id, ack.consumer_tail);
         return;
     }
 
@@ -409,9 +419,14 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
 
         /* Update flow control: DPU told us how much of our TX buffer it consumed.
          * Ignore values >= DPU_BUFFER_SIZE — the DPU's first response may
-         * piggyback an uninitialized rx_consumer_tail before any data is consumed. */
-        if (hdr->consumer_tail < DPU_BUFFER_SIZE)
+         * piggyback an uninitialized rx_consumer_tail before any data is consumed.
+         * Wake enqueue waiters blocked on fc_cond. */
+        if (hdr->consumer_tail < DPU_BUFFER_SIZE) {
+            pthread_mutex_lock(&ctx->ring_lock);
             ctx->fc_tx_last_consumer_tail = hdr->consumer_tail;
+            pthread_cond_broadcast(&ctx->fc_cond);
+            pthread_mutex_unlock(&ctx->ring_lock);
+        }
 
         /* Snapshot the old tail BEFORE advancing — we need it to detect a gap
          * caused by a lost comch DMA_COMPLETION. The DPU writes reverse-DMA
@@ -450,16 +465,16 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         if (ctx->fc_rx_consumer_tail >= (uint32_t)ctx->rx_dma_buf_size)
             ctx->fc_rx_consumer_tail = 0;
 
-        DOCA_LOG_INFO("DMA_COMPLETION: pos=%u len=%u fc_tail=%u new_rx_tail=%u",
-                      pos, dma_len, hdr->consumer_tail, ctx->fc_rx_consumer_tail);
+        DOCA_LOG_DBG("DMA_COMPLETION: pos=%u len=%u fc_tail=%u new_rx_tail=%u",
+                     pos, dma_len, hdr->consumer_tail, ctx->fc_rx_consumer_tail);
         return;
     }
 
     /* === Legacy comch data path (DMESH_MSG_RX_DATA) === */
     const struct dmesh_rx_data_msg *msg = (const struct dmesh_rx_data_msg *)data;
 
-    DOCA_LOG_INFO("rx_data_hook ENTER: len=%u body_len=%u sizeof_hdr=%zu",
-                  len, msg->body_len, sizeof(struct dmesh_rx_data_msg));
+    DOCA_LOG_DBG("rx_data_hook ENTER: len=%u body_len=%u sizeof_hdr=%zu",
+                 len, msg->body_len, sizeof(struct dmesh_rx_data_msg));
 
     uint32_t expected = (uint32_t)sizeof(struct dmesh_rx_data_msg) + msg->body_len;
     if (len < expected) {
@@ -480,9 +495,9 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
     memcpy(&desc, msg->desc, sizeof(desc));
     desc.body_buf_slot = slot;
 
-    DOCA_LOG_INFO("rx_data_hook DESC: req_id=%u flags=0x%x dst_pod=%d src_pod=%d slot=%d body_len=%u",
-                  desc.req_id, (unsigned)(uint8_t)desc.flags, desc.dst_pod_id, desc.src_pod_id,
-                  slot, desc.body_len);
+    DOCA_LOG_DBG("rx_data_hook DESC: req_id=%u flags=0x%x dst_pod=%d src_pod=%d slot=%d body_len=%u",
+                 desc.req_id, (unsigned)(uint8_t)desc.flags, desc.dst_pod_id, desc.src_pod_id,
+                 slot, desc.body_len);
 
     rx_deliver_desc(ctx, &desc, slot);
 }
@@ -626,7 +641,9 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     ctx->slot_bitmap = (uint8_t *)calloc(ctx->num_slots, 1);
     if (!ctx->slot_bitmap) goto fail;
     pthread_mutex_init(&ctx->slot_lock, NULL);
+    pthread_cond_init(&ctx->slot_cond, NULL);
     pthread_mutex_init(&ctx->ring_lock, NULL);
+    pthread_cond_init(&ctx->fc_cond, NULL);
 
     /* rx_buffer is the STAGING area for delivered messages — must be separate
      * from rx_dma_buffer (the DMA landing zone). If they share memory, the
@@ -727,7 +744,9 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
 
     cleanup_objects(&ctx->doca_objs);
 
+    pthread_cond_destroy(&ctx->fc_cond);
     pthread_mutex_destroy(&ctx->ring_lock);
+    pthread_cond_destroy(&ctx->slot_cond);
     pthread_mutex_destroy(&ctx->slot_lock);
     if (ctx->slot_bitmap) free(ctx->slot_bitmap);
 
@@ -780,11 +799,11 @@ static int reclaim_ring_tx_slots(dpumesh_ctx_t *ctx) {
 }
 
 int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
-    const int max_retry = 1000;
-    struct timespec backoff = {0, 10000}; /* 10us initial */
+    /* Total wait budget = max_retry × cond_timeout_ns ≈ 5 s before failing. */
+    const int max_retry = 5000;
 
+    pthread_mutex_lock(&ctx->slot_lock);
     for (int retry = 0; retry < max_retry; retry++) {
-        pthread_mutex_lock(&ctx->slot_lock);
         for (int i = 0; i < ctx->num_slots; i++) {
             if (ctx->slot_bitmap[i] == 0) {
                 ctx->slot_bitmap[i] = 1;
@@ -798,14 +817,23 @@ int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
          * the deadlock: tx_alloc waits for free slots, but slots are
          * only freed inside dpumesh_enqueue which can't run until
          * tx_alloc returns. */
-        if (reclaim_ring_tx_slots(ctx) > 0)
-            continue;  /* freed some — retry immediately */
+        int reclaimed = reclaim_ring_tx_slots(ctx);
+        pthread_mutex_lock(&ctx->slot_lock);
+        if (reclaimed > 0)
+            continue;  /* freed some — retry scan */
 
-        if (retry == 0) continue;  /* first miss: immediate retry */
-        nanosleep(&backoff, NULL);
-        if (backoff.tv_nsec < 1000000)  /* cap at 1ms */
-            backoff.tv_nsec *= 2;
+        /* Wait for tx_free to signal, with 1ms timeout as backstop.
+         * cond_timedwait atomically unlocks + waits + relocks. */
+        struct timespec abs_ts;
+        clock_gettime(CLOCK_REALTIME, &abs_ts);
+        abs_ts.tv_nsec += 1000000;  /* 1 ms */
+        if (abs_ts.tv_nsec >= 1000000000) {
+            abs_ts.tv_nsec -= 1000000000;
+            abs_ts.tv_sec += 1;
+        }
+        pthread_cond_timedwait(&ctx->slot_cond, &ctx->slot_lock, &abs_ts);
     }
+    pthread_mutex_unlock(&ctx->slot_lock);
     DOCA_LOG_ERR("TX alloc failed: all %d slots busy after %d retries", ctx->num_slots, max_retry);
     return -1;
 }
@@ -823,6 +851,7 @@ void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
     /* Flow control ensures no stale read — no memset needed */
     pthread_mutex_lock(&ctx->slot_lock);
     ctx->slot_bitmap[slot] = 0;
+    pthread_cond_signal(&ctx->slot_cond);
     pthread_mutex_unlock(&ctx->slot_lock);
 }
 
@@ -855,14 +884,19 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
      * fc_tx_producer_head mirrors the DPA's pos[ring_idx] advancement.
      * fc_tx_last_consumer_tail is piggybacked from DPU via reverse DMA fc_header.
      * Without this check, the DPA overwrites unconsumed data in the DPU buffer
-     * under high load, causing data corruption or silent drops. */
+     * under high load, causing data corruption or silent drops.
+     *
+     * Wait strategy: pthread_cond_timedwait on fc_cond — PE thread broadcasts
+     * after every TX_ACK / reverse-DMA fc_header parse. cond_timedwait atomically
+     * releases ring_lock and reacquires after wakeup, eliminating the busy-poll
+     * cost of nanosleep (which has a ~50µs Linux precision floor) and giving
+     * immediate wake-up when the DPU consumes data. */
     {
         uint32_t dma_size = (uint32_t)(sizeof(struct fc_header) + desc->body_len);
         uint32_t padded_len = (dma_size + 127) & ~(uint32_t)127;
         uint32_t buf_size = DPU_BUFFER_SIZE;
         int fc_retry = 0;
         const int max_fc_retry = 10000;
-        struct timespec fc_backoff = {0, 10000}; /* 10µs initial */
 
         while (1) {
             uint32_t head = ctx->fc_tx_producer_head;
@@ -885,11 +919,16 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
                              max_fc_retry, head, tail, padded_len, available);
                 return -1;
             }
-            /* Release lock while waiting — PE thread updates fc_tx_last_consumer_tail */
-            pthread_mutex_unlock(&ctx->ring_lock);
-            nanosleep(&fc_backoff, NULL);
-            if (fc_backoff.tv_nsec < 1000000) fc_backoff.tv_nsec *= 2;
-            pthread_mutex_lock(&ctx->ring_lock);
+
+            /* 1ms timeout as backstop in case a TX_ACK is genuinely delayed. */
+            struct timespec abs_ts;
+            clock_gettime(CLOCK_REALTIME, &abs_ts);
+            abs_ts.tv_nsec += 1000000;
+            if (abs_ts.tv_nsec >= 1000000000) {
+                abs_ts.tv_nsec -= 1000000000;
+                abs_ts.tv_sec += 1;
+            }
+            pthread_cond_timedwait(&ctx->fc_cond, &ctx->ring_lock, &abs_ts);
         }
     }
 
