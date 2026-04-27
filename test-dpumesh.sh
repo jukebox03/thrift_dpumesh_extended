@@ -513,10 +513,28 @@ run_test() {
     fi
 }
 
-### wrk2-style throughput 테스트 ###
+### wrk2-style throughput 테스트 (Go client) ###
+build_tput_client() {
+    if [ ! -f "$PROJ_ROOT/tput_client" ] || \
+       [ "$PROJ_ROOT/tput_client.go" -nt "$PROJ_ROOT/tput_client" ]; then
+        info "Building tput_client (Go)..."
+        if ! command -v go >/dev/null 2>&1; then
+            err "go not found in PATH (need Go 1.21+)"
+            return 1
+        fi
+        (cd "$PROJ_ROOT" && go build -o tput_client tput_client.go) || {
+            err "go build failed"
+            return 1
+        }
+    fi
+    return 0
+}
+
 run_throughput_test() {
-    step "=== Running Throughput Test (wrk2-style) ==="
+    step "=== Running Throughput Test (Go client) ==="
     sleep 3
+
+    build_tput_client || return 1
 
     local gw_ip
     gw_ip=$(kubectl get pod -n "$NS" -l app=dpumesh-gateway -o jsonpath='{.items[0].status.podIP}' 2>/dev/null || true)
@@ -528,21 +546,18 @@ run_throughput_test() {
 
     local rps="${1:-100}"
     local duration="${2:-10}"
-    local msg_size="${3:-}"
-    local threads="${4:-}"
+    local msg_size="${3:-8192}"
+    local conns="${4:-0}"
 
-    info "Gateway IP: $gw_ip:$GATEWAY_PORT"
-    info "Throughput test: ${rps} RPS, ${duration}s duration"
-    [ -n "$msg_size" ] && info "Message size: $msg_size"
+    info "Gateway: $gw_ip:$GATEWAY_PORT  RPS=$rps  duration=${duration}s  msg=${msg_size}B  conns=${conns} (0=auto)"
 
-    if [ -f "$PROJ_ROOT/test_thrift.py" ]; then
-        local cmd="python3 $PROJ_ROOT/test_thrift.py $gw_ip $GATEWAY_PORT throughput $rps $duration"
-        [ -n "$msg_size" ] && cmd="$cmd $msg_size"
-        [ -n "$threads" ] && cmd="$cmd $threads"
-        $cmd
-    else
-        warn "test_thrift.py not found, skipping"
-    fi
+    "$PROJ_ROOT/tput_client" \
+        -host="$gw_ip" \
+        -port="$GATEWAY_PORT" \
+        -rps="$rps" \
+        -duration="$duration" \
+        -msg-size="$msg_size" \
+        -conns="$conns"
 }
 
 ### 고부하 스트레스 테스트 ###
@@ -751,7 +766,7 @@ case "$CMD" in
         echo "  test     - test_thrift.py 실행"
         echo "  test-size - DMA 사이즈 경계 테스트 (59~1024B)"
         echo "  stress [T] [N] [SIZE] - 고부하 스트레스 테스트 (T스레드 x N요청, SIZE=메시지크기 예: 8K,128K)"
-        echo "  throughput [RPS] [DUR] [SIZE] [T] - wrk2-style 정률 부하 테스트 (coordinated omission 보정)"
+        echo "  throughput [RPS] [DUR] [SIZE] [CONNS] - wrk2-style 정률 부하 테스트 (Go client; CONNS=0 → auto-size)"
         echo "  logs     - DPU + pod 로그 확인"
         echo "  status   - 전체 상태 확인"
         echo "  dpu-log  - DPU 로그 실시간 follow"
