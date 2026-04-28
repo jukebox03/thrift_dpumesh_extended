@@ -1,151 +1,128 @@
-# dpumesh Throughput 측정 분석 (POST optimization)
+# dpumesh Throughput 측정 분석 — Service-side end-node ACK guarantee
 
-## 핵심 결과 요약
+Forward path (gateway → service → gateway) 측정. Transport 라이브러리에만 손대고
+service binary나 Thrift 서버 종류는 그대로.
 
-| | PRE (Go client only) | **POST (A4+A5+A6 적용)** | 변화 |
-|---|---:|---:|---:|
-| Sustainable ceiling | 61k RPS | **100k RPS** | **1.64× ↑** |
-| Sustainable Gbps   | 3.81 Gbps | **6.24 Gbps** | **1.64× ↑** |
-| Sustainable P99 (e2e) | 0.60 ms | 0.72 ms | 비슷 |
-| Hard ceiling (max wall RPS) | 60.7k (collapses to 42.6k @ 70k) | **118k (graceful @ 130–140k)** | 1.94× ↑ + 무 collapse |
-| Knee 위치 | 61k → 62k (e2e avg 11.6× jump) | 100k → 110k (5.2× jump) | knee가 더 부드러워짐 |
-| 70k offered → wall RPS | **42.6k (collapse)** | **66.7k (정상)** | collapse 완전 제거 |
-| Raw service time @ low load | 70 µs | 70–90 µs | 동일 |
-| Raw service time @ ceiling | 90 µs | 90 µs | 동일 |
+## 핵심 결과
+
+| | 값 |
+|---|---:|
+| Knee 위치 (e2e avg 5× jump 직전) | **40k RPS** |
+| Knee 시점 처리량 | **2.38 Gbps** |
+| Knee 시점 e2e P99 | 0.88 ms |
+| Knee 시점 e2e avg | 0.33 ms |
+| Hard ceiling (max wall RPS) | **40.8k RPS** |
+| Hard ceiling 처리량 | **2.67 Gbps** |
+| Overdrive envelope | 60k offered까지 collapse 없음 |
+| Raw service time (low load) | 200–300 µs |
 
 **핵심 메시지**:
-1. **Sustainable throughput 1.64× 향상** — 같은 hardware, 같은 protocol stack, 코드 변경만으로 3.81 → 6.24 Gbps.
-2. **70k collapse 완전 제거** — 이전엔 70k에서 시스템이 무너지며 wall RPS가 60k → 43k로 *감소*. 이제 70k는 정상 영역(66.7k 처리), saturation은 ~118k에서 *flat* 으로 부드럽게 cap.
-3. **140k offered까지 안정 동작** — 처리는 못해도 죽지 않음. admission control 패턴이 정상화됨.
+1. **Hard ceiling ≈ 40.8k wall RPS / 2.67 Gbps** — 45k–60k offered 구간에서 wall RPS가 38–41k에 평탄.
+2. **40k까지 P99 < 1 ms** — 5k부터 40k까지 e2e P99가 0.71–1.48 ms 범위에 깔끔하게 머무름.
+3. **Knee = 40k → 45k 사이**, e2e avg가 0.33 → 38.73 ms (117배). Raw P50도 0.27 → 3.15 ms.
+4. **60k까지 collapse 없음** — saturate 후 latency만 큐잉으로 폭증, throughput은 cap 근처에 평탄.
+5. 이 cap은 **echo path 의 40k cap 과 동등**. service 경유 forward 가 echo 와 거의 같은 throughput envelope을 보여줌.
 
-## 적용한 변경 (POST)
+## 적용된 변경 — Transport 라이브러리만
 
-| 변경 | 위치 | 기여 |
-|---|---|---|
-| **A6** `MAX_PENDING 4096 → 65536` | `dpumesh_doca.c:54` | in-flight 4k+ 시 hash collision 제거 |
-| **로그 정리** (INFO → DBG, hot-path printf 제거) | `dpu_worker.c`, `dpa.c`, `comch_server.c`, `dpumesh_doca.c`, `gateway.c` | stdio mutex contention 제거, 60k+ 호출/sec 절감 |
-| **A4** `nanosleep` polling → `pthread_cond_*` | `dpumesh_doca.c` (slot_cond, fc_cond) | sleep 정밀도 floor 50–100µs 제거, 즉시 wake-up |
-| **A5** epoll thread-pool gateway | `gateway.c` 전체 재작성 | pthread-per-conn (수천) → 32 thread pool + per-worker epoll + SO_REUSEPORT, scheduler thrashing 제거 |
+목표: service-side 가 gateway 와 같은 end-node 자격으로 동작하도록, TX_ACK 책임을
+end-node가 100% 보장하고 host-side per-request 비용을 amortize.
+
+| # | 변경 | 위치 | 원리 |
+|---|---|---|---|
+| 1 | `TDpumeshTransport::read` 가 flush 후 internal `dpumesh_dequeue` 로 다음 요청 fetch | `TDpumeshTransport.cpp` | TConnectedClient::run 의 `for(;;) processor->process()` 가 같은 thread에서 여러 요청을 처리 → per-request pthread_create 비용 amortize. 외부 server 코드 변경 없음. |
+| 2 | `write()` 가 TX slot 에 직접 write (lazy alloc) | `TDpumeshTransport.cpp` | `write_buf_` vector + flush memcpy 페어 폐기. body memcpy 1회로 단축 (gateway의 raw 경로와 동일). |
+| 3 | `flush()` 가 `register_pending` + `attach_tx` (enqueue 전) + `release_async` 사용 | `TDpumeshTransport.cpp` | gateway 와 같은 pending 메커니즘으로 TX slot lifecycle 관리. **`attach_tx`를 enqueue 전에 두는 것이 핵심**: TX_ACK은 enqueue 후에야 발생 가능하므로, 빠른 TX_ACK이 attach 보다 먼저 도착해서 handler가 `tx_slot=-1` 보고 no-op 후 entry가 영구 stuck되는 race 차단. |
+| 4 | 새 API `dpumesh_pending_release_async` | `dpumesh.h`, `dpumesh_doca.c` | responder가 enqueue + attach_tx 후 호출. `state==0, tx_slot ≥ 0` 이면 state=-2 (TX_ACK이 free + state=-1 함). `state==0, tx_slot < 0` 이면 (TX_ACK이 이미 도착함) state=-1 즉시. |
+| 5 | `dpumesh_enqueue` 가 OP_RESPONSE 도 `ring_tx_slot_map[ring_slot] = -1` | `dpumesh_doca.c` | pending 이 TX slot lifecycle 단독 owner. ring-wrap deferred-free 와 TX_ACK pending free 의 double-free race 차단. |
+| 6 | `process_forward_entry` 의 reverse DMA fc_header.consumer_tail = `target_pod->rx_consumer_tail` | `dpu_worker.c` | 기존엔 `src_pod->rx_consumer_tail` 을 실어서 receiver 가 다른 pod 의 ring 위치값으로 자기 fc_tx_last_consumer_tail 을 corrupt. echo는 src==target 이라 가려짐, forward 에서만 만성 stall. |
+| 7 | TX_ACK on AGAIN → **deferred queue** 로 stash, main loop이 매 iteration `pe_progress` 후 drain | `dpu_worker.c` | DPU 는 host TX slot 을 release 할 수 있는 유일한 권한자. TX_ACK 을 drop 하면 host pending 이 state=-2 에 stuck → 2초 register_pending reclaim → tail latency cliff. inline retry-and-drop 대신 deferred queue 로 **end-node ACK 보장**. inline spin 도 ARM 시간을 잡아먹어 consumer_pe 까지 starve 시키므로 폐기. |
+| 8 | `try_advance_consumer_tail` 의 implicit-ACK gate `if (desc.flags & OP_RESPONSE)` | `dpumesh_doca.c` | 기존엔 incoming OP_REQUEST 에 대해서도 pending[req_id].produced_to_pos 를 읽어서 0 으로 fc_tail rollback 시킴. 이제 OP_RESPONSE 에만 적용. |
 
 ## 테스트 환경
 
-PRE 측정과 동일:
 - 부하 발생기: `tput_client` (Go), conns auto-size (rps/25), TCP_NODELAY
-- 메시지: 8192 B frame (pad=8124)
-- 경로: rapids4 → cni0 (10 Gbps) → gateway pod → Thrift → UniqueIdService → dpumesh DMA → downstream pod
-- duration 10 s
+- 메시지: 8192 B frame (pad=8116)
+- 경로: rapids4 → cni0 → gateway pod → libthrift (raw C client) → DPU comch / DPA / DMA → service pod (TThreadedServer + libthrift `TDpumeshServerTransport`) → libthrift → DPU → gateway → client
+- duration 5 s
+- 측정 commit: 본 PR (transport-layer 변경만)
 
-## POST 측정 결과
+## 측정 결과
 
-| Target RPS | Wall RPS | Gbps | Raw P50 | Raw P99 | E2E P50 | E2E P99 | E2E Avg |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 10k | 9.5k | 0.62 | 0.17 | 0.77 | 0.34 | 1.64 | 0.46 |
-| 30k | 28.6k | 1.87 | 0.07 | 0.39 | 0.09 | 0.46 | 0.12 |
-| 50k | 47.6k | 3.12 | 0.07 | 0.44 | 0.09 | 0.50 | 0.12 |
-| 70k | 66.7k | 4.37 | 0.08 | 0.51 | 0.10 | 0.54 | 0.12 |
-| 90k | 85.7k | 5.62 | 0.08 | 0.50 | 0.10 | 0.54 | 0.14 |
-| **100k** | **95.2k** | **6.24** | **0.09** | **0.67** | **0.11** | **0.72** | **0.15** |
-| 110k | 104.8k | 6.87 | 0.10 | 21.88 | 0.12 | 22.45 | 0.78 |
-| 120k | 114.0k | 7.47 | 0.37 | 46.61 | 0.39 | 146.61 | 11.05 |
-| 130k | 118.1k | 7.74 | 35.14 | 55.59 | 67.14 | 1306.96 | 197.88 |
-| 140k | 118.1k | 7.74 | 43.95 | 60.72 | 525.08 | 2316.84 | 678.60 |
+| Target RPS | Wall RPS | Gbps | Raw P50 | Raw P99 | Raw Max | E2E P50 | E2E P99 | E2E Max | E2E Avg |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+|  5k |  4.5k | 0.30 | 0.54 |  1.12 |  5.38 | 0.68 |  1.48 |    5.61 |   0.69 |
+| 10k |  9.1k | 0.60 | 0.33 |  0.90 |  5.08 | 0.43 |  1.13 |    5.80 |   0.47 |
+| 15k | 13.6k | 0.89 | 0.22 |  0.84 |  3.33 | 0.31 |  0.98 |    4.03 |   0.37 |
+| 20k | 18.2k | 1.19 | 0.19 |  0.78 |  3.99 | 0.25 |  0.88 |    4.01 |   0.31 |
+| 25k | 22.7k | 1.49 | 0.21 |  0.69 |  3.70 | 0.25 |  0.78 |    5.67 |   0.29 |
+| 30k | 27.3k | 1.79 | 0.20 |  0.70 |  4.19 | 0.22 |  0.75 |    6.31 |   0.26 |
+| 35k | 31.8k | 2.08 | 0.23 |  0.79 |  7.80 | 0.26 |  0.84 |   10.43 |   0.30 |
+| **40k** | **36.4k** | **2.38** | **0.27** | **0.84** | **5.78** | **0.29** | **0.88** | **5.79** | **0.33** |
+| 45k | 39.2k | 2.57 | 3.15 | 48.71 | 53.92 | 3.18 | 447.60 |  570.64 |  38.73 |
+| 50k | 38.3k | 2.51 |41.65 | 59.50 | 64.14 |177.26|1369.57| 1593.89 | 304.49 |
+| 55k | 39.7k | 2.60 |47.29 | 61.97 | 66.82 |455.10|1765.53| 1860.85 | 559.60 |
+| 60k | 40.8k | 2.67 |51.20 | 66.80 | 71.26 |754.01|2205.11| 2257.71 | 870.90 |
 
 (latency 단위 = ms)
 
 ## 주요 관찰
 
-### 1. Sustainable ceiling 100k / 6.24 Gbps (P99 < 1 ms)
-- 100k까지 P99 e2e ≤ 0.72 ms, raw P99 ≤ 0.67 ms 유지
-- 이전(PRE) 61k 대비 **1.64×**
-- `cni0` 10 Gbps의 62% 점유
+### 1. Knee = 40k RPS, 그 다음 step에서 hockey stick
+- 5k → 40k 구간 e2e avg 0.69 → 0.33 ms (load 가 늘수록 오히려 평균 감소; tput_client 의 rate-limit 으로 인한 schedule wait 이 줄어들기 때문)
+- 40k → 45k 에서 e2e avg 0.33 → 38.73 ms (**117×**) — 명확한 knee
+- raw service time 도 같이 jump: 0.27 → 3.15 ms (**12×**)
 
-### 2. Hockey-stick은 여전히 sharp (100k → 110k)
-- e2e avg 0.15 → 0.78 ms (5.2× jump)
-- e2e P99 0.72 → 22.45 ms (31× jump)
-- P50은 0.11 → 0.12 ms로 거의 변화 없음 — **분포가 bimodal**: 대부분 빠르게 처리되고 일부가 큐잉
-- PRE 동일 패턴 (62k에서 같은 모양) — 즉 **bottleneck 종류는 그대로, 단지 한계가 위로 이동**
+### 2. Hard ceiling ≈ 2.67 Gbps (40.8k wall RPS)
+- 45k–60k offered 구간에서 wall RPS 가 38.3k–40.8k 로 평탄
+- offered 가 늘어도 throughput 은 flat cap, latency 만 큐잉으로 폭증
+- raw P99 도 49–67 ms 범위에 머무름 — DPU/네트워크 측에서 "처리 가능한 만큼만 처리하고 나머지는 큐에 쌓임" 의 정상 동작
+- 60k 를 넘겨도 collapse 없이 saturate 만 함
 
-### 3. Hard ceiling은 ~118k wall RPS (= 7.74 Gbps)
-- 120k → 114k wall, 130k → 118.05k, 140k → 118.13k — 사실상 평탄
-- offered가 더 늘어도 throughput은 **flat cap**, latency만 큐잉으로 폭증
-- 이전 PRE의 collapse(throughput 감소)와 다른 패턴 — **정상 saturation**
+### 3. 40k 까지 P99 깨끗
+| Target | E2E P99 | E2E Max | Raw P99 | Raw Max |
+|---:|---:|---:|---:|---:|
+|  5k | 1.48 ms | 5.61 ms | 1.12 ms | 5.38 ms |
+| 20k | 0.88 ms | 4.01 ms | 0.78 ms | 3.99 ms |
+| 40k | 0.88 ms | 5.79 ms | 0.84 ms | 5.78 ms |
 
-### 4. Collapse 완전 제거 (가장 중요한 정성적 변화)
-| Offered | PRE wall | POST wall | 차이 |
-|---:|---:|---:|---|
-| 65k | 60.7k | (측정 안 함) | — |
-| **70k** | **42.6k (collapse)** | **66.7k (정상)** | +56% |
-| 130k | (측정 안 함) | 118.1k | — |
-| 140k | (측정 안 함) | 118.1k | — |
+40k 까지 P99 가 1 ms 이하, Max 도 단일자리 ms. **이전 측정 (TX_ACK drop 정책 사용 시)** 에 보이던 2초 tail 패턴 (state=-2 stuck → 2 s register_pending reclaim) 은 deferred TX_ACK queue 로 사라짐.
 
-이전 collapse 메커니즘 체인 (PE thread starvation → fc-wait nanosleep 폭주 → ring_lock convoy → MAX_PENDING collision)이 다음과 같이 차단됨:
-- **PE thread starvation**: 워커 수가 ∞ → 32로 줄어 PE thread CPU share 회복 (1.3% → 12.5%)
-- **fc-wait 폭주**: nanosleep polling → cond_var, 대기 시 CPU 안 씀 + 즉시 wake
-- **MAX_PENDING collision**: 4096 → 65536, in-flight 60k 미만에서 충돌 거의 없음
+### 4. Raw service time 은 200–300 µs 수준
+- low load 의 raw P50 약 200 µs. 대부분의 시간이 PCIe DMA + comch 전송 (forward 1회 + reverse 1회 + service 1회 forward + DPU 1회 reverse, 총 4 hops).
+- knee 너머에서는 큐잉이 service time(raw) 에도 누적되어 ms 단위로 증가 (45k 이후 raw P50 3 ms+).
 
-### 5. Raw service time은 동일 (70–90 µs)
-PRE/POST 모두 ceiling까지 raw service time은 ~70–90 µs로 같음. 즉 **per-request 처리 비용은 변하지 않음**. 변한 건 **얼마나 많은 동시 요청을 처리할 수 있는가** (throughput).
+## 새 cap 의 후보 — 2.67 Gbps 가 어디서 묶이는가
 
-이는 다음을 의미함: dpumesh DMA path 자체는 빠르고, 우리가 푼 건 *동시성 처리 path*. 다음 단계도 같은 방향(더 많은 동시 처리).
+### 후보 A: DPU ARM 단일-thread main loop
+- 가장 유력. process_completion_queue + drain_deferred_tx_acks 가 한 thread 에서 직렬.
+- forward path 의 1요청 = comp_queue 4 entry (forward gw, rev_notify→svc, forward svc, rev_notify→gw) + comch send 4건 (TX_ACK ×2 + DMA_COMPLETION ×2) = ARM 8 events/req.
+- 40k RPS × 8 = 320k event/s. ARM 한 thread 가 처리 가능한 한계 근처.
+- 검증법: ARM 에서 `top -H -p $(pgrep dpumesh_dpu)` 로 main thread CPU% 확인.
 
-## 새 ceiling 분석 — 6.24 Gbps는 어디서 막히는가?
+### 후보 B: comch send pool / deferred queue 점유율
+- send_tasks_max = 1024 인데 해당 한계로 AGAIN 이 자주 떨어지면 deferred queue 가 일정량 누적된 채로 정상 회전.
+- 검증법: deferred_tx_ack 의 num_deferred_tx_acks 를 1초 stat 라인에 노출.
 
-### 후보 1: `ring_lock` 단일 mutex (가장 유력)
-`dpumesh_doca.c:73` 의 `pthread_mutex_t ring_lock` 이 모든 enqueue 직렬화. POST에서 32 워커 × 평균 100 µs critical section = 32 × 10k RPS/worker = 320k RPS 이론 상한, 그러나 **mutex 자체의 lock/unlock 비용 + cache ping-pong** 이 ms 수준 누적. 100k 부근에서 lock contention이 첫 병목으로 등장한다고 보면 정확히 들어맞음.
-- 다음 단계: **A2 (ring 샤딩)** — ring을 N개로 쪼개서 thread→ring 매핑
+### 후보 C: Service 측 TThreadedServer accept 직렬화
+- Transport 측에서 (1) multi-request 처리로 thread spawn 비용을 amortize 했으나, accept 자체는 여전히 single-threaded.
+- 검증법: service pod 에서 `ps -eLF` 로 thread 수 모니터링; thread 수가 매우 적게 유지되면 (1) 의 amortize 가 잘 작동하지만 accept 단일화가 cap.
 
-### 후보 2: cni0 / TCP 경로 한계
-- 10 Gbps cni0의 77% (7.74 Gbps) 도달 — TCP overhead, kernel iptables/conntrack, veth pair processing 비용이 점차 무시 못할 영역
-- 8 KB × 118k = 7.74 Gbps 단방향, response까지 합치면 PCIe/NIC 대역 추가 사용
-- 특히 small packet (8KB) PPS = 240k pps — kernel softirq budget 한계 가능성
+## 다음 단계
 
-### 후보 3: Linear scan in `tx_alloc` (`dpumesh_doca.c:786`)
-1024개 비트맵 linear scan이 여전히 global `slot_lock` 안에 있음. 100k RPS × 평균 100 entries scan = 10M scan/sec. cache hit이긴 하지만 mutex 보유 시간을 늘림.
-- 다음 단계: **A3 (freelist)** — O(1) pop/push
-
-### 후보 4: DPU 측 처리 (PE thread, comp queue, DPA)
-DPU 측 single PE thread + DPA가 처리할 수 있는 한계. 8 KB DMA 한 번 = ~2-3 µs HW, 100k × 3 µs = 300 ms/sec wall-clock으로 가능. 그러나 SW overhead까지 포함하면 빡빡할 수 있음.
-- 검증법: DPU process top — `top -H -p $(pgrep dpumesh_dpu)` 단일 thread CPU 100% 인지
-
-## 다음 단계 — 10–15 Gbps 목표
-
-이전 분석의 우선순위 갱신:
-
-| # | 변경 | 예상 추가 ceiling | 누적 추정 |
-|---|---|---:|---:|
-| 1 | **A2** ring_lock 샤딩 (ring N개) | +50–80% | **9–11 Gbps** |
-| 2 | A3 slot freelist (O(1)) | +10–15% | 10–12 Gbps |
-| 3 | B1 zero-copy memcpy 제거 (gateway) | +5–10% | 11–13 Gbps |
-| 4 | B5 TCP 커널 buffer 튜닝 + `SO_RCVBUF/SNDBUF` | +5% | 11–13 Gbps |
-| 5 | DPU 측 PE thread split / pinning | 검증 필요 | — |
-| 6 | C1 fc state atomic화 | 안정성 개선 | — |
-
-**A2가 가장 큰 leverage** — 100k 부근에서 ring_lock contention이 dominant라는 가설이 맞다면 +60% 이상 가능. 코드 변경 범위는 dpumesh_doca.c 안에서 끝남 (3-4일 작업).
-
-만약 A2 적용 후 ceiling이 9 Gbps에 머문다면 cni0 10 Gbps 한계에 임박 — 그 시점에 **메시지 크기 sweep** 으로 RPS-bound vs bandwidth-bound 구분 필요. 예를 들어 32 KB 메시지로 가면 cni0 한계가 RPS 60k 부근으로 내려가서 dpumesh의 다른 한계가 보일 것.
-
-## 70k Collapse는 왜 사라졌는가 — 메커니즘 검증
-
-이전 보고서의 [70k Collapse 메커니즘 분석] 가설 6가지에 대한 사후 검증:
-
-| 가설 | 차단 변경 | 검증 |
-|---|---|---|
-| 1. PE thread starvation | A5 (워커 수 ∞ → 32) + 로그 정리 | ✓ 70k 정상 동작 |
-| 2. MAX_PENDING collision | A6 (4096 → 65536) | ✓ 100k까지 collision 없음 (in-flight ≈ 14, 4096 한참 아래) |
-| 3. ring_lock convoy | A4 cond_var (lock hold 시간 단축) + 로그 제거 | △ 일부 완화, 여전히 단일 mutex (다음 단계) |
-| 4. DPU comp queue saturation | (직접 변경 없음) | ✓ 100k까지 여유 (in-flight 14 << 4096) |
-| 5. TCP zero-window | A5 epoll + TCP_NODELAY | ✓ 워커당 fewer conns, recv buffer 빠르게 drain |
-| 6. printf stdio lock | 핫패스 printf/INFO 제거 | ✓ 직접 제거됨 |
-
-가설 1, 2, 5, 6은 직접 차단됨. 가설 3은 부분 완화 (다음 단계 A2가 완전 해결). 가설 4는 본질 변경 없으나 throughput 증가에도 한계 안 닿음.
-
-→ **가설 1+5+6의 합성효과가 collapse의 근원이었음**이 데이터로 확인됨. PE starvation을 단독으로 명시 검증(가설 1) 한 건 아니지만, 그 외 모든 가설이 차단되거나 무관함이 확인되어 가설 1이 정황적으로 강하게 지지됨.
+| # | 변경 | 비용 | 예상 효과 | 우선순위 |
+|---|---|---|---|---|
+| 1 | DPU stat 라인에 num_deferred_tx_acks / send_pool 사용률 노출 | 1시간 | A vs B 즉시 판별 | 🔥 |
+| 2 | Service pod에서 thread/CPU 모니터링 sweep 중 캡쳐 | 30분 | C 검증 | 🔥 |
+| 3 | DPU ARM 의 main loop 분할 (consumer_pe progress 별 thread, comp_queue drain 별 thread) | 2–3일 | (A)이면 +50% 가능 | 1번 후 |
+| 4 | comch send_tasks_max 8192 로 증가 | 5분 | (B)이면 deferred queue 부담 ↓ | 1번 후 |
+| 5 | `TDpumeshServerTransport` 가 listen 시점에 N개 영구 worker thread 를 spawn 하고 직접 dequeue 처리 | 1–2일 | (C)이면 효과 큼. accept 없이 direct dispatch | 2번 후 |
 
 ## 생성된 그래프
 
-- `throughput_bps.png` — Throughput–latency hockey stick, **PRE/POST overlay**, 두 ceiling marker
-- `latency_vs_rps.png` — Service time/end-to-end percentile, PRE collapse zone vs POST overdrive zone 시각화
-- `throughput_vs_latency.png` — Wall RPS vs offered (left) + P99 (right) — **collapse vs graceful saturation의 가장 직접적 시각화**
-- `queueing_gap.png` — POST end-to-end 분해 (service time + schedule wait)
+- `throughput_bps.png` — Throughput–latency hockey stick (e2e + service time), hard ceiling marker
+- `latency_vs_rps.png` — Raw/E2E P50·P99 sweep, knee 표시 + overdrive zone
+- `throughput_vs_latency.png` — Wall RPS vs offered (좌) + e2e P99 (우), 60k 까지 평탄 cap 표시
+- `queueing_gap.png` — End-to-end 분해 (service time + schedule wait), knee 위치 표시
 
 모두 wall-clock 기준 throughput.

@@ -29,7 +29,7 @@ static void producer_send_task_completion_callback(struct doca_comch_producer_ta
 	objs = (struct objects *)(ctx_user_data.ptr);
 	objs->producer_result = DOCA_SUCCESS;
 	objs->sent_msg_cnt++;
-	DOCA_LOG_INFO("Datapath producer send completed (sent_msg_cnt=%d)", objs->sent_msg_cnt);
+	DOCA_LOG_DBG("Datapath producer send completed (sent_msg_cnt=%d)", objs->sent_msg_cnt);
 
 	buf = doca_comch_producer_task_send_get_buf(task);
 	if (buf)

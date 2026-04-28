@@ -595,3 +595,7 @@ void dpumesh_pending_attach_tx(dpumesh_ctx_t *ctx, uint32_t req_id, int tx_slot)
 void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
     (void)ctx; (void)req_id;
 }
+
+void dpumesh_pending_release_async(dpumesh_ctx_t *ctx, uint32_t req_id) {
+    (void)ctx; (void)req_id;
+}

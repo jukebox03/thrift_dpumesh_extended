@@ -178,9 +178,21 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
                                    : ((entry->flags & OP_RESPONSE) | CASE_INGRESS);
         fwd_desc.valid = 1;
 
-        uint32_t fc_tail = 0;
-        if (src_pod)
-            fc_tail = src_pod->rx_consumer_tail;
+        /* The fc_header.consumer_tail in the reverse DMA tells the RECEIVER
+         * (target_pod) how much of *its own* host TX buffer DPU has consumed,
+         * so target_pod can advance its fc_tx_last_consumer_tail window.
+         *
+         * Therefore the value must be target_pod->rx_consumer_tail (DPU's
+         * tracking of target_pod's forward-direction consumption), NOT
+         * src_pod's. In echo mode (src==target) these are the same pod so
+         * either works — but in the forwarding case (gateway→service or
+         * service→gateway) they are different pods, and embedding src_pod's
+         * tail caused the receiver to set its fc_tx_last_consumer_tail to a
+         * value from an unrelated ring. That collapses receiver's flow
+         * control on every incoming entry, producing the symptom where
+         * echo at 40k RPS is fine but forwarding stalls within ~1s at
+         * even 300 RPS. TX_ACK below correctly carries src_pod's tail. */
+        uint32_t fc_tail = target_pod ? target_pod->rx_consumer_tail : 0;
 
         doca_error_t fwd_result = dpu_enqueue_reverse_dma(
             objs, target_pod, &fwd_desc, data, payload_len, fc_tail);
@@ -201,17 +213,83 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
     }
 
     /* Send TX_ACK with the advanced tail so the Host refreshes its
-     * flow-control window even on an idle connection (no reverse DMA). */
+     * flow-control window and frees the host TX slot via the pending
+     * mechanism. The DPU is the sole authority that can release that
+     * slot — an inline retry-and-drop policy parks the host's pending
+     * entry at state=-2 until the 2-second collision-wait reclaim hits,
+     * which is exactly the long-tail-latency cliff observed at
+     * saturation. Treat TX_ACK as a hard guarantee: try once, and on
+     * AGAIN stash to the deferred queue so the main loop retries each
+     * iteration after pe_progress has had a chance to drain send
+     * completions. */
     if (src_pod && src_pod->connection) {
         uint32_t ack_tail = tail_advanced ? new_tail : (src_pod ? src_pod->rx_consumer_tail : 0);
         doca_error_t ack_result = server_send_tx_ack_to(objs, src_pod->connection,
                                                          req_id, dst_pod_id, ack_tail);
-        if (ack_result != DOCA_SUCCESS)
+        if (ack_result == DOCA_ERROR_AGAIN) {
+            if (objs->num_deferred_tx_acks < MAX_DEFERRED_TX_ACK) {
+                int n = objs->num_deferred_tx_acks++;
+                objs->deferred_tx_acks[n].conn        = src_pod->connection;
+                objs->deferred_tx_acks[n].req_id      = req_id;
+                objs->deferred_tx_acks[n].dst_pod_id  = dst_pod_id;
+                objs->deferred_tx_acks[n].ack_tail    = ack_tail;
+            } else {
+                /* Should not happen with 16384 entries unless the system
+                 * is fundamentally overcommitted. Log loudly so we know. */
+                DOCA_LOG_ERR("deferred TX_ACK queue full — dropping req_id=%u (pod %d). "
+                             "Host slot will reclaim at 2s.",
+                             req_id, src_pod_id);
+            }
+        } else if (ack_result != DOCA_SUCCESS) {
             DOCA_LOG_WARN("TX_ACK failed for req_id=%u to pod %d: %s",
                           req_id, src_pod_id, doca_error_get_descr(ack_result));
+        }
     }
 
     return 1;
+}
+
+/*
+ * Drain the deferred TX_ACK queue. Called every main-loop iteration after
+ * doca_pe_progress(pe), which releases comch send-pool slots as send
+ * completions fire. Order is preserved (FIFO) so a stale ack_tail can
+ * never overwrite a fresher one on the host's lockless atomic publish.
+ * Returns the number of ACKs successfully sent; the rest stay in the
+ * queue for the next iteration.
+ */
+static int
+drain_deferred_tx_acks(struct objects *objs)
+{
+    if (objs->num_deferred_tx_acks == 0)
+        return 0;
+
+    int sent = 0;
+    int kept = 0;
+    int total = objs->num_deferred_tx_acks;
+    for (int i = 0; i < total; i++) {
+        deferred_tx_ack_t *d = &objs->deferred_tx_acks[i];
+        doca_error_t rc = server_send_tx_ack_to(objs, d->conn, d->req_id,
+                                                 d->dst_pod_id, d->ack_tail);
+        if (rc == DOCA_SUCCESS) {
+            sent++;
+            continue;
+        }
+        if (rc == DOCA_ERROR_AGAIN) {
+            /* Pool still full — keep entry for next iteration. Compact in
+             * place so retained entries stay contiguous + FIFO ordered. */
+            if (kept != i)
+                objs->deferred_tx_acks[kept] = *d;
+            kept++;
+            continue;
+        }
+        /* Hard error — log and drop (host's 2s reclaim is the safety net
+         * for these once-in-a-blue-moon hard failures). */
+        DOCA_LOG_WARN("deferred TX_ACK fatal for req_id=%u: %s",
+                      d->req_id, doca_error_get_descr(rc));
+        sent++;  /* count as "removed from queue" */
+    }
+    objs->num_deferred_tx_acks = kept;
+    return sent;
 }
 
 /*
@@ -383,6 +461,11 @@ run_dpu_worker(struct objects *objs)
         doca_pe_progress(objs->consumer_pe);
         doca_pe_progress(objs->pe);  /* handle new connections, REGISTER, TX_DATA */
 
+        /* Retry any TX_ACKs that were deferred when the comch send pool was
+         * full. Done right after pe_progress so the just-released send-pool
+         * slots are available. */
+        drain_deferred_tx_acks(objs);
+
         /* Drain deferred completion queue (reverse DMA enqueue).
          * 128 entries per batch — safe because consumer_pe is progressed
          * inside the loop, keeping DPA recv tasks recycled. */
@@ -429,9 +512,15 @@ run_dpu_worker(struct objects *objs)
                   (now.tv_nsec - last.tv_nsec) / 1e9;
         if (elapsed >= 1.0) {
             uint32_t cq_depth = comp_queue_usage(&objs->comp_queue);
-            DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s, pods: %d, cq_depth: %u, deferred: %d",
-                          elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt, objs->num_pods,
-                          cq_depth, objs->num_deferred_recv);
+            /* Only emit the periodic stat line when there is something to report.
+             * On an idle DPU this fired every second, growing the log file
+             * indefinitely with no useful information. */
+            if (objs->sent_msg_cnt > 0 || objs->recv_msg_cnt > 0 ||
+                cq_depth > 0 || objs->num_deferred_recv > 0) {
+                DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s, pods: %d, cq_depth: %u, deferred: %d",
+                              elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt, objs->num_pods,
+                              cq_depth, objs->num_deferred_recv);
+            }
 
             objs->sent_msg_cnt = 0;
             objs->recv_msg_cnt = 0;

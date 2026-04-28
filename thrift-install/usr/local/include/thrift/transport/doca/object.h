@@ -84,6 +84,24 @@ static inline uint32_t comp_queue_usage(const dpu_comp_queue_t *q) {
 /* Max deferred recv tasks (one per CC_DPA_MAX_MSG_NUM) */
 #define MAX_DEFERRED_RECV  1024
 
+/* Max deferred TX_ACK sends. Each entry is a small POD (~32B). The DPU
+ * MUST eventually deliver every TX_ACK — dropping one parks the host's
+ * pending entry at state=-2 until the 2-second collision-wait reclaim,
+ * which is the source of the long-tail-latency cliff observed under
+ * saturation. So we never drop on the AGAIN path; we defer and retry
+ * each main-loop iteration. Sized large enough to absorb a few hundred
+ * ms of saturation-burst at 40k+ RPS. */
+#define MAX_DEFERRED_TX_ACK  16384
+
+/* TX_ACK we couldn't send synchronously because the comch send pool was
+ * full. Stored verbatim so the main loop can retry without recomputing. */
+typedef struct {
+    struct doca_comch_connection *conn;
+    uint32_t  req_id;
+    int32_t   dst_pod_id;
+    uint32_t  ack_tail;
+} deferred_tx_ack_t;
+
 /* ====== DOCA task pool capacity tracking (check-first model) ======
  * DOCA does not expose in-flight task counts, so we mirror them at
  * submit/completion boundaries. Submits are gated on our counter rather
@@ -221,6 +239,16 @@ struct objects {
      * resubmits when queue drains below BP_LOW. */
     struct doca_task *deferred_recv[MAX_DEFERRED_RECV];
     int num_deferred_recv;
+
+    /* Deferred TX_ACK sends (DPU only). When server_send_tx_ack_to returns
+     * AGAIN (comch send pool full), we stash the ACK here and the main
+     * loop retries each iteration after pe_progress drains completions.
+     * The DPU is the only authority that can free a host's TX slot via
+     * the pending mechanism, so dropping a TX_ACK here would force the
+     * host into a 2-second register_pending reclaim — observed as a tail
+     * latency cliff at saturation. Deferring keeps the contract intact. */
+    deferred_tx_ack_t deferred_tx_acks[MAX_DEFERRED_TX_ACK];
+    int num_deferred_tx_acks;
 
     /* ====== In-flight counters for DOCA task pools ======
      * Mirror DOCA's internal task pool usage so submits can be gated

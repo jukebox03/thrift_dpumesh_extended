@@ -20,7 +20,12 @@ extern "C" {
 
 /* ====== Default constants ====== */
 #define DPUMESH_SLOT_SIZE_DEFAULT       8192            /* 8KB */
-#define DPUMESH_NUM_SLOTS_DEFAULT       1024
+/* Slot pool size — used both for host TX (outgoing) and host RX (incoming
+ * application data). Must comfortably exceed peak concurrent in-flight
+ * requests so PE thread never has to drop on rx_slot_alloc. With gateway
+ * admission cap of 900 and TThreadedServer-style services, 8192 is a
+ * comfortable headroom. Memory cost: 8192 × 8192B = 64 MB per direction. */
+#define DPUMESH_NUM_SLOTS_DEFAULT       8192
 #define DPUMESH_DESCRIPTOR_SIZE         64
 #define DPUMESH_MAX_DESCRIPTORS_DEFAULT 1024
 #define DPUMESH_PREFIX_DEFAULT          "dpumesh"
@@ -122,6 +127,21 @@ void dpumesh_pending_attach_tx(dpumesh_ctx_t *ctx, uint32_t req_id, int tx_slot)
  * If TX is attached and DPA may still be using it, defers cleanup
  * until the response arrives (state -2 → rx_data_hook frees TX). */
 void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
+
+/* Asynchronously release a pending entry registered via dpumesh_register_pending.
+ * Intended for responder-side use (e.g. server sending OP_RESPONSE) after
+ * enqueue + attach_tx, when no response is expected on this req_id and the
+ * caller does NOT want to call dpumesh_wait_response.
+ *
+ * Behavior (only acts on state == 0):
+ *   - tx_slot still attached: transition to state -2; TX_ACK handler will
+ *     free the TX slot and clear the entry (state -2 → -1).
+ *   - tx_slot already released by an earlier TX_ACK: clear immediately
+ *     (state 0 → -1) so the slot is reusable for future register_pending.
+ *   - any other state: no-op (already managed by another path).
+ *
+ * Idempotent. Safe to call concurrently with TX_ACK arrival. */
+void dpumesh_pending_release_async(dpumesh_ctx_t *ctx, uint32_t req_id);
 
 #ifdef __cplusplus
 }

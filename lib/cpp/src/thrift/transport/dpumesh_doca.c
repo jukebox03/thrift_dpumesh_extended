@@ -46,7 +46,12 @@ static void cleanup_ctx(struct dpumesh_ctx *ctx);
  * ==================================================================== */
 
 /* RX queue capacity */
-#define RX_QUEUE_SIZE 512
+/* RX queue between PE thread (producer, drains rx_dma_buffer) and the
+ * application accept loop (consumer, e.g. TThreadedServer). Sized to be
+ * larger than gateway's admission_cap (900) and the server's worst-case
+ * concurrent in-flight, so the PE thread never has to drop on enqueue.
+ * 65536 entries × ~200B = ~13MB pure RAM, same scale as `pending` pool. */
+#define RX_QUEUE_SIZE 65536
 
 /* Pending response table for client-side request/response matching.
  * Indexed by req_id % MAX_PENDING. Must exceed expected in-flight requests
@@ -60,6 +65,12 @@ typedef struct {
     sw_descriptor_t desc;
     volatile int state;   /* -1=unused, -2=cancelled(tx deferred), 0=waiting, 1=arrived */
     int tx_slot;          /* TX buffer slot owned by this request, -1 if none */
+    /* fc_tx_producer_head value AFTER this request was enqueued. Used as the
+     * implicit-ACK target when the response arrives or this request times out:
+     * the consumer (DPU) must have advanced at least to this position by the
+     * time we see either signal, so we can advance our local consumer_tail to
+     * this value even if the explicit TX_ACK from DPU was lost. */
+    uint32_t produced_to_pos;
 } dpumesh_pending_t;
 
 struct dpumesh_ctx {
@@ -235,6 +246,49 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
 }
 
 /*
+ * Wrap-aware advance of fc_tx_last_consumer_tail toward `target`.
+ *
+ * Used by the end-node implicit-ACK path: when a response arrives (or a
+ * pending request times out), the originating producer position is known
+ * and must by then have been consumed by DPU, regardless of whether DPU's
+ * explicit TX_ACK / piggyback survived comch backpressure. Calling this
+ * lets gateway maintain fc state from its own bookkeeping rather than
+ * trusting the upstream comch path alone.
+ *
+ * `target` is interpreted in the same modular space as fc_tx_last_consumer_tail
+ * (range [0, DPU_BUFFER_SIZE)). Advance happens iff target is within the
+ * forward half-range from the current value; differences greater than
+ * buf_size/2 are treated as "target is behind, ignore" so a stale signal
+ * cannot rewind the tail. On successful advance, fc-waiters are woken.
+ *
+ * Caller must NOT hold ring_lock.
+ */
+static void try_advance_consumer_tail(dpumesh_ctx_t *ctx, uint32_t target) {
+    const uint32_t buf_size = DPU_BUFFER_SIZE;
+    if (target >= buf_size) return;
+
+    uint32_t cur;
+    do {
+        cur = atomic_load_explicit(&ctx->fc_tx_last_consumer_tail,
+                                   memory_order_acquire);
+        if (cur == target) return;
+        uint32_t forward = (target >= cur) ? (target - cur)
+                                           : (buf_size - cur + target);
+        if (forward >= buf_size / 2) return;  /* target is behind in wrap */
+    } while (!atomic_compare_exchange_weak_explicit(
+                 &ctx->fc_tx_last_consumer_tail,
+                 &cur, target,
+                 memory_order_release,
+                 memory_order_acquire));
+
+    /* Empty critical section pairs with cond_var happens-before so
+     * fc-waiters mid-transition into cond_wait don't miss the broadcast. */
+    pthread_mutex_lock(&ctx->ring_lock);
+    pthread_mutex_unlock(&ctx->ring_lock);
+    pthread_cond_broadcast(&ctx->fc_cond);
+}
+
+/*
  * Parse + deliver one DMA-reverse entry at rx_dma_buffer[pos] whose total DMA
  * length is dma_len. On success delivers the descriptor via rx_deliver_desc
  * and clears sw_descriptor.valid in the buffer so a future scan cannot
@@ -283,6 +337,32 @@ static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_l
     desc.body_len = body_len;
 
     rx_deliver_desc(ctx, &desc, slot);
+
+    /* End-node implicit ACK — ONLY for OP_RESPONSE.
+     *
+     * For an OP_RESPONSE matching one of OUR outstanding requests, the
+     * pending[req_id] slot was filled by dpumesh_enqueue with our
+     * produced_to_pos at request time. By the time the response gets back
+     * to us, DPU has unambiguously consumed at least up to that position,
+     * so we can advance our local fc_tx_last_consumer_tail without waiting
+     * for an explicit TX_ACK (covers TX_ACK loss under comch backpressure).
+     *
+     * For incoming OP_REQUEST at a service node, we have NEVER touched
+     * pending[req_id]: produced_to_pos is the init default (0) or a stale
+     * value from an unrelated previous OP_RESPONSE we sent that happened
+     * to map to the same slot. Calling try_advance_consumer_tail with
+     * such a value rewinds fc_tx_last_consumer_tail to the past once cur
+     * crosses buf_size/2, breaking flow control and stalling the service
+     * within ~2 seconds at modest RPS. So gate strictly on OP_RESPONSE. */
+    if (desc.flags & OP_RESPONSE) {
+        uint32_t idx = desc.req_id % MAX_PENDING;
+        dpumesh_pending_t *p = &ctx->pending[idx];
+        uint32_t target;
+        pthread_mutex_lock(&p->lock);
+        target = p->produced_to_pos;
+        pthread_mutex_unlock(&p->lock);
+        try_advance_consumer_tail(ctx, target);
+    }
     return 0;
 }
 
@@ -696,6 +776,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         pthread_cond_init(&ctx->pending[i].cond, NULL);
         ctx->pending[i].state = -1;
         ctx->pending[i].tx_slot = -1;
+        ctx->pending[i].produced_to_pos = 0;
     }
 
     /* Initialize ring_tx_slot_map for deferred TX slot free */
@@ -831,11 +912,13 @@ static int reclaim_ring_tx_slots(dpumesh_ctx_t *ctx) {
 }
 
 int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
-    /* Total wait budget = max_retry × cond_timeout_ns ≈ 5 s before failing. */
-    const int max_retry = 5000;
-
+    /* Backpressure: block indefinitely until a TX slot is free. The caller
+     * (gateway worker via admission control, or any blocking RPC site) has
+     * already committed to this request, so failure here would propagate
+     * up as a Thrift exception — unwanted. The 1ms cond_timedwait below is
+     * a safety re-poll in case a tx_free signal is dropped. */
     pthread_mutex_lock(&ctx->slot_lock);
-    for (int retry = 0; retry < max_retry; retry++) {
+    for (;;) {
         for (int i = 0; i < ctx->num_slots; i++) {
             if (ctx->slot_bitmap[i] == 0) {
                 ctx->slot_bitmap[i] = 1;
@@ -854,8 +937,7 @@ int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
         if (reclaimed > 0)
             continue;  /* freed some — retry scan */
 
-        /* Wait for tx_free to signal, with 1ms timeout as backstop.
-         * cond_timedwait atomically unlocks + waits + relocks. */
+        /* Wait for tx_free to signal, with 1ms re-poll backstop. */
         struct timespec abs_ts;
         clock_gettime(CLOCK_REALTIME, &abs_ts);
         abs_ts.tv_nsec += 1000000;  /* 1 ms */
@@ -865,9 +947,6 @@ int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
         }
         pthread_cond_timedwait(&ctx->slot_cond, &ctx->slot_lock, &abs_ts);
     }
-    pthread_mutex_unlock(&ctx->slot_lock);
-    DOCA_LOG_ERR("TX alloc failed: all %d slots busy after %d retries", ctx->num_slots, max_retry);
-    return -1;
 }
 
 uint8_t *dpumesh_tx_buf(dpumesh_ctx_t *ctx, int slot) {
@@ -927,9 +1006,14 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
         uint32_t dma_size = (uint32_t)(sizeof(struct fc_header) + desc->body_len);
         uint32_t padded_len = (dma_size + 127) & ~(uint32_t)127;
         uint32_t buf_size = DPU_BUFFER_SIZE;
-        int fc_retry = 0;
-        const int max_fc_retry = 10000;
+        int stall_iters = 0;
 
+        /* Block indefinitely until DPU buffer has contiguous room. PE thread
+         * advances fc_tx_last_consumer_tail on every TX_ACK and broadcasts;
+         * the 1ms cond_timedwait below is a safety re-poll in case a
+         * broadcast is missed. The caller (gateway worker under admission
+         * control) has already accepted this request — returning -1 here
+         * would surface as a Thrift exception, defeating backpressure. */
         while (1) {
             uint32_t head = ctx->fc_tx_producer_head;  /* worker-only, under ring_lock */
             uint32_t tail = atomic_load_explicit(&ctx->fc_tx_last_consumer_tail,
@@ -945,14 +1029,6 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
                     break;  /* fits after wrap to 0 */
             }
 
-            if (++fc_retry >= max_fc_retry) {
-                pthread_mutex_unlock(&ctx->ring_lock);
-                DOCA_LOG_ERR("ENQUEUE: DPU buffer full after %d retries "
-                             "(head=%u tail=%u need=%u avail=%u)",
-                             max_fc_retry, head, tail, padded_len, available);
-                return -1;
-            }
-
             /* 1ms timeout as backstop in case a TX_ACK is genuinely delayed. */
             struct timespec abs_ts;
             clock_gettime(CLOCK_REALTIME, &abs_ts);
@@ -962,15 +1038,47 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
                 abs_ts.tv_sec += 1;
             }
             pthread_cond_timedwait(&ctx->fc_cond, &ctx->ring_lock, &abs_ts);
+
+            /* Self-sync safety net: if we have been stalled here for ~1 second
+             * AND the pending pool is empty, the fc bookkeeping is provably
+             * stale (no in-flight requests means DPU's buffer is logically
+             * empty). This recovers from the deadlock where TX_ACKs were lost
+             * during a prior overload episode and head/tail diverged from
+             * physical state. We hold ring_lock so the reset is atomic vs
+             * other workers; new requests after this point start from a
+             * consistent (head=0, tail=0) state. */
+            if (++stall_iters >= 1000) {
+                stall_iters = 0;
+                int has_active = 0;
+                for (int i = 0; i < MAX_PENDING; i++) {
+                    int s = ctx->pending[i].state;
+                    if (s == 0 || s == -2) {
+                        has_active = 1;
+                        break;
+                    }
+                }
+                if (!has_active) {
+                    DOCA_LOG_WARN("fc-wait self-sync: pending pool empty but "
+                                  "head=%u tail=%u — resetting fc state",
+                                  ctx->fc_tx_producer_head,
+                                  atomic_load_explicit(&ctx->fc_tx_last_consumer_tail,
+                                                       memory_order_acquire));
+                    ctx->fc_tx_producer_head = 0;
+                    atomic_store_explicit(&ctx->fc_tx_last_consumer_tail, 0,
+                                          memory_order_release);
+                    pthread_cond_broadcast(&ctx->fc_cond);
+                }
+            }
         }
     }
 
-    /* Retry with exponential backoff if DMA ring is temporarily full */
+    /* Block with exponential backoff until a DMA ring slot frees. DPA
+     * advances the ring tail as it consumes descriptors. No artificial
+     * timeout — the caller has committed to this request and must not see
+     * a failure. backoff is capped at 1ms. */
     {
-        int ring_retry = 0;
-        const int max_ring_retry = 1000;
         struct timespec backoff = {0, 10000}; /* 10µs initial */
-        while (ring_retry < max_ring_retry) {
+        while (1) {
             dma = get_next_dma_desc(ctx->dma_ring);
             if (dma)
                 break;
@@ -979,32 +1087,27 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
             if (backoff.tv_nsec < 1000000) /* cap at 1ms */
                 backoff.tv_nsec *= 2;
             pthread_mutex_lock(&ctx->ring_lock);
-            ring_retry++;
-        }
-        if (!dma) {
-            pthread_mutex_unlock(&ctx->ring_lock);
-            DOCA_LOG_ERR("ENQUEUE failed: DMA ring exhausted after %d retries", max_ring_retry);
-            return -1;
         }
     }
 
     ring_slot = (uint32_t)(dma - ctx->dma_ring->descs);
 
-    /* Deferred TX slot free: if this ring slot previously held data for
-     * an OP_RESPONSE, the DPA has now cleared valid=0 (get_next_dma_desc
-     * checked), so the old TX slot is safe to free. Capture the slot id
-     * here but defer the actual dpumesh_tx_free() until AFTER ring_lock
-     * is released — tx_free takes slot_lock, and avoiding nested lock
-     * acquisition shortens ring_lock hold time. */
+    /* Deferred TX slot free: prev_tx_slot will be -1 in steady state (since
+     * we no longer track in ring_tx_slot_map). Kept as a safety net for any
+     * stale entries from older code paths. */
     int prev_tx_slot = ctx->ring_tx_slot_map[ring_slot];
 
-    /* Track TX slot for OP_RESPONSE — freed when ring slot is reused.
-     * For OP_REQUEST, pending table handles TX slot lifetime. */
-    if (desc->flags & OP_RESPONSE) {
-        ctx->ring_tx_slot_map[ring_slot] = desc->body_buf_slot;
-    } else {
-        ctx->ring_tx_slot_map[ring_slot] = -1;
-    }
+    /* TX slot lifetime is owned by the pending mechanism for BOTH OP_REQUEST
+     * (gateway) and OP_RESPONSE (server transport):
+     *   - OP_REQUEST: caller registers + attach_tx; wait_response/timeout
+     *     paths or TX_ACK handler free the TX slot.
+     *   - OP_RESPONSE: caller registers + attach_tx + release_async; TX_ACK
+     *     handler frees the TX slot via the deferred state -2 → -1 path.
+     *
+     * The previous design tracked OP_RESPONSE in ring_tx_slot_map for
+     * deferred-until-ring-wrap free. That races with TX_ACK pending free
+     * (double-free of a slot already reallocated to a new request). Disable. */
+    ctx->ring_tx_slot_map[ring_slot] = -1;
 
     /* Write fc_header at slot base (before body data).
      * Body was written by caller at base + sizeof(fc_header).
@@ -1032,6 +1135,7 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     /* Advance DPU buffer producer head — mirrors DPA's pos advancement.
      * DPA: if (pos + padded > buf_size) pos = 0; pos += padded;
      *       if (pos >= buf_size) pos = 0; */
+    uint32_t produced_to;  /* captured for end-node implicit-ACK bookkeeping */
     {
         uint32_t dma_size = (uint32_t)(sizeof(struct fc_header) + desc->body_len);
         uint32_t padded_len = (dma_size + 127) & ~(uint32_t)127;
@@ -1040,6 +1144,7 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
         ctx->fc_tx_producer_head += padded_len;
         if (ctx->fc_tx_producer_head >= DPU_BUFFER_SIZE)
             ctx->fc_tx_producer_head = 0;
+        produced_to = ctx->fc_tx_producer_head;
     }
 
     DOCA_LOG_DBG("ENQUEUE: req_id=%u slot=%u len=%u fc_head=%u",
@@ -1047,6 +1152,24 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
                  ctx->fc_tx_producer_head);
 
     pthread_mutex_unlock(&ctx->ring_lock);
+
+    /* Record producer position so the response handler can advance our
+     * consumer_tail without depending on DPU's TX_ACK survival.
+     *
+     * ONLY for OP_REQUEST: the read side (process_rx_dma_entry) gates on
+     * OP_RESPONSE and reads pending[req_id].produced_to_pos. If a service
+     * sending OP_RESPONSE were to write here too, it could overwrite the
+     * value some unrelated requester (sharing the same req_id MOD
+     * MAX_PENDING) recorded — corrupting that requester's implicit-ACK.
+     *
+     * Done outside ring_lock to keep the critical section short. */
+    if (!(desc->flags & OP_RESPONSE)) {
+        uint32_t idx = desc->req_id % MAX_PENDING;
+        dpumesh_pending_t *p = &ctx->pending[idx];
+        pthread_mutex_lock(&p->lock);
+        p->produced_to_pos = produced_to;
+        pthread_mutex_unlock(&p->lock);
+    }
 
     /* Free the previous occupant's TX slot OUTSIDE ring_lock to avoid
      * nested slot_lock acquisition under ring_lock — keeps the ring_lock
@@ -1232,8 +1355,15 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
                  * If a late response arrives first, the RX path handles it
                  * under state=-2 as well. */
                 p->state = -2;
+                uint32_t produced = p->produced_to_pos;
                 pthread_cond_broadcast(&p->cond);
                 pthread_mutex_unlock(&p->lock);
+                /* End-node implicit ACK on timeout: by the 30s mark DPU has
+                 * long since processed (or dropped) our request, so its
+                 * consumer_tail is at least at our recorded producer position.
+                 * Advance fc state ourselves to break out of any stale-ACK
+                 * deadlock without relying on DPU's TX_ACK arriving late. */
+                try_advance_consumer_tail(ctx, produced);
                 return -1;
             }
         }
@@ -1297,12 +1427,66 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
         p->state = -1;
         pthread_cond_broadcast(&p->cond);
     } else if (p->state == -2) {
-        /* Timeout path: wait_response already deferred the TX free.
-         * Do NOT force-free here — DPA may still be reading from the slot.
-         * The TX_ACK handler (or a late response) will release it and
-         * transition state -2 → -1. Leaving state=-2 preserves that. */
+        /* Timeout path: wait_response already returned -1 to the caller and
+         * left state=-2 hoping a late TX_ACK would free the slot. Under
+         * sustained DPU overload the TX_ACK can be lost, leaving the slot
+         * leaked across the test boundary.
+         *
+         * gateway's wait_response timeout is RESPONSE_TIMEOUT_MS = 30s,
+         * many orders of magnitude longer than any DPA forward DMA
+         * (microseconds). By the time we reach this branch the DPA is
+         * guaranteed not to be reading the slot anymore, so it is safe to
+         * force-free here. Also advance fc consumer_tail using the recorded
+         * producer position — same end-node implicit-ACK reasoning as the
+         * wait_response timeout path. */
+        if (p->tx_slot >= 0) {
+            dpumesh_tx_free(ctx, p->tx_slot);
+            p->tx_slot = -1;
+        }
+        uint32_t produced = p->produced_to_pos;
+        p->state = -1;
+        pthread_cond_broadcast(&p->cond);
+        pthread_mutex_unlock(&p->lock);
+        try_advance_consumer_tail(ctx, produced);
+        return;
     } else {
         /* state == -1, already clean — nothing to do. */
     }
+    pthread_mutex_unlock(&p->lock);
+}
+
+/*
+ * Asynchronous-release a pending entry without waiting for a response.
+ *
+ * Used by responder-side code (server transport) that has just enqueued an
+ * OP_RESPONSE: it needs the TX slot held until DPA finishes the forward DMA,
+ * confirmed by TX_ACK from DPU. This function tells the pending machinery
+ * "no response is coming for this req_id; free TX on TX_ACK and clear the
+ * entry". This mirrors the gateway's TX-slot lifecycle (early free on
+ * TX_ACK arrival) for the responder direction, replacing the legacy
+ * ring_tx_slot_map deferred-until-ring-wrap approach.
+ *
+ * Only acts on state == 0; other states are left alone since they're
+ * already owned by another path (response arrived, cancelled, or unused).
+ */
+void dpumesh_pending_release_async(dpumesh_ctx_t *ctx, uint32_t req_id) {
+    uint32_t idx = req_id % MAX_PENDING;
+    dpumesh_pending_t *p = &ctx->pending[idx];
+
+    pthread_mutex_lock(&p->lock);
+    if (p->state == 0) {
+        if (p->tx_slot < 0) {
+            /* TX_ACK already arrived between attach_tx and now — TX slot is
+             * back in the pool; the entry just needs to be released so a
+             * future register_pending can claim this idx. */
+            p->state = -1;
+            pthread_cond_broadcast(&p->cond);
+        } else {
+            /* TX_ACK still pending — switch to the deferred-release state
+             * the TX_ACK handler already knows how to finish. */
+            p->state = -2;
+        }
+    }
+    /* state ∈ {-1, -2, 1}: someone else is finishing the entry — no-op. */
     pthread_mutex_unlock(&p->lock);
 }

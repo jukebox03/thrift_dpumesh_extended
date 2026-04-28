@@ -49,7 +49,7 @@ err()   { echo -e "${RED}[ERR]${NC} $*"; }
 step()  { echo -e "${BLUE}[STEP]${NC} $*"; }
 
 dpu_sudo() {
-    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S bash -c '$1'" 2>&1 | grep -v '^\[sudo\]'
+    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S bash -c '$1'" 2>&1 | sed 's/^\[sudo\][^:]*: *//'
 }
 
 ### 소스 동기화 ###
@@ -204,10 +204,30 @@ build_gateway_image() {
     info "Gateway Docker image built and imported"
 }
 
+### Ensure external images are present in containerd (k8s.io ns) ###
+# unique-id-service:latest is built outside this repo (DeathStarBench).
+# kubelet image GC may evict it when replicas=0, so re-import from docker
+# daemon every deploy if missing.
+ensure_unique_id_image() {
+    local img="social-network/unique-id-service:latest"
+    if echo "$HOST_PASS" | sudo -S ctr -n k8s.io images list -q 2>/dev/null \
+           | grep -v '^\[sudo\]' | grep -q "docker.io/$img"; then
+        info "unique-id-service image already in containerd"
+        return 0
+    fi
+    if ! docker image inspect "$img" >/dev/null 2>&1; then
+        err "unique-id-service image not found in docker daemon either."
+        err "Build it first via DeathStarBench (Dockerfile.uniqueid)."
+        exit 1
+    fi
+    info "Importing unique-id-service image to containerd k8s.io ns..."
+    docker save "$img" | sudo ctr -n k8s.io images import -
+}
+
 ### DPU 프로세스 관리 ###
 stop_dpu() {
     info "Stopping dpumesh_dpu..."
-    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S killall -9 dpumesh_dpu 2>/dev/null; true" 2>&1 | grep -v '^\[sudo\]' || true
+    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S killall -9 dpumesh_dpu 2>/dev/null; true" 2>&1 | sed 's/^\[sudo\][^:]*: *//' || true
     info "Waiting for devx resources to release..."
     sleep 5
 }
@@ -226,42 +246,33 @@ LAUNCHER
 chmod +x /tmp/start_dpu.sh"
 
     local pid
-    pid=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S bash /tmp/start_dpu.sh" 2>&1 | grep -v '^\[sudo\]')
+    pid=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S bash /tmp/start_dpu.sh" 2>&1 | sed 's/^\[sudo\][^:]*: *//')
 
     if [ "$pid" = "NO_PID" ] || [ -z "$pid" ]; then
         err "dpumesh_dpu failed to start! Log:"
-        ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -20 $DPU_LOG" 2>&1 | grep -v '^\[sudo\]'
+        ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -20 $DPU_LOG" 2>&1 | sed 's/^\[sudo\][^:]*: *//'
         exit 1
     fi
     info "dpumesh_dpu running (PID: $pid)"
 
-    # DPU 안정화 대기 — 프로세스 실행 확인 + 로그 체크
-    info "Waiting for DPU to stabilize..."
+    # DPU init은 첫 client 연결까지 comch setup 단계에서 block. 여기선 process가
+    # 살아있는지만 확인하고 진행. 실제 main loop 진입은 start_gateway() 단계의
+    # "pods: 1" 검출로 확인된다.
+    info "Verifying dpumesh_dpu is alive..."
     local attempts=0
-    while [ $attempts -lt 15 ]; do
-        local log_line
-        log_line=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -3 $DPU_LOG" 2>&1 | grep -v '^\[sudo\]' || true)
-        # INFO 로그 레벨이면 "pods: 0" 확인, ERR 레벨이면 프로세스 존재만 확인
-        if echo "$log_line" | grep -q "pods: 0"; then
-            info "DPU ready (pods: 0, waiting for connections)"
-            return 0
-        fi
-        if echo "$log_line" | grep -q "elapsed:"; then
-            info "DPU ready (main loop running)"
-            return 0
-        fi
-        # 프로세스가 살아있고 로그가 최근 것이면 OK
+    while [ $attempts -lt 5 ]; do
         local dpu_alive
-        dpu_alive=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S pgrep -f 'dpumesh_dpu.*03:00'" 2>&1 | grep -v '^\[sudo\]' | head -1 || true)
-        if [ -n "$dpu_alive" ] && [ "$attempts" -ge 5 ]; then
-            info "DPU ready (PID: $dpu_alive, log level may suppress INFO)"
+        dpu_alive=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S pgrep -x dpumesh_dpu" 2>&1 | sed 's/^\[sudo\][^:]*: *//' | head -1 || true)
+        if [ -n "$dpu_alive" ]; then
+            info "dpumesh_dpu alive (PID: $dpu_alive) — blocks in init until gateway connects"
             return 0
         fi
         sleep 1
         attempts=$((attempts + 1))
     done
-    warn "DPU stabilization timeout (may still be initializing)"
-    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -5 $DPU_LOG" 2>&1 | grep -v '^\[sudo\]'
+    err "dpumesh_dpu not running after launch! Log:"
+    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -20 $DPU_LOG" 2>&1 | sed 's/^\[sudo\][^:]*: *//'
+    exit 1
 }
 
 ### K8s 리소스 ###
@@ -448,7 +459,7 @@ start_gateway() {
     local attempts=0
     while [ $attempts -lt 15 ]; do
         local log_line
-        log_line=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -3 $DPU_LOG" 2>&1 | grep -v '^\[sudo\]' || true)
+        log_line=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -3 $DPU_LOG" 2>&1 | sed 's/^\[sudo\][^:]*: *//' || true)
         if echo "$log_line" | grep -q "pods: 1"; then
             info "DPU registered gateway (pods: 1)"
             return 0
@@ -457,7 +468,7 @@ start_gateway() {
         attempts=$((attempts + 1))
     done
     warn "DPU gateway registration timeout — continuing anyway"
-    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -3 $DPU_LOG" 2>&1 | grep -v '^\[sudo\]'
+    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -3 $DPU_LOG" 2>&1 | sed 's/^\[sudo\][^:]*: *//'
 }
 
 start_service() {
@@ -478,7 +489,7 @@ start_service() {
     local attempts=0
     while [ $attempts -lt 15 ]; do
         local log_line
-        log_line=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -3 $DPU_LOG" 2>&1 | grep -v '^\[sudo\]' || true)
+        log_line=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -3 $DPU_LOG" 2>&1 | sed 's/^\[sudo\][^:]*: *//' || true)
         if echo "$log_line" | grep -q "pods: 2"; then
             info "DPU registered service (pods: 2)"
             return 0
@@ -487,7 +498,7 @@ start_service() {
         attempts=$((attempts + 1))
     done
     warn "DPU service registration timeout — continuing anyway"
-    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -3 $DPU_LOG" 2>&1 | grep -v '^\[sudo\]'
+    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -3 $DPU_LOG" 2>&1 | sed 's/^\[sudo\][^:]*: *//'
 }
 
 ### 테스트 ###
@@ -621,7 +632,7 @@ run_size_test() {
 show_logs() {
     echo ""
     step "========== DPU Worker Log (last 50 lines) =========="
-    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -50 $DPU_LOG" 2>&1 | grep -v '^\[sudo\]' || true
+    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -50 $DPU_LOG" 2>&1 | sed 's/^\[sudo\][^:]*: *//' || true
 
     echo ""
     step "========== Gateway Pod Log (last 30 lines) =========="
@@ -652,10 +663,10 @@ show_status() {
     # DPU process
     info "DPU process:"
     local dpu_pid
-    dpu_pid=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S pgrep -f 'dpumesh_dpu.*03:00'" 2>&1 | grep -v '^\[sudo\]' | head -1 || true)
+    dpu_pid=$(ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S pgrep -x dpumesh_dpu" 2>&1 | sed 's/^\[sudo\][^:]*: *//' | head -1 || true)
     if [ -n "$dpu_pid" ]; then
         echo "  dpumesh_dpu running (PID: $dpu_pid)"
-        ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -1 $DPU_LOG" 2>&1 | grep -v '^\[sudo\]' | sed 's/^/  /'
+        ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -1 $DPU_LOG" 2>&1 | sed 's/^\[sudo\][^:]*: *//' | sed 's/^/  /'
     else
         echo "  dpumesh_dpu NOT running"
     fi
@@ -672,7 +683,7 @@ show_status() {
 ### DPU 로그 실시간 ###
 follow_dpu_log() {
     info "Following DPU log (Ctrl+C to stop)..."
-    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -f $DPU_LOG" 2>&1 | grep -v '^\[sudo\]'
+    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -f $DPU_LOG" 2>&1 | sed 's/^\[sudo\][^:]*: *//'
 }
 
 ### Cleanup ###
@@ -681,7 +692,7 @@ cleanup() {
     kubectl delete ns "$NS" --ignore-not-found
 
     info "Stopping dpumesh_dpu..."
-    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S killall -9 dpumesh_dpu 2>/dev/null; true" 2>&1 | grep -v '^\[sudo\]' || true
+    ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S killall -9 dpumesh_dpu 2>/dev/null; true" 2>&1 | sed 's/^\[sudo\][^:]*: *//' || true
 
     info "Restoring social-network pods..."
     kubectl scale deployment dpumesh-gateway --replicas=1 -n social-network 2>/dev/null || true
@@ -703,6 +714,7 @@ case "$CMD" in
         build_dpu
         build_host
         build_gateway_image
+        ensure_unique_id_image
         start_dpu
         start_gateway
         start_service

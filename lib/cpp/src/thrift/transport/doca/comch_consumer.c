@@ -229,7 +229,7 @@ static void consumer_recv_task_comp_cb(struct doca_comch_consumer_task_post_recv
 	}
 
 	if (recv_msg_len > 0 && objs->rx_data_hook != NULL) {
-		DOCA_LOG_INFO("Datapath RX received: len=%zu, dispatching to rx_data_hook", recv_msg_len);
+		DOCA_LOG_DBG("Datapath RX received: len=%zu, dispatching to rx_data_hook", recv_msg_len);
 		objs->rx_data_hook(objs->rx_hook_ctx, (const uint8_t *)recv_msg, (uint32_t)recv_msg_len);
 	}
 

@@ -32,6 +32,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -48,9 +49,51 @@
 #define RESPONSE_TIMEOUT_MS   30000
 #define LISTEN_BACKLOG        4096
 
+/* Admission control: cap concurrent in-flight requests below the dpumesh
+ * resource limits (DPU buffer slots = 1024, DMA ring = 1024). When the cap
+ * is reached, workers block on g_inflight_cond before reading the next frame
+ * from any connection in their epoll set. The worker's epoll loop is paused
+ * → TCP recv buffers fill on its connections → kernel TCP advertise window
+ * shrinks → clients block on send. End-to-end backpressure with no
+ * exception responses, no buffer-full errors, no slot leaks. */
+#define GATEWAY_MAX_INFLIGHT  900   /* < 1024 dpumesh slot pool */
+
+static atomic_int g_inflight = 0;
+static pthread_mutex_t g_inflight_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_inflight_cond = PTHREAD_COND_INITIALIZER;
+
 static dpumesh_ctx_t *g_ctx = NULL;
 static volatile int g_running = 1;
 static int g_num_workers = DEFAULT_WORKERS;
+
+/* Block until in-flight count drops below the cap, then reserve a slot.
+ * Caller must call admission_release() after the request is fully processed
+ * (response sent or terminal failure path). */
+static void admission_acquire(void)
+{
+    pthread_mutex_lock(&g_inflight_lock);
+    while (atomic_load_explicit(&g_inflight, memory_order_acquire)
+           >= GATEWAY_MAX_INFLIGHT) {
+        if (!g_running) {
+            pthread_mutex_unlock(&g_inflight_lock);
+            return;
+        }
+        pthread_cond_wait(&g_inflight_cond, &g_inflight_lock);
+    }
+    atomic_fetch_add_explicit(&g_inflight, 1, memory_order_release);
+    pthread_mutex_unlock(&g_inflight_lock);
+}
+
+static void admission_release(void)
+{
+    int prev = atomic_fetch_sub_explicit(&g_inflight, 1, memory_order_release);
+    /* Wake one waiter — there's exactly one slot newly available. */
+    if (prev <= GATEWAY_MAX_INFLIGHT) {
+        pthread_mutex_lock(&g_inflight_lock);
+        pthread_cond_signal(&g_inflight_cond);
+        pthread_mutex_unlock(&g_inflight_lock);
+    }
+}
 
 /* Per-connection state — owned exclusively by one worker. */
 typedef struct conn_state {
@@ -198,7 +241,7 @@ static int process_request(conn_state_t *cs)
     desc.body_buf_slot        = tx_slot;
     desc.body_len             = (uint32_t)req_len;
     desc.req_id               = req_id;
-    desc.dst_pod_id           = 0;
+    desc.dst_pod_id           = 0;  /* forward to unique-id-service (pod_id=0) */
     desc.src_pod_id           = dpumesh_get_pod_id(g_ctx);
     desc.flags                = OP_REQUEST | CASE_EXTERNAL;
     desc.valid                = 1;
@@ -247,8 +290,16 @@ static int conn_drain(conn_state_t *cs)
                           : (4 + cs->frame_len - cs->buf_pos);
 
         if (need == 0) {
-            /* Whole frame in buffer — process it. */
-            if (process_request(cs) < 0) return -1;
+            /* Whole frame in buffer — admission gate, then process it.
+             * admission_acquire() blocks the worker thread when in-flight cap
+             * is reached. The worker's epoll loop is paused while blocked, so
+             * TCP recv buffers fill on its connections and clients see
+             * natural TCP-level backpressure. No exception responses,
+             * no leaks. */
+            admission_acquire();
+            int rc = process_request(cs);
+            admission_release();
+            if (rc < 0) return -1;
             cs->buf_pos   = 0;
             cs->frame_len = 0;
             continue;
@@ -409,6 +460,11 @@ static void on_sigterm(int signo)
 {
     (void)signo;
     g_running = 0;
+    /* Wake any worker thread blocked in admission_acquire() so it can observe
+     * g_running == 0 and exit cleanly. */
+    pthread_mutex_lock(&g_inflight_lock);
+    pthread_cond_broadcast(&g_inflight_cond);
+    pthread_mutex_unlock(&g_inflight_lock);
 }
 
 int main(void)

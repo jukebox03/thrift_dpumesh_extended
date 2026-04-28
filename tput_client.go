@@ -111,16 +111,27 @@ type wstate struct {
 	conn    *net.TCPConn
 	indices []int // global request indices owned by this worker
 	samples []sample
-	fail    int
+	failNet int // network/IO errors (connection broken, read deadline)
+	failExc int // server-side TApplicationException (gateway / dpumesh failure)
 }
 
 // runSchedule drives one connection through its assigned request indices.
 // ts(idx) = base + idx*interval — computed at fire time so all workers share clock.
+//
+// Result classification per request:
+//   ok        — Thrift Reply (msg_type=0x02)         → counted in samples
+//   failExc   — Thrift Exception (msg_type=0x03)     → connection alive, keep using
+//   failNet   — TCP error / read timeout / EOF       → redial connection
 func runSchedule(s *wstate, addr string, base time.Time, interval time.Duration, frame []byte) {
 	var resp4 [4]byte
 	samples := make([]sample, 0, len(s.indices))
-	fail := 0
+	failNet := 0
+	failExc := 0
 	bodyBuf := make([]byte, 0, 1024)
+
+	// Per-request read deadline. Gateway's RESPONSE_TIMEOUT_MS is 30s, so allow
+	// 35s for the round-trip; anything longer is a hung path, count as failNet.
+	const readDeadline = 35 * time.Second
 
 	for k, idx := range s.indices {
 		ts := base.Add(time.Duration(idx) * interval)
@@ -128,16 +139,19 @@ func runSchedule(s *wstate, addr string, base time.Time, interval time.Duration,
 			time.Sleep(d)
 		}
 		sendTs := time.Now()
-		ok := true
+		netErr := false
+		excErr := false
+
+		_ = s.conn.SetReadDeadline(time.Now().Add(readDeadline))
 
 		if _, err := s.conn.Write(frame); err != nil {
-			ok = false
+			netErr = true
 		} else if _, err := io.ReadFull(s.conn, resp4[:]); err != nil {
-			ok = false
+			netErr = true
 		} else {
 			rl := binary.BigEndian.Uint32(resp4[:])
-			if rl > 16*1024*1024 {
-				ok = false
+			if rl > 16*1024*1024 || rl < 4 {
+				netErr = true
 			} else {
 				if cap(bodyBuf) < int(rl) {
 					bodyBuf = make([]byte, rl)
@@ -145,33 +159,50 @@ func runSchedule(s *wstate, addr string, base time.Time, interval time.Duration,
 					bodyBuf = bodyBuf[:rl]
 				}
 				if _, err := io.ReadFull(s.conn, bodyBuf); err != nil {
-					ok = false
+					netErr = true
+				} else {
+					// Thrift binary protocol header in body[0..3]:
+					//   bytes 0..1 = version 0x8001
+					//   bytes 2..3 = message type (LE on wire = upper byte 0x00,
+					//                lower byte = 0x02 Reply / 0x03 Exception)
+					// gateway/send_thrift_exception writes 0x80 0x01 0x00 0x03.
+					// Real unique-id-service Reply writes 0x80 0x01 0x00 0x02.
+					if bodyBuf[3] == 0x03 {
+						excErr = true
+					}
 				}
 			}
 		}
 		now := time.Now()
 
-		if ok {
+		switch {
+		case !netErr && !excErr:
 			samples = append(samples, sample{
 				corrected: float64(now.Sub(ts).Microseconds()) / 1000.0,
 				raw:       float64(now.Sub(sendTs).Microseconds()) / 1000.0,
 			})
-		} else {
-			fail++
+		case excErr:
+			// Server-side failure (e.g. ENQUEUE rejected, DPUmesh timeout).
+			// Connection is still healthy — keep using it.
+			failExc++
+		case netErr:
+			failNet++
 			_ = s.conn.Close()
 			c, derr := dialNoDelay(addr)
 			if derr != nil {
-				// Cannot recover — count remaining indices as failed
-				fail += len(s.indices) - k - 1
+				// Cannot recover — count remaining indices as network-failed.
+				failNet += len(s.indices) - k - 1
 				s.samples = samples
-				s.fail = fail
+				s.failNet = failNet
+				s.failExc = failExc
 				return
 			}
 			s.conn = c
 		}
 	}
 	s.samples = samples
-	s.fail = fail
+	s.failNet = failNet
+	s.failExc = failExc
 }
 
 func percentile(s []float64, p float64) float64 {
@@ -201,7 +232,7 @@ func main() {
 	port := flag.Int("port", 9091, "Gateway port")
 	rps := flag.Int("rps", 1000, "Target RPS")
 	dur := flag.Int("duration", 10, "Duration seconds")
-	msgSize := flag.Int("msg-size", 8192, "Frame size in bytes (>=59)")
+	msgSize := flag.Int("msg-size", 8192, "Total DMA size in bytes incl. fc_header, 128-aligned (min 128, max 8192)")
 	numConns := flag.Int("conns", 0, "Number of TCP connections (0=auto: rps/25, min 64, max 8192)")
 	flag.Parse()
 
@@ -219,14 +250,43 @@ func main() {
 		*numConns = n
 	}
 
+	// msg-size = total DMA bytes the gateway will issue per request:
+	//   DMA = align_up_128( fc_header(8) + TCP wire frame length )
+	// To make actual DMA == msg-size:
+	//   wire = msg-size - 8, and msg-size must be 128-aligned and ≤ DPA_DMA_COPY_MAX (8192).
+	const fcHeaderSize = 8
+	const dmaAlign = 128
+	const dmaMax = 8192
+	if *msgSize < dmaAlign {
+		fmt.Fprintf(os.Stderr, "msg-size %d below DMA alignment (%d); bumping to %d\n",
+			*msgSize, dmaAlign, dmaAlign)
+		*msgSize = dmaAlign
+	}
+	if *msgSize > dmaMax {
+		fmt.Fprintf(os.Stderr, "msg-size %d exceeds DPA_DMA_COPY_MAX (%d); capping to %d\n",
+			*msgSize, dmaMax, dmaMax)
+		*msgSize = dmaMax
+	}
+	if *msgSize%dmaAlign != 0 {
+		aligned := ((*msgSize) + dmaAlign - 1) &^ (dmaAlign - 1)
+		fmt.Fprintf(os.Stderr, "msg-size %d not %d-aligned; rounding up to %d\n",
+			*msgSize, dmaAlign, aligned)
+		*msgSize = aligned
+	}
+
+	wireSize := *msgSize - fcHeaderSize
 	pad := 0
-	if *msgSize > 68 {
-		pad = *msgSize - 68
-	} else if *msgSize < 59 {
-		*msgSize = 59
+	if wireSize > 68 {
+		pad = wireSize - 68
+	} else if wireSize < 59 {
+		fmt.Fprintf(os.Stderr, "msg-size %d → wire %d < baseline frame 59; using 59\n",
+			*msgSize, wireSize)
+		wireSize = 59
 	}
 	frame := buildFrame("ComposeUniqueId", pad)
-	actualSize := len(frame)
+	actualWire := len(frame)
+	dmaPayload := fcHeaderSize + actualWire
+	dmaActual := (dmaPayload + dmaAlign - 1) &^ (dmaAlign - 1)
 
 	total := (*rps) * (*dur)
 	interval := time.Second / time.Duration(*rps)
@@ -239,7 +299,9 @@ func main() {
 	fmt.Printf("  Duration:     %ds\n", *dur)
 	fmt.Printf("  Connections:  %d\n", *numConns)
 	fmt.Printf("  Total reqs:   %d\n", total)
-	fmt.Printf("  Msg size:     %d bytes (pad=%d)\n", actualSize, pad)
+	fmt.Printf("  DMA size:     %d bytes  (= 8 fc_header + %d wire, 128-aligned)\n",
+		dmaActual, actualWire)
+	fmt.Printf("  TCP wire:     %d bytes  (Thrift frame, pad=%d)\n", actualWire, pad)
 	fmt.Printf("  Interval:     %v\n", interval)
 	fmt.Println("============================================================")
 	fmt.Println()
@@ -309,15 +371,17 @@ func main() {
 
 	// Aggregate
 	var corrected, raws []float64
-	var ok, fail int64
+	var ok, failNet, failExc int64
 	for i := range states {
 		for _, s := range states[i].samples {
 			corrected = append(corrected, s.corrected)
 			raws = append(raws, s.raw)
 		}
 		ok += int64(len(states[i].samples))
-		fail += int64(states[i].fail)
+		failNet += int64(states[i].failNet)
+		failExc += int64(states[i].failExc)
 	}
+	fail := failNet + failExc
 	sort.Float64s(corrected)
 	sort.Float64s(raws)
 
@@ -325,7 +389,8 @@ func main() {
 	actualDur := wallDur.Seconds()
 	rpsNom := float64(ok) / nominalDur
 	rpsWall := float64(ok) / actualDur
-	bps := float64(ok) * float64(actualSize) / actualDur
+	dmaBps := float64(ok) * float64(dmaActual) / actualDur
+	wireBps := float64(ok) * float64(actualWire) / actualDur
 
 	fmt.Println("============================================================")
 	fmt.Println("  Results")
@@ -336,11 +401,15 @@ func main() {
 	}
 	fmt.Printf("  Requests:     %d OK, %d failed (%.1f%% ok)\n",
 		ok, fail, 100*float64(ok)/float64(denom))
+	fmt.Printf("                  · %d Thrift exception (server-side fail: ENQUEUE/timeout)\n", failExc)
+	fmt.Printf("                  · %d network error (TCP / read timeout)\n", failNet)
 	fmt.Printf("  Wall-clock:   %.2fs (nominal %ds)\n", actualDur, *dur)
 	fmt.Printf("  Actual RPS:   %.1f (nominal-dur basis)\n", rpsNom)
 	fmt.Printf("  Actual RPS:   %.1f (wall-clock basis) <- real throughput\n", rpsWall)
-	fmt.Printf("  Bandwidth:    %.2f MB/s, %.3f Gbps (wall-clock)\n",
-		bps/1024/1024, bps*8/1e9)
+	fmt.Printf("  DMA bandwidth:  %.2f MB/s, %.3f Gbps (wall-clock, %dB DMA)\n",
+		dmaBps/1024/1024, dmaBps*8/1e9, dmaActual)
+	fmt.Printf("  TCP bandwidth:  %.2f MB/s, %.3f Gbps (wall-clock, %dB wire)\n",
+		wireBps/1024/1024, wireBps*8/1e9, actualWire)
 
 	if len(corrected) > 0 {
 		fmt.Println()

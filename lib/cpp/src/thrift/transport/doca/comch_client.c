@@ -37,7 +37,7 @@ static void client_send_task_completion_callback(struct doca_comch_task_send *ta
 	objs = (struct objects *)(ctx_user_data.ptr);
 	doca_pool_release(&objs->send_tasks_in_flight);
 
-	DOCA_LOG_INFO("Client task sent successfully");
+	DOCA_LOG_DBG("Client task sent successfully");
 	if (payload_copy != NULL)
 		free(payload_copy);
 	doca_task_free(doca_comch_task_send_as_task(task));
@@ -118,14 +118,14 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 				     msg_len, sizeof(struct dmesh_rx_data_msg));
 			return;
 		}
-		DOCA_LOG_INFO("Client received DMESH_MSG_RX_DATA len=%u", msg_len);
+		DOCA_LOG_DBG("Client received DMESH_MSG_RX_DATA len=%u", msg_len);
 		if (objs->rx_data_hook)
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
 
 	case DMESH_MSG_TX_ACK:
 		/* Forward DMA consumed by DPU — sender can free TX buffer slot */
-		DOCA_LOG_INFO("Client received DMESH_MSG_TX_ACK len=%u", msg_len);
+		DOCA_LOG_DBG("Client received DMESH_MSG_TX_ACK len=%u", msg_len);
 		if (objs->rx_data_hook)
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
@@ -133,7 +133,7 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 	case DMESH_MSG_DMA_COMPLETION:
 		/* Reverse DMA (DPU→CPU) completion: data is already in Host RX DMA buffer.
 		 * The notification carries comch_dma_comp_msg in desc[64] with pos/length. */
-		DOCA_LOG_INFO("Client received DMESH_MSG_DMA_COMPLETION len=%u", msg_len);
+		DOCA_LOG_DBG("Client received DMESH_MSG_DMA_COMPLETION len=%u", msg_len);
 		if (objs->rx_data_hook)
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;

@@ -265,7 +265,7 @@ static void dmesh_doca_dpa_msgq_send_cb(struct doca_comch_producer_task_send *se
     struct objects *objs = (struct objects *)ctx_user_data.ptr;
     objs->sent_msg_cnt++;
 
-    DOCA_LOG_INFO("DPA MsgQ send completion callback: sent_msg_cnt=%d", objs->sent_msg_cnt);
+    DOCA_LOG_DBG("DPA MsgQ send completion callback: sent_msg_cnt=%d", objs->sent_msg_cnt);
 	if (payload_copy != NULL)
 		free(payload_copy);
     
