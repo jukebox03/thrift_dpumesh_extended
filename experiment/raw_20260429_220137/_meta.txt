@@ -1,0 +1,48 @@
+=== Sweep metadata ===
+Date: 2026-04-29T22:01:37+09:00
+Git HEAD: e4ea27a1188ae9e1b193dd374eaf1b9e6b3ced93
+Git status (modified files):
+ M build-doca/lib/libthrift.a
+ M build-doca/lib/libthrift.so.0.12.0
+ M lib/cpp/src/thrift/transport/doca/comch_client.h
+ M lib/cpp/src/thrift/transport/doca/comch_common.h
+ M lib/cpp/src/thrift/transport/doca/comch_consumer.h
+ M lib/cpp/src/thrift/transport/doca/comch_server.c
+ M lib/cpp/src/thrift/transport/doca/comch_server.h
+ M lib/cpp/src/thrift/transport/doca/device/dpa_kernel.c
+ M lib/cpp/src/thrift/transport/doca/dpa.c
+ M lib/cpp/src/thrift/transport/doca/dpa_common.h
+ M lib/cpp/src/thrift/transport/doca/dpu_worker.c
+ M lib/cpp/src/thrift/transport/doca/dpumesh_common.h
+ M lib/cpp/src/thrift/transport/doca/object.h
+ M lib/cpp/src/thrift/transport/dpumesh.h
+ M lib/cpp/src/thrift/transport/dpumesh_doca.c
+ M thrift-install/usr/local/include/thrift/transport/doca/comch_client.h
+ M thrift-install/usr/local/include/thrift/transport/doca/comch_common.h
+ M thrift-install/usr/local/include/thrift/transport/doca/comch_consumer.h
+ M thrift-install/usr/local/include/thrift/transport/doca/comch_server.h
+ M thrift-install/usr/local/include/thrift/transport/doca/dpa_common.h
+ M thrift-install/usr/local/include/thrift/transport/doca/dpumesh_common.h
+ M thrift-install/usr/local/include/thrift/transport/doca/object.h
+ M thrift-install/usr/local/include/thrift/transport/dpumesh.h
+ M thrift-install/usr/local/lib/libthrift.a
+ M thrift-install/usr/local/lib/libthrift.so.0.12.0
+?? doc/hang-analysis-2026-04-29.md
+?? experiment/raw_20260429_220137/
+
+RPS levels: 5000 10000 15000 20000 25000 30000 35000 40000 45000 50000 60000 65000
+Per-test duration: 30s
+Per-test wall timeout: 45s (kill + stop suite)
+Msg size: default (8192B)
+
+DPU log (pre-sweep tail):
+[12:58:57:104040][3203674144][DOCA][INF][dpu_worker.c:496][run_dpu_worker] elapsed: 1.00, sent: 1/s, recv: 0/s, pods: 2, cq_depth: 0, deferred: 0
+[12:58:58:104041][3203674144][DOCA][INF][dpu_worker.c:496][run_dpu_worker] elapsed: 1.00, sent: 1/s, recv: 0/s, pods: 2, cq_depth: 0, deferred: 0
+[12:58:59:104041][3203674144][DOCA][INF][dpu_worker.c:496][run_dpu_worker] elapsed: 1.00, sent: 1/s, recv: 0/s, pods: 2, cq_depth: 0, deferred: 0
+[12:59:00:104042][3203674144][DOCA][INF][dpu_worker.c:496][run_dpu_worker] elapsed: 1.00, sent: 1/s, recv: 0/s, pods: 2, cq_depth: 0, deferred: 0
+[12:59:01:104041][3203674144][DOCA][INF][dpu_worker.c:496][run_dpu_worker] elapsed: 1.00, sent: 1/s, recv: 0/s, pods: 2, cq_depth: 0, deferred: 0
+[12:59:02:104042][3203674144][DOCA][INF][dpu_worker.c:496][run_dpu_worker] elapsed: 1.00, sent: 1/s, recv: 0/s, pods: 2, cq_depth: 0, deferred: 0
+[12:59:03:104042][3203674144][DOCA][INF][dpu_worker.c:496][run_dpu_worker] elapsed: 1.00, sent: 1/s, recv: 0/s, pods: 2, cq_depth: 0, deferred: 0
+[12:59:04:104042][3203674144][DOCA][INF][dpu_worker.c:496][run_dpu_worker] elapsed: 1.00, sent: 1/s, recv: 0/s, pods: 2, cq_depth: 0, deferred: 0
+[12:59:05:104043][3203674144][DOCA][INF][dpu_worker.c:496][run_dpu_worker] elapsed: 1.00, sent: 1/s, recv: 0/s, pods: 2, cq_depth: 0, deferred: 0
+[12:59:06:104043][3203674144][DOCA][INF][dpu_worker.c:496][run_dpu_worker] elapsed: 1.00, sent: 1/s, recv: 0/s, pods: 2, cq_depth: 0, deferred: 0

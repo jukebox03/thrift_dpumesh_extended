@@ -99,7 +99,6 @@ typedef struct {
     struct doca_comch_connection *conn;
     uint32_t  req_id;
     int32_t   dst_pod_id;
-    uint32_t  ack_tail;
 } deferred_tx_ack_t;
 
 /* ====== DOCA task pool capacity tracking (check-first model) ======
@@ -159,14 +158,12 @@ struct pod_state {
     void *host_rx_addr;
     size_t host_rx_buf_size;
 
-    /* === Flow control state === */
-
-    /* As receiver (CPU→DPU): tracks consumption of RX DMA buffer */
-    uint32_t rx_consumer_tail;
-
-    /* As sender (DPU→CPU): tracks production into TX buffer */
+    /* === DPU-internal write cursor for reverse DMA ===
+     * DPU is a pure forwarder. End-nodes do flow control end-to-end via
+     * slot-based admission (slot_count × slot_size ≤ DPU_BUFFER_SIZE), so
+     * DPU does not throttle. tx_producer_head only chooses the next physical
+     * write offset (with wrap) inside this pod's reverse-DMA staging buffer. */
     uint32_t tx_producer_head;
-    uint32_t tx_last_consumer_tail; /* last known Host RX consumption from received header */
 };
 
 struct objects {

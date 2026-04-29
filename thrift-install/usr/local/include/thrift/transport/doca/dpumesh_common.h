@@ -23,9 +23,26 @@
 #define MAX_DPA_RINGS       8
 #define MAX_PODS            8
 
-/* DPU-side DMA buffer size per pod (shared by Host FC check and DPU allocation).
- * Must be >= Host TX buffer (DPUMESH_NUM_SLOTS_DEFAULT * DPUMESH_SLOT_SIZE_DEFAULT)
- * to avoid overrunning the DPU RX buffer under full load. */
-#define DPU_BUFFER_SIZE     (8 * 1024 * 1024)  /* 8MB */
+/* DPU-side DMA buffer size per pod (DPU's intermediate buffers used for
+ * forward and reverse DMA staging). MUST equal
+ * DPUMESH_NUM_SLOTS_DEFAULT × DPUMESH_SLOT_SIZE_DEFAULT so end-node
+ * slot-based admission directly bounds in-flight bytes ≤ DPU buffer size.
+ *
+ * That invariant is the entire flow-control story for a single (src, dst)
+ * pair: end-nodes hold a TX slot from enqueue until response (or TX_ACK),
+ * so #live slots × slot_size is the worst-case per-source in-flight
+ * footprint inside DPU. With this equality DPU never laps unconsumed
+ * bytes, even though DPU/DPA do no FC of their own.
+ *
+ * Both directions carry per-entry payload = [fc_header][body], with
+ * body_len ≤ slot_size − sizeof(fc_header). Per-request metadata travels
+ * via dma_desc / comch_dma_comp_msg, NOT in the DMA payload — that is what
+ * keeps reverse footprint = forward footprint = num_slots × slot_size.
+ *
+ * Caveat: a destination pod's reverse staging buffer aggregates entries
+ * from ALL source pods that target it. With N concurrent sources targeting
+ * one dst, worst-case dst staging occupancy is N × this size. Single-source
+ * workloads fit exactly; multi-source needs a scaled DPU_BUFFER_SIZE. */
+#define DPU_BUFFER_SIZE     (8 * 1024 * 1024)  /* 8MB = 1024 × 8KB */
 
 #endif /* DPUMESH_COMMON_H */

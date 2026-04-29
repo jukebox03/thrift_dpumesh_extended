@@ -21,11 +21,11 @@ extern "C" {
 /* ====== Default constants ====== */
 #define DPUMESH_SLOT_SIZE_DEFAULT       8192            /* 8KB */
 /* Slot pool size — used both for host TX (outgoing) and host RX (incoming
- * application data). Must comfortably exceed peak concurrent in-flight
- * requests so PE thread never has to drop on rx_slot_alloc. With gateway
- * admission cap of 900 and TThreadedServer-style services, 8192 is a
- * comfortable headroom. Memory cost: 8192 × 8192B = 64 MB per direction. */
-#define DPUMESH_NUM_SLOTS_DEFAULT       8192
+ * application data). num_slots × slot_size MUST equal DPU_BUFFER_SIZE
+ * (8 MB) so slot-based admission directly bounds in-flight bytes inside
+ * DPU. 1024 × 8 KB = 8 MB exactly. This is the only flow-control mechanism;
+ * DPU/DPA do no throttling. Memory cost: 8 MB per direction. */
+#define DPUMESH_NUM_SLOTS_DEFAULT       1024
 #define DPUMESH_DESCRIPTOR_SIZE         64
 #define DPUMESH_MAX_DESCRIPTORS_DEFAULT 1024
 #define DPUMESH_PREFIX_DEFAULT          "dpumesh"

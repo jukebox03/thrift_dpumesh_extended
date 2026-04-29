@@ -8,8 +8,8 @@
 
 struct objects; /* Forward declaration */
 
-#define CC_SEND_TASK_NUM 1024 /* Number of CC send tasks  */
-#define CC_RECV_QUEUE_SIZE 1024 /* Size of CC receive queue */
+#define CC_SEND_TASK_NUM 8192 /* Number of CC send tasks (HW max ~65536) */
+#define CC_RECV_QUEUE_SIZE 8192 /* Size of CC receive queue */
 
 #define STR_START_DATA_PATH_TEST "start_data_path_test" /* The negotiation message between client and server */
 #define STR_STOP_DATA_PATH_TEST "stop_data_path_test"	/* The negotiation message between client and server */

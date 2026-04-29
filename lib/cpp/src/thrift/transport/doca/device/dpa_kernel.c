@@ -545,12 +545,18 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
         thread_arg->rev_pos[r] = 0;
 
     /* Build completion message for DPU ARM (which forwards to Host).
-     * Reverse direction: src=DPU TX buffer, dst=Host RX buffer. */
+     * Reverse direction: src=DPU TX buffer, dst=Host RX buffer.
+     *
+     * src_pod_id is the ORIGINAL forward sender (DPU set it on the desc
+     * during dpu_enqueue_reverse_dma). The reverse ring's ring->pod_id
+     * is the RECEIVER pod, not the source — using it here would lose
+     * the original sender identity, which the receiving host needs for
+     * routing. */
     comp.type = COMCH_MSG_TYPE_REV_DMA_COMPLETED;
     comp.pos = thread_arg->rev_pos[r];
     comp.length = desc->size;
     comp.req_id = (uint32_t)desc->idx;
-    comp.src_pod_id = ring->pod_id;
+    comp.src_pod_id = desc->src_pod_id;
     comp.dst_pod_id = desc->dst_pod_id;
     comp.flags = desc->flags;
 

@@ -48,12 +48,22 @@ struct dpa_thread_arg {
 	uint32_t rev_pos[MAX_DPA_RINGS];
 } __attribute__((__packed__, aligned(8)));
 
-/* ====== Flow-control message header ======
- * Prepended to every DMA payload by the sender.
- * DPA copies it verbatim; the receiver parses it. */
+/* ====== Per-message header ======
+ * Prepended to every DMA payload by the sender. DPA copies it verbatim;
+ * the receiver parses payload_len to know how many body bytes follow.
+ *
+ * Forward path (Host→DPU): payload = [fc_header][body]; payload_len = body_len.
+ * Reverse path (DPU→Host): payload = [fc_header][body]; payload_len = body_len.
+ *   sw_descriptor is NOT in the payload — req_id / src_pod_id / dst_pod_id /
+ *   flags are carried via dmesh_dma_completion_msg (and dma_desc on-DPU).
+ *   This keeps reverse per-entry size = forward per-entry size = slot_size,
+ *   which is what makes num_slots × slot_size ≤ DPU_BUFFER_SIZE actually
+ *   bound the reverse buffer occupancy.
+ *
+ * Flow control is handled end-to-end at the application layer via slot-
+ * based admission. DPU/DPA do not interpret any byte-position field. */
 struct fc_header {
-	uint32_t consumer_tail;  /* sender's RX buffer consumption position */
-	uint32_t payload_len;    /* actual payload length after this header */
+	uint32_t payload_len;    /* body length following this header */
 } __attribute__((__packed__));
 
 /* ====== Comch message types (DPU ↔ DPA) ====== */
@@ -127,7 +137,17 @@ struct dma_desc {
 	uint64_t idx;                  /* 8B (req_id) */
 	int32_t dst_pod_id;            /* 4B (routing target) */
 	int8_t flags;                  /* 1B (OP_REQUEST/OP_RESPONSE + CASE_*) */
-	uint8_t reserved[34];          /* 34B */
+	uint8_t pad0[3];               /* 3B alignment for src_pod_id */
+	int32_t src_pod_id;            /* 4B (original forward sender; on reverse rings,
+	                                * ring->pod_id is the receiver, so the source
+	                                * must be carried in the descriptor itself.
+	                                * Forward path: DPA derives src from ring->pod_id
+	                                * and ignores this field. Reverse path: DPU sets
+	                                * it in dpu_enqueue_reverse_dma; DPA copies into
+	                                * comp.src_pod_id so the receiving host can
+	                                * route OP_REQUEST/RESPONSE correctly without
+	                                * an in-payload sw_descriptor. */
+	uint8_t reserved[27];          /* 27B */
 	volatile uint8_t valid;        /* 1B */
 } __attribute__((__packed__, aligned(8)));
 
@@ -138,6 +158,7 @@ _Static_assert(offsetof(struct dma_desc, size) == 12, "dma_desc.size offset mism
 _Static_assert(offsetof(struct dma_desc, idx) == 16, "dma_desc.idx offset mismatch");
 _Static_assert(offsetof(struct dma_desc, dst_pod_id) == 24, "dma_desc.dst_pod_id offset mismatch");
 _Static_assert(offsetof(struct dma_desc, flags) == 28, "dma_desc.flags offset mismatch");
+_Static_assert(offsetof(struct dma_desc, src_pod_id) == 32, "dma_desc.src_pod_id offset mismatch");
 _Static_assert(offsetof(struct dma_desc, valid) == 63, "dma_desc.valid offset mismatch");
 
 #endif

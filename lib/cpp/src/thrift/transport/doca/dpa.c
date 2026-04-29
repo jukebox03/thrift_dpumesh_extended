@@ -103,15 +103,14 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             uint32_t raw_len = comp_msg->length;
 
             /* Parse fc_header from the beginning of DMA'd data.
-             * Layout: [fc_header(8B)] [body(N)] */
+             * Layout: [fc_header(payload_len)] [body(N)]
+             *
+             * DPU is a pure forwarder — read payload_len only; flow control
+             * is end-to-end via slot-based admission at end-nodes. */
             uint32_t payload_len = raw_len;
             uint32_t body_offset = comp_msg->pos;
             if (raw_len >= sizeof(struct fc_header)) {
                 struct fc_header *hdr = (struct fc_header *)payload_src;
-                /* Update flow control: Host told us how much of our TX buffer
-                 * (DPU→CPU direction) it has consumed. */
-                if (src_pod)
-                    src_pod->tx_last_consumer_tail = hdr->consumer_tail;
                 payload_len = hdr->payload_len;
                 body_offset = comp_msg->pos + sizeof(struct fc_header);
             }
@@ -131,7 +130,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             entry.flags = comp_msg->flags;
 
             /* Zero-copy: record buffer offset (after fc_header) instead of heap-copying.
-             * Flow control guarantees DPA won't overwrite until consumer_tail advances. */
+             * End-node slot-based admission keeps in-flight bytes ≤ buf_size
+             * so DPA cannot lap unconsumed data. */
             entry.buf_offset = body_offset;
             entry.pod_idx = -1; /* will be resolved by pod lookup */
             for (int pi = 0; pi < objs->num_pods; pi++) {
@@ -1334,10 +1334,9 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         }
     }
 
-    /* Initialize flow control state */
-    pod->rx_consumer_tail = 0;
+    /* Initialize DPU-internal write cursor for reverse DMA. DPU is a pure
+     * forwarder; this only chooses the next physical write offset. */
     pod->tx_producer_head = 0;
-    pod->tx_last_consumer_tail = 0;
 
     pod->dma_ready = 1;
     return DOCA_SUCCESS;
