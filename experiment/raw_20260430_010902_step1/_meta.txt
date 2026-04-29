@@ -1,0 +1,97 @@
+=== Step1 200Hz keepalive sweep ===
+2026-04-30T01:09:21+09:00
+Git HEAD: 5977b706d048bb5d0a921f16b6e6cb546bcfb122
+
+=== Modified files ===
+ M lib/cpp/src/thrift/transport/doca/dpu_worker.c
+?? architecture/dpumesh_architecture.md
+?? experiment/raw_20260430_010902_step1/
+
+=== Change in dpu_worker.c ===
+diff --git a/lib/cpp/src/thrift/transport/doca/dpu_worker.c b/lib/cpp/src/thrift/transport/doca/dpu_worker.c
+index aaeddcecb..c915b407c 100644
+--- a/lib/cpp/src/thrift/transport/doca/dpu_worker.c
++++ b/lib/cpp/src/thrift/transport/doca/dpu_worker.c
+@@ -364,8 +364,9 @@ void
+ run_dpu_worker(struct objects *objs)
+ {
+     doca_error_t result;
+-    struct timespec last, now;
++    struct timespec last, now, last_kick;
+     double elapsed = 0.0;
++    double kick_elapsed = 0.0;
+ 
+     DOCA_LOG_INFO("Starting DPU worker");
+ 
+@@ -433,6 +434,7 @@ run_dpu_worker(struct objects *objs)
+ 
+     /* Main loop: poll consumer PE + ctrl path PE + per-pod producer PE */
+     clock_gettime(CLOCK_MONOTONIC, &last);
++    last_kick = last;
+     while (true) {
+         doca_pe_progress(objs->consumer_pe);
+         doca_pe_progress(objs->pe);  /* handle new connections, REGISTER, TX_DATA */
+@@ -484,13 +486,38 @@ run_dpu_worker(struct objects *objs)
+         objects_drain_consumer_retry(objs);
+ 
+         clock_gettime(CLOCK_MONOTONIC, &now);
++
++        /* 200 Hz keepalive trigger (every 5 ms): wake source for DPA's idle
++         * reschedule. dma_ring valid-bit polling has no HW completion event,
++         * so without this an idle DPA never sees host-posted descriptors.
++         * Bounds idle→active wakeup latency to ≤5 ms. The previous 1 Hz tick
++         * left a 1 s race window that was observed to cause multi-RPS sweep
++         * hangs (idle between RPS levels) even though single-RPS load passed.
++         * Trigger msg is ≤32 B immediate, so 200 sends/s costs essentially
++         * nothing in comch send pool capacity. */
++        kick_elapsed = (now.tv_sec - last_kick.tv_sec) +
++                       (now.tv_nsec - last_kick.tv_nsec) / 1e9;
++        if (kick_elapsed >= 0.005) {
++            if (objs->dpa_thread_running && objs->dpa_comch) {
++                struct comch_msg trigger;
++                memset(&trigger, 0, sizeof(trigger));
++                trigger.type = COMCH_MSG_TYPE_TRIGGER;
++                (void)dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
++                                               &trigger, sizeof(trigger));
++            }
++            last_kick = now;
++        }
++
+         elapsed = (now.tv_sec - last.tv_sec) +
+                   (now.tv_nsec - last.tv_nsec) / 1e9;
+         if (elapsed >= 1.0) {
+             uint32_t cq_depth = comp_queue_usage(&objs->comp_queue);
+             /* Only emit the periodic stat line when there is something to report.
+              * On an idle DPU this fired every second, growing the log file
+-             * indefinitely with no useful information. */
++             * indefinitely with no useful information. With 200 Hz keepalive
++             * sent_msg_cnt has a baseline of ~200/s, so the heartbeat fires
++             * every second under normal operation — that's intentional, it's
++             * the signal that the DPU loop is alive. */
+             if (objs->sent_msg_cnt > 0 || objs->recv_msg_cnt > 0 ||
+                 cq_depth > 0 || objs->num_deferred_recv > 0) {
+                 DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s, pods: %d, cq_depth: %u, deferred: %d",
+@@ -501,18 +528,6 @@ run_dpu_worker(struct objects *objs)
+             objs->sent_msg_cnt = 0;
+             objs->recv_msg_cnt = 0;
+             last = now;
+-
+-            /* 1Hz keepalive trigger: wake source for DPA's idle reschedule.
+-             * dma_ring valid-bit polling has no HW completion event, so without
+-             * this an idle DPA never sees host-posted descriptors. Bounds
+-             * idle→active wakeup latency to ≤1s. */
+-            if (objs->dpa_thread_running && objs->dpa_comch) {
+-                struct comch_msg trigger;
+-                memset(&trigger, 0, sizeof(trigger));
+-                trigger.type = COMCH_MSG_TYPE_TRIGGER;
+-                (void)dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+-                                               &trigger, sizeof(trigger));
+-            }
+         }
+     }
+ 
+
+=== Plan ===
+1. ./test-dpumesh.sh deploy
+2. 4× ./test-dpumesh.sh throughput 40000 30, each killed at 45s wall
+3. Capture DPU log before/after each run

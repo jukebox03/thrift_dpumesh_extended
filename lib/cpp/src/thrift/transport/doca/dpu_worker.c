@@ -364,8 +364,9 @@ void
 run_dpu_worker(struct objects *objs)
 {
     doca_error_t result;
-    struct timespec last, now;
+    struct timespec last, now, last_kick;
     double elapsed = 0.0;
+    double kick_elapsed = 0.0;
 
     DOCA_LOG_INFO("Starting DPU worker");
 
@@ -433,6 +434,7 @@ run_dpu_worker(struct objects *objs)
 
     /* Main loop: poll consumer PE + ctrl path PE + per-pod producer PE */
     clock_gettime(CLOCK_MONOTONIC, &last);
+    last_kick = last;
     while (true) {
         doca_pe_progress(objs->consumer_pe);
         doca_pe_progress(objs->pe);  /* handle new connections, REGISTER, TX_DATA */
@@ -484,6 +486,28 @@ run_dpu_worker(struct objects *objs)
         objects_drain_consumer_retry(objs);
 
         clock_gettime(CLOCK_MONOTONIC, &now);
+
+        /* 1 kHz keepalive trigger: bounds the idle→active wake-up latency
+         * for DPA to ~1 ms when no other event arrives on its consumer_comp.
+         * During a busy burst, drain_all_rings keeps DPA spinning (chunks > 0
+         * never reschedules), so the keepalive does nothing.  During idle
+         * (chunks == 0 → DPA reschedules), the next keepalive fires within
+         * 1 ms and pulls DPA back to drain whatever the host posted. Send
+         * fire-and-forget: a missed kick is recovered by the next one. The
+         * cost is 1000 × 68 B = 68 KB/s on the DPU→DPA msgq — negligible. */
+        kick_elapsed = (now.tv_sec - last_kick.tv_sec) +
+                       (now.tv_nsec - last_kick.tv_nsec) / 1e9;
+        if (kick_elapsed >= 0.001) {
+            if (objs->dpa_thread_running && objs->dpa_comch) {
+                struct comch_msg trigger;
+                memset(&trigger, 0, sizeof(trigger));
+                trigger.type = COMCH_MSG_TYPE_TRIGGER;
+                (void)dmesh_doca_dpa_msgq_send_try(&objs->dpa_comch->send,
+                                                    &trigger, sizeof(trigger));
+            }
+            last_kick = now;
+        }
+
         elapsed = (now.tv_sec - last.tv_sec) +
                   (now.tv_nsec - last.tv_nsec) / 1e9;
         if (elapsed >= 1.0) {
@@ -502,17 +526,13 @@ run_dpu_worker(struct objects *objs)
             objs->recv_msg_cnt = 0;
             last = now;
 
-            /* 1Hz keepalive trigger: wake source for DPA's idle reschedule.
-             * dma_ring valid-bit polling has no HW completion event, so without
-             * this an idle DPA never sees host-posted descriptors. Bounds
-             * idle→active wakeup latency to ≤1s. */
-            if (objs->dpa_thread_running && objs->dpa_comch) {
-                struct comch_msg trigger;
-                memset(&trigger, 0, sizeof(trigger));
-                trigger.type = COMCH_MSG_TYPE_TRIGGER;
-                (void)dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
-                                               &trigger, sizeof(trigger));
-            }
+            /* No keepalive: DPA wake-up is driven entirely by per-request
+             * triggers (host WAKE_DPA on dpumesh_enqueue, DPU TRIGGER on
+             * dpu_enqueue_reverse_dma). The 1Hz tick had two roles —
+             * timer reset against the 12 s max kernel runtime, and idle
+             * fallback wake — neither needed once DPA reschedules every
+             * iteration and every desc post is paired with an explicit
+             * trigger. */
         }
     }
 

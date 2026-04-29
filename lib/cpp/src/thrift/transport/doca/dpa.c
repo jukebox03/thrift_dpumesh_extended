@@ -979,7 +979,48 @@ dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t m
 	return DOCA_SUCCESS;
 }
 
-doca_error_t 
+/* Non-blocking variant: returns DOCA_ERROR_AGAIN immediately on submit
+ * failure, no PE progress, no retry. For hot-path DPU→DPA TRIGGER signals
+ * where the rev desc is already on the ring and a missed trigger is
+ * recoverable by the next successful send. Used by comch_server.c WAKE_DPA
+ * forwarder and dpu_worker.c reverse DMA trigger. */
+doca_error_t
+dmesh_doca_dpa_msgq_send_try(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t msg_size)
+{
+    doca_error_t result;
+    union doca_data user_data;
+    void *msg_copy;
+    struct doca_comch_producer_task_send *send_task;
+    struct doca_task *task;
+
+    msg_copy = malloc(msg_size);
+    if (msg_copy == NULL)
+        return DOCA_ERROR_NO_MEMORY;
+    memcpy(msg_copy, msg, msg_size);
+
+    result = doca_comch_producer_task_send_alloc_init(msgq->producer, NULL,
+                                                       msg_copy, msg_size,
+                                                       msgq->target_consumer_id,
+                                                       &send_task);
+    if (result != DOCA_SUCCESS) {
+        free(msg_copy);
+        return result;
+    }
+
+    task = doca_comch_producer_task_send_as_task(send_task);
+    user_data.ptr = msg_copy;
+    doca_task_set_user_data(task, user_data);
+
+    result = doca_task_submit(task);
+    if (result != DOCA_SUCCESS) {
+        free(msg_copy);
+        doca_task_free(task);
+        return result;
+    }
+    return DOCA_SUCCESS;
+}
+
+doca_error_t
 dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg,
                                 void *msg, uint32_t msg_size)
 {

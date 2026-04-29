@@ -709,19 +709,25 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
                          thread_arg->dpu_consumer_id,
                          thread_arg->num_rings);
 
-    DOCA_DPA_DEV_LOG_INFO("entering polling loop (consumer_id=%u)\n",
+    DOCA_DPA_DEV_LOG_INFO("entering hybrid spin/yield loop (consumer_id=%u)\n",
                          thread_arg->dpu_consumer_id);
 
-    /* Pure polling loop — no thread_reschedule().
-     * DOCA DPA notification events are edge-triggered and lost if the
-     * thread is running when they fire, creating an unavoidable race
-     * window between request_notification() and thread_reschedule().
-     * Polling eliminates this entirely: the DPA core continuously checks
-     * the ring buffer for valid descriptors and the comch CQ for control
-     * messages (ADD_RING, etc.). */
+    /* Hybrid: spin while there is work (cache-hot, low per-desc overhead),
+     * yield to RTOS only when both rings are empty AND no producer slots
+     * are pending. This:
+     *   - resets the 12 s max kernel runtime timer whenever the workload
+     *     pauses, avoiding the silent fatal termination observed under
+     *     pure-spin earlier
+     *   - sustains the ~40 k+ DMA/s rate during bursts because there is
+     *     no wake/reschedule overhead inside the work batch
+     *   - relies on the DPU forwarding a TRIGGER (host WAKE_DPA on enqueue,
+     *     DPU rev DMA enqueue) to fire consumer_comp and re-activate the
+     *     thread when a new desc arrives during idle */
     while (1) {
         handle_msgs(thread_arg);
-        drain_all_rings(thread_arg);
+        int chunks = drain_all_rings(thread_arg);
         drain_producer_completions(thread_arg);
+        if (chunks == 0)
+            doca_dpa_dev_thread_reschedule();
     }
 }

@@ -89,6 +89,11 @@ dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dp
 doca_error_t
 dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t msg_size);
 
+/* Non-blocking variant of dmesh_doca_dpa_msgq_send: returns AGAIN on submit
+ * failure, no retry, no PE progress. For hot-path TRIGGER fire-and-forget. */
+doca_error_t
+dmesh_doca_dpa_msgq_send_try(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t msg_size);
+
 doca_error_t
 dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg,
                                 void *msg, uint32_t msg_size);
