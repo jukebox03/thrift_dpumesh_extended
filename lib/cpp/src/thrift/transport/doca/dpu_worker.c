@@ -128,6 +128,13 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
     uint32_t req_id = entry->req_id;
     uint32_t payload_len = entry->length;
 
+    /* Resolve src_pod first so we can ACK even on error paths below.
+     * The DPU is the sole authority that can release the host's pending
+     * slot — failing to TX_ACK leaves the originating client waiting on
+     * the 2s collision-wait reclaim, which is the long-tail latency
+     * cliff. Treat ACK as a hard guarantee whenever src_pod is alive. */
+    struct pod_state *src_pod = find_pod_by_id(objs, src_pod_id);
+
     /* Zero-copy: resolve data pointer from pod's RX DMA buffer + offset */
     uint8_t *data = NULL;
     if (entry->pod_idx >= 0 && entry->pod_idx < objs->num_pods) {
@@ -137,10 +144,33 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
     }
     if (!data) {
         DOCA_LOG_ERR("comp_queue: invalid pod_idx=%d for req_id=%u", entry->pod_idx, req_id);
+        /* Pod owning the payload is gone; we cannot forward, but we MUST
+         * still release the host slot of src_pod so its caller doesn't
+         * stall. Send TX_ACK with src_pod's current tail (we have no new
+         * tail to report since we never DMA'd anything). */
+        if (src_pod && src_pod->connection) {
+            doca_error_t ack_result = server_send_tx_ack_to(objs, src_pod->connection,
+                                                             req_id, dst_pod_id,
+                                                             src_pod->rx_consumer_tail);
+            if (ack_result == DOCA_ERROR_AGAIN) {
+                if (objs->num_deferred_tx_acks < MAX_DEFERRED_TX_ACK) {
+                    int n = objs->num_deferred_tx_acks++;
+                    objs->deferred_tx_acks[n].conn        = src_pod->connection;
+                    objs->deferred_tx_acks[n].req_id      = req_id;
+                    objs->deferred_tx_acks[n].dst_pod_id  = dst_pod_id;
+                    objs->deferred_tx_acks[n].ack_tail    = src_pod->rx_consumer_tail;
+                } else {
+                    DOCA_LOG_ERR("deferred TX_ACK queue full on error path — "
+                                 "dropping req_id=%u (pod %d)",
+                                 req_id, src_pod_id);
+                }
+            } else if (ack_result != DOCA_SUCCESS) {
+                DOCA_LOG_WARN("error-path TX_ACK failed for req_id=%u to pod %d: %s",
+                              req_id, src_pod_id, doca_error_get_descr(ack_result));
+            }
+        }
         return -1;
     }
-
-    struct pod_state *src_pod = find_pod_by_id(objs, src_pod_id);
 
     /* Route data to destination pod via reverse DMA (DPU→CPU) */
     int echo_mode = (dst_pod_id == -1 || dst_pod_id == src_pod_id);

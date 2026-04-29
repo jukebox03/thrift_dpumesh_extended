@@ -93,6 +93,50 @@
    DMA 경로로 대체되어 더 이상 데이터 수신에 사용되지 않음. 그러나 DPU-side consumer는 
    DPA message queue에 필요. Host-side consumer만 선택적으로 제거 가능.
 
+### Disconnect / 실패 경로 후속 작업
+
+DPU end-node가 host pod 사망/네트워크 단절 시 ACK 보장과 자원 정리를 책임지는 부분.
+일부는 이미 적용됨:
+- `dpu_worker.c` `process_forward_entry`의 `pod_idx` invalid early-return 경로에서
+  src_pod에 TX_ACK 보내고 빠지도록 변경 → 페이로드 소유 pod이 죽어도 호출자는
+  2s reclaim 타임아웃 없이 host slot 회수.
+- `comch_server.c` `server_disconnection_event_callback` 빈 구현을
+  `pods_remove_connection()` 호출로 교체. 슬롯을 dead로 마킹(`registered=0`,
+  `connection=NULL`, `pod_id=-1`)하고 host-export mmap 3개(ring/remote/host_rx)를
+  `doca_mmap_destroy()`로 DPU 측 view 해제. 슬롯은 압축하지 않고 인덱스 유지
+  (in-flight `comp_queue` 엔트리가 dead 슬롯을 안전하게 식별하도록).
+
+**남은 작업 (이걸 안 하면 disconnect 시 메모리/DPA 자원이 영구 누수):**
+
+6. **disconnect cleanup step 2 — DPA REMOVE_RING + 로컬 자원 해제**:
+   현재 ADD_RING만 있고 REMOVE_RING 메시지 타입이 없어서, disconnect 시 DPA thread는
+   여전히 죽은 pod의 ring을 폴링함. 로컬 DPU 자원(`dma_buffer`/`local_mmap`,
+   `tx_buffer`/`tx_mmap`, `tx_ring`/`tx_ring_mmap`, `buf_arr`)은 DPA가 access 중이라
+   `pods_remove_connection`에서 일부러 해제 안 한 상태.
+   → 작업 순서: (a) `dpa_common.h`에 `COMCH_MSG_TYPE_REMOVE_RING` 추가,
+     (b) `device/dpa_kernel.c`에서 ring slot을 비활성화하는 핸들러,
+     (c) DPU 측에서 REMOVE_RING 보내고 ack 받은 뒤 로컬 버퍼/링/buf_arr destroy,
+     (d) `pods_remove_connection`에 step 2 실행 추가.
+
+7. **client-side disconnect 감지 비대칭**:
+   `comch_client.c:258-262`에서 `doca_ctx_set_state_changed_cb` 호출이 주석 처리됨,
+   `doca_comch_client_event_connection_status_changed_register`도 호출 자체가 없음.
+   server 죽으면 service-side DPU(=client role)는 알 길이 없어 in-flight 자원
+   정리/재연결 트리거 불가.
+   → `client_state_changed_callback` 정의하고 등록, connection-status changed
+     이벤트도 등록 필요. server 측 패턴 그대로 따라가면 됨.
+
+8. **peer-death 타임아웃 감지**:
+   현재 explicit disconnect 이벤트에만 의존. host kernel panic / NIC 끊김 등
+   TCP-level disconnect가 안 오는 행 상태에서는 영원히 못 알아챔. 그 사이
+   `MAX_DEFERRED_TX_ACK = 16384`(`dpu_worker.c`)가 가득 차면 ACK가 silent drop.
+   → per-pod last-activity 타임스탬프를 main loop에서 갱신하고, 일정 시간
+     무활동이면 stale 판정해서 `pods_remove_connection` 트리거. 또는 comch
+     heartbeat 메시지 추가.
+
+9. **`expired_consumer_callback`이 양쪽 다 no-op**(`comch_consumer.c:85-93`):
+   fast-path consumer 만료 시 정리 로직 없음. #6/#7과 함께 처리.
+
 ## 수정된 파일 목록
 - `lib/cpp/src/thrift/transport/doca/dpa_common.h` — fc_header, message types, rev ring
 - `lib/cpp/src/thrift/transport/doca/object.h` — pod_state 확장 (per-pod producer 제거), dpu_comp_entry_t 변경, progress_all_pes 정리

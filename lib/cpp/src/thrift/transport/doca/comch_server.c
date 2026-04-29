@@ -275,11 +275,30 @@ static void server_disconnection_event_callback(struct doca_comch_event_connecti
 						struct doca_comch_connection *comch_connection,
 						uint8_t change_success)
 {
+	union doca_data user_data;
+	struct doca_comch_server *comch_server;
+	struct objects *objs;
+	doca_error_t result;
+
 	(void)event;
-	(void)comch_connection;
 
 	if (change_success == 0)
-		DOCA_LOG_ERR("Failed disconnection received");
+		DOCA_LOG_ERR("Disconnection reported as failed; cleaning up anyway");
+
+	comch_server = doca_comch_server_get_server_ctx(comch_connection);
+	result = doca_ctx_get_user_data(doca_comch_server_as_ctx(comch_server), &user_data);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("disconnect: failed to get user data from ctx: %s",
+			     doca_error_get_name(result));
+		return;
+	}
+	objs = (struct objects *)user_data.ptr;
+
+	if (objs->connection == comch_connection)
+		objs->connection = NULL;
+
+	if (pods_remove_connection(objs, comch_connection) != 0)
+		DOCA_LOG_WARN("disconnect: no pod slot matched the disconnected connection");
 }
 
 static void server_state_changed_callback(const union doca_data user_data,
@@ -588,6 +607,77 @@ pods_add_connection(struct objects *objs, struct doca_comch_connection *conn)
 	pthread_mutex_unlock(&objs->pods_lock);
 
 	DOCA_LOG_INFO("pods_add_connection: slot %d", idx);
+	return 0;
+}
+
+int
+pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn)
+{
+	struct doca_mmap *ring_mmap = NULL;
+	struct doca_mmap *remote_mmap = NULL;
+	struct doca_mmap *host_rx_mmap = NULL;
+	int32_t pod_id = -1;
+	int found_idx = -1;
+
+	pthread_mutex_lock(&objs->pods_lock);
+	for (int i = 0; i < objs->num_pods; i++) {
+		if (objs->pods[i].connection != conn)
+			continue;
+		found_idx = i;
+		pod_id = objs->pods[i].pod_id;
+
+		/* Capture the host-exported mmap views so we can destroy them
+		 * outside the lock. These are local DPU representations of host
+		 * memory exports, created via doca_mmap_create_from_export, so
+		 * destroying them here only releases the DPU-side handle. */
+		ring_mmap    = objs->pods[i].ring_mmap;
+		remote_mmap  = objs->pods[i].remote_mmap;
+		host_rx_mmap = objs->pods[i].host_rx_mmap;
+
+		/* Mark slot dead so find_pod_by_id / find_pod_by_connection skip
+		 * it and dpu_worker error paths route to the empty branch. The
+		 * slot is not compacted out — keeping the index stable means
+		 * any in-flight comp_queue entries with pod_idx == i will hit
+		 * the (data == NULL) branch and ACK the originator instead of
+		 * dereferencing freed memory. Local DPU buffers and the DPA-side
+		 * ring stay registered for now (a follow-up will add REMOVE_RING
+		 * + buffer free once the DPA side is quiesced). */
+		objs->pods[i].registered      = 0;
+		objs->pods[i].dma_ready       = 0;
+		objs->pods[i].connection      = NULL;
+		objs->pods[i].pod_id          = -1;
+		objs->pods[i].app_name[0]     = '\0';
+		objs->pods[i].ring_mmap       = NULL;
+		objs->pods[i].remote_mmap     = NULL;
+		objs->pods[i].host_rx_mmap    = NULL;
+		break;
+	}
+	pthread_mutex_unlock(&objs->pods_lock);
+
+	if (found_idx < 0)
+		return -1;
+
+	if (ring_mmap) {
+		doca_error_t r = doca_mmap_destroy(ring_mmap);
+		if (r != DOCA_SUCCESS)
+			DOCA_LOG_WARN("disconnect: ring_mmap destroy failed: %s",
+				      doca_error_get_name(r));
+	}
+	if (remote_mmap) {
+		doca_error_t r = doca_mmap_destroy(remote_mmap);
+		if (r != DOCA_SUCCESS)
+			DOCA_LOG_WARN("disconnect: remote_mmap destroy failed: %s",
+				      doca_error_get_name(r));
+	}
+	if (host_rx_mmap) {
+		doca_error_t r = doca_mmap_destroy(host_rx_mmap);
+		if (r != DOCA_SUCCESS)
+			DOCA_LOG_WARN("disconnect: host_rx_mmap destroy failed: %s",
+				      doca_error_get_name(r));
+	}
+
+	DOCA_LOG_INFO("pods_remove_connection: slot %d (pod_id=%d) invalidated",
+		      found_idx, pod_id);
 	return 0;
 }
 
