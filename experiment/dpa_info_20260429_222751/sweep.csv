@@ -1,2 +1,0 @@
-run,target_rps,wall_clock_s,actual_rps_wall,ok,failed,fail_thrift,fail_net,gbps,c_p50,c_p95,c_p99,c_max,r_p50,r_p99,r_max,test_wall_s,exit_code,dpu_log_size_bytes
-1,40000,,,,,0,0,,,,,,,,,45,124,37785

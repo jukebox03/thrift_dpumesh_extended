@@ -1,5 +1,0 @@
-Date: 2026-04-29T22:34:09+09:00
-Git HEAD: e4ea27a1188ae9e1b193dd374eaf1b9e6b3ced93
-Scenario: 4 × 40K RPS × 30s back-to-back, 45s timeout each
-DPA log level: ERROR (default)
-Initial DPU log size: 51029 bytes

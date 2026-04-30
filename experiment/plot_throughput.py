@@ -1,37 +1,26 @@
 #!/usr/bin/env python3
 """
-dpumesh throughput sweep analysis — service-side path with end-node ACK
-guarantee.
+DPUmesh throughput sweep analysis (2026-04-30 data set).
 
-Single dataset measured after the following library-side fixes are in
-place (transport-layer only; no Thrift server / service-binary changes):
+Forward path: gateway -> DPU/DPA -> unique-id-service -> DPU/DPA -> gateway.
+Single sweep at 8192 B frame, nominal 30 s per point, conns = rps/25.
 
-  1. TDpumeshTransport: read() transparently fetches the next dpumesh
-     descriptor after flush(), so a single TConnectedClient runner thread
-     amortises its pthread spawn cost across many requests.
-  2. TDpumeshTransport: write() lazy-allocates the TX slot and writes
-     directly into it — no write_buf_ vector, no flush memcpy.
-  3. TDpumeshTransport: flush() registers a pending entry, attaches the
-     TX slot BEFORE enqueue (TX_ACK cannot precede enqueue, so attach
-     before enqueue eliminates the TX_ACK-arrives-first race), then
-     issues release_async so the TX_ACK handler frees the slot.
-  4. process_forward_entry (DPU): reverse-DMA fc_header carries
-     target_pod->rx_consumer_tail, not src_pod's — fixes a forwarding
-     flow-control corruption that bypassed echo (where src==target).
-  5. process_forward_entry (DPU): TX_ACK on AGAIN is deferred to a
-     side queue and retried by the main loop after pe_progress, instead
-     of inline retry-and-drop. Dropping a TX_ACK parks the host's
-     pending entry at state=-2 until the 2-second register_pending
-     reclaim, which is the long-tail-latency cliff observed previously.
-     The DPU is the sole authority that can release a host TX slot via
-     the pending pathway, so the queue treats TX_ACK as a hard
-     guarantee.
+Key features of this dataset:
+  - Linear scaling 5k -> 45k offered RPS (wall_rps tracks offered at ~98 %).
+  - Hard ceiling at 45k offered = 44.3k wall RPS / 2.90 Gbps with 100 % OK
+    and P99 = 7.55 ms.
+  - Overload collapse at 50k offered: wall-clock test duration extends from
+    30.5 s to 52.16 s; effective throughput DROPS from 44.3k to 28.8k (i.e.
+    not graceful saturation - the 1024-slot pool / single DPU ARM thread
+    cannot keep up and queueing tail dominates).
+  - Recovery confirmed: rerun @ 40k after the 50k/55k overdrive runs still
+    achieves 39.3k wall RPS at sub-ms P50, proving no state/slot leak.
 
 Output PNGs:
-  - throughput_bps.png        — hockey stick (Gbps vs avg latency)
-  - latency_vs_rps.png        — percentile sweep
-  - throughput_vs_latency.png — wall RPS tracking + e2e P99
-  - queueing_gap.png          — service time vs schedule wait
+  - throughput_bps.png        - hockey stick (Gbps vs avg latency)
+  - latency_vs_rps.png        - percentile sweep (raw + e2e)
+  - throughput_vs_latency.png - wall RPS vs offered + e2e P99
+  - queueing_gap.png          - service time vs schedule wait
 
 Usage:
     python3 plot_throughput.py
@@ -47,20 +36,19 @@ MSG_BYTES = 8192  # frame size, pad=8116
 # Columns: target_rps, wall_rps, gbps,
 #          corr_avg, corr_p50, corr_p95, corr_p99, corr_max,
 #          raw_avg,  raw_p50,  raw_p95,  raw_p99,  raw_max
-# Throughput (gbps) is wall-clock based.
+# All latencies in ms. gbps is wall-clock based (DMA bandwidth).
 DATA = [
-    ( 5000,  4545.3, 0.298,   0.69,   0.68,    1.17,    1.48,    5.61,   0.54,  0.54,  0.86,  1.12,   5.38),
-    (10000,  9090.4, 0.596,   0.47,   0.43,    0.89,    1.13,    5.80,   0.37,  0.33,  0.72,  0.90,   5.08),
-    (15000, 13636.0, 0.894,   0.37,   0.31,    0.76,    0.98,    4.03,   0.30,  0.22,  0.65,  0.84,   3.33),
-    (20000, 18181.0, 1.192,   0.31,   0.25,    0.66,    0.88,    4.01,   0.25,  0.19,  0.58,  0.78,   3.99),
-    (25000, 22724.8, 1.488,   0.29,   0.25,    0.55,    0.78,    5.67,   0.24,  0.21,  0.46,  0.69,   3.70),
-    (30000, 27271.7, 1.786,   0.26,   0.22,    0.47,    0.75,    6.31,   0.23,  0.20,  0.43,  0.70,   4.19),
-    (35000, 31816.8, 2.083,   0.30,   0.26,    0.50,    0.84,   10.43,   0.27,  0.23,  0.46,  0.79,   7.80),
-    (40000, 36361.0, 2.381,   0.33,   0.29,    0.57,    0.88,    5.79,   0.31,  0.27,  0.54,  0.84,   5.78),
-    (45000, 39224.1, 2.568,  38.73,   3.18,  272.72,  447.60,  570.64,  11.91,  3.15, 45.13, 48.71,  53.92),
-    (50000, 38254.9, 2.505, 304.49, 177.26,  980.51, 1369.57, 1593.89,  32.30, 41.65, 53.87, 59.50,  64.14),
-    (55000, 39671.3, 2.597, 559.60, 455.10, 1481.16, 1765.53, 1860.85,  43.74, 47.29, 58.97, 61.97,  66.82),
-    (60000, 40784.6, 2.670, 870.90, 754.01, 2018.38, 2205.11, 2257.71,  49.18, 51.20, 64.52, 66.80,  71.26),
+    ( 5000,  4917.5, 0.322,    2.42,    2.32,    3.95,    4.96,    14.09,  2.10,  2.00,   3.79,    4.77,   14.04),
+    (10000,  9835.3, 0.645,    1.74,    1.63,    3.17,    4.53,    30.25,  1.50,  1.29,   2.94,    4.17,   29.62),
+    (15000, 14752.3, 0.967,    1.36,    1.24,    2.65,    3.66,    29.58,  1.14,  1.04,   2.32,    3.35,   29.02),
+    (20000, 19670.0, 1.289,    1.13,    1.04,    2.24,    2.97,    13.09,  0.92,  0.86,   1.97,    2.73,   12.20),
+    (25000, 24589.9, 1.612,    0.96,    0.81,    2.08,    2.95,    36.56,  0.82,  0.66,   1.82,    2.70,   36.42),
+    (30000, 29506.9, 1.934,    0.71,    0.58,    1.49,    2.30,    11.84,  0.67,  0.55,   1.39,    2.08,   11.41),
+    (35000, 34424.5, 2.256,    0.67,    0.51,    1.48,    2.47,    13.79,  0.64,  0.48,   1.41,    2.29,   13.77),
+    (40000, 39343.7, 2.578,    0.66,    0.43,    1.44,    3.73,    38.72,  0.63,  0.41,   1.38,    3.65,   33.12),
+    (45000, 44260.2, 2.901,    0.62,    0.34,    1.51,    7.55,    17.75,  0.59,  0.32,   1.48,    7.47,   17.73),
+    (50000, 28756.5, 1.885,  495.92,    3.52, 2672.86, 7682.99, 21667.69, 18.07,  3.49,  48.57,  154.02,  186.41),
+    (55000, 27881.5, 1.827, 1984.11, 1353.62, 5304.38, 9521.09, 28680.30, 40.66, 44.13,  53.29,  156.15,  189.47),
 ]
 
 
@@ -97,14 +85,14 @@ peak_idx = int(np.argmax(d["wall"]))
 
 
 # ---------------------------------------------------------------------------
-# Figure 1: hockey stick — true throughput (Gbps) vs avg latency (log)
+# Figure 1: hockey stick - true throughput (Gbps) vs avg latency (log)
 # ---------------------------------------------------------------------------
 fig, ax = plt.subplots(figsize=(10, 5.8))
 
 ax.plot(d["gbps"], d["corr_avg"], "s-", color="#1f77b4",
-        linewidth=2.2, markersize=7, label="end-to-end")
+        linewidth=2.2, markersize=7, label="end-to-end (corrected)")
 ax.plot(d["gbps"], d["raw_avg"],  "o-", color="#2ca02c",
-        linewidth=2.0, markersize=6, label="service time")
+        linewidth=2.0, markersize=6, label="service time (raw RTT)")
 
 ax.axvline(d["gbps"][peak_idx], color="#1f77b4", linestyle="--",
            linewidth=1.4, alpha=0.7)
@@ -124,7 +112,7 @@ for i in range(len(d["target"])):
 ax.set_yscale("log")
 ax.set_xlabel("Throughput (Gbps, wall-clock)", fontsize=11)
 ax.set_ylabel("Average latency (ms, log scale)", fontsize=11)
-ax.set_title(f"Throughput–latency curve  (forward path, msg {MSG_BYTES} B)",
+ax.set_title(f"Throughput-latency curve  (forward path, msg {MSG_BYTES} B)",
              fontsize=12)
 ax.grid(True, which="both", alpha=0.3)
 ax.legend(loc="upper left", fontsize=10)
@@ -139,25 +127,26 @@ plt.close(fig)
 fig, ax = plt.subplots(figsize=(10, 5.8))
 
 ax.plot(d["target"], d["raw_p50"],  "o--", color="#2ca02c", alpha=0.7,
-        linewidth=1.5, label="raw P50 (service)")
+        linewidth=1.5, label="raw P50 (service time)")
 ax.plot(d["target"], d["raw_p99"],  "^--", color="#2ca02c", alpha=0.7,
-        linewidth=1.5, label="raw P99 (service)")
+        linewidth=1.5, label="raw P99 (service time)")
 ax.plot(d["target"], d["corr_p50"], "o-",  color="#1f77b4",
-        linewidth=2.0, label="e2e P50")
+        linewidth=2.0, label="e2e P50 (corrected)")
 ax.plot(d["target"], d["corr_p99"], "^-",  color="#d62728",
-        linewidth=2.0, label="e2e P99")
+        linewidth=2.0, label="e2e P99 (corrected)")
 
 ax.axvline(knee_rps, color="#444444", linestyle="--", linewidth=1.4, alpha=0.7)
 ax.text(knee_rps, ax.get_ylim()[1] * 0.5, f"  knee {knee_rps//1000}k",
         ha="left", va="top", fontsize=10, color="#444444", fontweight="bold")
 
-# Overdrive zone
+# Overdrive zone (target > knee)
 overdrive = d["target"] > knee_rps
 od = d["target"][overdrive]
 if len(od):
     ax.axvspan(od.min(), d["target"].max(), color="#fff4b3", alpha=0.4, zorder=0)
     ax.text(od.min(), ax.get_ylim()[1] * 0.05,
-            "  overdrive (graceful)", color="#7a5b00", fontsize=9, fontweight="bold")
+            "  overdrive (queueing collapse, 100% OK)",
+            color="#7a5b00", fontsize=9, fontweight="bold")
 
 ax.set_yscale("log")
 ax.set_xlabel("Target RPS", fontsize=11)
@@ -171,7 +160,7 @@ plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
-# Figure 3: dual-axis — wall-clock RPS (left) vs target,
+# Figure 3: dual-axis - wall-clock RPS (left) vs target,
 #           plus e2e P99 latency (right).
 # ---------------------------------------------------------------------------
 fig, ax1 = plt.subplots(figsize=(10, 5.8))
@@ -194,11 +183,12 @@ ax2.plot(d["target"] / 1000, d["corr_p99"], "^-", color="#d62728",
 ax2.set_ylabel("End-to-end P99 latency (ms, log scale)", fontsize=11)
 ax2.set_yscale("log")
 
-# Plateau annotation
-ax1.annotate(f"hard ceiling ≈ {int(d['wall'][peak_idx])//1000}k wall RPS\n"
-             f"({d['gbps'][peak_idx]:.2f} Gbps) — flat for 45k–60k offered",
-             xy=(55, d["wall"][peak_idx] / 1000),
-             xytext=(20, d["wall"][peak_idx] / 1000 + 8),
+# Plateau / collapse annotation
+ax1.annotate(f"hard ceiling\n{int(d['wall'][peak_idx])//1000}k wall RPS  "
+             f"({d['gbps'][peak_idx]:.2f} Gbps)\n"
+             f"@ {int(d['target'][peak_idx])//1000}k offered",
+             xy=(d["target"][peak_idx] / 1000, d["wall"][peak_idx] / 1000),
+             xytext=(20, d["wall"][peak_idx] / 1000 - 12),
              fontsize=9, color="#0d4a8b",
              arrowprops=dict(arrowstyle="->", color="#0d4a8b"))
 
@@ -212,15 +202,15 @@ plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
-# Figure 4: latency decomposition — service time vs schedule wait
+# Figure 4: latency decomposition - service time vs schedule wait
 # ---------------------------------------------------------------------------
 fig, ax = plt.subplots(figsize=(10, 5.4))
 
 ax.fill_between(d["target"], 0, d["raw_avg"], color="#2ca02c", alpha=0.55,
-                label="Service time   (send_ts → recv_done)")
+                label="Service time   (send_ts -> recv_done)")
 ax.fill_between(d["target"], d["raw_avg"], d["corr_avg"],
                 color="#d62728", alpha=0.40,
-                label="Schedule wait  (sched_ts → send_ts)")
+                label="Schedule wait  (sched_ts -> send_ts)")
 ax.plot(d["target"], d["corr_avg"], "o-", color="#d62728", linewidth=1.5)
 ax.plot(d["target"], d["raw_avg"],  "o-", color="#2ca02c", linewidth=1.5)
 
@@ -247,13 +237,13 @@ print(f"Knee                  : {knee_rps//1000}k RPS = {knee_gbps:.3f} Gbps "
       f"(P99 corr {d['corr_p99'][knee_idx]:.2f} ms)")
 if knee_idx + 1 < len(d["target"]):
     print(f"  next step ({int(d['target'][knee_idx+1])} RPS): "
-          f"e2e avg jumps {knee_jump:.1f}× "
-          f"({d['corr_avg'][knee_idx]:.2f} → {d['corr_avg'][knee_idx+1]:.2f} ms)")
+          f"e2e avg jumps {knee_jump:.1f}x "
+          f"({d['corr_avg'][knee_idx]:.2f} -> {d['corr_avg'][knee_idx+1]:.2f} ms)")
 print(f"Hard ceiling          : {int(d['wall'][peak_idx])} wall RPS  "
       f"= {d['gbps'][peak_idx]:.3f} Gbps "
       f"({int(d['target'][peak_idx])} offered)")
-print(f"Overdrive envelope    : up to {int(d['target'].max())} offered RPS, "
-      f"no collapse (graceful saturation)")
+print(f"Overdrive (failed=0)  : 50k/55k offered still 100% OK but "
+      f"throughput collapses to ~28k due to queueing past nominal duration")
 
 print("\nSaved figures:")
 for fname in ("throughput_bps.png", "latency_vs_rps.png",
