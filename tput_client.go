@@ -105,6 +105,7 @@ func dialNoDelay(addr string) (*net.TCPConn, error) {
 type sample struct {
 	corrected float64 // ms (sched_ts → recv_done)
 	raw       float64 // ms (send_ts  → recv_done)
+	respWire  int     // bytes on wire for response (4B frame_len + body)
 }
 
 type wstate struct {
@@ -141,6 +142,7 @@ func runSchedule(s *wstate, addr string, base time.Time, interval time.Duration,
 		sendTs := time.Now()
 		netErr := false
 		excErr := false
+		var respLen uint32
 
 		_ = s.conn.SetReadDeadline(time.Now().Add(readDeadline))
 
@@ -149,14 +151,14 @@ func runSchedule(s *wstate, addr string, base time.Time, interval time.Duration,
 		} else if _, err := io.ReadFull(s.conn, resp4[:]); err != nil {
 			netErr = true
 		} else {
-			rl := binary.BigEndian.Uint32(resp4[:])
-			if rl > 16*1024*1024 || rl < 4 {
+			respLen = binary.BigEndian.Uint32(resp4[:])
+			if respLen > 16*1024*1024 || respLen < 4 {
 				netErr = true
 			} else {
-				if cap(bodyBuf) < int(rl) {
-					bodyBuf = make([]byte, rl)
+				if cap(bodyBuf) < int(respLen) {
+					bodyBuf = make([]byte, respLen)
 				} else {
-					bodyBuf = bodyBuf[:rl]
+					bodyBuf = bodyBuf[:respLen]
 				}
 				if _, err := io.ReadFull(s.conn, bodyBuf); err != nil {
 					netErr = true
@@ -180,6 +182,7 @@ func runSchedule(s *wstate, addr string, base time.Time, interval time.Duration,
 			samples = append(samples, sample{
 				corrected: float64(now.Sub(ts).Microseconds()) / 1000.0,
 				raw:       float64(now.Sub(sendTs).Microseconds()) / 1000.0,
+				respWire:  int(4 + respLen),
 			})
 		case excErr:
 			// Server-side failure (e.g. ENQUEUE rejected, DPUmesh timeout).
@@ -372,10 +375,14 @@ func main() {
 	// Aggregate
 	var corrected, raws []float64
 	var ok, failNet, failExc int64
+	var totalRespWire, totalRespDma int64
 	for i := range states {
 		for _, s := range states[i].samples {
 			corrected = append(corrected, s.corrected)
 			raws = append(raws, s.raw)
+			totalRespWire += int64(s.respWire)
+			respDma := (fcHeaderSize + s.respWire + dmaAlign - 1) &^ (dmaAlign - 1)
+			totalRespDma += int64(respDma)
 		}
 		ok += int64(len(states[i].samples))
 		failNet += int64(states[i].failNet)
@@ -389,8 +396,23 @@ func main() {
 	actualDur := wallDur.Seconds()
 	rpsNom := float64(ok) / nominalDur
 	rpsWall := float64(ok) / actualDur
-	dmaBps := float64(ok) * float64(dmaActual) / actualDur
-	wireBps := float64(ok) * float64(actualWire) / actualDur
+
+	// TX (request) bandwidth
+	dmaTxBps := float64(ok) * float64(dmaActual) / actualDur
+	wireTxBps := float64(ok) * float64(actualWire) / actualDur
+	// RX (response) bandwidth — sums actual per-request response sizes
+	dmaRxBps := float64(totalRespDma) / actualDur
+	wireRxBps := float64(totalRespWire) / actualDur
+	// Total bidirectional bandwidth
+	dmaBps := dmaTxBps + dmaRxBps
+	wireBps := wireTxBps + wireRxBps
+
+	avgRespWire := 0.0
+	avgRespDma := 0.0
+	if ok > 0 {
+		avgRespWire = float64(totalRespWire) / float64(ok)
+		avgRespDma = float64(totalRespDma) / float64(ok)
+	}
 
 	fmt.Println("============================================================")
 	fmt.Println("  Results")
@@ -406,10 +428,21 @@ func main() {
 	fmt.Printf("  Wall-clock:   %.2fs (nominal %ds)\n", actualDur, *dur)
 	fmt.Printf("  Actual RPS:   %.1f (nominal-dur basis)\n", rpsNom)
 	fmt.Printf("  Actual RPS:   %.1f (wall-clock basis) <- real throughput\n", rpsWall)
-	fmt.Printf("  DMA bandwidth:  %.2f MB/s, %.3f Gbps (wall-clock, %dB DMA)\n",
-		dmaBps/1024/1024, dmaBps*8/1e9, dmaActual)
-	fmt.Printf("  TCP bandwidth:  %.2f MB/s, %.3f Gbps (wall-clock, %dB wire)\n",
-		wireBps/1024/1024, wireBps*8/1e9, actualWire)
+	fmt.Println()
+	fmt.Println("  DMA bandwidth (req + resp, wall-clock):")
+	fmt.Printf("    TX (req):   %.2f MB/s, %.3f Gbps  (%dB DMA/req)\n",
+		dmaTxBps/1024/1024, dmaTxBps*8/1e9, dmaActual)
+	fmt.Printf("    RX (resp):  %.2f MB/s, %.3f Gbps  (avg %.0fB DMA/resp)\n",
+		dmaRxBps/1024/1024, dmaRxBps*8/1e9, avgRespDma)
+	fmt.Printf("    Total:      %.2f MB/s, %.3f Gbps\n",
+		dmaBps/1024/1024, dmaBps*8/1e9)
+	fmt.Println("  TCP bandwidth (req + resp, wall-clock):")
+	fmt.Printf("    TX (req):   %.2f MB/s, %.3f Gbps  (%dB wire/req)\n",
+		wireTxBps/1024/1024, wireTxBps*8/1e9, actualWire)
+	fmt.Printf("    RX (resp):  %.2f MB/s, %.3f Gbps  (avg %.0fB wire/resp)\n",
+		wireRxBps/1024/1024, wireRxBps*8/1e9, avgRespWire)
+	fmt.Printf("    Total:      %.2f MB/s, %.3f Gbps\n",
+		wireBps/1024/1024, wireBps*8/1e9)
 
 	if len(corrected) > 0 {
 		fmt.Println()
