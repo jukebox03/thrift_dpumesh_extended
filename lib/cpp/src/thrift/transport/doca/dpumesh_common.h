@@ -43,6 +43,12 @@
  * from ALL source pods that target it. With N concurrent sources targeting
  * one dst, worst-case dst staging occupancy is N × this size. Single-source
  * workloads fit exactly; multi-source needs a scaled DPU_BUFFER_SIZE. */
-#define DPU_BUFFER_SIZE     (8 * 1024 * 1024)  /* 8MB = 1024 × 8KB */
+#define DPU_BUFFER_SIZE     (16 * 1024 * 1024)  /* 16MB = 2048 × 8KB */
+#define DPUMESH_SLOT_SIZE   8192               /* matches DPUMESH_SLOT_SIZE_DEFAULT */
+/* DMA descriptor ring depth (host→DPU forward). Mirrored from ring.h so
+ * the DPA kernel — which can't include ring.h — knows the ring length.
+ * Host's setup_dma_ring allocates this many slots PLUS 1 extra for the
+ * credit counter at index DMA_RING_SIZE. */
+#define DMA_RING_SIZE       2048
 
 #endif /* DPUMESH_COMMON_H */

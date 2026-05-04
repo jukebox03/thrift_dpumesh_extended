@@ -20,15 +20,20 @@ int setup_dma_ring(struct objects *objs, size_t size)
     }
 
     ring = objs->dma_ring;
-    ring->size = size;
+    ring->size = size;          /* logical ring size (host wraps at this) */
     ring->head = 0;
     ring->tail = 0;
     ring->descs = NULL;
 
-    /* allocate local buffer and set mmap for PCI export */
+    /* Allocate one EXTRA slot at the end. Slots 0..size-1 are normal dma_desc
+     * entries; slot `size` (index DMA_RING_SIZE) is reserved for the RX credit
+     * counter. Host atomically increments slot[size].first 8 bytes on rx_free;
+     * DPA polls the same slot via the same buf_arr (no separate mmap, no
+     * separate buf_arr, no race with other PCIe reads). */
+    size_t alloc_slots = ring->size + 1;
     result = alloc_buffer_and_set_mmap(&ring->mmap, objs->dev,
-                           (void **)&ring->descs, 
-                           ring->size * sizeof(struct dma_desc),
+                           (void **)&ring->descs,
+                           alloc_slots * sizeof(struct dma_desc),
                            DOCA_ACCESS_FLAG_PCI_READ_WRITE);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to allocate DMA resources: %s", doca_error_get_descr(result));
@@ -37,12 +42,12 @@ int setup_dma_ring(struct objects *objs, size_t size)
     }
 
     /* Descriptors must start as invalid; otherwise DPA may consume garbage slots. */
-    memset(ring->descs, 0, ring->size * sizeof(struct dma_desc));
-    
-    /* export mmap to DPU */
-    result = export_mmap_to_remote(objs, ring->mmap, 
-                                   ring->descs, 
-                                   ring->size * sizeof(struct dma_desc), 
+    memset(ring->descs, 0, alloc_slots * sizeof(struct dma_desc));
+
+    /* export mmap to DPU (covers all alloc_slots) */
+    result = export_mmap_to_remote(objs, ring->mmap,
+                                   ring->descs,
+                                   alloc_slots * sizeof(struct dma_desc),
                                    DMA_RING, HOST_TO_DPU);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to export mmap and buffer to DPU: %s", doca_error_get_descr(result));

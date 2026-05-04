@@ -22,12 +22,13 @@ extern "C" {
 #define DPUMESH_SLOT_SIZE_DEFAULT       8192            /* 8KB */
 /* Slot pool size — used both for host TX (outgoing) and host RX (incoming
  * application data). num_slots × slot_size MUST equal DPU_BUFFER_SIZE
- * (8 MB) so slot-based admission directly bounds in-flight bytes inside
- * DPU. 1024 × 8 KB = 8 MB exactly. This is the only flow-control mechanism;
- * DPU/DPA do no throttling. Memory cost: 8 MB per direction. */
-#define DPUMESH_NUM_SLOTS_DEFAULT       1024
+ * so slot-based admission directly bounds in-flight bytes inside DPU.
+ * Bumped 1024 → 2048 (16 MB per buffer): provides 2× headroom which lets
+ * the DPA-side admission gate's lazy-refresh tolerate larger cache lag
+ * without false-positive defers, smoothing the latency curve at cap. */
+#define DPUMESH_NUM_SLOTS_DEFAULT       2048
 #define DPUMESH_DESCRIPTOR_SIZE         64
-#define DPUMESH_MAX_DESCRIPTORS_DEFAULT 1024
+#define DPUMESH_MAX_DESCRIPTORS_DEFAULT 2048
 #define DPUMESH_PREFIX_DEFAULT          "dpumesh"
 
 /* ====== Configuration ====== */

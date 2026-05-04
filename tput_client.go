@@ -354,10 +354,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Phase 2: launch workers, all racing toward the same shared base time
+	// Phase 2: launch workers, all racing toward the same shared base time.
+	// 500ms cushion lets every goroutine reach its sleep-until-base point
+	// before the first scheduled request, so workers don't shift their
+	// schedule due to startup jitter. wallStart = base (not Now) so the
+	// 500ms warmup is excluded from the throughput measurement window —
+	// otherwise wall RPS reads ~1-2% low (e.g. 44.3K instead of 45K at
+	// 30s × 45K target).
 	base := time.Now().Add(500 * time.Millisecond)
 	var wg sync.WaitGroup
-	wallStart := time.Now()
+	wallStart := base
 	for i := range states {
 		if states[i].conn == nil {
 			continue

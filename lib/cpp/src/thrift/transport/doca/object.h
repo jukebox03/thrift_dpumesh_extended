@@ -158,6 +158,10 @@ struct pod_state {
     void *host_rx_addr;
     size_t host_rx_buf_size;
 
+    /* Host's RX RQ depth (= num_slots), derived from host_rx_buf_size.
+     * Used by DPA admission gate as the cap on in-flight reverse DMAs. */
+    uint32_t rq_depth;
+
     /* === DPU-internal write cursor for reverse DMA ===
      * DPU is a pure forwarder. End-nodes do flow control end-to-end via
      * slot-based admission (slot_count × slot_size ≤ DPU_BUFFER_SIZE), so

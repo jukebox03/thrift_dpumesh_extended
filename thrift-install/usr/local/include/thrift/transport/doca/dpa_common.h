@@ -22,6 +22,15 @@ struct dpa_ring_info {
 	uint64_t dpu_addr;               /* DPU local buffer addr */
 	uint32_t dpu_buf_size;
 	int32_t pod_id;
+	/* Credit return (reverse rings only — admission gate on DPA side).
+	 * Host atomically increments freed_cumulative in the credit block;
+	 * DPA reads it before issuing reverse DMA via host_credit_buf_arr (a
+	 * 1-element buf_arr over the host credit mmap, exactly like dma_ring).
+	 * host_credit_buf_arr=0 means "skip admission check" (forward rings,
+	 * or not yet wired). */
+	doca_dpa_dev_buf_arr_t host_credit_buf_arr;
+	uint32_t rq_depth;
+	uint32_t _pad_credit;
 } __attribute__((__packed__, aligned(8)));
 
 struct dpa_thread_arg {

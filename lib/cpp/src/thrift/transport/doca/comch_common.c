@@ -9,6 +9,7 @@
 #include "comch_client.h"
 #include "comch_server.h"
 #include "dpa.h"
+#include "dpumesh_common.h"
 DOCA_LOG_REGISTER(COMCH_COMMON);
 
 
@@ -100,8 +101,10 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 	if (mmap_msg->mmap_type == DMA_HOST_RX_BUFFER) {
 		pod->host_rx_addr = remote_addr;
 		pod->host_rx_buf_size = buf_size;
-		DOCA_LOG_INFO("Pod %d: Host RX buffer stored (addr=%p, size=%zu)",
-			      pod->pod_id, remote_addr, buf_size);
+		/* rq_depth derived from host_rx buffer size: num_slots × slot_size. */
+		pod->rq_depth = (uint32_t)(buf_size / DPUMESH_SLOT_SIZE);
+		DOCA_LOG_INFO("Pod %d: Host RX buffer stored (addr=%p, size=%zu, rq_depth=%u)",
+			      pod->pod_id, remote_addr, buf_size, pod->rq_depth);
 	} else {
 		pod->remote_addr = remote_addr;
 		pod->remote_buf_size = buf_size;

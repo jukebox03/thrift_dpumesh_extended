@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define DMA_RING_SIZE 1024
+#include "dpumesh_common.h"  /* DMA_RING_SIZE */
 
 struct dma_desc;
 struct doca_dev;

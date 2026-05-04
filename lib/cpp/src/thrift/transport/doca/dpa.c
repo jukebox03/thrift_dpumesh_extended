@@ -362,7 +362,7 @@ init_dpa_objects(struct objects *objs)
         goto destroy_dpa;
     }
 
-    result = doca_dpa_set_log_level(objs->dpa_thread->dpa, DOCA_DPA_DEV_LOG_LEVEL_ERROR);
+    result = doca_dpa_set_log_level(objs->dpa_thread->dpa, DOCA_DPA_DEV_LOG_LEVEL_INFO);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_WARN("Failed to set DPA log level: %s", doca_error_get_name(result));
     }
@@ -1183,8 +1183,11 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
 
     DOCA_LOG_INFO("setup_pod_dma: pod_id=%d", pod->pod_id);
 
-    /* 1. Create per-pod buf_arr over ring_mmap */
-    result = setup_dpa_buf_array_pod(objs, DMA_RING_SIZE, pod->ring_mmap, &pod->buf_arr);
+    /* 1. Create per-pod buf_arr over ring_mmap. Size is DMA_RING_SIZE + 1
+     * because host's setup_dma_ring allocates one extra slot at the end
+     * for the RX credit counter; DPA reads it via this same buf_arr at
+     * index DMA_RING_SIZE (no separate buf_arr needed). */
+    result = setup_dpa_buf_array_pod(objs, DMA_RING_SIZE + 1, pod->ring_mmap, &pod->buf_arr);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("setup_pod_dma: buf_arr failed for pod %d: %s",
                      pod->pod_id, doca_error_get_descr(result));
@@ -1327,11 +1330,17 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         return result;
     }
 
-    /* 10. Fill reverse ring info and send ADD_REV_RING to DPA */
+
+    /* 10. Fill reverse ring info and send ADD_REV_RING to DPA.
+     * Credit-handle reuses the FORWARD pod->buf_arr — host writes the freed
+     * counter to the LAST slot (index DMA_RING_SIZE) of the dma_ring buffer,
+     * and DPA polls that slot via the same buf_arr it already uses for
+     * forward desc reads. No separate buf_arr needed. */
     {
         struct dpa_ring_info rev_ring_info;
         doca_dpa_dev_buf_arr_t dpa_buf_arr;
         doca_dpa_dev_mmap_t dpu_tx_mmap_h, host_rx_mmap_h;
+        doca_dpa_dev_buf_arr_t fwd_buf_arr_h = 0;
 
         result = doca_buf_arr_get_dpa_handle(pod->tx_buf_arr, &dpa_buf_arr);
         if (result != DOCA_SUCCESS) return result;
@@ -1349,6 +1358,17 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
             }
         }
 
+        /* Forward buf_arr handle — credit slot is at index DMA_RING_SIZE within it */
+        if (pod->buf_arr) {
+            result = doca_buf_arr_get_dpa_handle(pod->buf_arr, &fwd_buf_arr_h);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_WARN("setup_pod_dma: fwd buf_arr DPA handle failed: %s",
+                              doca_error_get_descr(result));
+                fwd_buf_arr_h = 0;
+            }
+        }
+
+        memset(&rev_ring_info, 0, sizeof(rev_ring_info));
         rev_ring_info.buf_arr = dpa_buf_arr;
         rev_ring_info.buf_arr_size = DMA_RING_SIZE;
         /* For reverse: dpu=source (TX), host=destination (RX) */
@@ -1359,6 +1379,8 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         rev_ring_info.host_addr = (uint64_t)pod->host_rx_addr;
         rev_ring_info.host_buf_size = (uint32_t)pod->host_rx_buf_size;
         rev_ring_info.pod_id = pod->pod_id;
+        rev_ring_info.host_credit_buf_arr = fwd_buf_arr_h;  /* same buf_arr, slot DMA_RING_SIZE */
+        rev_ring_info.rq_depth = pod->rq_depth;
 
         struct comch_add_rev_ring_msg rev_msg;
         memset(&rev_msg, 0, sizeof(rev_msg));
@@ -1371,7 +1393,8 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
             DOCA_LOG_WARN("setup_pod_dma: send ADD_REV_RING failed: %s",
                           doca_error_get_descr(result));
         } else {
-            DOCA_LOG_INFO("Sent ADD_REV_RING to DPA for pod_id=%d", pod->pod_id);
+            DOCA_LOG_INFO("Sent ADD_REV_RING to DPA for pod_id=%d (rq_depth=%u, credit_at_slot=%d)",
+                          pod->pod_id, pod->rq_depth, DMA_RING_SIZE);
         }
     }
 
@@ -1401,6 +1424,7 @@ update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod)
     struct dpa_ring_info rev_ring_info;
     doca_dpa_dev_buf_arr_t dpa_buf_arr;
     doca_dpa_dev_mmap_t dpu_tx_mmap_h, host_rx_mmap_h;
+    doca_dpa_dev_buf_arr_t credit_buf_arr_h = 0;
 
     result = doca_buf_arr_get_dpa_handle(pod->tx_buf_arr, &dpa_buf_arr);
     if (result != DOCA_SUCCESS) return result;
@@ -1415,6 +1439,17 @@ update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod)
         return result;
     }
 
+    /* Forward buf_arr handle — credit slot is at index DMA_RING_SIZE within it */
+    if (pod->buf_arr) {
+        result = doca_buf_arr_get_dpa_handle(pod->buf_arr, &credit_buf_arr_h);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_WARN("update_rev_ring_host_rx: fwd buf_arr DPA handle failed: %s",
+                          doca_error_get_descr(result));
+            credit_buf_arr_h = 0;
+        }
+    }
+
+    memset(&rev_ring_info, 0, sizeof(rev_ring_info));
     rev_ring_info.buf_arr = dpa_buf_arr;
     rev_ring_info.buf_arr_size = DMA_RING_SIZE;
     rev_ring_info.dpu_mmap = dpu_tx_mmap_h;
@@ -1424,6 +1459,8 @@ update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod)
     rev_ring_info.host_addr = (uint64_t)pod->host_rx_addr;
     rev_ring_info.host_buf_size = (uint32_t)pod->host_rx_buf_size;
     rev_ring_info.pod_id = pod->pod_id;
+    rev_ring_info.host_credit_buf_arr = credit_buf_arr_h;
+    rev_ring_info.rq_depth = pod->rq_depth;
 
     struct comch_add_rev_ring_msg rev_msg;
     memset(&rev_msg, 0, sizeof(rev_msg));

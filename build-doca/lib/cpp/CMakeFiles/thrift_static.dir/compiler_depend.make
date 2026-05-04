@@ -21598,6 +21598,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o: ../lib/
   /usr/include/x86_64-linux-gnu/bits/stdint-intn.h \
   /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stddef.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   /usr/include/stdlib.h \
   /usr/include/x86_64-linux-gnu/bits/waitflags.h \
   /usr/include/x86_64-linux-gnu/bits/waitstatus.h \
@@ -21662,7 +21663,6 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o: ../lib/
   /usr/include/x86_64-linux-gnu/asm/posix_types.h \
   /usr/include/x86_64-linux-gnu/asm/posix_types_64.h \
   /usr/include/asm-generic/posix_types.h \
-  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/object.h \
   /usr/include/pthread.h \
   /usr/include/sched.h \

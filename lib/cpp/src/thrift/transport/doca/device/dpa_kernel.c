@@ -30,6 +30,22 @@
 static void drain_producer_completions(struct dpa_thread_arg *thread_arg);
 static int ensure_producer_slot(struct dpa_thread_arg *thread_arg);
 
+/* DPA-local cache of host's freed_cumulative, refreshed lazily.
+ * process_one_rev_desc reads from this cache (no PCIe access in reverse
+ * path) to avoid the window/cache race seen with reverse-path reads. */
+uint64_t dpa_cached_freed[MAX_DPA_RINGS] = {0};
+
+/* Per-ring count of reverse DMAs DPA has issued (admission accounting).
+ * Was a static local in process_one_rev_desc; promoted to file scope so
+ * drain_all_rings can use it for lazy-refresh decisions. */
+uint64_t dpa_sent_count[MAX_DPA_RINGS] = {0};
+
+/* Lazy-refresh margin: refresh credit when computed inflight is within
+ * this many slots of the cap. Smaller = fewer PCIe reads but tighter
+ * margin; larger = more reads, more headroom. 64 leaves enough buffer
+ * to refresh before false-positive defer at the cap. */
+#define CREDIT_REFRESH_MARGIN 64
+
 /*
  * RPC for initializing DPA IO thread called before running the thread
  *
@@ -502,6 +518,9 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     doca_dpa_dev_uintptr_t dev_ptr;
     struct dma_desc *desc;
 
+    /* sent_count promoted to file scope as dpa_sent_count so drain_all_rings
+     * can use it for lazy credit refresh decisions. */
+
     buf = doca_dpa_dev_buf_array_get_buf(ring->buf_arr, thread_arg->rev_desc_idx[r]);
     dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
     desc = (struct dma_desc *)dev_ptr;
@@ -515,6 +534,16 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
         __dpa_thread_window_writeback();
         thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
         return 1;
+    }
+
+    /* === Admission gate using cached_freed[] (refreshed in drain_all_rings) ===
+     * dpa_sent_count[r] - dpa_cached_freed[r] = inflight reverse DMAs.
+     * If >= rq_depth, host's RX RQ is at capacity — defer (return 0; desc
+     * stays valid, retry next iter when cache is refreshed). */
+    if (ring->host_credit_buf_arr != 0 && ring->rq_depth != 0) {
+        if (dpa_sent_count[r] - dpa_cached_freed[r] >= ring->rq_depth) {
+            return 0;
+        }
     }
 
     /* Wait for DPU consumer availability */
@@ -632,6 +661,8 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
         thread_arg->rev_pos[r] += padded_total;
         if (thread_arg->rev_pos[r] >= ring->host_buf_size)
             thread_arg->rev_pos[r] = 0;
+        /* Successfully consumed one host RX slot (admission accounting) */
+        dpa_sent_count[r]++;
     }
 
     __dpa_thread_window_writeback();
@@ -674,8 +705,35 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
             }
         }
 
-        /* Reverse rings (DPU→CPU) */
+        /* Lazy credit refresh: only PCIe-read the credit slot when computed
+         * inflight is approaching the cap. At low/medium load, inflight is
+         * tiny relative to rq_depth so this never fires — zero overhead.
+         * At cap, refreshes once every ~(rq_depth - MARGIN) sends. The
+         * credit slot lives at index DMA_RING_SIZE within each pod's
+         * forward buf_arr (host's dma_ring extended by 1 slot). */
         uint32_t nr_rev = thread_arg->num_rev_rings;
+        for (uint32_t r = 0; r < nr_rev; r++) {
+            struct dpa_ring_info *rev = &thread_arg->rev_rings[r];
+            if (rev->host_credit_buf_arr == 0 || rev->rq_depth == 0)
+                continue;
+            uint64_t inflight = dpa_sent_count[r] - dpa_cached_freed[r];
+            if (inflight + CREDIT_REFRESH_MARGIN < (uint64_t)rev->rq_depth)
+                continue;  /* still plenty of headroom — skip PCIe read */
+            /* Credit slot is at the END of forward dma_ring (one past
+             * DMA_RING_SIZE descriptors). buf_arr_size is forward ring's
+             * buf_arr size; index = forward ring count. The forward
+             * ring_info_buf_arr_size used in process_one_desc is its own
+             * (DMA_RING_SIZE), so credit at index = DMA_RING_SIZE. */
+            doca_dpa_dev_buf_t cbuf =
+                doca_dpa_dev_buf_array_get_buf(rev->host_credit_buf_arr,
+                                               /* slot index */ DMA_RING_SIZE);
+            doca_dpa_dev_uintptr_t cptr = doca_dpa_dev_buf_get_external_ptr(cbuf);
+            volatile uint64_t *fp = (volatile uint64_t *)cptr;
+            __dpa_thread_window_read_inv();
+            dpa_cached_freed[r] = *fp;
+        }
+
+        /* Reverse rings (DPU→CPU) */
         for (uint32_t r = 0; r < nr_rev; r++) {
             int chunks = process_one_rev_desc(thread_arg, r);
             if (chunks > 0) {
@@ -701,28 +759,12 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
 
-    DOCA_DPA_DEV_LOG_INFO("[PAIRCHK] run_dma_manager arg: consumer_comp=0x%lx producer_comp=0x%lx consumer=0x%lx producer=0x%lx consumer_id=%u num_rings=%u\n",
-                         thread_arg->dpa_consumer_comp,
-                         thread_arg->dpa_producer_comp,
-                         thread_arg->dpa_consumer,
-                         thread_arg->dpa_producer,
-                         thread_arg->dpu_consumer_id,
-                         thread_arg->num_rings);
-
-    DOCA_DPA_DEV_LOG_INFO("entering hybrid spin/yield loop (consumer_id=%u)\n",
-                         thread_arg->dpu_consumer_id);
-
-    /* Hybrid: spin while there is work (cache-hot, low per-desc overhead),
-     * yield to RTOS only when both rings are empty AND no producer slots
-     * are pending. This:
-     *   - resets the 12 s max kernel runtime timer whenever the workload
-     *     pauses, avoiding the silent fatal termination observed under
-     *     pure-spin earlier
-     *   - sustains the ~40 k+ DMA/s rate during bursts because there is
-     *     no wake/reschedule overhead inside the work batch
-     *   - relies on the DPU forwarding a TRIGGER (host WAKE_DPA on enqueue,
-     *     DPU rev DMA enqueue) to fire consumer_comp and re-activate the
-     *     thread when a new desc arrives during idle */
+    /* DPA scheduling model verified empirically: this function is RE-ENTERED
+     * on every activation (after yield + new event), and a single activation
+     * can spin for 30M+ iterations across many seconds without being killed.
+     * The "12 s max kernel runtime timer" concern from earlier comments did
+     * not reproduce. Yield is kept as good cooperative-scheduling practice —
+     * spinning when there is no work wastes EU cycles for no benefit. */
     while (1) {
         handle_msgs(thread_arg);
         int chunks = drain_all_rings(thread_arg);

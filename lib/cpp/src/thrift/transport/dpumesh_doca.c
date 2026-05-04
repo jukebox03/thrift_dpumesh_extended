@@ -125,7 +125,6 @@ struct dpumesh_ctx {
      * reused by get_next_dma_desc, the associated TX slot can be freed.
      * -1 means no TX slot to free for that ring slot. */
     int ring_tx_slot_map[DMA_RING_SIZE];
-
 };
 
 /* ====================================================================
@@ -432,7 +431,7 @@ static doca_error_t init_control_path(dpumesh_ctx_t *ctx) {
     ctx->reg_msg.type = DMESH_MSG_REGISTER;
     ctx->reg_msg.pod_id = ctx->pod_id;
     snprintf(ctx->reg_msg.app_name, sizeof(ctx->reg_msg.app_name), "%s", ctx->app_name);
-    
+
     result = client_send_msg(&ctx->doca_objs, (const char *)&ctx->reg_msg, sizeof(ctx->reg_msg));
     if (result == DOCA_SUCCESS) {
         DOCA_LOG_INFO("Sent REGISTER to DPU: pod_id=%d app=%s", ctx->pod_id, ctx->app_name);
@@ -683,11 +682,16 @@ static int reclaim_ring_tx_slots(dpumesh_ctx_t *ctx) {
 }
 
 int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
-    /* Backpressure: block indefinitely until a TX slot is free. The caller
-     * (gateway worker via admission control, or any blocking RPC site) has
-     * already committed to this request, so failure here would propagate
-     * up as a Thrift exception — unwanted. The 1ms cond_timedwait below is
-     * a safety re-poll in case a tx_free signal is dropped. */
+    /* Backpressure: block until a TX slot is free. The caller has already
+     * committed to this request, so failure here would propagate as a
+     * Thrift exception — unwanted.
+     *
+     * Latency-tuned wait: at 44K RPS the per-request budget is ~23µs, so
+     * a 1ms cond_timedwait blocks ~44 requests-worth of progress. We use
+     * a 50µs re-poll backstop instead. The cond is signaled directly by
+     * tx_free / TX_ACK handlers, so the timedwait only fires when a
+     * signal was missed (rare race) or when reclaim_ring_tx_slots needs
+     * a periodic poll. */
     pthread_mutex_lock(&ctx->slot_lock);
     for (;;) {
         for (int i = 0; i < ctx->num_slots; i++) {
@@ -699,19 +703,16 @@ int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
         }
         pthread_mutex_unlock(&ctx->slot_lock);
 
-        /* Reclaim TX slots from completed ring descriptors to break
-         * the deadlock: tx_alloc waits for free slots, but slots are
-         * only freed inside dpumesh_enqueue which can't run until
-         * tx_alloc returns. */
+        /* Reclaim TX slots from completed ring descriptors. */
         int reclaimed = reclaim_ring_tx_slots(ctx);
         pthread_mutex_lock(&ctx->slot_lock);
         if (reclaimed > 0)
-            continue;  /* freed some — retry scan */
+            continue;
 
-        /* Wait for tx_free to signal, with 1ms re-poll backstop. */
+        /* 50µs re-poll backstop (was 1ms — too coarse for cap-region latency). */
         struct timespec abs_ts;
         clock_gettime(CLOCK_REALTIME, &abs_ts);
-        abs_ts.tv_nsec += 1000000;  /* 1 ms */
+        abs_ts.tv_nsec += 50000;  /* 50 µs */
         if (abs_ts.tv_nsec >= 1000000000) {
             abs_ts.tv_nsec -= 1000000000;
             abs_ts.tv_sec += 1;
@@ -768,18 +769,18 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     pthread_mutex_lock(&ctx->ring_lock);
 
     /* Block with exponential backoff until a DMA ring slot frees. DPA
-     * advances the ring tail as it consumes descriptors. No artificial
-     * timeout — the caller has committed to this request and must not see
-     * a failure. backoff is capped at 1ms. */
+     * advances the ring tail as it consumes descriptors. backoff capped at
+     * 50µs (was 1ms — at 44K RPS, 1ms = 44 requests-worth of latency
+     * stalled in this loop while DPA is actively draining the ring). */
     {
-        struct timespec backoff = {0, 10000}; /* 10µs initial */
+        struct timespec backoff = {0, 1000}; /* 1µs initial */
         while (1) {
             dma = get_next_dma_desc(ctx->dma_ring);
             if (dma)
                 break;
             pthread_mutex_unlock(&ctx->ring_lock);
             nanosleep(&backoff, NULL);
-            if (backoff.tv_nsec < 1000000) /* cap at 1ms */
+            if (backoff.tv_nsec < 50000) /* cap at 50µs */
                 backoff.tv_nsec *= 2;
             pthread_mutex_lock(&ctx->ring_lock);
         }
@@ -891,6 +892,16 @@ void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot) {
     pthread_mutex_lock(&ctx->rx_slot_lock);
     ctx->rx_slot_bitmap[slot] = 0;
     pthread_mutex_unlock(&ctx->rx_slot_lock);
+
+    /* DPA-poll credit return: bump the counter at the LAST (extra) slot of
+     * the dma_ring buffer. DPA polls this slot via the same buf_arr it
+     * already uses for forward dma_desc reads — no separate buf_arr, no
+     * extra PCIe read mechanism. ~10ns on host hot path. */
+    if (ctx->dma_ring && ctx->dma_ring->descs) {
+        volatile uint64_t *credit =
+            (volatile uint64_t *)(ctx->dma_ring->descs + ctx->dma_ring->size);
+        __sync_add_and_fetch(credit, 1);
+    }
 }
 
 /* ====================================================================
