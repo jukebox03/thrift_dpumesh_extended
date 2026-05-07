@@ -34,10 +34,10 @@
  * footprint inside DPU. With this equality DPU never laps unconsumed
  * bytes, even though DPU/DPA do no FC of their own.
  *
- * Both directions carry per-entry payload = [fc_header][body], with
- * body_len ≤ slot_size − sizeof(fc_header). Per-request metadata travels
- * via dma_desc / comch_dma_comp_msg, NOT in the DMA payload — that is what
- * keeps reverse footprint = forward footprint = num_slots × slot_size.
+ * Both directions carry per-entry payload = body (no in-band header), with
+ * body_len ≤ slot_size. Per-request metadata travels via dma_desc /
+ * comch_dma_comp_msg, NOT in the DMA payload — that is what keeps reverse
+ * footprint = forward footprint = num_slots × slot_size.
  *
  * Caveat: a destination pod's reverse staging buffer aggregates entries
  * from ALL source pods that target it. With N concurrent sources targeting

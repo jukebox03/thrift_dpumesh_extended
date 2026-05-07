@@ -14,7 +14,6 @@ struct objects;
 struct dma_ring {
     struct doca_mmap *mmap;
     uint32_t head;
-    uint32_t tail;
     uint32_t size;
     struct dma_desc *descs;
 };

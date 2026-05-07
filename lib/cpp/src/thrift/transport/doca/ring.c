@@ -22,7 +22,6 @@ int setup_dma_ring(struct objects *objs, size_t size)
     ring = objs->dma_ring;
     ring->size = size;          /* logical ring size (host wraps at this) */
     ring->head = 0;
-    ring->tail = 0;
     ring->descs = NULL;
 
     /* Allocate one EXTRA slot at the end. Slots 0..size-1 are normal dma_desc
@@ -69,7 +68,6 @@ int setup_dpu_tx_ring(struct doca_dev *dev, size_t size,
 
     ring->size = size;
     ring->head = 0;
-    ring->tail = 0;
     ring->descs = NULL;
 
     result = alloc_buffer_and_set_mmap(&ring->mmap, dev,

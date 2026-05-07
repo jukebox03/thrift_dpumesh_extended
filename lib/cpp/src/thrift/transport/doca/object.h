@@ -139,7 +139,6 @@ struct pod_state {
     /* Per-pod RX DMA buffer (DPU receives CPU→DPU data here) */
     struct doca_mmap *local_mmap;
     void *dma_buffer;
-    size_t dma_buf_size;
 
     /* === Reverse direction (DPU→CPU) === */
 

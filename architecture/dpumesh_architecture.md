@@ -8,7 +8,7 @@
 | **Unique-ID Service** | Host (x86), pod_id=0 | Thrift 비즈니스 로직 + `TDpumeshServerTransport` |
 | **DPU** | BlueField ARM | comch 컨트롤 평면 + 라우팅 + DMA 스테이징 + **1kHz DPA keepalive** |
 | **DPA** | BlueField RISC-V (HW DMA engine) | **hybrid spin/yield** DMA descriptor polling + `dma_copy` 실행 (idle 시 `thread_reschedule`) |
-| **DMA Machine** | Host ↔ DPU shared mmap | 1024-slot ring + body-pool buffer + 64B descriptor |
+| **DMA Machine** | Host ↔ DPU shared mmap | 2048-slot ring (+ 1 credit slot) + body-pool buffer + 64B descriptor |
 
 핵심 구조: 모든 host(gateway, unique-id-service)는 **동일한 transport 라이브러리** (`dpumesh_doca.c`)를 통해 DPU에 연결되며, `pod_id` 와 `OP_REQUEST/OP_RESPONSE` flag로 라우팅이 결정됨.
 
@@ -25,10 +25,11 @@
 │  │  ↑ wait_response            │         │  ↓ TDpumeshTransport (per req)     │ │
 │  └────────────┬───────────────┘         └────────────┬───────────────────────┘ │
 │               │ libthriftd (dpumesh_doca.c)         │                          │
-│               │  - dma_buffer (8 MB tx body pool)   │                          │
-│               │  - rx_buffer  (8 MB rx body pool)   │                          │
+│               │  - dma_buffer (16 MB tx body pool)  │                          │
+│               │  - rx_buffer  (16 MB rx body pool)  │                          │
 │               │  - rx_dma_buffer (DPU→Host DMA dst) │                          │
-│               │  - dma_ring (1024 × 64B desc)       │                          │
+│               │  - dma_ring (2048 × 64B desc + 1     │                          │
+│               │              credit slot @end)      │                          │
 │               │  - pending[MAX_PENDING] (req↔resp)  │                          │
 │               │  - PE thread (drives doca_pe)       │                          │
 │               └────────────┬─────────────────────────┘                          │
@@ -102,8 +103,9 @@
 | **`comch_msg` family** (`dpa_common.h:71-129`) | ≤ 32 B (immediate data) | DPU↔DPA comch FIFO | DPU ARM ↔ DPA. `DMA_REQ`, `ADD_RING`, `ADD_REV_RING`, `TRIGGER`, `DMA_COMPLETED`, `DMA_CHUNK`, `REV_DMA_COMPLETED` |
 | **`dmesh_*_msg`** (control path) | varies | DPU↔Host comch 컨트롤 채널 | `DMESH_MSG_REGISTER`, `MMAP`, `TX_ACK`, `DMA_COMPLETION`, `POD_CONSUMER_ID` |
 
-핵심 invariant (`dpumesh_common.h:30-46`):
-- `num_slots(1024) × slot_size(8 KB) = DPU_BUFFER_SIZE = 8 MB`
+핵심 invariant (`dpumesh_common.h:26-52`):
+- `num_slots(2048) × slot_size(8 KB) = DPU_BUFFER_SIZE = 16 MB`
+- `DMA_RING_SIZE = 2048` 디스크립터 슬롯 + **1개 추가 슬롯**(인덱스 = `DMA_RING_SIZE`)이 reverse-path RX credit 카운터로 사용됨 (`ring.c:30-46`).
 - per-payload = `[fc_header(4B)][body]`. 메타데이터(req_id, src/dst_pod, flags)는 **payload 안에 절대 넣지 않음** — `dma_desc`와 `comch_dma_comp_msg`가 운반함. → reverse 쪽 staging 풀이 forward와 같은 footprint를 유지.
 
 ---
@@ -254,8 +256,16 @@ DPU: process_forward_entry(entry)
    │  server_send_tx_ack_to(pod[0]_conn, req_id)  ← unique-id의 TX 슬롯 해제
    ▼
 DPA: process_one_rev_desc(reverse ring of pod[1])
+   │  ── admission gate (credit-return) ──
+   │     inflight = dpa_sent_count[r] − dpa_cached_freed[r]
+   │     if inflight ≥ pod[1].rq_depth → defer (return 0, retry next iter)
+   │     dpa_cached_freed[r]는 drain_all_rings에서 lazy refresh:
+   │       inflight + CREDIT_REFRESH_MARGIN(64) ≥ rq_depth 일 때만
+   │       host의 credit slot(forward dma_ring 끝의 +1 슬롯) 1워드 PCIe read
+   │  ──────────────────────────────────
    │  dma_copy(DPU TX pod[1].tx_buffer → Host pod[1].rx_dma_buffer)
    │  comp_msg.type=REV_DMA_COMPLETED, src=0, dst=1, req_id
+   │  dpa_sent_count[r]++  (admission accounting)
    ▼
 DPU: consumer_pe callback on REV_DMA_COMPLETED
    │  comp_queue_enqueue(COMP_ENTRY_REV_NOTIFY)
@@ -277,6 +287,11 @@ Gateway host transport: rx_data_hook (dpumesh_doca.c:275-380)
    │      if OP_RESPONSE → pending[req_id % MAX_PENDING]
    │        state==0 → desc=*; state=1; cond_signal()
    │        state==-2 (timeout 후 cancel됐던 것) → tx free + rx free
+   │
+   │  (later) dpumesh_rx_free(slot):
+   │    rx_slot_bitmap[slot] = 0
+   │    __sync_add_and_fetch(&dma_ring->descs[size].first8B, 1)
+   │      ← DPA가 lazy-poll하는 credit counter. ~10ns hot-path 비용.
    ▼
 Gateway worker waiting in dpumesh_wait_response:
    resp slot=desc.body_buf_slot, len=desc.body_len
@@ -291,7 +306,8 @@ Gateway worker waiting in dpumesh_wait_response:
 | 종류 | 발생 위치 | 메커니즘 | 역할 |
 |---|---|---|---|
 | **DMA descriptor polling** | DPA RISC-V | `desc->valid` 비트 spin (`__dpa_thread_window_read_inv`); 부하 중에는 spin 유지 (chunks > 0 → no reschedule) | host가 enqueue한 forward 요청, DPU가 enqueue한 reverse 요청 picking |
-| **DPA reschedule (idle yield)** | DPA RISC-V | drain_all_rings 결과 chunks==0이면 `doca_dpa_dev_thread_reschedule()` | 12 s `max_run_time` 초과로 인한 silent fatal kernel 종료 방지. 부하 중에는 호출 0회. |
+| **Reverse-path admission gate** | DPA RISC-V | `dpa_sent_count[r] − dpa_cached_freed[r] ≥ rq_depth` 시 `process_one_rev_desc` defer. `dpa_cached_freed[]`는 `drain_all_rings`에서 lazy refresh — inflight가 cap 근처(`+ CREDIT_REFRESH_MARGIN=64`)일 때만 host credit slot 1워드 PCIe read. | DPU→Host reverse DMA가 host RX RQ를 overrun하는 것 방지. 저부하에서 PCIe read 0회 → 거의 zero overhead. |
+| **DPA reschedule (idle yield)** | DPA RISC-V | drain_all_rings 결과 chunks==0이면 `doca_dpa_dev_thread_reschedule()` | 협력적 스케줄링 — work 없을 때 EU 양보. (이전 가설인 `max_run_time=12s` 초과 종료는 retest에서 재현 안 됨; `dpa_kernel.c:759-766` 주석. 한 활성화에서 30M+ iter spin 가능 확인.) 부하 중 호출 0회. |
 | **DMA completion (DPA→DPU)** | DPA → DPU consumer comch | `dma_copy()`의 마지막 chunk에 immediate data로 `comch_dma_comp_msg` (≤32B) 첨부 | host→DPU 또는 DPU→host DMA가 끝났음을 DPU ARM에 알림 |
 | **DMA completion (DPU→Host)** | DPU comch → Host comch | `DMESH_MSG_DMA_COMPLETION` (control msg) | DPU가 host RX buffer에 reverse DMA 끝낸 뒤 host에 위치/길이 알림 |
 | **Producer slot completion** | DPA self | `doca_dpa_dev_get_completion(producer_comp)` poll | `dma_copy`마다 1슬롯 소모, 1024 slot pool, drain 안 하면 silently fail |
@@ -300,6 +316,8 @@ Gateway worker waiting in dpumesh_wait_response:
 | **TX_ACK** | DPU → Host comch | `DMESH_MSG_TX_ACK{req_id, dst_pod}` | host TX 슬롯 라이프사이클 종료 (pending state 0/-2 → -1) |
 | **TRIGGER (keepalive)** | DPU → DPA comch (1 kHz) | `COMCH_MSG_TYPE_TRIGGER` empty msg, `dmesh_doca_dpa_msgq_send_try` (fire-and-forget) | DPA reschedule 후 host/DPU가 새로 post한 desc 발견 보장. idle→active wake 최대 1 ms. 부하 중에는 spin 상태라 사실상 no-op. |
 | **Pending wait** | Host transport | `pending[req_id%MAX_PENDING]` mutex+cond, 30 s timeout | gateway worker가 응답 도착까지 block, OP_RESPONSE 도착 시 cond_signal |
+| **RX credit return** | Host (`dpumesh_rx_free`) | `__sync_add_and_fetch(&dma_ring->descs[size].first8B, 1)` — `DMA_RING_SIZE`+1번째 슬롯이 credit 카운터. forward dma_ring buf_arr를 그대로 재활용 (별도 mmap/buf_arr 없음). | DPA의 reverse-path admission gate에 free 신호. ~10ns. |
+| **Host TX wait backoff** | Host transport | `dpumesh_tx_alloc` cond_timedwait 50µs 백스톱 (이전 1ms), `dpumesh_enqueue` ring slot exponential backoff 1µs→50µs cap (이전 10µs→1ms cap) | cap-region에서 1ms wait이 ~44 req-worth latency 잡아먹는 문제 해결 |
 | **PE thread** | Host (dedicated thread) | `pe_progress_fn` 별도 스레드 | comch ctrl msg 콜백 (`rx_data_hook`)을 driving |
 
 ---
@@ -309,15 +327,19 @@ Gateway worker waiting in dpumesh_wait_response:
 | | TCP | Frame parse | Pending table | Slot/Buf admission | DMA ring | DMA copy 실행 | Routing | Backpressure |
 |---|---|---|---|---|---|---|---|---|
 | Client (wrk) | ✓ | | | | | | | TCP window |
-| **Gateway** | ✓ (epoll) | ✓ (4B size + thrift) | ✓ (req↔resp) | ✓ (tx_alloc/rx_alloc) | ✓ (ring write via libthriftd) | | dst_pod=0 (hardcoded) | admission cap (900<1024) + epoll pause + TCP backpressure |
-| **Unique-ID Service** | | | ✓ (per response) | ✓ | ✓ (ring write via libthriftd) | | dst_pod=src (응답) | TX slot pool |
+| **Gateway** | ✓ (epoll) | ✓ (4B size + thrift) | ✓ (req↔resp) | ✓ (tx_alloc/rx_alloc) | ✓ (ring write via libthriftd) | | dst_pod=0 (hardcoded) | admission cap (900<2048) + epoll pause + TCP backpressure |
+| **Unique-ID Service** | | | ✓ (per response) | ✓ | ✓ (ring write via libthriftd) | | dst_pod=src (응답) | TX slot pool + RX credit-return on `rx_free` |
 | **DPU ARM** | | | | (forwarder, no own slots) | reverse ring write | | by `pod_id`+flags | deferred TX_ACK queue + `comp_queue` 128/iter + `recv_tasks_in_flight` pool + **1 kHz DPA keepalive** |
-| **DPA** | | | | producer 1024 slots | poll forward+reverse rings (idle 시 reschedule) | ✓ (`dma_copy` HW) | ring → comp_msg | none — 위 단계가 보장 |
-| **DMA Machine** | | | | | shared mmap | (passive) | | none |
+| **DPA** | | | | producer 1024 slots + **reverse admission gate** (cached `freed_cumulative` vs `rq_depth`) | poll forward+reverse rings (idle 시 reschedule) | ✓ (`dma_copy` HW) | ring → comp_msg | reverse-path defer when `inflight ≥ rq_depth` |
+| **DMA Machine** | | | | | shared mmap (+ 1 credit slot) | (passive) | | none |
 
-DPA/DPU는 자체 flow control이 없다는 점이 중요. host의 slot-pool admission이 in-flight 바이트를 `num_slots × slot_size = 8 MB = DPU_BUFFER_SIZE`로 묶어서 전체 정합성을 유지함 (`dpumesh_common.h:30-46` 주석).
+Flow control은 **4-layer** 구조 (`dpa_kernel.c:520-548`, `dpumesh_doca.c:683-728/892-904` 등):
+1. **End-node TX/RX slot admission**: host의 `slot_bitmap` / `rx_slot_bitmap` (`num_slots × slot_size = 16 MB = DPU_BUFFER_SIZE` 불변식이 DPU staging overflow 방지).
+2. **Forward DMA ring slot** (host→DPU): `DMA_RING_SIZE=2048` slot 짜리 ring, 1µs→50µs exponential backoff.
+3. **Reverse DMA admission gate** (DPA→host RX RQ): credit-return 카운터 한 워드. host `__sync_add_and_fetch` (~10ns), DPA lazy-poll (cap 근처에서만 PCIe read). forward `dma_ring`을 1슬롯 늘려서 마지막 슬롯을 credit으로 재활용 (별도 mmap 없음).
+4. **DPU staging buffer 정적 sizing**: `DPU_BUFFER_SIZE=16 MB` per pod. N-source × dst worst-case fan-in 견디기 위해 8MB→16MB로 키움 (`dpumesh_common.h:42-45`).
 
-**DPA kernel runtime 제약**: `doca_dpa_get_kernel_max_run_time()`이 BF-3에서 **12 s** 반환. while(1) 무한 spin은 이 한도를 초과하면 runtime이 fatal로 종료시키고 회복 불가. 따라서 `run_dma_manager`는 idle (chunks==0) 시점에 `doca_dpa_dev_thread_reschedule()`로 yield해서 timer를 reset. 부하 중에는 chunks>0이 유지되므로 reschedule 호출 0회 → polling 처리량 보존. idle→active 재시동은 DPU의 1 kHz keepalive TRIGGER가 보장 (P50 latency 영향 ≤ 0.5 ms).
+**DPA kernel runtime 제약 (재검증됨)**: 초기 가설 — `doca_dpa_get_kernel_max_run_time()`이 BF-3에서 **12 s** 반환하므로 while(1) 무한 spin이 한도 초과 시 fatal 종료 — 은 `dpa_kernel.c:759-766` retest에서 **재현되지 않음**. 단일 활성화에서 30M+ iter, 수 초 spin이 정상 작동함 확인. 그래도 `if (chunks == 0) doca_dpa_dev_thread_reschedule()`은 **협력적 스케줄링** 차원에서 유지 — work 없을 때 EU 점유는 낭비. idle→active 재시동은 DPU의 1 kHz keepalive TRIGGER가 보장 (P50 latency 영향 ≤ 0.5 ms).
 
 ---
 
@@ -388,20 +410,29 @@ T22 w0: admission_release; epoll_wait next
 
 ### DPA 사망/회복 (현재 설계의 출발점)
 
-초기 구현은 `run_dma_manager`를 *순수* `while(1)` spin loop로 두고 thread_reschedule 호출하지 않았다. NVIDIA 문서의 *"DPA 메모리 모델은 weakly ordered, polling은 명시적 fence와 함께 가능"* 만 보고, BlueField-3 의 `doca_dpa_get_kernel_max_run_time()` 한도 (이 HW에서는 **12 초**)를 간과했다. 결과:
+초기 구현은 `run_dma_manager`를 *순수* `while(1)` spin loop로 두고 thread_reschedule 호출하지 않았다. 배포 직후 DPA EU가 점유 0%로 떨어지면서 forward DMA 영구 무시 → host gateway worker가 wait_response 30 s 타임아웃 cycle 들어가는 증상이 관측됨:
 
-- 배포 직후 ~12 초 후 DPA 커널이 runtime에 의해 silent fatal 종료
 - DPU/host 측 어느 누구도 감지 못 함 (우리 코드는 `doca_dpa_peek_at_last_error()` 호출 0회)
-- forward DMA 영구 무시 → host gateway worker가 wait_response 30 s 타임아웃 cycle
 - DPU→DPA msgq의 1 Hz keepalive조차 drain 안 되어 ~17 분 후 producer task pool 1024 가득 → `DOCA_ERROR_AGAIN` 폭주
 - `dpa-statistics collect --timeout 2000 --reset`이 `Cycles=0, Executions=0` 반환 → DPA EU 점유 0%로 확정
 
-수정 (현재 설계):
-1. `run_dma_manager`에 `if (chunks == 0) doca_dpa_dev_thread_reschedule();` 삽입. 부하 중 처리율 손실 0, idle gap에서 timer reset.
+당시 추정 원인은 BlueField-3의 `doca_dpa_get_kernel_max_run_time()` = **12 초** 한도 초과로 인한 silent fatal kernel 종료였다. 그러나 이후 retest에서 (`dpa_kernel.c:759-766` 주석) 단일 활성화 시 30M+ iter, 수 초 spin이 정상적으로 동작함이 확인되어 **12s 한도 가설은 재현되지 않음**. 진짜 원인은 별도 — 가능성으로는 (a) producer task pool 고갈로 dma_copy 발행이 silent fail, (b) DPU send-pool / msgq 점유로 DPA가 통신 못 하는 상태 등이 있음.
+
+어쨌든 현재 설계는 idle 시 yield하는 보수적 패턴으로 안정화됨:
+1. `run_dma_manager`에 `if (chunks == 0) doca_dpa_dev_thread_reschedule();` 삽입. 부하 중 처리율 손실 0, idle 시 EU 양보(협력적 스케줄링).
 2. DPU main loop 1 kHz keepalive TRIGGER로 reschedule된 DPA를 다음 1 ms 안에 wake.
 3. `dmesh_doca_dpa_msgq_send_try` (fire-and-forget) 변형 추가 — 10000-step retry loop가 main thread를 점유하지 않도록.
 
 검증: 40 k RPS × 30 s × 12 회 연속 100 % 성공 (14.4 M reqs, 0 failures). P50 0.41 ms, P99 2.1 ms.
+
+### Reverse-path admission gate (commit 225a543a)
+
+이전에는 DPA가 reverse DMA를 host RX RQ 가득 차도 멈출 수단이 없었다. 추가된 메커니즘:
+
+- Host: `dpumesh_rx_free`에서 `dma_ring` 끝의 +1 슬롯에 `__sync_add_and_fetch(credit, 1)` (~10 ns)
+- DPA: `dpa_sent_count[r] − dpa_cached_freed[r] ≥ rq_depth` 시 `process_one_rev_desc`가 0 리턴(defer)
+- Lazy refresh: `inflight + CREDIT_REFRESH_MARGIN(64) < rq_depth` 이면 PCIe read 스킵 → 저부하에서 거의 0 overhead, cap 근처에서만 refresh
+- 영리한 점: 별도 mmap/buf_arr 안 만들고 forward `dma_ring`을 1슬롯 늘려서 그 슬롯을 credit 카운터로 재활용 (`ring.c:30-46`, `dpa.c:1187` `DMA_RING_SIZE+1`로 buf_arr 생성)
 
 ---
 

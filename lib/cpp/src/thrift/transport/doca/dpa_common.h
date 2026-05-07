@@ -57,23 +57,18 @@ struct dpa_thread_arg {
 	uint32_t rev_pos[MAX_DPA_RINGS];
 } __attribute__((__packed__, aligned(8)));
 
-/* ====== Per-message header ======
- * Prepended to every DMA payload by the sender. DPA copies it verbatim;
- * the receiver parses payload_len to know how many body bytes follow.
- *
- * Forward path (Host→DPU): payload = [fc_header][body]; payload_len = body_len.
- * Reverse path (DPU→Host): payload = [fc_header][body]; payload_len = body_len.
- *   sw_descriptor is NOT in the payload — req_id / src_pod_id / dst_pod_id /
- *   flags are carried via dmesh_dma_completion_msg (and dma_desc on-DPU).
- *   This keeps reverse per-entry size = forward per-entry size = slot_size,
- *   which is what makes num_slots × slot_size ≤ DPU_BUFFER_SIZE actually
- *   bound the reverse buffer occupancy.
+/* ====== Per-message payload layout ======
+ * The DMA payload is the body itself — no in-band header.
+ *   Forward path (Host→DPU): payload = body
+ *   Reverse path (DPU→Host): payload = body
+ * Per-request metadata (req_id / src_pod_id / dst_pod_id / flags / length)
+ * is carried via dmesh_dma_completion_msg (and dma_desc on-DPU), keeping
+ * reverse per-entry size = forward per-entry size = slot_size. That is
+ * what makes num_slots × slot_size ≤ DPU_BUFFER_SIZE actually bound the
+ * reverse buffer occupancy.
  *
  * Flow control is handled end-to-end at the application layer via slot-
  * based admission. DPU/DPA do not interpret any byte-position field. */
-struct fc_header {
-	uint32_t payload_len;    /* body length following this header */
-} __attribute__((__packed__));
 
 /* ====== Comch message types (DPU ↔ DPA) ====== */
 

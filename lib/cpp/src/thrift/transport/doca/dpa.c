@@ -93,30 +93,18 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 
             /* Find the source pod's local DMA buffer for data */
             struct pod_state *src_pod = find_pod_by_id(objs, src_pod_id);
-            uint8_t *payload_src = NULL;
-            if (src_pod && src_pod->dma_buffer) {
-                payload_src = (uint8_t *)src_pod->dma_buffer + comp_msg->pos;
-            } else {
+            if (!src_pod || !src_pod->dma_buffer) {
                 DOCA_LOG_ERR("DMA completed but src_pod %d not found or no buffer", src_pod_id);
                 break;
             }
-            uint32_t raw_len = comp_msg->length;
 
-            /* Parse fc_header from the beginning of DMA'd data.
-             * Layout: [fc_header(payload_len)] [body(N)]
-             *
-             * DPU is a pure forwarder — read payload_len only; flow control
-             * is end-to-end via slot-based admission at end-nodes. */
-            uint32_t payload_len = raw_len;
+            /* Body is the entire DMA payload — no in-band header.
+             * length / pos / req_id / pod ids / flags travel via comp_msg. */
+            uint32_t payload_len = comp_msg->length;
             uint32_t body_offset = comp_msg->pos;
-            if (raw_len >= sizeof(struct fc_header)) {
-                struct fc_header *hdr = (struct fc_header *)payload_src;
-                payload_len = hdr->payload_len;
-                body_offset = comp_msg->pos + sizeof(struct fc_header);
-            }
 
-            DOCA_LOG_DBG("DMA completed: src_pod=%d, dst_pod=%d, req_id=%u, pos=%u, raw_len=%u, body_len=%u",
-                         src_pod_id, dst_pod_id, req_id, comp_msg->pos, raw_len, payload_len);
+            DOCA_LOG_DBG("DMA completed: src_pod=%d, dst_pod=%d, req_id=%u, pos=%u, body_len=%u",
+                         src_pod_id, dst_pod_id, req_id, comp_msg->pos, payload_len);
 
             /* Enqueue for deferred processing in main loop.
              * TX_ACK + reverse DMA routing handled there — never send
@@ -129,7 +117,7 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             entry.length = payload_len;
             entry.flags = comp_msg->flags;
 
-            /* Zero-copy: record buffer offset (after fc_header) instead of heap-copying.
+            /* Zero-copy: record buffer offset instead of heap-copying.
              * End-node slot-based admission keeps in-flight bytes ≤ buf_size
              * so DPA cannot lap unconsumed data. */
             entry.buf_offset = body_offset;
@@ -1203,7 +1191,6 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
                      pod->pod_id, doca_error_get_descr(result));
         return result;
     }
-    pod->dma_buf_size = DPU_BUFFER_SIZE;
 
     /* 3. Export local DMA buffer mmap back to Host */
     result = export_mmap_to_remote(objs, pod->local_mmap, pod->dma_buffer,

@@ -19,9 +19,7 @@
  *
  *   3. flush() uses dpumesh_register_pending + attach_tx + release_async,
  *      mirroring the gateway's TX-slot lifetime model: TX_ACK frees the
- *      slot as soon as the DPU confirms forward DMA consumption. Replaces
- *      the previous ring_tx_slot_map deferred-until-ring-wrap scheme,
- *      which raced with TX_ACK pending free under high load.
+ *      slot as soon as the DPU confirms forward DMA consumption.
  */
 
 #include <thrift/transport/TDpumeshTransport.h>

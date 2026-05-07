@@ -1,0 +1,11 @@
+FROM ubuntu:22.04
+
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY echo_tcp /usr/local/bin/echo_tcp
+
+EXPOSE 9091
+
+ENTRYPOINT ["/usr/local/bin/echo_tcp"]

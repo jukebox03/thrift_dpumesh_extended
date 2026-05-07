@@ -119,12 +119,6 @@ struct dpumesh_ctx {
     /* Client-side pending response table */
     dpumesh_pending_t pending[MAX_PENDING];
     atomic_uint_fast32_t next_req_id;
-
-    /* Deferred TX slot free: ring_slot → tx_slot mapping.
-     * When DPA processes a ring descriptor (clears valid=0) and the slot is
-     * reused by get_next_dma_desc, the associated TX slot can be freed.
-     * -1 means no TX slot to free for that ring slot. */
-    int ring_tx_slot_map[DMA_RING_SIZE];
 };
 
 /* ====================================================================
@@ -224,11 +218,11 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
 }
 
 /*
- * Parse + deliver one DMA-reverse entry at rx_dma_buffer[pos] whose total DMA
+ * Parse + deliver one DMA-reverse entry at rx_dma_buffer[pos] whose body
  * length is dma_len. Per-request metadata (req_id, src_pod_id, dst_pod_id,
  * flags) is taken from the comch DMA_COMPLETION message — NOT from the DMA
- * payload. The on-wire layout at pos is [fc_header][body]; sw_descriptor
- * is no longer in-band. Returns 0 on success, -1 on malformed/undeliverable.
+ * payload. The DMA payload is the body itself (no in-band header).
+ * Returns 0 on success, -1 on malformed/undeliverable.
  */
 static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_len,
                                 uint32_t req_id, int32_t src_pod_id,
@@ -238,14 +232,8 @@ static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_l
                      pos, dma_len, ctx->rx_dma_buf_size);
         return -1;
     }
-    uint8_t *buf = (uint8_t *)ctx->rx_dma_buffer + pos;
-
-    if (dma_len < sizeof(struct fc_header)) return -1;
-    struct fc_header *hdr = (struct fc_header *)buf;
-    uint32_t body_len = hdr->payload_len;
-    if (sizeof(struct fc_header) + body_len > dma_len) return -1;
-
-    uint8_t *body = buf + sizeof(struct fc_header);
+    uint8_t *body = (uint8_t *)ctx->rx_dma_buffer + pos;
+    uint32_t body_len = dma_len;
 
     int slot = rx_slot_alloc(ctx);
     if (slot < 0) {
@@ -310,10 +298,9 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
     if (comch_msg->type == DMESH_MSG_DMA_COMPLETION) {
         /* === Reverse DMA notification (DPU→CPU) ===
          * DPU ARM forwards this after DPA completes DMA from DPU TX buffer
-         * to Host RX buffer. Data is already at rx_dma_buffer[pos].
-         * Layout at pos: [fc_header(4B)] [body(payload_len B)].
-         * Per-request metadata (req_id, src/dst pod, flags) comes from
-         * comp itself — not from the DMA payload. */
+         * to Host RX buffer. Data (body only) is already at rx_dma_buffer[pos].
+         * Per-request metadata (req_id, src/dst pod, flags, length) comes
+         * from comp itself — not from the DMA payload. */
         struct dmesh_dma_completion_msg comp;
         if (len < sizeof(comp)) {
             DOCA_LOG_ERR("DMA_COMPLETION: too short (len=%u need=%zu)", len, sizeof(comp));
@@ -327,10 +314,6 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         if (!ctx->rx_dma_buffer || pos + dma_len > ctx->rx_dma_buf_size) {
             DOCA_LOG_ERR("DMA_COMPLETION: invalid pos=%u len=%u buf_size=%zu",
                          pos, dma_len, ctx->rx_dma_buf_size);
-            return;
-        }
-        if (dma_len < sizeof(struct fc_header)) {
-            DOCA_LOG_ERR("DMA_COMPLETION: too short for fc_header (len=%u)", dma_len);
             return;
         }
 
@@ -550,10 +533,6 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         ctx->pending[i].tx_slot = -1;
     }
 
-    /* Initialize ring_tx_slot_map for deferred TX slot free */
-    for (int i = 0; i < DMA_RING_SIZE; i++)
-        ctx->ring_tx_slot_map[i] = -1;
-
     ctx->doca_objs.rx_data_hook = rx_data_hook;
     ctx->doca_objs.rx_hook_ctx = ctx;
 
@@ -581,14 +560,6 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
     /* Free resources BEFORE destroying locks they depend on.
      * Pending cleanup calls dpumesh_tx_free/rx_free which acquire
      * slot_lock/rx_slot_lock. */
-
-    /* Deferred TX slot free: free any remaining mapped TX slots */
-    for (int i = 0; i < DMA_RING_SIZE; i++) {
-        if (ctx->ring_tx_slot_map[i] >= 0) {
-            dpumesh_tx_free(ctx, ctx->ring_tx_slot_map[i]);
-            ctx->ring_tx_slot_map[i] = -1;
-        }
-    }
 
     for (int i = 0; i < MAX_PENDING; i++) {
         dpumesh_pending_t *p = &ctx->pending[i];
@@ -647,40 +618,6 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx) {
  * TX functions
  * ==================================================================== */
 
-/*
- * Reclaim TX slots from completed ring descriptors (valid=0).
- * OP_RESPONSE TX slots are deferred in ring_tx_slot_map until ring reuse.
- * This function proactively frees them to prevent deadlock when tx_alloc
- * can't find free slots and dpumesh_enqueue can't be called to recycle them.
- * Caller must NOT hold slot_lock.
- *
- * Two-phase: collect freeable slot ids under ring_lock (cheap memory ops only),
- * then release ring_lock and free them — tx_free takes slot_lock and we avoid
- * nesting it under ring_lock.
- */
-static int reclaim_ring_tx_slots(dpumesh_ctx_t *ctx) {
-    int slots_to_free[DMA_RING_SIZE];
-    int n_to_free = 0;
-
-    pthread_mutex_lock(&ctx->ring_lock);
-    for (int i = 0; i < DMA_RING_SIZE; i++) {
-        if (ctx->ring_tx_slot_map[i] >= 0) {
-            struct dma_desc *d = &ctx->dma_ring->descs[i];
-            __sync_synchronize();
-            if (!d->valid) {
-                slots_to_free[n_to_free++] = ctx->ring_tx_slot_map[i];
-                ctx->ring_tx_slot_map[i] = -1;
-            }
-        }
-    }
-    pthread_mutex_unlock(&ctx->ring_lock);
-
-    for (int j = 0; j < n_to_free; j++)
-        dpumesh_tx_free(ctx, slots_to_free[j]);
-
-    return n_to_free;
-}
-
 int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
     /* Backpressure: block until a TX slot is free. The caller has already
      * committed to this request, so failure here would propagate as a
@@ -689,9 +626,8 @@ int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
      * Latency-tuned wait: at 44K RPS the per-request budget is ~23µs, so
      * a 1ms cond_timedwait blocks ~44 requests-worth of progress. We use
      * a 50µs re-poll backstop instead. The cond is signaled directly by
-     * tx_free / TX_ACK handlers, so the timedwait only fires when a
-     * signal was missed (rare race) or when reclaim_ring_tx_slots needs
-     * a periodic poll. */
+     * tx_free / TX_ACK handlers, so the timedwait fires only when a
+     * signal was missed (rare race). */
     pthread_mutex_lock(&ctx->slot_lock);
     for (;;) {
         for (int i = 0; i < ctx->num_slots; i++) {
@@ -701,13 +637,6 @@ int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
                 return i;
             }
         }
-        pthread_mutex_unlock(&ctx->slot_lock);
-
-        /* Reclaim TX slots from completed ring descriptors. */
-        int reclaimed = reclaim_ring_tx_slots(ctx);
-        pthread_mutex_lock(&ctx->slot_lock);
-        if (reclaimed > 0)
-            continue;
 
         /* 50µs re-poll backstop (was 1ms — too coarse for cap-region latency). */
         struct timespec abs_ts;
@@ -723,10 +652,7 @@ int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
 
 uint8_t *dpumesh_tx_buf(dpumesh_ctx_t *ctx, int slot) {
     if (slot < 0 || slot >= ctx->num_slots) return NULL;
-    /* Reserve fc_header space at the beginning of each slot.
-     * Caller writes body starting after the header area. */
-    return (uint8_t *)ctx->dma_buffer + ((size_t)slot * ctx->slot_size)
-           + sizeof(struct fc_header);
+    return (uint8_t *)ctx->dma_buffer + ((size_t)slot * ctx->slot_size);
 }
 
 void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
@@ -753,10 +679,9 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
         return -1;
     }
 
-    if (desc->body_len > (uint32_t)(ctx->slot_size - (int)sizeof(struct fc_header))) {
-        DOCA_LOG_ERR("ENQUEUE rejected: body_len=%u exceeds usable slot_size=%d (slot=%d - fc_header=%zu)",
-                     desc->body_len, (int)(ctx->slot_size - sizeof(struct fc_header)),
-                     ctx->slot_size, sizeof(struct fc_header));
+    if (desc->body_len > (uint32_t)ctx->slot_size) {
+        DOCA_LOG_ERR("ENQUEUE rejected: body_len=%u exceeds slot_size=%d",
+                     desc->body_len, ctx->slot_size);
         return -1;
     }
 
@@ -788,36 +713,17 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
 
     ring_slot = (uint32_t)(dma - ctx->dma_ring->descs);
 
-    /* Deferred TX slot free: prev_tx_slot will be -1 in steady state (since
-     * we no longer track in ring_tx_slot_map). Kept as a safety net for any
-     * stale entries from older code paths. */
-    int prev_tx_slot = ctx->ring_tx_slot_map[ring_slot];
-
     /* TX slot lifetime is owned by the pending mechanism for BOTH OP_REQUEST
      * (gateway) and OP_RESPONSE (server transport):
      *   - OP_REQUEST: caller registers + attach_tx; wait_response/timeout
      *     paths or TX_ACK handler free the TX slot.
      *   - OP_RESPONSE: caller registers + attach_tx + release_async; TX_ACK
-     *     handler frees the TX slot via the deferred state -2 → -1 path.
-     *
-     * The previous design tracked OP_RESPONSE in ring_tx_slot_map for
-     * deferred-until-ring-wrap free. That races with TX_ACK pending free
-     * (double-free of a slot already reallocated to a new request). Disable. */
-    ctx->ring_tx_slot_map[ring_slot] = -1;
-
-    /* Write fc_header at slot base (before body data).
-     * Body was written by caller at base + sizeof(fc_header). */
-    {
-        uint8_t *slot_base = (uint8_t *)ctx->dma_buffer +
-                             ((size_t)desc->body_buf_slot * ctx->slot_size);
-        struct fc_header *hdr = (struct fc_header *)slot_base;
-        hdr->payload_len = desc->body_len;
-    }
+     *     handler frees the TX slot via the deferred state -2 → -1 path. */
 
     dma->mmap = ctx->dpa_mmap_handle;
     dma->addr = (uint64_t)ctx->dma_buffer +
                 ((size_t)desc->body_buf_slot * ctx->slot_size);
-    dma->size = sizeof(struct fc_header) + desc->body_len;
+    dma->size = desc->body_len;
     dma->idx  = desc->req_id;
     dma->dst_pod_id = desc->dst_pod_id;
     dma->flags = desc->flags;
@@ -829,12 +735,6 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
                  desc->req_id, ring_slot, desc->body_len);
 
     pthread_mutex_unlock(&ctx->ring_lock);
-
-    /* Free the previous occupant's TX slot OUTSIDE ring_lock to avoid
-     * nested slot_lock acquisition under ring_lock — keeps the ring_lock
-     * critical section shorter and reduces 32-worker contention. */
-    if (prev_tx_slot >= 0)
-        dpumesh_tx_free(ctx, prev_tx_slot);
 
     return 0;
 }
@@ -1140,8 +1040,7 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
  * confirmed by TX_ACK from DPU. This function tells the pending machinery
  * "no response is coming for this req_id; free TX on TX_ACK and clear the
  * entry". This mirrors the gateway's TX-slot lifecycle (early free on
- * TX_ACK arrival) for the responder direction, replacing the legacy
- * ring_tx_slot_map deferred-until-ring-wrap approach.
+ * TX_ACK arrival) for the responder direction.
  *
  * Only acts on state == 0; other states are left alone since they're
  * already owned by another path (response arrived, cancelled, or unused).

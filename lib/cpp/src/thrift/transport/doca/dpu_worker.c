@@ -27,9 +27,7 @@ DOCA_LOG_REGISTER(DPU_WORKER);
 /*
  * Enqueue data for DPU→CPU DMA via the destination pod's TX ring.
  *
- * Layout in TX buffer:
- *   [fc_header (4B)] [body (body_len B)]
- *   Total padded to 128B alignment for DMA.
+ * Layout in TX buffer: [body (body_len B)], padded to 128B for DMA.
  *
  * Per-request metadata (req_id, src_pod_id, dst_pod_id, flags) is carried
  * via dma_desc on-DPU and propagated to the receiving host through
@@ -53,9 +51,7 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *dst_pod,
         return DOCA_ERROR_NOT_CONNECTED;
     }
 
-    /* Total payload = fc_header + body (no sw_descriptor on the wire) */
-    uint32_t total_len = sizeof(struct fc_header) + body_len;
-    uint32_t padded_len = (total_len + 127) & ~(uint32_t)127;
+    uint32_t padded_len = (body_len + 127) & ~(uint32_t)127;
     uint32_t buf_size = (uint32_t)dst_pod->tx_buf_size;
 
     /* Wrap if writing at current head would cross the buffer end. */
@@ -63,14 +59,10 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *dst_pod,
     if (write_pos + padded_len > buf_size)
         write_pos = 0;
 
-    /* Write fc_header + body into TX buffer */
+    /* Write body into TX buffer */
     uint8_t *dst = (uint8_t *)dst_pod->tx_buffer + write_pos;
-
-    struct fc_header *hdr = (struct fc_header *)dst;
-    hdr->payload_len = body_len;
-
     if (body_len > 0)
-        memcpy(dst + sizeof(struct fc_header), body, body_len);
+        memcpy(dst, body, body_len);
 
     /* Post descriptor to TX ring */
     struct dma_desc *dma = get_next_dma_desc(dst_pod->tx_ring);
@@ -85,7 +77,7 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *dst_pod,
      * handler can put it into comp.src_pod_id (ring->pod_id is the
      * receiver, not the original source). */
     dma->addr = write_pos;
-    dma->size = total_len;
+    dma->size = body_len;
     dma->idx = desc->req_id;
     dma->dst_pod_id = desc->dst_pod_id;
     dma->src_pod_id = desc->src_pod_id;
@@ -99,8 +91,8 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *dst_pod,
     if (dst_pod->tx_producer_head >= buf_size)
         dst_pod->tx_producer_head = 0;
 
-    DOCA_LOG_DBG("dpu_enqueue_reverse_dma: pod=%d write_pos=%u total_len=%u padded=%u new_head=%u",
-                 dst_pod->pod_id, write_pos, total_len, padded_len, dst_pod->tx_producer_head);
+    DOCA_LOG_DBG("dpu_enqueue_reverse_dma: pod=%d write_pos=%u body_len=%u padded=%u new_head=%u",
+                 dst_pod->pod_id, write_pos, body_len, padded_len, dst_pod->tx_producer_head);
     return DOCA_SUCCESS;
 }
 

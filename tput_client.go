@@ -235,7 +235,7 @@ func main() {
 	port := flag.Int("port", 9091, "Gateway port")
 	rps := flag.Int("rps", 1000, "Target RPS")
 	dur := flag.Int("duration", 10, "Duration seconds")
-	msgSize := flag.Int("msg-size", 8192, "Total DMA size in bytes incl. fc_header, 128-aligned (min 128, max 8192)")
+	msgSize := flag.Int("msg-size", 8192, "Total DMA size in bytes, 128-aligned (min 128, max 8192)")
 	numConns := flag.Int("conns", 0, "Number of TCP connections (0=auto: rps/25, min 64, max 8192)")
 	flag.Parse()
 
@@ -254,10 +254,8 @@ func main() {
 	}
 
 	// msg-size = total DMA bytes the gateway will issue per request:
-	//   DMA = align_up_128( fc_header(8) + TCP wire frame length )
-	// To make actual DMA == msg-size:
-	//   wire = msg-size - 8, and msg-size must be 128-aligned and ≤ DPA_DMA_COPY_MAX (8192).
-	const fcHeaderSize = 8
+	//   DMA = align_up_128( TCP wire frame length )
+	// msg-size must be 128-aligned and ≤ DPA_DMA_COPY_MAX (8192).
 	const dmaAlign = 128
 	const dmaMax = 8192
 	if *msgSize < dmaAlign {
@@ -277,7 +275,7 @@ func main() {
 		*msgSize = aligned
 	}
 
-	wireSize := *msgSize - fcHeaderSize
+	wireSize := *msgSize
 	pad := 0
 	if wireSize > 68 {
 		pad = wireSize - 68
@@ -288,8 +286,7 @@ func main() {
 	}
 	frame := buildFrame("ComposeUniqueId", pad)
 	actualWire := len(frame)
-	dmaPayload := fcHeaderSize + actualWire
-	dmaActual := (dmaPayload + dmaAlign - 1) &^ (dmaAlign - 1)
+	dmaActual := (actualWire + dmaAlign - 1) &^ (dmaAlign - 1)
 
 	total := (*rps) * (*dur)
 	interval := time.Second / time.Duration(*rps)
@@ -302,7 +299,7 @@ func main() {
 	fmt.Printf("  Duration:     %ds\n", *dur)
 	fmt.Printf("  Connections:  %d\n", *numConns)
 	fmt.Printf("  Total reqs:   %d\n", total)
-	fmt.Printf("  DMA size:     %d bytes  (= 8 fc_header + %d wire, 128-aligned)\n",
+	fmt.Printf("  DMA size:     %d bytes  (= %d wire, 128-aligned)\n",
 		dmaActual, actualWire)
 	fmt.Printf("  TCP wire:     %d bytes  (Thrift frame, pad=%d)\n", actualWire, pad)
 	fmt.Printf("  Interval:     %v\n", interval)
@@ -387,7 +384,7 @@ func main() {
 			corrected = append(corrected, s.corrected)
 			raws = append(raws, s.raw)
 			totalRespWire += int64(s.respWire)
-			respDma := (fcHeaderSize + s.respWire + dmaAlign - 1) &^ (dmaAlign - 1)
+			respDma := (s.respWire + dmaAlign - 1) &^ (dmaAlign - 1)
 			totalRespDma += int64(respDma)
 		}
 		ok += int64(len(states[i].samples))

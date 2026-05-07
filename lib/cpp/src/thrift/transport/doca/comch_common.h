@@ -93,7 +93,7 @@ struct dmesh_tx_ack_msg {
 struct dmesh_dma_completion_msg {
     enum dmesh_msg_type type;   /* = DMESH_MSG_DMA_COMPLETION */
     uint32_t pos;               /* offset in Host RX DMA buffer */
-    uint32_t length;            /* DMA'd data length (fc_header + payload) */
+    uint32_t length;            /* DMA'd body length */
     uint32_t req_id;
     int32_t src_pod_id;
     int32_t dst_pod_id;
