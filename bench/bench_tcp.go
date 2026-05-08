@@ -71,7 +71,11 @@ func worker(
 		if stop.Load() {
 			break
 		}
-		// Pace
+		// wrk2-style scheduled-time semantics. Latency starts at the tick this
+		// request was supposed to fire, not when this goroutine actually got
+		// to it. Fixes coordinated omission: under saturation, scheduled is
+		// in the past, sleep is skipped, and the captured latency includes
+		// the queuing wait — what a constant-rate client would actually see.
 		scheduled := startAt + float64(i)*intervalSec
 		now := nowSec()
 		if scheduled > now {
@@ -79,7 +83,7 @@ func worker(
 			time.Sleep(d)
 		}
 
-		t0 := nowSec()
+		t0 := scheduled
 		_ = conn.SetDeadline(time.Now().Add(time.Duration(waitTimeoutMs) * time.Millisecond))
 
 		if _, err := conn.Write(tx); err != nil {

@@ -258,18 +258,44 @@ chmod +x /tmp/start_dpu_bench.sh"
 # DVFS is also frozen at 2.5 GHz (cores 0-7) so latency tail noise from
 # frequency scaling doesn't mask transport-level differences.
 
+#
+# Pin profiles:
+#   fair (default): 1 host core per pod. dpumesh side gets 1 core for app
+#                   (transport on DPU/DPA), tcp side gets 1 core shared
+#                   between app + sidecar. This is the apples-to-apples
+#                   Istio-like comparison.
+#   hw            : multi-core for dpumesh side. Goal is to remove host
+#                   software bottleneck so dpumesh can approach the
+#                   chain ceiling (Method 2 = 66K RPS). TCP side untouched
+#                   since that comparison only makes sense in fair mode.
+#
 get_pod_cores() {
-    case "$1" in
-        bench-dpumesh) echo "0" ;;
-        echo-dpumesh)  echo "1" ;;
-        bench-tcp)     echo "2" ;;   # bench + sidecar1 share core 2
-        echo-tcp)      echo "3" ;;   # echo  + sidecar2 share core 3
-        *) echo "" ;;
+    local app="$1" profile="${2:-fair}"
+    case "$profile" in
+        hw)
+            case "$app" in
+                bench-dpumesh) echo "0,4" ;;
+                echo-dpumesh)  echo "1,5" ;;
+                bench-tcp)     echo "2" ;;   # untouched
+                echo-tcp)      echo "3" ;;   # untouched
+                *) echo "" ;;
+            esac
+            ;;
+        fair|*)
+            case "$app" in
+                bench-dpumesh) echo "0" ;;
+                echo-dpumesh)  echo "1" ;;
+                bench-tcp)     echo "2" ;;   # bench + sidecar1 share core 2
+                echo-tcp)      echo "3" ;;   # echo  + sidecar2 share core 3
+                *) echo "" ;;
+            esac
+            ;;
     esac
 }
 
 pin_pods() {
-    step "=== Pinning pods to dedicated cores (taskset) ==="
+    local profile="${1:-fair}"
+    step "=== Pinning pods to dedicated cores (taskset, profile=$profile) ==="
     if ! command -v jq >/dev/null 2>&1; then
         err "jq not found — needed to parse crictl output. apt install jq"
         return 1
@@ -285,7 +311,7 @@ pin_pods() {
 
     for app in bench-dpumesh echo-dpumesh bench-tcp echo-tcp; do
         local cores pod_id
-        cores=$(get_pod_cores "$app")
+        cores=$(get_pod_cores "$app" "$profile")
         [ -z "$cores" ] && continue
 
         pod_id=$(echo "$HOST_PASS" | sudo -S crictl pods --label "app=$app" -q 2>/dev/null | head -n 1)
@@ -399,7 +425,7 @@ spec:
         env:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
         - { name: BENCH_WORKER_ID, value: "11" }
-        - { name: ECHO_THREADS, value: "32" }
+        - { name: ECHO_THREADS, value: "64" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리.
         volumeMounts:
@@ -700,22 +726,39 @@ case "$CMD" in
         ensure_envoy_image
         start_dpu
         start_pods
-        pin_pods
+        pin_pods fair
         info "=== Deploy complete ==="
         echo
-        echo "  Run:"
-        echo "    $0 dpumesh <RPS> <DUR> <SIZE> [<CONNS>]"
-        echo "    $0 tcp     <RPS> <DUR> <SIZE> [<CONNS>]"
-        echo "  If pods restart, re-pin: $0 pin"
+        echo "  Run (fair 1-core/pod, TCP vs DPUmesh 비교용):"
+        echo "    $0 dpumesh    <RPS> <DUR> <SIZE> [<CONNS>]"
+        echo "    $0 tcp        <RPS> <DUR> <SIZE> [<CONNS>]"
+        echo "  Run (HW limit chase, dpumesh 측만 multi-core):"
+        echo "    $0 dpumesh-hw <RPS> <DUR> <SIZE> [<CONNS>]"
+        echo "  If pods restart, re-pin: $0 pin (or pin-hw)"
         ;;
     dpumesh)
+        # fair-mode가 묵시적 default. 직전이 hw-mode였으면 fair로 되돌리는 게
+        # 안전함 — re-pin 비용은 한 번 작은 taskset 호출들이라 무시 가능.
+        pin_pods fair >/dev/null
+        run_bench "dpumesh" "${@:2}"
+        ;;
+    dpumesh-hw)
+        # HW limit chase: dpumesh 측만 multi-core. echo-dpumesh "1,5", bench
+        # "0,4". 이 모드의 결과는 TCP와 직접 비교 불가 (자원 비대칭) — 오직
+        # chain ceiling 까지 dpumesh 가 도달하는지 보는 용도.
+        pin_pods hw >/dev/null
         run_bench "dpumesh" "${@:2}"
         ;;
     tcp)
+        # TCP는 항상 fair-mode로 강제 (B안 자체가 1-core 비교 전제)
+        pin_pods fair >/dev/null
         run_bench "tcp" "${@:2}"
         ;;
-    pin)
-        pin_pods
+    pin|pin-fair)
+        pin_pods fair
+        ;;
+    pin-hw)
+        pin_pods hw
         ;;
     logs)
         show_logs
@@ -727,16 +770,19 @@ case "$CMD" in
         cleanup
         ;;
     *)
-        echo "Usage: $0 {deploy|dpumesh|tcp|pin|logs|status|cleanup}"
+        echo "Usage: $0 {deploy|dpumesh|tcp|dpumesh-hw|pin|pin-hw|logs|status|cleanup}"
         echo
-        echo "  deploy                                    # 전체 배포 (pinning 자동)"
-        echo "  dpumesh <RPS> <DUR> <SIZE> [<CONNS>]      # A안 부하 실행"
-        echo "  tcp     <RPS> <DUR> <SIZE> [<CONNS>]      # B안 부하 실행"
-        echo "  pin                                       # pod 재시작 후 재핀 (taskset)"
+        echo "  deploy                                    # 전체 배포 (fair 핀 자동)"
+        echo "  dpumesh     <RPS> <DUR> <SIZE> [<CONNS>]  # 1-core fair (TCP 대조군용)"
+        echo "  tcp         <RPS> <DUR> <SIZE> [<CONNS>]  # 1-core fair (sidecar 모델)"
+        echo "  dpumesh-hw  <RPS> <DUR> <SIZE> [<CONNS>]  # multi-core (HW 한계 측정)"
+        echo "  pin / pin-fair                            # fair 모드 재핀"
+        echo "  pin-hw                                    # hw 모드 재핀 (수동 토글)"
         echo "  logs                                      # bench/echo pod 로그"
         echo "  status                                    # 상태"
         echo "  cleanup                                   # ns 삭제 + DPU 중지"
         echo
         echo "Note: 같은 DPU를 사용하므로 test-dpumesh.sh와 동시 deploy 불가"
+        echo "      pin profile은 dpumesh/dpumesh-hw/tcp 명령마다 자동으로 맞춰줌"
         ;;
 esac

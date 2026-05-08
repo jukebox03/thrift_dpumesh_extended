@@ -350,7 +350,11 @@ init_dpa_objects(struct objects *objs)
         goto destroy_dpa;
     }
 
-    result = doca_dpa_set_log_level(objs->dpa_thread->dpa, DOCA_DPA_DEV_LOG_LEVEL_INFO);
+    /* DPA log level kept at ERROR. INFO produces per-DMA / per-trigger lines
+     * that pile up at chain throughput rates (54K RPS × 4 dma_copy + 1 kHz
+     * keepalive → GB/min). Forwarded to /tmp/dpumesh_dpu_bench.log on DPU,
+     * filling /tmp and stalling sshd writes (banner-exchange hang seen). */
+    result = doca_dpa_set_log_level(objs->dpa_thread->dpa, DOCA_DPA_DEV_LOG_LEVEL_ERROR);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_WARN("Failed to set DPA log level: %s", doca_error_get_name(result));
     }

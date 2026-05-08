@@ -32,7 +32,15 @@
 #include <thrift/transport/dpumesh.h>
 
 #define CTRL_PORT          9092
-#define MAX_WORKERS        512
+/* MAX_WORKERS sets the upper bound on closed-loop concurrency. With wrk2-style
+ * scheduled-time latency measurement (t0 = scheduled, not now-when-sent), the
+ * cap no longer hides saturation in the latency tail — but a low cap still
+ * limits achievable throughput to MAX_WORKERS / mean_latency. 4096 is large
+ * enough that for any workload where p99 < 75ms at 50K rps, the bench is not
+ * the bottleneck. Stack size is shrunk to 128KB so 4096 × 128KB = 512MB worth
+ * of stacks, well within 30GB host RAM. */
+#define MAX_WORKERS        4096
+#define WORKER_STACK_BYTES (128 * 1024)
 #define WAIT_TIMEOUT_MS    5000
 #define DRAIN_GRACE_SEC    5
 
@@ -81,9 +89,18 @@ static void *worker_fn(void *arg) {
     for (long i = 0; i < w->budget; i++) {
         if (atomic_load(w->stop)) break;
 
-        sleep_until(w->start_at + (double)i * w->interval_sec);
+        /* wrk2-style scheduled-time semantics. Latency is measured from the
+         * tick this request was *supposed* to fire, not from when the worker
+         * actually got around to sending it. Fixes coordinated omission:
+         * when service slows down, this iter's scheduled is far in the past,
+         * sleep_until returns immediately, and t0 = scheduled captures the
+         * full queuing wait + service time — i.e. what a real client paced
+         * at this rate would observe, not just the part visible to a worker
+         * that froze in lockstep with the system. */
+        double scheduled = w->start_at + (double)i * w->interval_sec;
+        sleep_until(scheduled);
 
-        double t0 = now_sec();
+        double t0 = scheduled;
 
         uint32_t req_id = dpumesh_alloc_req_id(g_ctx);
         int tx_slot = dpumesh_tx_alloc(g_ctx);
@@ -220,6 +237,13 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns) {
 
     double start = now_sec() + 0.05;  /* small offset so all workers warm before t=0 */
 
+    /* Use small per-thread stack — n_workers can reach MAX_WORKERS=4096, and
+     * the default 8MB stack would consume ~32GB. 128KB is plenty for our
+     * worker_fn locals (a sw_descriptor_t is 64B, no recursion, no big arrays). */
+    pthread_attr_t worker_attr;
+    pthread_attr_init(&worker_attr);
+    pthread_attr_setstacksize(&worker_attr, WORKER_STACK_BYTES);
+
     for (int i = 0; i < n_workers; i++) {
         wargs[i].worker_id    = i;
         wargs[i].budget       = per_worker + (i < remainder ? 1 : 0);
@@ -235,11 +259,12 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns) {
         if (!wargs[i].samples) {
             atomic_store(&stop, 1);
         }
-        if (pthread_create(&tids[i], NULL, worker_fn, &wargs[i]) != 0) {
+        if (pthread_create(&tids[i], &worker_attr, worker_fn, &wargs[i]) != 0) {
             atomic_store(&stop, 1);
             tids[i] = 0;
         }
     }
+    pthread_attr_destroy(&worker_attr);
 
     /* Watchdog: hard deadline at dur + DRAIN_GRACE_SEC.
      * Main thread joins workers immediately so wall time reflects actual
