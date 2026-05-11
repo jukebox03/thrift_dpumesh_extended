@@ -529,7 +529,15 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     if (!desc->valid)
         return 0;
 
-    if (desc->size == 0 || ring->host_mmap == 0 || ring->dpu_mmap == 0) {
+    /* Under in-place forwarding desc->mmap is the SOURCE of reverse DMA
+     * (set by DPU ARM in dpu_enqueue_reverse_dma to the original sender's
+     * local_mmap DPA handle). Fall back to ring->dpu_mmap if a legacy
+     * desc arrives with mmap=0 — keeps the path working during a partial
+     * deploy. */
+    doca_dpa_dev_mmap_t src_mmap = desc->mmap ? desc->mmap : ring->dpu_mmap;
+    uint64_t src_base = desc->mmap ? desc->addr : (ring->dpu_addr + desc->addr);
+
+    if (desc->size == 0 || ring->host_mmap == 0 || src_mmap == 0) {
         desc->valid = 0;
         __dpa_thread_window_writeback();
         thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
@@ -628,13 +636,13 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
             }
 
             if (remaining <= chunk) {
-                /* Final chunk: src=DPU TX, dst=Host RX */
+                /* Final chunk: src=src_pod's dma_buffer (in-place), dst=Host RX */
                 doca_dpa_dev_comch_producer_dma_copy(producer,
                                             dpu_consumer_id,
                                             ring->host_mmap,  /* dst = Host RX */
                                             ring->host_addr + thread_arg->rev_pos[r] + offset,
-                                            ring->dpu_mmap,   /* src = DPU TX */
-                                            ring->dpu_addr + desc->addr + offset,
+                                            src_mmap,         /* src = src pod buf */
+                                            src_base + offset,
                                             chunk,
                                             (uint8_t *)&comp,
                                             sizeof(struct comch_dma_comp_msg),
@@ -644,8 +652,8 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
                                             dpu_consumer_id,
                                             ring->host_mmap,
                                             ring->host_addr + thread_arg->rev_pos[r] + offset,
-                                            ring->dpu_mmap,
-                                            ring->dpu_addr + desc->addr + offset,
+                                            src_mmap,
+                                            src_base + offset,
                                             chunk,
                                             (uint8_t *)&chunk_type,
                                             sizeof(chunk_type),

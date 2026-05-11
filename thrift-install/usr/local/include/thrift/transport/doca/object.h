@@ -17,6 +17,10 @@ struct dma_ring;
 typedef uint64_t doca_dpa_dev_comch_producer_t;
 typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
+/* doca_dpa_dev_mmap_t is 32-bit in the SDK (doca_dpa_dev_buf.h:35) — must
+ * stay uint32_t to match the dma_desc.mmap field at offset 0 (followed by
+ * the 64-bit addr at offset 4). */
+typedef uint32_t doca_dpa_dev_mmap_t;
 
 #define MAX_CONSUMERS 16
 
@@ -136,9 +140,18 @@ struct pod_state {
     /* Per-pod DPA buffer array (forward ring에 매핑) */
     struct doca_buf_arr *buf_arr;
 
-    /* Per-pod RX DMA buffer (DPU receives CPU→DPU data here) */
+    /* Per-pod RX DMA buffer (DPU receives CPU→DPU data here, AND — under
+     * in-place forwarding — also serves as the source of reverse DMA when
+     * this pod is a forward sender). Lifetime per slot is full RTT instead
+     * of forward-only, so host's TX-slot accounting must hold the slot
+     * until reverse-completion TX_ACK lands. */
     struct doca_mmap *local_mmap;
     void *dma_buffer;
+    /* DPA handle for local_mmap, cached at setup_pod_dma so the reverse
+     * desc enqueued by DPU ARM can carry it as desc->mmap, letting DPA
+     * read directly from this pod's dma_buffer without going through the
+     * destination pod's tx_buffer. */
+    doca_dpa_dev_mmap_t local_mmap_dpa_handle;
 
     /* === Reverse direction (DPU→CPU) === */
 

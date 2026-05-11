@@ -1146,6 +1146,11 @@ dmesh_fill_dpa_ring_info(struct objects *objs, struct pod_state *pod,
         return result;
     }
 
+    /* Cache the DPA handle for reverse-DMA in-place forwarding: when this
+     * pod is the forward sender, dpu_enqueue_reverse_dma writes this handle
+     * into desc->mmap so DPA reads from THIS pod's dma_buffer directly. */
+    pod->local_mmap_dpa_handle = dpu_mmap;
+
     ring_info->buf_arr = dpa_buf_arr;
     ring_info->buf_arr_size = DMA_RING_SIZE;
     ring_info->host_mmap = host_mmap;

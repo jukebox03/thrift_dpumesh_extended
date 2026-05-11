@@ -396,9 +396,14 @@ dpumesh per-op 시간 4.67 µs 중 M2 와 다른 부분 (≈ +1.45 µs):
 
 **우선순위 (single-core 환경 기준)**:
 1. **Idle backoff** — 가장 cheap, syscall overhead 감소, ceiling 까지 ~10 % 추가 가능
+   → **§6.5 의 분석으로 단연 1순위 확정**. ARM 의 polling 이 cap 의 진짜 정체.
+   useful_CPU 33 % → 50 % 가능 → **+50 % RPS (NIC 한계까지 ~80 K RPS)**.
 2. **TX_ACK piggyback** — comch send 의 chain 비용 감소
 3. **comp_queue 우회** — 간접화 줄여 cache 친화적
-4. **In-place forwarding** — staging memcpy 제거 (architecture-level 변경 필요)
+4. ~~**In-place forwarding** — staging memcpy 제거 (architecture-level 변경 필요)~~
+   → **§6.4 에서 적용 완료**. 실측 sustainable 52 K → 54 K (+ ~4 %), overload
+   ceiling 53.5 K → 54.5 K (+ ~2 %). 예측 (10-15 %) 대비 작은 이유는 §6.5 참조
+   (free 된 CPU 가 polling 으로 흡수됨).
 
 위 4 개 모두 적용 시 단일 core 에서 dpumesh 가 M2 baseline 의 90 %+ 도달 가능
 (이론적). 즉 dpumesh = ~280 K ops/s = **70 K RPS** 까지 single core 에서 가능.
@@ -451,6 +456,221 @@ ops/s ÷ 4) 에 host-side 자원을 충분히 줬을 때 얼마나 근접하는�
 - **bench 측 thread 수 (workers)** — `dpumesh-hw <RPS> <DUR> <SIZE> <CONNS>`
   로 worker 수 직접 지정. 기본값 (rps/100) 이 cap region 에서 thread thrashing
   유발할 수 있음.
+
+### 6.4 In-place forwarding 적용 후 실측 (2026-05-08)
+
+§6.2.4 우선순위 4 항목 중 가장 큰 ratio (10-15 % 예측) 의 **`process_forward_entry`
+8 KB staging memcpy 제거** 를 commit. dst pod 의 `tx_buffer` 에 memcpy 하던
+단계를 제거하고, reverse DMA 가 src pod 의 `dma_buffer` (forward 가 쓴 그
+자리) 를 직접 source 로 사용. dma_desc 의 `mmap` / `addr` 필드 (이미 정의되어
+있던 4B + 8B) 에 src pod 의 mmap handle + full VA 를 박아서 DPA reverse
+handler 가 per-descriptor 로 dispatch.
+
+#### 6.4.1 코드 변경
+
+| 파일 | 변경 |
+|---|---|
+| `lib/cpp/src/thrift/transport/doca/object.h` | `pod_state.local_mmap_dpa_handle` 필드 추가 (uint32_t — SDK 일치) |
+| `lib/cpp/src/thrift/transport/doca/dpa.c` | `setup_pod_dma` 에서 DPA mmap handle 캐싱 |
+| `lib/cpp/src/thrift/transport/doca/dpu_worker.c` | `dpu_enqueue_reverse_dma` signature 변경 (memcpy / write_pos 제거); `process_forward_entry` 성공 path 에서 TX_ACK 제거 (에러 path 만 유지); `process_rev_notify_entry` 에 reverse 완료 후 TX_ACK 추가; `send_or_defer_tx_ack` 헬퍼 |
+| `lib/cpp/src/thrift/transport/doca/device/dpa_kernel.c` | reverse handler 가 `desc->mmap` / `desc->addr` 를 source 로 사용. `desc->mmap == 0` 이면 ring 의 legacy `dpu_mmap` fallback (partial deploy 대비) |
+
+**보존**: `tx_buffer` / `tx_mmap` / `tx_buf_size` / `tx_producer_head`
+allocation 자체는 살림 (legacy fallback 가능 + rollback 안전). 별도 cleanup
+PR 권장.
+
+**Slot lifecycle 변화**: src 의 `dma_buffer` slot 점유 시간이
+forward-only → **full RTT** 로 늘어남. host TX slot 도 reverse 완료 후 TX_ACK
+받아야 release. sustainable 52 K @ 5.5 ms RTT = ~290 in-flight slots,
+`DMA_RING_SIZE = 2048` 안에 충분히 fit.
+
+**받아들인 trade-off**: dst pod 별 staging buffer 가 사라지면서 한 src 가
+여러 dst 로 보낼 때 **HOL blocking across destinations from same source**
+발생. echo bench (src==dst) 에는 영향 없음 — multi-dst 워크로드에서만
+manifest. 사용자 합의 사항 (verified prior).
+
+#### 6.4.2 RPS sweep 비교 (8 KB, 10 s, conns=auto)
+
+§6.2.2 와 동일 측정 조건 (wrk2 식 scheduled-time, MAX_WORKERS=4096). 좌측 =
+baseline (separate buffer + memcpy), 우측 = new (in-place forward):
+
+| Target | Baseline ach | New ach | Baseline p99 | New p99 | Δ p99 |
+|---:|---:|---:|---:|---:|---:|
+| 5,000 | 4,968.6 | 4,968.8 | 1.93 ms | 1.92 ms | -0.5 % |
+| 10,000 | 9,939.2 | 9,935.9 | 2.82 ms | 2.78 ms | -1.4 % |
+| 30,000 | 29,807.8 | 29,800.9 | 6.51 ms | 6.38 ms | -2.0 % |
+| 50,000 | 49,664.7 | 49,655.3 | 11.89 ms | 9.94 ms | -16.4 % |
+| 52,000 | 51,644.8 | 51,625.3 | 12.16 ms | 12.12 ms | -0.3 % |
+| **53,000** | — (안 측정) | **52,641.9** | — | **12.23 ms** | **새 sustainable** |
+| **54,000** | — (안 측정) | **53,636.3** | — | **12.38 ms** | **새 sustainable** |
+| 55,000 | 53,553.4 | 54,085.4 | 189.59 ms | 101.39 ms | **-46.5 %** |
+| 60,000 | 53,698.8 | 54,198.6 | 1,154.25 ms | 998.98 ms | -13.5 % |
+| 65,000 | 53,841.1 | 54,748.5 | 1,961.63 ms | 1,767.98 ms | -9.9 % |
+| 70,000 | — | 54,369.7 | — | 2,817.77 ms | overload |
+
+**결과**:
+
+- **Sustainable region 확장**: 52 K → **54 K** (+ ~4 %, p99 < 13 ms 기준).
+  53 K, 54 K target 에서 baseline 의 52 K 와 동일한 latency profile (p50 5.5 ms,
+  p99 12 ms) 가 깨끗하게 나옴.
+- **Overload ceiling**: 53,553 → **54,748** (+ ~2 %).
+- **Overload p99 약 절반** (55 K target 에서 190 → 101 ms). cap 너머 큐잉이
+  덜 발산 — backpressure 가 더 부드럽게 진입.
+- **0 failure 전체**. Back-to-back 11 회 sequential test, slot leak 없음 (per
+  feedback memory rule: redeploy 없이 연속 통과 확인).
+
+#### 6.4.3 chain ceiling 대비 새 위치
+
+```
+   100% ┃ ┌── HW max (Method 0)              ── 320,014 ops/s = 20.97 Gbps
+        ┃ │
+    97% ┃ ├── DMA + completion (Method 2)    ── 310,472 ops/s = 20.34 Gbps
+        ┃ │
+    67% ┃ │   dpumesh @ baseline overload    ── 214,212 ops/s = 13.71 Gbps
+        ┃ │     (53,553 RPS × 4 dma_copy)
+    68% ┃ └── dpumesh @ new overload         ── 218,992 ops/s = 14.02 Gbps
+        ┃         (54,748 RPS × 4 dma_copy, +2.2 %)
+```
+
+| | dma_copy ops/sec | vs Method 0 | vs Method 2 |
+|---|---:|---:|---:|
+| dpumesh baseline @ overload (53,553 RPS) | 214,212 | 67 % | 69 % |
+| **dpumesh new @ overload (54,748 RPS)** | **218,992** | **68 %** | **71 %** |
+| dpumesh new @ sustainable (53,636 RPS, p99 12.4 ms) | 214,544 | 67 % | 69 % |
+
+Method 2 (DMA + completion) baseline 대비 69 % → **71 %**. ceiling 까지 남은
+gap 의 약 7 % 를 단일 변경으로 닫음.
+
+#### 6.4.4 예측 (10-15 %) vs 실측 (~4 %) 의 gap 분석
+
+§6.2.4 의 예측은 memcpy 제거가 per-op time 4.67 → ~4.27 µs (-9 %) 로 줄어 saturation
+영역에서 amplify 되어 RPS +10-15 % 로 이어진다는 가정. 실측은 더 작음. 가설:
+
+1. **memcpy 의 실제 self-time 이 예상보다 작았을 가능성**. perf flame 의 5.5 %
+   app 코드 중 memcpy 차지 비중이 추정치보다 작음. 새 빌드로 `dpumesh_dpu_flame.svg`
+   재캡처해서 process_forward_entry 의 self-time 변화 확인 필요.
+2. **TX_ACK + DMA_COMPLETION clustering**. 새 설계는 두 comch send 가 같은
+   `process_rev_notify_entry` iter 에서 fire — 평균 발송 수는 동일하지만 burst
+   빈도가 늘어 deferred queue hit 가 잦아짐. send pool 압력 burst 화.
+3. **저부하 p999 regression** (5 K 에서 2.0 → 5-6 ms): (2) 의 deferred queue 가
+   단일 request 의 TX_ACK 를 다음 main-loop iter 로 미는 경우 추가 ~1-3 ms 가산.
+   p50/p99 영향 없음, p999 만 끌어올림. 이는 ceiling 보다 latency 분포에 영향.
+
+가설 (2) 가 맞으면 §6.2.4 의 #2 후보 (**TX_ACK piggyback**) 가 자연스러운
+다음 단계 — DMA_COMPLETION 메시지에 TX_ACK 정보를 fold 해서 single send per
+RPC 로 만들면 burst 자체가 사라짐.
+
+> **2026-05-08 추가**: §6.4 의 "+4% 만 늘었다" 가설들은 §6.5 의 더 큰 진단으로
+> 대체됨. 진짜 원인은 ARM 의 free 된 CPU 가 polling 으로 흡수되어 throughput 으로
+> 전환 안 됐기 때문. §6.5 참조.
+
+### 6.5 진짜 cap 의 정체 — DPA stat + cross-baseline 폴링 분석 (2026-05-08)
+
+§6.4 의 "예측 10-15 % vs 실측 ~4 %" gap 의 원인을 추적하다가 §6.2.4 의 "**single
+ARM thread 가 cap**" 결론 자체가 부정확했음을 확인. ARM 이 100 % busy 인 건
+사실이지만 **그 이유가 compute 가 아니라 polling**. DPA EU stat + M2 baseline 과
+폴링 비중 직접 비교로 정정.
+
+#### 6.5.1 DPA EU stat — ARM 99.9 % 인데 EU 99.5 % idle
+
+```
+sudo /opt/mellanox/doca/tools/dpa-statistics collect -d mlx5_0 -t 10000
+```
+
+50 K RPS 부하 중 10 s 윈도우:
+
+| 항목 | 값 | 해석 |
+|---|---:|---|
+| Wall time | 10,000 ms | 측정창 |
+| **EU active time** | **51.5 ms** (ticks @ 1 ns) | **EU 가 실제 실행한 시간** |
+| **EU active %** | **0.51 %** | **99.49 % idle** |
+| Cycles | 92.7 G | 51.5 ms × ~1.8 GHz EU clock 일치 |
+| Instructions | 7.22 G | IPC = 0.078 (memory/DMA stall heavy — 정상) |
+| Executions | 7,314 (= 731 / s) | DPA thread 가 깬 횟수 |
+| Cycles/execution | 12.7 M | wake 당 평균 7 µs 실행 |
+| dma_copy/execution | ~273 (200K dma_copy/s ÷ 731) | wake 당 batch size |
+
+DPA 는 burst 처리 — wake → 273 dma_copy 일괄 → re-schedule. **99.5 % idle**.
+
+ARM (`top -H -p $(pgrep dpumesh_dpu)`): thread 0 = 99.9 % busy. 수치는 §6.2.4 와
+동일. 하지만 이 99.9 % 의 분포가 § 6.2.4 의 해석과 다름.
+
+#### 6.5.2 폴링 비중 cross-baseline — M2 가 dpumesh 보다 더 폴링함
+
+`bench/m2_dpu_flame.svg` (Method 2 baseline) vs `bench/dpumesh_dpu_flame_inplace.svg`
+(현재 dpumesh) 의 subtree % 직접 비교:
+
+| | M2 (baseline ceiling) | dpumesh new | M2 가 더 ↑? |
+|---|---:|---:|---|
+| `doca_pe_progress` subtree | **82.08 %** | 67.52 % | ✓ |
+| `__GI_epoll_pwait` | 54.84 % | 45.99 % | ✓ |
+| `el0t_64_sync` (kernel syscall path) | 44.48 % | 37.77 % | ✓ |
+| **추정 폴링 비중** | **~77 %** | ~67 % | ✓ |
+| **추정 useful work 비중** | ~23 % | ~33 % | dpumesh 가 ↑ |
+
+M2 가 **더 많이 폴링** 하는데도 **더 높은 throughput** 도달 (310 K events/s vs
+dpumesh 219 K dma_copy/s). 즉 "폴링 = cap" 의 단순 모델로는 설명 불가.
+
+#### 6.5.3 정정된 모델 — `throughput = useful_CPU / per_event_work`
+
+ARM CPU 100 % = polling + useful_work. throughput cap = `useful_work_time /
+per_event_cost`. 양쪽 다 측정 데이터로 검증:
+
+| | useful CPU | per-event 비용 | 모델 계산 | 측정 |
+|---|---:|---:|---:|---:|
+| M2 | 23 % = 230 ms/s | 0.74 µs/event | 230 ms ÷ 0.74 µs = 311 K events/s | **310 K ✓** |
+| dpumesh | 33 % = 330 ms/s | 6.0 µs/RPC | 330 ms ÷ 6.0 µs = 55 K RPC/s | **55 K ✓** |
+
+dpumesh 가 useful CPU 는 더 많은데 throughput 이 적은 건 **per-event 비용이
+8× 무겁기 때문** (M2: counter++ + 1 comch send vs dpumesh: comp_queue + routing
++ reverse desc + 2× comch send).
+
+#### 6.5.4 진짜 cap — 어디서 막히고 있나
+
+| 시스템 | 진짜 cap | 증거 |
+|---|---|---|
+| M2 | **NIC DMA bandwidth** | 310 K / 320 K (HW max) = **97 %** saturated |
+| dpumesh | **ARM 의 useful CPU 양** | 219 K / 320 K = 68 %. NIC 32 % 헤드룸 남았는데 ARM useful 33 % 만 |
+
+**§6.2.3 의 "dpumesh 가 M2 ceiling 의 71 %" 비교는 misleading** — M2 는 ARM-bound
+가 아니라 NIC-bound. dpumesh 의 ARM 폴링을 줄이면 NIC 한계까지 도달 가능.
+
+§6.2.4 의 "single ARM thread 가 cap" 도 절반만 정확:
+- ✅ ARM 이 cap 인 것은 사실 (99.9 % busy)
+- ❌ "compute 가 부족해서" 가 아니라 "**polling 이 useful work 시간을 잠식해서**"
+
+#### 6.5.5 Idle backoff 의 효과 모델
+
+폴링을 줄여 useful work time 을 늘렸을 때 dpumesh 의 RPS:
+
+| useful CPU | per-RPC 비용 (현재 6.0 µs) | RPC/s | dma_copy/s | NIC 활용 |
+|---:|---:|---:|---:|---:|
+| 33 % (현재) | 6.0 µs | 55 K | 220 K | 68 % |
+| 40 % | 6.0 µs | 67 K (+21 %) | 268 K | 84 % |
+| 50 % | 6.0 µs | 83 K (+50 %) | 332 K | 100 % (NIC cap) |
+
+useful CPU 50 % 까지 끌어올리면 **NIC 한계 (320 K dma_copy/s) 에 수렴 → ~80 K
+RPS**. §6.2.4 의 "70 K RPS 까지 가능" 추정과 일치.
+
+M2 에 같은 idle backoff 를 적용해도 효과 없음 — 이미 NIC saturated.
+
+#### 6.5.6 함의
+
+1. **§6.2.4 우선순위 재정렬**: idle backoff 가 단연 1순위. 다른 후보들은 per-event
+   비용 (6.0 µs) 을 4-5 µs 로 줄이는 효과지만 (+10-30 % RPS), idle backoff 는
+   useful_CPU 자체를 늘리므로 **+50 % RPS** 가능.
+2. **§6.4 의 "+4 %" gap 의 진짜 원인**: memcpy 제거로 free 된 ~8 pp CPU 가
+   throughput 으로 전환되지 않은 건 ARM 이 polling 으로 흡수했기 때문. cap 이
+   "useful CPU 양" 인 한, per-event 비용을 줄여도 saturation 모양은 안 바뀜
+   (ARM 이 free 된 시간을 polling 으로 채워버림). idle backoff 와 같이 적용해야
+   memcpy 의 이득이 throughput 으로 보임.
+3. **NIC saturation 까지 도달 시 다음 cap**: 320 K dma_copy/s 도달 후에는 dpumesh
+   가 NIC-bound 가 됨. 그 이후로는 RPC 당 dma_copy 횟수 (현재 4) 를 줄이는 게
+   유일한 길 — 예: forward + reverse 의 chunk 통합, 또는 작은 메시지 batching.
+4. **다음 측정 (idle backoff 적용 후 검증)**:
+   - DPA EU active % 가 늘어나는지 (현재 0.51 % → ↑)
+   - ARM polling % 가 줄어드는지 (flame 의 epoll 비중 ↓)
+   - RPS 가 useful_CPU 모델 예측과 일치하는지
 
 ---
 

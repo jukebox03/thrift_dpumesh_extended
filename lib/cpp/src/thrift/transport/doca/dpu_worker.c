@@ -22,47 +22,82 @@
 
 DOCA_LOG_REGISTER(DPU_WORKER);
 
+/* ====== TX_ACK send helper ====== */
+
+/*
+ * Try to send TX_ACK; on EAGAIN park to deferred queue. Used by:
+ *   (a) process_forward_entry error paths where reverse DMA will not fire,
+ *   (b) process_rev_notify_entry after reverse-DMA completes (normal path).
+ * No-op when src_pod is gone — host's 2-second collision-wait reclaim is
+ * the safety net.
+ */
+static void
+send_or_defer_tx_ack(struct objects *objs, struct pod_state *src_pod,
+                     uint32_t req_id, int32_t dst_pod_id)
+{
+    if (!src_pod || !src_pod->connection)
+        return;
+
+    doca_error_t r = server_send_tx_ack_to(objs, src_pod->connection, req_id, dst_pod_id);
+    if (r == DOCA_SUCCESS)
+        return;
+
+    if (r == DOCA_ERROR_AGAIN) {
+        if (objs->num_deferred_tx_acks < MAX_DEFERRED_TX_ACK) {
+            int n = objs->num_deferred_tx_acks++;
+            objs->deferred_tx_acks[n].conn        = src_pod->connection;
+            objs->deferred_tx_acks[n].req_id      = req_id;
+            objs->deferred_tx_acks[n].dst_pod_id  = dst_pod_id;
+        } else {
+            DOCA_LOG_ERR("deferred TX_ACK queue full — dropping req_id=%u (pod %d). "
+                         "Host slot will reclaim at 2s.",
+                         req_id, src_pod->pod_id);
+        }
+        return;
+    }
+
+    DOCA_LOG_WARN("TX_ACK failed for req_id=%u to pod %d: %s",
+                  req_id, src_pod->pod_id, doca_error_get_descr(r));
+}
+
 /* ====== Reverse DMA Enqueue (DPU→CPU) ====== */
 
 /*
- * Enqueue data for DPU→CPU DMA via the destination pod's TX ring.
+ * Enqueue a reverse-DMA descriptor for in-place forwarding.
  *
- * Layout in TX buffer: [body (body_len B)], padded to 128B for DMA.
+ * Source = src_pod->dma_buffer at src_buf_offset (where forward DMA
+ * landed). NO DPU-side staging memcpy: dst_pod's old tx_buffer is bypassed
+ * entirely. Each descriptor carries the source mmap handle and full
+ * virtual address so DPA reverse handler can dispatch to the right pod's
+ * buffer per request.
  *
  * Per-request metadata (req_id, src_pod_id, dst_pod_id, flags) is carried
  * via dma_desc on-DPU and propagated to the receiving host through
- * comch_dma_comp_msg → dmesh_dma_completion_msg. There is intentionally NO
- * sw_descriptor inside the DMA payload: keeping it would inflate per-entry
- * size by 64B, breaking the num_slots × slot_size = DPU_BUFFER_SIZE
- * invariant that bounds reverse buffer occupancy.
+ * comch_dma_comp_msg → dmesh_dma_completion_msg.
  *
- * No flow control: DPU is a pure forwarder. End-nodes guarantee that the
- * total in-flight bytes never exceed buf_size by sizing num_slots ×
- * slot_size = DPU_BUFFER_SIZE and holding TX slots until response arrives.
+ * Slot lifecycle: src's RX slot is held from forward-completion through
+ * reverse-completion (full RTT). TX_ACK to src is therefore deferred to
+ * process_rev_notify_entry, NOT sent here. End-node host TX-slot
+ * accounting (num_slots × slot_size ≤ DPU_BUFFER_SIZE) is what bounds
+ * the unified-buffer occupancy.
+ *
  * Returns DOCA_SUCCESS or DOCA_ERROR_AGAIN (TX descriptor ring full).
  */
 static doca_error_t
-dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *dst_pod,
-                        const sw_descriptor_t *desc,
-                        const uint8_t *body, uint32_t body_len)
+dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *src_pod,
+                        struct pod_state *dst_pod,
+                        const sw_descriptor_t *desc, uint32_t src_buf_offset,
+                        uint32_t body_len)
 {
-    if (!dst_pod->tx_ring || !dst_pod->tx_buffer) {
-        DOCA_LOG_ERR("dpu_enqueue_reverse_dma: pod %d reverse DMA not ready", dst_pod->pod_id);
+    if (!dst_pod->tx_ring) {
+        DOCA_LOG_ERR("dpu_enqueue_reverse_dma: pod %d reverse ring not ready", dst_pod->pod_id);
         return DOCA_ERROR_NOT_CONNECTED;
     }
-
-    uint32_t padded_len = (body_len + 127) & ~(uint32_t)127;
-    uint32_t buf_size = (uint32_t)dst_pod->tx_buf_size;
-
-    /* Wrap if writing at current head would cross the buffer end. */
-    uint32_t write_pos = dst_pod->tx_producer_head;
-    if (write_pos + padded_len > buf_size)
-        write_pos = 0;
-
-    /* Write body into TX buffer */
-    uint8_t *dst = (uint8_t *)dst_pod->tx_buffer + write_pos;
-    if (body_len > 0)
-        memcpy(dst, body, body_len);
+    if (!src_pod->dma_buffer || src_pod->local_mmap_dpa_handle == 0) {
+        DOCA_LOG_ERR("dpu_enqueue_reverse_dma: src pod %d dma_buffer/handle not ready",
+                     src_pod->pod_id);
+        return DOCA_ERROR_NOT_CONNECTED;
+    }
 
     /* Post descriptor to TX ring */
     struct dma_desc *dma = get_next_dma_desc(dst_pod->tx_ring);
@@ -71,12 +106,12 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *dst_pod,
         return DOCA_ERROR_AGAIN;
     }
 
-    /* Fill descriptor: DPA DMAs from DPU TX buffer to Host RX buffer.
-     * addr is offset within TX buffer — DPA adds ring->dpu_addr base.
-     * src_pod_id carries the ORIGINAL forward sender so the DPA reverse
-     * handler can put it into comp.src_pod_id (ring->pod_id is the
-     * receiver, not the original source). */
-    dma->addr = write_pos;
+    /* Fill descriptor: DPA reverse handler reads the source from
+     * (desc->mmap, desc->addr). desc->addr is full virtual address inside
+     * src_pod's local_mmap range (DOCA dma_copy expects raw VA, see
+     * forward path's ring->dpu_addr usage in dpa_kernel.c). */
+    dma->mmap = src_pod->local_mmap_dpa_handle;
+    dma->addr = (uint64_t)src_pod->dma_buffer + src_buf_offset;
     dma->size = body_len;
     dma->idx = desc->req_id;
     dma->dst_pod_id = desc->dst_pod_id;
@@ -86,21 +121,23 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *dst_pod,
     __sync_synchronize();
     dma->valid = 1;
 
-    /* Advance TX producer head */
-    dst_pod->tx_producer_head = write_pos + padded_len;
-    if (dst_pod->tx_producer_head >= buf_size)
-        dst_pod->tx_producer_head = 0;
-
-    DOCA_LOG_DBG("dpu_enqueue_reverse_dma: pod=%d write_pos=%u body_len=%u padded=%u new_head=%u",
-                 dst_pod->pod_id, write_pos, body_len, padded_len, dst_pod->tx_producer_head);
+    DOCA_LOG_DBG("dpu_enqueue_reverse_dma: src_pod=%d dst_pod=%d offset=%u body_len=%u",
+                 src_pod->pod_id, dst_pod->pod_id, src_buf_offset, body_len);
     return DOCA_SUCCESS;
 }
 
 /* ====== Deferred Completion Queue Drain ====== */
 
 /*
- * Process a COMP_ENTRY_FORWARD entry: TX_ACK + reverse DMA routing.
- * Returns 1 if processed, 0 if should retry (TX buffer full), -1 on error.
+ * Process a COMP_ENTRY_FORWARD entry: enqueue reverse DMA for in-place
+ * forwarding. NO TX_ACK on the success path — that fires from
+ * process_rev_notify_entry once reverse DMA completes (slot must remain
+ * held in src's dma_buffer until DPA finishes reading it). Error paths
+ * (no src buffer, no target pod, hard reverse-enqueue failure) DO send
+ * TX_ACK here, since reverse will not fire and the host would otherwise
+ * sit on the 2-second collision-wait reclaim cliff.
+ *
+ * Returns 1 if processed, 0 if should retry (TX desc ring full), -1 on error.
  */
 static int
 process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
@@ -110,112 +147,67 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
     uint32_t req_id = entry->req_id;
     uint32_t payload_len = entry->length;
 
-    /* Resolve src_pod first so we can ACK even on error paths below.
-     * The DPU is the sole authority that can release the host's pending
-     * slot — failing to TX_ACK leaves the originating client waiting on
-     * the 2s collision-wait reclaim, which is the long-tail latency
-     * cliff. Treat ACK as a hard guarantee whenever src_pod is alive. */
+    /* Resolve src_pod for TX_ACK on error paths. */
     struct pod_state *src_pod = find_pod_by_id(objs, src_pod_id);
 
-    /* Zero-copy: resolve data pointer from pod's RX DMA buffer + offset */
-    uint8_t *data = NULL;
-    if (entry->pod_idx >= 0 && entry->pod_idx < objs->num_pods) {
-        struct pod_state *p = &objs->pods[entry->pod_idx];
-        if (p->dma_buffer)
-            data = (uint8_t *)p->dma_buffer + entry->buf_offset;
-    }
-    if (!data) {
+    /* The forward DMA landed in pods[entry->pod_idx]->dma_buffer at
+     * entry->buf_offset. That same offset is the source for reverse DMA. */
+    struct pod_state *fwd_buf_pod = NULL;
+    if (entry->pod_idx >= 0 && entry->pod_idx < objs->num_pods)
+        fwd_buf_pod = &objs->pods[entry->pod_idx];
+
+    if (!fwd_buf_pod || !fwd_buf_pod->dma_buffer ||
+        fwd_buf_pod->local_mmap_dpa_handle == 0) {
         DOCA_LOG_ERR("comp_queue: invalid pod_idx=%d for req_id=%u", entry->pod_idx, req_id);
-        /* Pod owning the payload is gone; we cannot forward, but we MUST
-         * still release the host slot of src_pod so its caller doesn't
-         * stall. Send TX_ACK with src_pod's current tail (we have no new
-         * tail to report since we never DMA'd anything). */
-        if (src_pod && src_pod->connection) {
-            doca_error_t ack_result = server_send_tx_ack_to(objs, src_pod->connection,
-                                                             req_id, dst_pod_id);
-            if (ack_result == DOCA_ERROR_AGAIN) {
-                if (objs->num_deferred_tx_acks < MAX_DEFERRED_TX_ACK) {
-                    int n = objs->num_deferred_tx_acks++;
-                    objs->deferred_tx_acks[n].conn        = src_pod->connection;
-                    objs->deferred_tx_acks[n].req_id      = req_id;
-                    objs->deferred_tx_acks[n].dst_pod_id  = dst_pod_id;
-                } else {
-                    DOCA_LOG_ERR("deferred TX_ACK queue full on error path — "
-                                 "dropping req_id=%u (pod %d)",
-                                 req_id, src_pod_id);
-                }
-            } else if (ack_result != DOCA_SUCCESS) {
-                DOCA_LOG_WARN("error-path TX_ACK failed for req_id=%u to pod %d: %s",
-                              req_id, src_pod_id, doca_error_get_descr(ack_result));
-            }
-        }
+        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id);
         return -1;
     }
 
-    /* Route data to destination pod via reverse DMA (DPU→CPU) */
     int echo_mode = (dst_pod_id == -1 || dst_pod_id == src_pod_id);
     struct pod_state *target_pod = echo_mode ? src_pod
                                              : find_pod_by_id(objs, dst_pod_id);
 
-    if (target_pod && target_pod->tx_ring) {
-        sw_descriptor_t fwd_desc;
-        memset(&fwd_desc, 0, sizeof(fwd_desc));
-        fwd_desc.header_buf_slot = -1;
-        fwd_desc.body_buf_slot = -1;
-        fwd_desc.body_len = payload_len;
-        fwd_desc.req_id = req_id;
-        fwd_desc.src_pod_id = src_pod_id;
-        fwd_desc.dst_pod_id = dst_pod_id;
-        fwd_desc.flags = echo_mode ? OP_RESPONSE
-                                   : ((entry->flags & OP_RESPONSE) | CASE_INGRESS);
-        fwd_desc.valid = 1;
-
-        doca_error_t fwd_result = dpu_enqueue_reverse_dma(
-            objs, target_pod, &fwd_desc, data, payload_len);
-        if (fwd_result == DOCA_ERROR_AGAIN) {
-            return 0;  /* TX descriptor ring full — preserve entry, retry */
-        }
-        if (fwd_result != DOCA_SUCCESS)
-            DOCA_LOG_ERR("%s failed for req_id=%u dst_pod=%d: %s",
-                         echo_mode ? "Echo" : "Forward",
-                         req_id, dst_pod_id, doca_error_get_descr(fwd_result));
-        else
-            DOCA_LOG_DBG("%s %u bytes to pod %d for req_id=%u via reverse DMA",
-                         echo_mode ? "Echo" : "Forwarded",
-                         payload_len, echo_mode ? src_pod_id : dst_pod_id, req_id);
-    } else {
+    if (!target_pod || !target_pod->tx_ring) {
         DOCA_LOG_ERR("DMA completed: target_pod=%d not found or TX ring not ready",
                      echo_mode ? src_pod_id : dst_pod_id);
+        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id);
+        return -1;
     }
 
-    /* Per-request TX_ACK so the host can release the TX slot tied to req_id.
-     * The DPU is the sole authority that can release that slot — an inline
-     * retry-and-drop policy parks the host's pending entry at state=-2 until
-     * the 2-second collision-wait reclaim hits, which is the long-tail-latency
-     * cliff observed at saturation. Treat TX_ACK as a hard guarantee: try
-     * once, and on AGAIN stash to the deferred queue so the main loop retries
-     * each iteration after pe_progress has had a chance to drain send
-     * completions. */
-    if (src_pod && src_pod->connection) {
-        doca_error_t ack_result = server_send_tx_ack_to(objs, src_pod->connection,
-                                                         req_id, dst_pod_id);
-        if (ack_result == DOCA_ERROR_AGAIN) {
-            if (objs->num_deferred_tx_acks < MAX_DEFERRED_TX_ACK) {
-                int n = objs->num_deferred_tx_acks++;
-                objs->deferred_tx_acks[n].conn        = src_pod->connection;
-                objs->deferred_tx_acks[n].req_id      = req_id;
-                objs->deferred_tx_acks[n].dst_pod_id  = dst_pod_id;
-            } else {
-                DOCA_LOG_ERR("deferred TX_ACK queue full — dropping req_id=%u (pod %d). "
-                             "Host slot will reclaim at 2s.",
-                             req_id, src_pod_id);
-            }
-        } else if (ack_result != DOCA_SUCCESS) {
-            DOCA_LOG_WARN("TX_ACK failed for req_id=%u to pod %d: %s",
-                          req_id, src_pod_id, doca_error_get_descr(ack_result));
-        }
+    sw_descriptor_t fwd_desc;
+    memset(&fwd_desc, 0, sizeof(fwd_desc));
+    fwd_desc.header_buf_slot = -1;
+    fwd_desc.body_buf_slot = -1;
+    fwd_desc.body_len = payload_len;
+    fwd_desc.req_id = req_id;
+    fwd_desc.src_pod_id = src_pod_id;
+    fwd_desc.dst_pod_id = dst_pod_id;
+    fwd_desc.flags = echo_mode ? OP_RESPONSE
+                               : ((entry->flags & OP_RESPONSE) | CASE_INGRESS);
+    fwd_desc.valid = 1;
+
+    doca_error_t fwd_result = dpu_enqueue_reverse_dma(
+        objs, fwd_buf_pod, target_pod, &fwd_desc, entry->buf_offset, payload_len);
+
+    if (fwd_result == DOCA_ERROR_AGAIN) {
+        return 0;  /* TX descriptor ring full — preserve entry, retry next iter */
+    }
+    if (fwd_result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("%s failed for req_id=%u dst_pod=%d: %s",
+                     echo_mode ? "Echo" : "Forward",
+                     req_id, dst_pod_id, doca_error_get_descr(fwd_result));
+        /* Reverse will not fire — release src host's TX slot now so the
+         * caller doesn't stall on 2s reclaim. */
+        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id);
+        return -1;
     }
 
+    DOCA_LOG_DBG("%s %u bytes to pod %d for req_id=%u via reverse DMA",
+                 echo_mode ? "Echo" : "Forwarded",
+                 payload_len, echo_mode ? src_pod_id : dst_pod_id, req_id);
+
+    /* Success: TX_ACK will fire from process_rev_notify_entry on reverse
+     * completion. The src dma_buffer slot stays held until then. */
     return 1;
 }
 
@@ -262,7 +254,16 @@ drain_deferred_tx_acks(struct objects *objs)
 
 /*
  * Process a COMP_ENTRY_REV_NOTIFY entry: reverse DMA completed (DPU→CPU).
- * Send DMA_COMPLETION notification to the destination Host pod via comch.
+ * Send DMA_COMPLETION to the destination Host pod, then TX_ACK to the
+ * src pod (under in-place forwarding the src's dma_buffer slot was held
+ * through the whole RTT — releasing it earlier would let host overwrite
+ * the slot before DPA's reverse DMA finished reading it).
+ *
+ * If DMA_COMPLETION returns AGAIN we retry the whole entry next iter and
+ * defer TX_ACK along with it (returning 0 leaves the comp_queue entry in
+ * place). TX_ACK has its own deferred queue for partial-progress cases
+ * where DMA_COMPLETION succeeded but TX_ACK hits an EAGAIN.
+ *
  * Returns 1 if processed, 0 if should retry, -1 on error.
  */
 static int
@@ -275,6 +276,11 @@ process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
 
     if (!target_pod || !target_pod->connection) {
         DOCA_LOG_ERR("REV_NOTIFY: target pod %d not found or no connection", target_id);
+        /* Still try to release the src's TX slot — reverse DMA already
+         * read the data out of src's dma_buffer, so the slot is logically
+         * free regardless of whether the dst notification lands. */
+        struct pod_state *src_pod = find_pod_by_id(objs, entry->src_pod_id);
+        send_or_defer_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id);
         return -1;
     }
 
@@ -292,13 +298,26 @@ process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
                                                    (const char *)&comp_msg,
                                                    sizeof(comp_msg));
     if (result == DOCA_ERROR_AGAIN) {
-        return 0;  /* retry next iteration */
+        return 0;  /* retry next iteration — TX_ACK deferred too */
     }
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("REV_NOTIFY: send DMA_COMPLETION to pod %d failed: %s",
                      target_id, doca_error_get_descr(result));
+        /* Hard error on dst notify; still release src's TX slot — its data
+         * has been DMA'd out and the slot is logically free. */
+        struct pod_state *src_pod = find_pod_by_id(objs, entry->src_pod_id);
+        send_or_defer_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id);
         return -1;
     }
+
+    /* DMA_COMPLETION sent. Now release src's TX slot (under in-place
+     * forwarding this is the only place it gets released on the success
+     * path — process_forward_entry no longer ACKs on success). For echo
+     * src==dst this goes to the same pod as the DMA_COMPLETION above;
+     * comch handles the second send (or defers via TX_ACK queue). */
+    struct pod_state *src_pod = echo_mode ? target_pod
+                                          : find_pod_by_id(objs, entry->src_pod_id);
+    send_or_defer_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id);
 
     DOCA_LOG_DBG("REV_NOTIFY: sent DMA_COMPLETION to pod %d (req_id=%u pos=%u len=%u)",
                  target_id, entry->req_id, entry->buf_offset, entry->length);
