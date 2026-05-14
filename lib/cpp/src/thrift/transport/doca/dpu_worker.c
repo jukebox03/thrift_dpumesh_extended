@@ -119,6 +119,11 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *src_pod,
     dma->dst_pod_id = desc->dst_pod_id;
     dma->src_pod_id = desc->src_pod_id;
     dma->flags = desc->flags;
+    /* Phase 2: body in-place forwarding keeps dst override unset → DPA
+     * falls back to ring->host_mmap (= dst pod's body RX). Phase 3+ hdr
+     * flush sets dst_mmap = dst_pod->host_hdr_rx_dpa_handle. */
+    dma->dst_mmap = 0;
+    dma->dst_addr = 0;
 
     __sync_synchronize();
     dma->valid = 1;

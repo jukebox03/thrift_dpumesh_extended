@@ -495,6 +495,8 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     desc->idx = 0;
     desc->dst_pod_id = 0;
     desc->flags = 0;
+    desc->dst_mmap = 0;
+    desc->dst_addr = 0;
     __dpa_thread_window_writeback();
     desc->valid = 0;
     __dpa_thread_window_writeback();
@@ -544,7 +546,15 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     doca_dpa_dev_mmap_t src_mmap = desc->mmap ? desc->mmap : ring->dpu_mmap;
     uint64_t src_base = desc->mmap ? desc->addr : (ring->dpu_addr + desc->addr);
 
-    if (desc->size == 0 || ring->host_mmap == 0 || src_mmap == 0) {
+    /* Phase 2 (v2 plan): destination override via desc->dst_mmap. When set,
+     * the descriptor carries an absolute virtual address inside that mmap
+     * (e.g. host_hdr_rx_dpa_handle for hdr forward) and the DPA-managed
+     * rev_pos[r] cursor is bypassed. Default reverse path keeps cursor
+     * management against ring->host_mmap (the body RX). */
+    doca_dpa_dev_mmap_t dst_mmap_used = desc->dst_mmap ? desc->dst_mmap : ring->host_mmap;
+    int dst_overridden = (desc->dst_mmap != 0);
+
+    if (desc->size == 0 || dst_mmap_used == 0 || src_mmap == 0) {
         desc->valid = 0;
         __dpa_thread_window_writeback();
         thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
@@ -554,8 +564,11 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     /* === Admission gate using cached_freed[] (refreshed in drain_all_rings) ===
      * dpa_sent_count[r] - dpa_cached_freed[r] = inflight reverse DMAs.
      * If >= rq_depth, host's RX RQ is at capacity — defer (return 0; desc
-     * stays valid, retry next iter when cache is refreshed). */
-    if (ring->host_credit_buf_arr != 0 && ring->rq_depth != 0) {
+     * stays valid, retry next iter when cache is refreshed). Phase 2:
+     * skip for dst_overridden case — that path writes to a separate buffer
+     * (hdr_rx_buffer) whose flow control is managed by Phase 3+ logic,
+     * not the body credit ring. */
+    if (!dst_overridden && ring->host_credit_buf_arr != 0 && ring->rq_depth != 0) {
         if (dpa_sent_count[r] - dpa_cached_freed[r] >= ring->rq_depth) {
             return 0;
         }
@@ -577,16 +590,24 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
 
     uint32_t padded_total = ALIGN_UP_128(desc->size);
 
-    if (padded_total > ring->host_buf_size) {
+    if (!dst_overridden && padded_total > ring->host_buf_size) {
         desc->valid = 0;
         __dpa_thread_window_writeback();
         thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
         return 1;
     }
 
-    /* Wrap around if padded DMA would exceed Host RX buffer boundary */
-    if (thread_arg->rev_pos[r] + padded_total > ring->host_buf_size)
+    /* Wrap around if padded DMA would exceed Host RX buffer boundary.
+     * Override path manages its own partition cursor (Phase 3+ chunk_flush
+     * / hdr_outbound flush write absolute addresses), so skip. */
+    if (!dst_overridden && thread_arg->rev_pos[r] + padded_total > ring->host_buf_size)
         thread_arg->rev_pos[r] = 0;
+
+    /* Compute destination base for dma_copy. Override path uses caller-supplied
+     * absolute address; default path uses ring->host_addr + cursor. */
+    uint64_t dst_base = dst_overridden
+        ? desc->dst_addr
+        : (ring->host_addr + thread_arg->rev_pos[r]);
 
     /* Build completion message for DPU ARM (which forwards to Host).
      * Reverse direction: src=DPU TX buffer, dst=Host RX buffer.
@@ -643,11 +664,12 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
             }
 
             if (remaining <= chunk) {
-                /* Final chunk: src=src_pod's dma_buffer (in-place), dst=Host RX */
+                /* Final chunk: src=src_pod's dma_buffer (in-place), dst=Host RX
+                 * (or hdr_rx_buffer when dst_overridden). */
                 doca_dpa_dev_comch_producer_dma_copy(producer,
                                             dpu_consumer_id,
-                                            ring->host_mmap,  /* dst = Host RX */
-                                            ring->host_addr + thread_arg->rev_pos[r] + offset,
+                                            dst_mmap_used,    /* dst override aware */
+                                            dst_base + offset,
                                             src_mmap,         /* src = src pod buf */
                                             src_base + offset,
                                             chunk,
@@ -657,8 +679,8 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
             } else {
                 doca_dpa_dev_comch_producer_dma_copy(producer,
                                             dpu_consumer_id,
-                                            ring->host_mmap,
-                                            ring->host_addr + thread_arg->rev_pos[r] + offset,
+                                            dst_mmap_used,
+                                            dst_base + offset,
                                             src_mmap,
                                             src_base + offset,
                                             chunk,
@@ -673,11 +695,16 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     }
 
     if (!aborted) {
-        thread_arg->rev_pos[r] += padded_total;
-        if (thread_arg->rev_pos[r] >= ring->host_buf_size)
-            thread_arg->rev_pos[r] = 0;
-        /* Successfully consumed one host RX slot (admission accounting) */
-        dpa_sent_count[r]++;
+        if (!dst_overridden) {
+            thread_arg->rev_pos[r] += padded_total;
+            if (thread_arg->rev_pos[r] >= ring->host_buf_size)
+                thread_arg->rev_pos[r] = 0;
+            /* Successfully consumed one host RX slot (admission accounting). */
+            dpa_sent_count[r]++;
+        }
+        /* Override path: caller (Phase 3+ hdr/chunk flush) tracks its own
+         * partition cursor and is not subject to the body-RX admission
+         * accounting; nothing to do here. */
     }
 
     __dpa_thread_window_writeback();
@@ -687,6 +714,8 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     desc->idx = 0;
     desc->dst_pod_id = 0;
     desc->flags = 0;
+    desc->dst_mmap = 0;
+    desc->dst_addr = 0;
     __dpa_thread_window_writeback();
     desc->valid = 0;
     __dpa_thread_window_writeback();

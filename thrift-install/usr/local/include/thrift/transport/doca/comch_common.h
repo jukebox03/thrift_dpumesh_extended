@@ -35,6 +35,7 @@ enum mmap_type {
     DMA_RING = 2,
     DMA_HOST_RX_BUFFER = 3, /* Host RX buffer for DPU→CPU reverse DMA */
     DMA_HOST_TX_HDR_BUFFER = 4, /* Phase 1: independent host TX pool for hdr batches */
+    DMA_HOST_RX_HDR_BUFFER = 5, /* Phase 2: independent host RX buffer for hdr forwards */
 };
 
 struct dmesh_mmap_msg {

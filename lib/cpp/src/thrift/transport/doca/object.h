@@ -180,6 +180,15 @@ struct pod_state {
     void *host_rx_addr;
     size_t host_rx_buf_size;
 
+    /* Phase 2 (v2 plan): independent host RX hdr buffer. DPU sets
+     * dma_desc.dst_mmap = host_hdr_rx_dpa_handle when flushing hdr
+     * forward batches via reverse DMA. DPA reverse kernel uses dst_mmap
+     * override (falls back to ring->host_mmap = body RX when zero). */
+    struct doca_mmap *host_hdr_rx_mmap;
+    void *host_hdr_rx_addr;
+    size_t host_hdr_rx_buf_size;
+    doca_dpa_dev_mmap_t host_hdr_rx_dpa_handle;
+
     /* Host's RX RQ depth (= num_slots), derived from host_rx_buf_size.
      * Used by DPA admission gate as the cap on in-flight reverse DMAs. */
     uint32_t rq_depth;

@@ -135,7 +135,7 @@ struct comch_msg {
 /* ====== DMA ring descriptor ====== */
 
 struct dma_desc {
-	doca_dpa_dev_mmap_t mmap;      /* 4B */
+	doca_dpa_dev_mmap_t mmap;      /* 4B - forward: src override (Phase 1), reverse: src override */
 	uint64_t addr;                 /* 8B */
 	uint32_t size;                 /* 4B (fixed width for Host/DPA ABI stability) */
 	uint64_t idx;                  /* 8B (req_id) */
@@ -151,7 +151,14 @@ struct dma_desc {
 	                                * comp.src_pod_id so the receiving host can
 	                                * route OP_REQUEST/RESPONSE correctly without
 	                                * an in-payload sw_descriptor. */
-	uint8_t reserved[27];          /* 27B */
+	doca_dpa_dev_mmap_t dst_mmap;  /* 4B (Phase 2) - reverse DST override. Non-zero
+	                                * means DPA reverse kernel writes into this mmap
+	                                * (e.g. host_hdr_rx_dpa_handle) instead of
+	                                * ring->host_mmap. Forward kernel ignores. */
+	uint8_t _pad_dst[4];           /* 4B align dst_addr to 8B */
+	uint64_t dst_addr;             /* 8B (Phase 2) - absolute virtual address in
+	                                * dst_mmap. Only used when dst_mmap != 0. */
+	uint8_t reserved[11];          /* 11B */
 	volatile uint8_t valid;        /* 1B */
 } __attribute__((__packed__, aligned(8)));
 
@@ -163,6 +170,8 @@ _Static_assert(offsetof(struct dma_desc, idx) == 16, "dma_desc.idx offset mismat
 _Static_assert(offsetof(struct dma_desc, dst_pod_id) == 24, "dma_desc.dst_pod_id offset mismatch");
 _Static_assert(offsetof(struct dma_desc, flags) == 28, "dma_desc.flags offset mismatch");
 _Static_assert(offsetof(struct dma_desc, src_pod_id) == 32, "dma_desc.src_pod_id offset mismatch");
+_Static_assert(offsetof(struct dma_desc, dst_mmap) == 36, "dma_desc.dst_mmap offset mismatch");
+_Static_assert(offsetof(struct dma_desc, dst_addr) == 44, "dma_desc.dst_addr offset mismatch");
 _Static_assert(offsetof(struct dma_desc, valid) == 63, "dma_desc.valid offset mismatch");
 
 #endif

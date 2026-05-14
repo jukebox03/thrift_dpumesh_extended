@@ -79,6 +79,8 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		mmap = &pod->host_rx_mmap;
 	} else if (mmap_msg->mmap_type == DMA_HOST_TX_HDR_BUFFER) {
 		mmap = &pod->remote_hdr_mmap;
+	} else if (mmap_msg->mmap_type == DMA_HOST_RX_HDR_BUFFER) {
+		mmap = &pod->host_hdr_rx_mmap;
 	} else {
 		DOCA_LOG_ERR("Invalid mmap type received: %d", mmap_msg->mmap_type);
 		return DOCA_ERROR_INVALID_VALUE;
@@ -122,6 +124,22 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		DOCA_LOG_INFO("Pod %d: Host TX HDR buffer stored (addr=%p, size=%zu, dpa_handle=0x%lx)",
 			      pod->pod_id, remote_addr, buf_size,
 			      (unsigned long)pod->remote_hdr_dpa_handle);
+	} else if (mmap_msg->mmap_type == DMA_HOST_RX_HDR_BUFFER) {
+		pod->host_hdr_rx_addr = remote_addr;
+		pod->host_hdr_rx_buf_size = buf_size;
+		/* Phase 2: DPA reverse kernel uses dst_mmap override via dma_desc.dst_mmap.
+		 * Resolve the handle eagerly so DPU's hdr-flush path (Phase 3) just fills
+		 * desc->dst_mmap = host_hdr_rx_dpa_handle without lookup. */
+		result = doca_mmap_dev_get_dpa_handle(pod->host_hdr_rx_mmap, objs->dev,
+		                                      &pod->host_hdr_rx_dpa_handle);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Pod %d: failed to get DPA handle for host_hdr_rx mmap: %s",
+				     pod->pod_id, doca_error_get_name(result));
+			return result;
+		}
+		DOCA_LOG_INFO("Pod %d: Host RX HDR buffer stored (addr=%p, size=%zu, dpa_handle=0x%lx)",
+			      pod->pod_id, remote_addr, buf_size,
+			      (unsigned long)pod->host_hdr_rx_dpa_handle);
 	} else {
 		pod->remote_addr = remote_addr;
 		pod->remote_buf_size = buf_size;

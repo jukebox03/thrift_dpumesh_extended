@@ -99,6 +99,15 @@ struct dpumesh_ctx {
     struct doca_mmap *rx_dma_mmap;
     size_t rx_dma_buf_size;
 
+    /* Phase 2 (v2 plan): independent host RX buffer for hdr forwards.
+     * DPU sets dma_desc.dst_mmap = host_hdr_rx_dpa_handle when flushing hdr
+     * batches via reverse DMA, so hdr lands here while body chunks land in
+     * rx_dma_buffer. Both buffers carry the same DMA_COMPLETION shape; the
+     * OP_HDR_BATCH flag (Phase 3) tells the host which buffer to read from. */
+    void *hdr_rx_buffer;
+    struct doca_mmap *hdr_rx_mmap;
+    size_t hdr_rx_buf_size;
+
     /* Persistent buffers for initial registration to avoid stack UAF */
     struct dmesh_register_msg reg_msg;
     struct dmesh_pod_consumer_id_msg pod_cid_msg;
@@ -557,6 +566,25 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
         return result;
     }
 
+    /* Phase 2: HDR RX buffer. Sized to match HDR TX pool — symmetric, 8MB. */
+    ctx->hdr_rx_buf_size = (size_t)ctx->hdr_num_slots * ctx->hdr_slot_size;
+    result = alloc_buffer_and_set_mmap(&ctx->hdr_rx_mmap,
+                                       ctx->doca_objs.dev,
+                                       &ctx->hdr_rx_buffer,
+                                       ctx->hdr_rx_buf_size,
+                                       DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to allocate HDR RX buffer: %s", doca_err_str(result));
+        return result;
+    }
+
+    result = export_mmap_to_remote(&ctx->doca_objs, ctx->hdr_rx_mmap,
+                                   ctx->hdr_rx_buffer, ctx->hdr_rx_buf_size,
+                                   DMA_HOST_RX_HDR_BUFFER, HOST_TO_DPU);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_WARN("Failed to export HDR RX buffer to DPU: %s", doca_err_str(result));
+    }
+
     return DOCA_SUCCESS;
 }
 
@@ -682,6 +710,16 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
     if (ctx->hdr_tx_buffer) {
         free(ctx->hdr_tx_buffer);
         ctx->hdr_tx_buffer = NULL;
+    }
+
+    /* Phase 2: HDR RX buffer teardown — same ordering requirement. */
+    if (ctx->hdr_rx_mmap) {
+        doca_mmap_destroy(ctx->hdr_rx_mmap);
+        ctx->hdr_rx_mmap = NULL;
+    }
+    if (ctx->hdr_rx_buffer) {
+        free(ctx->hdr_rx_buffer);
+        ctx->hdr_rx_buffer = NULL;
     }
 
     cleanup_objects(&ctx->doca_objs);
@@ -887,6 +925,10 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     dma->idx  = desc->req_id;
     dma->dst_pod_id = desc->dst_pod_id;
     dma->flags = desc->flags;
+    /* Phase 2: forward path never uses dst override. Explicit 0 in case
+     * a previous occupant of this ring slot left stale bytes here. */
+    dma->dst_mmap = 0;
+    dma->dst_addr = 0;
 
     __sync_synchronize();
     dma->valid = 1;
