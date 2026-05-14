@@ -9,7 +9,14 @@
 #include "buffer.h"
 #include "ring.h"
 #include "dma.h"
+#include "mesh.h"
 #include "../dpumesh.h"
+
+/* DPA size alignment — must match dpa_kernel.c ALIGN_UP_128 macro. */
+#ifndef DMA_COPY_SIZE_ALIGN
+#define DMA_COPY_SIZE_ALIGN 128
+#endif
+#define DPU_ALIGN_UP_128(x) (((x) + (DMA_COPY_SIZE_ALIGN - 1)) & ~(uint32_t)(DMA_COPY_SIZE_ALIGN - 1))
 
 #include <doca_log.h>
 #include <doca_dev.h>
@@ -50,16 +57,14 @@ send_or_defer_tx_ack(struct objects *objs, struct pod_state *src_pod,
             objs->deferred_tx_acks[n].req_id      = req_id;
             objs->deferred_tx_acks[n].dst_pod_id  = dst_pod_id;
             objs->deferred_tx_acks[n].pool_type   = pool_type;
-        } else {
-            DOCA_LOG_ERR("deferred TX_ACK queue full — dropping req_id=%u (pod %d). "
-                         "Host slot will reclaim at 2s.",
-                         req_id, src_pod->pod_id);
         }
+        /* Silently drop if deferred queue is also full — host's 2s reclaim is
+         * the safety net. Logging per-request here floods the DPU log and
+         * kills dpumesh_dpu (see plan §9.12 / memory rule). */
         return;
     }
-
-    DOCA_LOG_WARN("TX_ACK failed for req_id=%u to pod %d: %s",
-                  req_id, src_pod->pod_id, doca_error_get_descr(r));
+    /* Other hard errors: silent. Host-side stat counters detect persistent
+     * loss; per-request log on DPU floods. */
 }
 
 /* ====== Reverse DMA Enqueue (DPU→CPU) ====== */
@@ -91,20 +96,18 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *src_pod,
                         const sw_descriptor_t *desc, uint32_t src_buf_offset,
                         uint32_t body_len)
 {
-    if (!dst_pod->tx_ring) {
-        DOCA_LOG_ERR("dpu_enqueue_reverse_dma: pod %d reverse ring not ready", dst_pod->pod_id);
+    /* Hot path under repeated misconfig fires per request; suppress logs
+     * (host-side timeout / stat counters will surface persistent issues). */
+    if (!dst_pod->tx_ring) return DOCA_ERROR_NOT_CONNECTED;
+    if (!src_pod->dma_buffer || src_pod->local_mmap_dpa_handle == 0)
         return DOCA_ERROR_NOT_CONNECTED;
-    }
-    if (!src_pod->dma_buffer || src_pod->local_mmap_dpa_handle == 0) {
-        DOCA_LOG_ERR("dpu_enqueue_reverse_dma: src pod %d dma_buffer/handle not ready",
-                     src_pod->pod_id);
-        return DOCA_ERROR_NOT_CONNECTED;
-    }
 
     /* Post descriptor to TX ring */
     struct dma_desc *dma = get_next_dma_desc(dst_pod->tx_ring);
     if (!dma) {
-        DOCA_LOG_WARN("dpu_enqueue_reverse_dma: TX ring full for pod %d", dst_pod->pod_id);
+        /* Hot path under backpressure: ring is full this iteration. Caller
+         * retries next iter (EAGAIN). NO per-request log on DPU — at high
+         * RPS this fires every chunk and floods /tmp on the DPU. */
         return DOCA_ERROR_AGAIN;
     }
 
@@ -119,11 +122,27 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *src_pod,
     dma->dst_pod_id = desc->dst_pod_id;
     dma->src_pod_id = desc->src_pod_id;
     dma->flags = desc->flags;
-    /* Phase 2: body in-place forwarding keeps dst override unset → DPA
-     * falls back to ring->host_mmap (= dst pod's body RX). Phase 3+ hdr
-     * flush sets dst_mmap = dst_pod->host_hdr_rx_dpa_handle. */
-    dma->dst_mmap = 0;
-    dma->dst_addr = 0;
+    /* Phase 3: OP_HDR_BATCH overrides destination to dst's host_hdr_rx_buffer.
+     * Cursor managed per-dst (no credit return; Phase 4 will add a grant
+     * scheme). Body forwards (OP_CHUNK and legacy) keep dst override unset
+     * so DPA falls back to ring->host_mmap (= dst's body RX). */
+    if ((desc->flags & OP_HDR_BATCH) && dst_pod->host_hdr_rx_addr) {
+        /* Phase 3: cursor + absolute VA. DPA picks dst_mmap from
+         * ring->host_hdr_rx_mmap (resolved against DPU device), so we leave
+         * dma->dst_mmap = 0. dst_addr is the host VA — the DPA-side mmap
+         * exports the same VA range. dst_pos echoes the offset to host. */
+        uint32_t aligned = DPU_ALIGN_UP_128(body_len);
+        if (dst_pod->hdr_rx_cursor + aligned > dst_pod->host_hdr_rx_buf_size)
+            dst_pod->hdr_rx_cursor = 0;
+        dma->dst_mmap = 0;
+        dma->dst_pos  = dst_pod->hdr_rx_cursor;
+        dma->dst_addr = (uint64_t)dst_pod->host_hdr_rx_addr + dst_pod->hdr_rx_cursor;
+        dst_pod->hdr_rx_cursor += aligned;
+    } else {
+        dma->dst_mmap = 0;
+        dma->dst_pos  = 0;
+        dma->dst_addr = 0;
+    }
 
     __sync_synchronize();
     dma->valid = 1;
@@ -157,15 +176,44 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
     /* Resolve src_pod for TX_ACK on error paths. */
     struct pod_state *src_pod = find_pod_by_id(objs, src_pod_id);
 
+    /* Phase 4: CASE_DIRECT — DPA already wrote into dst host's rx_dma_buffer
+     * bypassing DPU staging. No reverse DMA to enqueue. Just notify dst
+     * (rx_data_hook drains) and ack src. EAGAIN on DMA_COMPLETION leaves
+     * the comp_queue entry in place (return 0) so we retry next iter —
+     * this matches the pattern used by REV_NOTIFY and prevents tail-latency
+     * cliffs at saturation. */
+    if (entry->flags & CASE_DIRECT) {
+        struct pod_state *dst_pod = find_pod_by_id(objs, dst_pod_id);
+        if (dst_pod && dst_pod->connection) {
+            struct dmesh_dma_completion_msg comp;
+            comp.type = DMESH_MSG_DMA_COMPLETION;
+            comp.pos = entry->buf_offset;
+            comp.length = entry->length;
+            comp.req_id = entry->req_id;
+            comp.src_pod_id = entry->src_pod_id;
+            comp.dst_pod_id = entry->dst_pod_id;
+            comp.flags = entry->flags;
+            doca_error_t r = server_send_msg_to_conn(objs, dst_pod->connection,
+                                                      (const char *)&comp, sizeof(comp));
+            if (r == DOCA_ERROR_AGAIN) {
+                return 0;  /* retry next iteration */
+            }
+            /* Other errors: silent. Host-side timeout is the backstop. */
+        }
+        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id, POOL_HOST_TX_BODY);
+        return 1;
+    }
+
     /* The forward DMA landed in pods[entry->pod_idx]->dma_buffer at
      * entry->buf_offset. That same offset is the source for reverse DMA. */
     struct pod_state *fwd_buf_pod = NULL;
     if (entry->pod_idx >= 0 && entry->pod_idx < objs->num_pods)
         fwd_buf_pod = &objs->pods[entry->pod_idx];
 
+    /* Hot path errors below fire per-request under misconfig; suppress logs.
+     * Host's wait_response_v2 timeout is the persistent-failure detector. */
     if (!fwd_buf_pod || !fwd_buf_pod->dma_buffer ||
         fwd_buf_pod->local_mmap_dpa_handle == 0) {
-        DOCA_LOG_ERR("comp_queue: invalid pod_idx=%d for req_id=%u", entry->pod_idx, req_id);
         send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id, POOL_HOST_TX_BODY);
         return -1;
     }
@@ -175,8 +223,6 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
                                              : find_pod_by_id(objs, dst_pod_id);
 
     if (!target_pod || !target_pod->tx_ring) {
-        DOCA_LOG_ERR("DMA completed: target_pod=%d not found or TX ring not ready",
-                     echo_mode ? src_pod_id : dst_pod_id);
         send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id, POOL_HOST_TX_BODY);
         return -1;
     }
@@ -191,6 +237,9 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
     fwd_desc.dst_pod_id = dst_pod_id;
     fwd_desc.flags = echo_mode ? OP_RESPONSE
                                : ((entry->flags & OP_RESPONSE) | CASE_INGRESS);
+    /* Phase 3: preserve OP_HDR_BATCH / OP_CHUNK discriminator bits so the
+     * dst host can demux to the correct buffer + parser. */
+    fwd_desc.flags |= (entry->flags & (OP_HDR_BATCH | OP_CHUNK));
     fwd_desc.valid = 1;
 
     doca_error_t fwd_result = dpu_enqueue_reverse_dma(
@@ -200,11 +249,8 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
         return 0;  /* TX descriptor ring full — preserve entry, retry next iter */
     }
     if (fwd_result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("%s failed for req_id=%u dst_pod=%d: %s",
-                     echo_mode ? "Echo" : "Forward",
-                     req_id, dst_pod_id, doca_error_get_descr(fwd_result));
         /* Reverse will not fire — release src host's TX slot now so the
-         * caller doesn't stall on 2s reclaim. */
+         * caller doesn't stall on 2s reclaim. Silent: host timeout reports. */
         send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id, POOL_HOST_TX_BODY);
         return -1;
     }
@@ -249,10 +295,8 @@ drain_deferred_tx_acks(struct objects *objs)
             kept++;
             continue;
         }
-        /* Hard error — log and drop (host's 2s reclaim is the safety net
-         * for these once-in-a-blue-moon hard failures). */
-        DOCA_LOG_WARN("deferred TX_ACK fatal for req_id=%u: %s",
-                      d->req_id, doca_error_get_descr(rc));
+        /* Hard error — silently drop. Host's 2s reclaim is the safety net;
+         * per-request log here floods DPU /tmp under sustained backpressure. */
         sent++;  /* count as "removed from queue" */
     }
     objs->num_deferred_tx_acks = kept;
@@ -281,13 +325,20 @@ process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
     int32_t target_id = echo_mode ? entry->src_pod_id : entry->dst_pod_id;
     struct pod_state *target_pod = find_pod_by_id(objs, target_id);
 
+    /* Phase 3: pool_type for TX_ACK is the SOURCE pool that fed the forward DMA.
+     * For OP_HDR_BATCH, the source was the sender's hdr_tx_buffer; for everything
+     * else (body chunks via legacy reverse path) it's the body TX pool. Without
+     * this, the sender's TX_ACK handler frees the wrong slot (body instead of
+     * hdr) and the hdr_tx pool leaks one slot per hdr_batch — exhausting the
+     * 1024-slot hdr pool within ~5s at 10k RPS and stalling all subsequent
+     * send_response calls (echo side) since they can't allocate a hdr slot. */
+    uint8_t ack_pool = (entry->flags & OP_HDR_BATCH) ? POOL_HOST_TX_HDR
+                                                     : POOL_HOST_TX_BODY;
+
     if (!target_pod || !target_pod->connection) {
-        DOCA_LOG_ERR("REV_NOTIFY: target pod %d not found or no connection", target_id);
-        /* Still try to release the src's TX slot — reverse DMA already
-         * read the data out of src's dma_buffer, so the slot is logically
-         * free regardless of whether the dst notification lands. */
+        /* Still try to release src's TX slot — silent (per-req log floods). */
         struct pod_state *src_pod = find_pod_by_id(objs, entry->src_pod_id);
-        send_or_defer_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id, POOL_HOST_TX_BODY);
+        send_or_defer_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id, ack_pool);
         return -1;
     }
 
@@ -308,12 +359,9 @@ process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
         return 0;  /* retry next iteration — TX_ACK deferred too */
     }
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("REV_NOTIFY: send DMA_COMPLETION to pod %d failed: %s",
-                     target_id, doca_error_get_descr(result));
-        /* Hard error on dst notify; still release src's TX slot — its data
-         * has been DMA'd out and the slot is logically free. */
+        /* Hard error: release src's TX slot. Silent (per-req log floods). */
         struct pod_state *src_pod = find_pod_by_id(objs, entry->src_pod_id);
-        send_or_defer_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id, POOL_HOST_TX_BODY);
+        send_or_defer_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id, ack_pool);
         return -1;
     }
 
@@ -324,7 +372,7 @@ process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
      * comch handles the second send (or defers via TX_ACK queue). */
     struct pod_state *src_pod = echo_mode ? target_pod
                                           : find_pod_by_id(objs, entry->src_pod_id);
-    send_or_defer_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id, POOL_HOST_TX_BODY);
+    send_or_defer_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id, ack_pool);
 
     DOCA_LOG_DBG("REV_NOTIFY: sent DMA_COMPLETION to pod %d (req_id=%u pos=%u len=%u)",
                  target_id, entry->req_id, entry->buf_offset, entry->length);

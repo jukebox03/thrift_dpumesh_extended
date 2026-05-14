@@ -6,6 +6,7 @@
  *
  * Phase 1: TX path only. RX functions are stubs.
  */
+#define _GNU_SOURCE
 
 #include "dpumesh.h"
 
@@ -14,6 +15,13 @@
 #include <string.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <errno.h>
+#include <unistd.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <limits.h>
+#include <sched.h>
 
 #include <doca_log.h>
 #include <doca_mmap.h>
@@ -32,6 +40,7 @@
 #include "doca/comch_msgq.h"
 #include "doca/dma.h"
 #include "doca/dpa_common.h"
+#include "doca/mesh.h"
 
 DOCA_LOG_REGISTER(DPUMESH_DOCA);
 
@@ -46,6 +55,16 @@ static void cleanup_ctx(struct dpumesh_ctx *ctx);
 int      dpumesh_hdr_tx_alloc(dpumesh_ctx_t *ctx);
 uint8_t *dpumesh_hdr_tx_buf(dpumesh_ctx_t *ctx, int slot);
 void     dpumesh_hdr_tx_free(dpumesh_ctx_t *ctx, int slot);
+
+/* Phase 3 internal forward declarations — needed because rx_data_hook,
+ * dpumesh_init, and cleanup_ctx are all earlier in the file than the
+ * mesh-side definitions. */
+static void process_hdr_batch(struct dpumesh_ctx *ctx, uint32_t pos, uint32_t dma_len, int32_t src_pod_id);
+static void process_chunk(struct dpumesh_ctx *ctx, uint32_t pos, uint32_t dma_len);
+static void *flush_timer_fn(void *arg);
+static void *sweep_fn(void *arg);
+/* Phase 4: 1-credit-per-chunk return helper, defined below near dpumesh_rx_free. */
+static inline void rx_dma_credit_return(struct dpumesh_ctx *ctx);
 
 /* ====================================================================
  * dpumesh_ctx — internal state
@@ -65,20 +84,193 @@ void     dpumesh_hdr_tx_free(dpumesh_ctx_t *ctx, int slot);
  * 65536 entries × ~200B = ~13 MB. */
 #define MAX_PENDING 65536
 
+/* === Lightweight wake primitives (futex direct, skip-wake-when-no-waiter) === */
+
+/* Spin disabled. Bench workers share their core with the PE thread; any
+ * spin burns CPU on the same scheduler entity, blocking the very wake
+ * we're spinning to catch. Always go straight to futex_wait. */
+#define PENDING_SPIN_ITER  0
+
+static inline void cpu_pause(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ volatile("yield" ::: "memory");
+#endif
+}
+
+/* Absolute-time FUTEX_WAIT (CLOCK_REALTIME via BITSET flag). Returns 0 on
+ * wake, -1 with errno on error (ETIMEDOUT, EAGAIN, EINTR). */
+static inline int futex_wait_abs(_Atomic int *uaddr, int val,
+                                 const struct timespec *abs_deadline) {
+    return (int)syscall(SYS_futex, (void *)uaddr,
+                        FUTEX_WAIT_BITSET_PRIVATE | FUTEX_CLOCK_REALTIME,
+                        val, abs_deadline, NULL, FUTEX_BITSET_MATCH_ANY);
+}
+
+static inline int futex_wake_one(_Atomic int *uaddr) {
+    return (int)syscall(SYS_futex, (void *)uaddr,
+                        FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+}
+
+static inline int futex_wake_all(_Atomic int *uaddr) {
+    return (int)syscall(SYS_futex, (void *)uaddr,
+                        FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+
+/* Pending wait primitive: atomic state acting as a futex word.
+ *
+ * State machine: -1 = unused, 0 = waiting, 1 = arrived, -2 = timed out
+ *
+ * Why no pthread_cond_t: pthread_cond_signal in the PE thread's
+ * deliver_one_body() became the dominant cost — per body delivered, kernel
+ * CFS wake_up_q + cgroup reweight ran. We replaced cond_wait/signal with:
+ *   - workers spin-poll `state` briefly (catches fast responses, no syscall)
+ *   - on miss they bump `waiters` and futex_wait on `state`
+ *   - PE deliver does atomic_store(state=1) and only futex_wake when
+ *     waiters > 0 (i.e., spinning workers don't trigger any wake)
+ *
+ * The mutex is kept for slot-lifecycle ops (tx_slot, hdr_tx_slot, desc)
+ * which are infrequent and need atomic compound updates. */
 typedef struct {
-    pthread_mutex_t lock;
-    pthread_cond_t cond;
+    pthread_mutex_t lock;          /* protects tx_slot / hdr_tx_slot / desc */
+    _Atomic int state;
+    _Atomic int waiters;
     sw_descriptor_t desc;
-    volatile int state;   /* -1=unused, -2=cancelled(tx deferred), 0=waiting, 1=arrived */
-    int tx_slot;          /* BODY TX buffer slot owned by this request, -1 if none.
-                           * Kept named `tx_slot` for legacy compat; semantically
-                           * this is the body pool slot (POOL_HOST_TX_BODY). */
-    /* Phase 1 (v2 plan): independent HDR TX pool. Same lifecycle rules as
-     * tx_slot but tracked separately so a single user RPC can simultaneously
-     * own a body slot and a hdr slot without clobbering. TX_ACK.pool_type
-     * tells the handler which one to free. */
-    int hdr_tx_slot;      /* HDR TX buffer slot, -1 if none */
+    int tx_slot;
+    int hdr_tx_slot;
+    struct mesh_req_id req_id_v2;
 } dpumesh_pending_t;
+
+/* Wake helpers — single point of truth for "if anyone is parked, prod them".
+ * Hot path (deliver_one_body) inlines the waiters check; these are for the
+ * mutex-protected cold paths (register / cancel / wait / TX_ACK cleanup). */
+static inline void pending_wake_all(dpumesh_pending_t *p) {
+    if (atomic_load_explicit(&p->waiters, memory_order_seq_cst) > 0) {
+        futex_wake_all(&p->state);
+    }
+}
+
+/* Atomic-state futex_wait-with-relock for cold-path waiters that hold
+ * p->lock. Drops the lock around the syscall, takes it back on return.
+ * Loops while state==wait_val; returns 0 when state changes, -1 on timeout
+ * (only if abs_deadline != NULL). */
+static int pending_wait_state(dpumesh_pending_t *p, int wait_val,
+                              const struct timespec *abs_deadline) {
+    while (atomic_load_explicit(&p->state, memory_order_acquire) == wait_val) {
+        atomic_fetch_add_explicit(&p->waiters, 1, memory_order_seq_cst);
+        if (atomic_load_explicit(&p->state, memory_order_acquire) != wait_val) {
+            atomic_fetch_sub_explicit(&p->waiters, 1, memory_order_relaxed);
+            return 0;
+        }
+        pthread_mutex_unlock(&p->lock);
+        int rc = futex_wait_abs(&p->state, wait_val, abs_deadline);
+        int err = errno;
+        pthread_mutex_lock(&p->lock);
+        atomic_fetch_sub_explicit(&p->waiters, 1, memory_order_relaxed);
+        if (rc == -1 && err == ETIMEDOUT) return -1;
+    }
+    return 0;
+}
+
+/* ====== Phase 3: builders + expected ring + parked chunks ====== */
+
+#define MAX_DST_PODS         16
+#define EXPECTED_RING_CAP    1024
+
+/* Per-dst builders are sharded into N independent (hdr, chunk) builder
+ * pairs to scale lock concurrency past the per-dst single-builder
+ * bottleneck. Workers hash to a shard via TLS-cached pthread_self().
+ *
+ * Cross-shard chunk arrival at dst can interleave with the matching hdr
+ * batch from a different shard. process_chunk match path calls
+ * drain_parked after consume so that whenever the expected-ring head
+ * advances, any matching parked chunk is consumed. With this fix,
+ * sharding is correctness-safe under arbitrary interleaving. */
+#define MESH_BUILDER_SHARDS  8
+
+/* Unified builder: holds both an hdr batch and a chunk under a single lock.
+ * Reason: separate hdr/chunk locks let one worker's hdr_append precede its
+ * chunk_append while another worker's full (hdr+chunk) send slips in between
+ * — the resulting hdr-order vs chunk-order mismatch desync's the receiver's
+ * expected-ring match check. A single lock makes "this send's hdr THEN this
+ * send's chunk" atomic, so the per-batch ordering invariant always holds. */
+typedef struct {
+    pthread_mutex_t    lock;
+
+    /* shared (set on first append, cleared at flush) */
+    int32_t            dst_pod_id;
+    struct mesh_req_id owner_req_id;
+    uint64_t           first_us;
+    uint8_t            builder_flags;
+
+    /* hdr batch state — flush goes through hdr_dma_ring */
+    int                hdr_tx_slot;
+    uint32_t           hdr_cursor;     /* bytes written into hdr_tx slot */
+    uint32_t           hdr_num;
+
+    /* chunk state — flush goes through dma_ring */
+    int                chunk_tx_slot;
+    uint32_t           chunk_cursor;   /* bytes incl. 12B chunk_header */
+    uint32_t           chunk_num;
+    uint32_t           chunk_first_seq;
+} mesh_builder_t;
+
+/* expected_ring[src_id]: per-src queue of (req_id, body_size, ...) seen
+ * via hdr_fwd arrivals. dst's chunk parser pops from head when consuming.
+ * Fixed-cap ring, no alloc on enqueue. */
+typedef struct {
+    struct mesh_req_id req_id;
+    uint32_t           size;
+    int32_t            src_pod_id;
+    uint64_t           trace_id;
+    uint64_t           span_id;
+    uint8_t            flags;
+    uint64_t           arrived_us;
+} expected_entry_t;
+
+typedef struct {
+    expected_entry_t buf[EXPECTED_RING_CAP];
+    uint32_t         head;
+    uint32_t         tail;
+    uint32_t         count;
+} expected_ring_t;
+
+/* parked_chunks[src_id]: chunks that arrived before their hdr_fwd. Each
+ * node points at the rx_dma_buffer slot still holding the bytes (zero-copy).
+ * drain_parked() wakes when matching hdr arrives; sweep() reclaims stuck
+ * entries after 1s. */
+typedef struct parked_chunk_node {
+    uint32_t                  rx_slot;     /* slot index in ctx->rx_dma_buffer (pos / slot_size) */
+    uint32_t                  total_size;  /* DMA payload */
+    uint32_t                  first_seq;
+    uint32_t                  num_bodies;
+    int32_t                   src_pod_id;
+    uint64_t                  arrived_us;
+    struct parked_chunk_node *next;
+} parked_chunk_node_t;
+
+typedef struct {
+    parked_chunk_node_t *head;
+    parked_chunk_node_t *tail;
+    uint32_t             count;
+} parked_list_t;
+
+/* Phase 4: peer registration table. Host does NOT import the peer's mmap
+ * (DOCA driver rejects host→host PCIe peer access). Instead the host only
+ * tracks whether a given dst_pod_id has been published, and stamps
+ * CASE_DIRECT on chunk descriptors when present. The actual host→host DMA
+ * is orchestrated by the DPA forward kernel on the DPU device, which has
+ * a separately-resolved peer table (DPU-device DPA handles for every
+ * registered pod's host_rx_buffer). */
+typedef struct {
+    int32_t  pod_id;          /* -1 = empty */
+    uint32_t src_id;
+    uint64_t write_cursor;    /* monotonic cursor inside peer's rx_buffer (host bookkeeping) */
+    uint64_t rx_buf_size;
+} peer_info_t;
+
+#define MAX_PEERS_TABLE 16
 
 struct dpumesh_ctx {
     char app_name[64];
@@ -90,9 +282,18 @@ struct dpumesh_ctx {
     /* DOCA objects */
     struct objects doca_objs;
     void *dma_buffer;          /* Host TX buffer (PCI mmap, CPU→DPU source) */
-    struct dma_ring *dma_ring;
-    pthread_mutex_t ring_lock;  /* Serializes get_next_dma_desc + descriptor fill + valid=1 */
+    struct dma_ring *dma_ring; /* Body forward DMA descriptor ring */
+    pthread_mutex_t ring_lock; /* Serializes body dma_ring ops */
     doca_dpa_dev_mmap_t dpa_mmap_handle;  /* DPA handle for local mmap (used in TX descriptors) */
+
+    /* Phase 4: independent forward DMA ring for hdr batches. Decouples
+     * hdr/body forward-ring slot pressure entirely — neither's backoff
+     * stalls the other. Separate ring_lock so concurrent hdr+body
+     * enqueues from chunk_flush (which forces hdr_flush first) don't
+     * serialize. */
+    struct dma_ring *hdr_dma_ring;
+    struct doca_mmap *hdr_ring_mmap_local;  /* host's local mmap for hdr_dma_ring */
+    pthread_mutex_t hdr_ring_lock;
 
     /* Host RX buffer (PCI mmap, DPU→CPU destination) */
     void *rx_dma_buffer;
@@ -114,6 +315,7 @@ struct dpumesh_ctx {
 
     /* TX slot management (body pool) */
     uint8_t *slot_bitmap;
+    int      slot_hint;          /* round-robin probe start for tx_alloc */
     pthread_mutex_t slot_lock;
     pthread_cond_t  slot_cond;  /* Signaled when a TX slot is freed */
 
@@ -127,6 +329,7 @@ struct dpumesh_ctx {
     struct doca_mmap     *hdr_tx_mmap;
     doca_dpa_dev_mmap_t   hdr_tx_dpa_handle;
     uint8_t              *hdr_tx_bitmap;
+    int                   hdr_slot_hint; /* round-robin probe start for hdr_tx_alloc */
     pthread_mutex_t       hdr_slot_lock;
     pthread_cond_t        hdr_slot_cond;
     int                   hdr_num_slots;
@@ -136,6 +339,11 @@ struct dpumesh_ctx {
     void *rx_buffer;
     uint8_t *rx_slot_bitmap;
     pthread_mutex_t rx_slot_lock;
+    /* Round-robin hint so rx_slot_alloc doesn't rescan from 0 every call.
+     * With 4096 slots and 150k allocs/sec, the linear-from-0 scan burned
+     * 300M comparisons/sec inside the lock. Hint walks forward and wraps;
+     * common case is 1 probe per alloc when load is below saturation. */
+    int      rx_slot_hint;
 
     /* RX descriptor queue (circular buffer) */
     sw_descriptor_t rx_queue[RX_QUEUE_SIZE];
@@ -156,6 +364,34 @@ struct dpumesh_ctx {
     /* Client-side pending response table */
     dpumesh_pending_t pending[MAX_PENDING];
     atomic_uint_fast32_t next_req_id;
+
+    /* ====== Phase 3: header/body split state ====== */
+    uint32_t              src_id;          /* this pod's stable src id (= pod_id) */
+    atomic_uint_fast32_t  next_seq;        /* mesh_req_id.seq counter */
+    mesh_builder_t        builders[MAX_DST_PODS][MESH_BUILDER_SHARDS];
+    expected_ring_t       expected[MAX_DST_PODS];     /* indexed by src_id; sparse OK */
+    parked_list_t         parked[MAX_DST_PODS];
+    pthread_mutex_t       expected_locks[MAX_DST_PODS];
+    pthread_t             flush_tid;       /* periodic builder timeout flush */
+    pthread_t             sweep_tid;       /* 1s parked/orphan sweep */
+    volatile int          mesh_running;
+
+    /* Phase 4: peer table indexed by pod_id (sparse). Populated on
+     * DMESH_MSG_PEER_TOPOLOGY arrival. chunk_flush consults this; if a
+     * peer entry is present, it issues a CASE_DIRECT host→host DMA via
+     * the peer's rx mmap instead of going through DPU staging. */
+    peer_info_t           peers[MAX_PEERS_TABLE];
+    pthread_rwlock_t      peer_lock;
+
+    /* Phase 4 diag counters — printed every 1s by sweep_fn (delta). */
+    atomic_uint_fast64_t  stat_send_req;
+    atomic_uint_fast64_t  stat_wait_timeout;
+    atomic_uint_fast64_t  stat_chunk_direct;
+    atomic_uint_fast64_t  stat_chunk_staging;
+    atomic_uint_fast64_t  stat_process_chunk;
+    atomic_uint_fast64_t  stat_process_hdr;
+    atomic_uint_fast64_t  stat_rx_free;
+    atomic_uint_fast64_t  stat_park;
 };
 
 /* ====================================================================
@@ -165,6 +401,7 @@ struct dpumesh_ctx {
 static void *pe_progress_fn(void *arg) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)arg;
     struct timespec ts = {0, 1000}; /* 1 µs */
+    (void)ts;
 
     while (ctx->pe_running) {
         int progressed = 0;
@@ -174,6 +411,7 @@ static void *pe_progress_fn(void *arg) {
 
         if (ctx->doca_objs.consumer_pe)
             progressed += doca_pe_progress(ctx->doca_objs.consumer_pe);
+        (void)progressed;
     }
     return NULL;
 }
@@ -184,9 +422,14 @@ static void *pe_progress_fn(void *arg) {
 
 static int rx_slot_alloc(dpumesh_ctx_t *ctx) {
     pthread_mutex_lock(&ctx->rx_slot_lock);
-    for (int i = 0; i < ctx->num_slots; i++) {
+    int n = ctx->num_slots;
+    int start = ctx->rx_slot_hint;
+    for (int k = 0; k < n; k++) {
+        int i = start + k;
+        if (i >= n) i -= n;
         if (ctx->rx_slot_bitmap[i] == 0) {
             ctx->rx_slot_bitmap[i] = 1;
+            ctx->rx_slot_hint = (i + 1 == n) ? 0 : i + 1;
             pthread_mutex_unlock(&ctx->rx_slot_lock);
             return i;
         }
@@ -205,34 +448,43 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
     if (desc->flags & OP_RESPONSE) {
         uint32_t idx = desc->req_id % MAX_PENDING;
         dpumesh_pending_t *p = &ctx->pending[idx];
-        pthread_mutex_lock(&p->lock);
-        if (p->state == 0) {
+
+        int s = atomic_load_explicit(&p->state, memory_order_acquire);
+        if (s == 0) {
             p->desc = *desc;
-            p->state = 1;
-            pthread_cond_signal(&p->cond);
-        } else if (p->state == -2) {
-            /* Cancelled request — DPA finished, now safe to free both pools + RX */
-            if (p->tx_slot >= 0) {
-                dpumesh_tx_free(ctx, p->tx_slot);
-                p->tx_slot = -1;
+            int expected = 0;
+            if (atomic_compare_exchange_strong_explicit(
+                    &p->state, &expected, 1,
+                    memory_order_release, memory_order_acquire)) {
+                if (atomic_load_explicit(&p->waiters, memory_order_seq_cst) > 0) {
+                    futex_wake_one(&p->state);
+                }
+                return;
             }
-            if (p->hdr_tx_slot >= 0) {
-                dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
-                p->hdr_tx_slot = -1;
-            }
-            pthread_mutex_lock(&ctx->rx_slot_lock);
-            ctx->rx_slot_bitmap[slot] = 0;
-            pthread_mutex_unlock(&ctx->rx_slot_lock);
-            p->state = -1;
-            pthread_cond_broadcast(&p->cond);
-        } else {
-            DOCA_LOG_ERR("RX deliver: OP_RESPONSE for req_id=%u but no waiter (state=%d)",
-                         desc->req_id, p->state);
-            pthread_mutex_lock(&ctx->rx_slot_lock);
-            ctx->rx_slot_bitmap[slot] = 0;
-            pthread_mutex_unlock(&ctx->rx_slot_lock);
+            s = expected;
         }
-        pthread_mutex_unlock(&p->lock);
+        if (s == -2) {
+            pthread_mutex_lock(&p->lock);
+            if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+            if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
+            pthread_mutex_unlock(&p->lock);
+            pthread_mutex_lock(&ctx->rx_slot_lock);
+            ctx->rx_slot_bitmap[slot] = 0;
+            pthread_mutex_unlock(&ctx->rx_slot_lock);
+            int expected = -2;
+            if (atomic_compare_exchange_strong(&p->state, &expected, -1)) {
+                if (atomic_load_explicit(&p->waiters, memory_order_seq_cst) > 0) {
+                    futex_wake_all(&p->state);
+                }
+            }
+            return;
+        }
+        /* state is -1 (no waiter) or 1 (duplicate) — drop the slot. */
+        DOCA_LOG_ERR("RX deliver: OP_RESPONSE for req_id=%u but no waiter (state=%d)",
+                     desc->req_id, s);
+        pthread_mutex_lock(&ctx->rx_slot_lock);
+        ctx->rx_slot_bitmap[slot] = 0;
+        pthread_mutex_unlock(&ctx->rx_slot_lock);
     } else {
         pthread_mutex_lock(&ctx->rx_lock);
 
@@ -273,6 +525,12 @@ static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_l
                      pos, dma_len, ctx->rx_dma_buf_size);
         return -1;
     }
+    /* Phase 4 fix: legacy 1 RPC = 1 rx_dma slot. Now that dpumesh_rx_free
+     * no longer bumps credit (it only clears the staging bitmap), we
+     * return the rx_dma credit explicitly here at deliver time. The data
+     * has been copied to the staging slot so DPA may reuse this rx_dma
+     * slot immediately. */
+    rx_dma_credit_return(ctx);
     uint8_t *body = (uint8_t *)ctx->rx_dma_buffer + pos;
     uint32_t body_len = dma_len;
 
@@ -321,24 +579,31 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
          * (POOL_NONE) which we map to BODY for compat. */
         int is_hdr = (ack.pool_type == POOL_HOST_TX_HDR);
         pthread_mutex_lock(&p->lock);
-        if (p->state == 0 || p->state == -2) {
-            if (is_hdr) {
-                if (p->hdr_tx_slot >= 0) {
-                    dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
-                    p->hdr_tx_slot = -1;
-                }
-            } else {
-                if (p->tx_slot >= 0) {
-                    dpumesh_tx_free(ctx, p->tx_slot);
-                    p->tx_slot = -1;
-                }
+        /* TX_ACK is unambiguous evidence the DPU is finished reading this
+         * slot — free unconditionally. The split-path responder
+         * (dpumesh_send_response) doesn't register a waiter, so its pending
+         * entries sit at state=-1; gating the free on state ∈ {0,-2} as
+         * before would leak every responder slot and exhaust the hdr_tx
+         * pool (1024 slots) in ~5s at 10k RPS. State transitions still
+         * only apply to 0/-2 since those are the request-side lifecycles. */
+        if (is_hdr) {
+            if (p->hdr_tx_slot >= 0) {
+                dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
+                p->hdr_tx_slot = -1;
             }
-            /* state=-2 transitions to -1 only when BOTH slots are free —
-             * a single user RPC may have owned both pools, so a partial
-             * ACK leaves the entry deferred. */
-            if (p->state == -2 && p->tx_slot < 0 && p->hdr_tx_slot < 0) {
-                p->state = -1;
-                pthread_cond_broadcast(&p->cond);
+        } else {
+            if (p->tx_slot >= 0) {
+                dpumesh_tx_free(ctx, p->tx_slot);
+                p->tx_slot = -1;
+            }
+        }
+        int s = atomic_load(&p->state);
+        if (s == -2 && p->tx_slot < 0 && p->hdr_tx_slot < 0) {
+            int expected = -2;
+            if (atomic_compare_exchange_strong(&p->state, &expected, -1)) {
+                if (atomic_load_explicit(&p->waiters, memory_order_seq_cst) > 0) {
+                    futex_wake_all(&p->state);
+                }
             }
         }
         pthread_mutex_unlock(&p->lock);
@@ -370,15 +635,53 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
             return;
         }
 
-        /* Process the entry. End-node slot-based admission keeps in-flight
-         * bytes ≤ buf_size, so DPU never laps. We trust DMA_COMPLETION
-         * delivery (no gap-recovery scan). */
+        /* Phase 3: branch on OP_HDR_BATCH / OP_CHUNK first, then legacy. */
+        if (comp.flags & OP_HDR_BATCH) {
+            process_hdr_batch(ctx, pos, dma_len, comp.src_pod_id);
+            return;
+        }
+        if (comp.flags & OP_CHUNK) {
+            process_chunk(ctx, pos, dma_len);
+            return;
+        }
+
+        /* Legacy path: 1 RPC = 1 body, treat the full DMA as a single body. */
         if (process_rx_dma_entry(ctx, pos, dma_len,
                                  comp.req_id, comp.src_pod_id,
                                  comp.dst_pod_id, comp.flags) != 0) {
             DOCA_LOG_WARN("DMA_COMPLETION: process_rx_dma_entry failed at pos=%u len=%u",
                           pos, dma_len);
         }
+        return;
+    }
+
+    if (comch_msg->type == DMESH_MSG_PEER_TOPOLOGY) {
+        /* Phase 4 redesign: do NOT attempt to import peer's mmap on host —
+         * DOCA driver rejects host→host peer access (DOCA_ERROR_DRIVER).
+         * Just record that the peer is registered. The actual host→host
+         * DMA is performed by the DPA on the DPU device, which has the
+         * peer's DPA handle in its ring info (pushed separately via
+         * ADD_PEER). Host only needs the pod_id to flip CASE_DIRECT. */
+        const struct dmesh_peer_topology_msg *m =
+            (const struct dmesh_peer_topology_msg *)data;
+        if (len < sizeof(*m)) {
+            DOCA_LOG_ERR("PEER_TOPOLOGY truncated: len=%u", len);
+            return;
+        }
+        if (m->pod_id < 0 || m->pod_id >= MAX_PEERS_TABLE) {
+            DOCA_LOG_ERR("PEER_TOPOLOGY: pod_id=%d out of range", m->pod_id);
+            return;
+        }
+        pthread_rwlock_wrlock(&ctx->peer_lock);
+        peer_info_t *p = &ctx->peers[m->pod_id];
+        p->pod_id = m->pod_id;
+        p->src_id = m->src_id;
+        p->rx_buf_size = m->rx_buf_size;
+        p->write_cursor = 0;
+        pthread_rwlock_unlock(&ctx->peer_lock);
+
+        DOCA_LOG_INFO("PEER_TOPOLOGY: registered peer pod_id=%d src_id=%u rx_size=%lu",
+                      m->pod_id, m->src_id, (unsigned long)m->rx_buf_size);
         return;
     }
 
@@ -499,6 +802,14 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
     if (result != DOCA_SUCCESS) return result;
     ctx->dma_ring = ctx->doca_objs.dma_ring;
 
+    /* Phase 4: independent forward DMA ring for hdr batches. */
+    result = setup_hdr_dma_ring(&ctx->doca_objs, DMA_RING_SIZE,
+                                &ctx->hdr_dma_ring, &ctx->hdr_ring_mmap_local);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to allocate HDR DMA ring: %s", doca_err_str(result));
+        return result;
+    }
+
     size_t buf_size = (size_t)ctx->num_slots * ctx->slot_size;
     result = alloc_buffer_and_set_mmap(&ctx->doca_objs.local_mmap,
                                        ctx->doca_objs.dev,
@@ -604,6 +915,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     pthread_mutex_init(&ctx->slot_lock, NULL);
     pthread_cond_init(&ctx->slot_cond, NULL);
     pthread_mutex_init(&ctx->ring_lock, NULL);
+    pthread_mutex_init(&ctx->hdr_ring_lock, NULL);
 
     /* Phase 1: HDR TX bitmap + slot lock (independent from body pool). */
     ctx->hdr_tx_bitmap = (uint8_t *)calloc(ctx->hdr_num_slots, 1);
@@ -636,14 +948,41 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     atomic_init(&ctx->next_req_id, 1);
     for (int i = 0; i < MAX_PENDING; i++) {
         pthread_mutex_init(&ctx->pending[i].lock, NULL);
-        pthread_cond_init(&ctx->pending[i].cond, NULL);
-        ctx->pending[i].state = -1;
+        atomic_init(&ctx->pending[i].state, -1);
+        atomic_init(&ctx->pending[i].waiters, 0);
         ctx->pending[i].tx_slot = -1;
         ctx->pending[i].hdr_tx_slot = -1;
     }
 
     ctx->doca_objs.rx_data_hook = rx_data_hook;
     ctx->doca_objs.rx_hook_ctx = ctx;
+
+    /* === Phase 3: mesh state init === */
+    ctx->src_id = (uint32_t)ctx->pod_id;
+    atomic_init(&ctx->next_seq, 1);
+    for (int i = 0; i < MAX_DST_PODS; i++) {
+        for (int s = 0; s < MESH_BUILDER_SHARDS; s++) {
+            mesh_builder_t *b = &ctx->builders[i][s];
+            pthread_mutex_init(&b->lock, NULL);
+            b->dst_pod_id     = -1;
+            b->hdr_tx_slot    = -1;
+            b->chunk_tx_slot  = -1;
+        }
+        ctx->expected[i].head = ctx->expected[i].tail = ctx->expected[i].count = 0;
+        ctx->parked[i].head = ctx->parked[i].tail = NULL;
+        ctx->parked[i].count = 0;
+        pthread_mutex_init(&ctx->expected_locks[i], NULL);
+    }
+    /* Phase 4: peer table init. pod_id = -1 marks empty slot. */
+    for (int i = 0; i < MAX_PEERS_TABLE; i++) {
+        ctx->peers[i].pod_id = -1;
+        ctx->peers[i].write_cursor = 0;
+    }
+    pthread_rwlock_init(&ctx->peer_lock, NULL);
+
+    ctx->mesh_running = 1;
+    if (pthread_create(&ctx->flush_tid, NULL, flush_timer_fn, ctx) != 0) goto fail;
+    if (pthread_create(&ctx->sweep_tid, NULL, sweep_fn, ctx) != 0) goto fail;
 
     ctx->pe_running = 1;
     if (pthread_create(&ctx->pe_tid, NULL, pe_progress_fn, ctx) != 0) goto fail;
@@ -666,6 +1005,36 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
         pthread_join(ctx->pe_tid, NULL);
     }
 
+    /* === Phase 3: stop mesh threads + release any in-flight builders === */
+    if (ctx->mesh_running) {
+        ctx->mesh_running = 0;
+        pthread_join(ctx->flush_tid, NULL);
+        pthread_join(ctx->sweep_tid, NULL);
+    }
+    for (int i = 0; i < MAX_DST_PODS; i++) {
+        for (int s = 0; s < MESH_BUILDER_SHARDS; s++) {
+            mesh_builder_t *b = &ctx->builders[i][s];
+            if (b->hdr_tx_slot >= 0) {
+                dpumesh_hdr_tx_free(ctx, b->hdr_tx_slot);
+                b->hdr_tx_slot = -1;
+            }
+            if (b->chunk_tx_slot >= 0) {
+                dpumesh_tx_free(ctx, b->chunk_tx_slot);
+                b->chunk_tx_slot = -1;
+            }
+            pthread_mutex_destroy(&b->lock);
+        }
+        /* free any parked chunks */
+        parked_chunk_node_t *n = ctx->parked[i].head;
+        while (n) { parked_chunk_node_t *next = n->next; free(n); n = next; }
+        ctx->parked[i].head = ctx->parked[i].tail = NULL;
+        pthread_mutex_destroy(&ctx->expected_locks[i]);
+    }
+
+    /* Phase 4 redesign: peer table holds no host-side mmap imports, just
+     * registration bookkeeping — nothing to destroy beyond the lock. */
+    pthread_rwlock_destroy(&ctx->peer_lock);
+
     /* Free resources BEFORE destroying locks they depend on.
      * Pending cleanup calls dpumesh_tx_free/rx_free which acquire
      * slot_lock/rx_slot_lock. */
@@ -673,7 +1042,7 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
     for (int i = 0; i < MAX_PENDING; i++) {
         dpumesh_pending_t *p = &ctx->pending[i];
         pthread_mutex_lock(&p->lock);
-        if (p->state == 1 && p->desc.body_buf_slot >= 0) {
+        if (atomic_load(&p->state) == 1 && p->desc.body_buf_slot >= 0) {
             dpumesh_rx_free(ctx, p->desc.body_buf_slot);
         }
         if (p->tx_slot >= 0) {
@@ -684,10 +1053,9 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
             dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
             p->hdr_tx_slot = -1;
         }
-        p->state = -1;
+        atomic_store(&p->state, -1);
         pthread_mutex_unlock(&p->lock);
         pthread_mutex_destroy(&p->lock);
-        pthread_cond_destroy(&p->cond);
     }
 
     /* Destroy DMA landing-zone mmap + buffer (Host RX DMA buffer).
@@ -725,6 +1093,7 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
     cleanup_objects(&ctx->doca_objs);
 
     pthread_mutex_destroy(&ctx->ring_lock);
+    pthread_mutex_destroy(&ctx->hdr_ring_lock);
     pthread_cond_destroy(&ctx->slot_cond);
     pthread_mutex_destroy(&ctx->slot_lock);
     if (ctx->slot_bitmap) free(ctx->slot_bitmap);
@@ -768,9 +1137,14 @@ int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
      * signal was missed (rare race). */
     pthread_mutex_lock(&ctx->slot_lock);
     for (;;) {
-        for (int i = 0; i < ctx->num_slots; i++) {
+        int n = ctx->num_slots;
+        int start = ctx->slot_hint;
+        for (int k = 0; k < n; k++) {
+            int i = start + k;
+            if (i >= n) i -= n;
             if (ctx->slot_bitmap[i] == 0) {
                 ctx->slot_bitmap[i] = 1;
+                ctx->slot_hint = (i + 1 == n) ? 0 : i + 1;
                 pthread_mutex_unlock(&ctx->slot_lock);
                 return i;
             }
@@ -809,9 +1183,14 @@ void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
 int dpumesh_hdr_tx_alloc(dpumesh_ctx_t *ctx) {
     pthread_mutex_lock(&ctx->hdr_slot_lock);
     for (;;) {
-        for (int i = 0; i < ctx->hdr_num_slots; i++) {
+        int n = ctx->hdr_num_slots;
+        int start = ctx->hdr_slot_hint;
+        for (int k = 0; k < n; k++) {
+            int i = start + k;
+            if (i >= n) i -= n;
             if (ctx->hdr_tx_bitmap[i] == 0) {
                 ctx->hdr_tx_bitmap[i] = 1;
+                ctx->hdr_slot_hint = (i + 1 == n) ? 0 : i + 1;
                 pthread_mutex_unlock(&ctx->hdr_slot_lock);
                 return i;
             }
@@ -841,7 +1220,17 @@ void dpumesh_hdr_tx_free(dpumesh_ctx_t *ctx, int slot) {
     pthread_mutex_unlock(&ctx->hdr_slot_lock);
 }
 
-int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
+/* Internal enqueue that lets the caller stamp dst override fields onto the
+ * dma_desc. dpumesh_enqueue (public) forwards with zeros — Phase 4's
+ * chunk_flush direct path calls this directly with peer's mmap handle.
+ *
+ * Phase 4: hdr (OP_HDR_BATCH) uses hdr_dma_ring + hdr_ring_lock; body
+ * (everything else, including CASE_DIRECT chunk) uses dma_ring + ring_lock.
+ * Two rings are fully independent — no slot/credit/backoff coupling. */
+static int dpumesh_enqueue_ex(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc,
+                              doca_dpa_dev_mmap_t dst_mmap_override,
+                              uint64_t dst_addr_override,
+                              uint32_t dst_pos_override) {
     struct dma_desc *dma;
     uint32_t ring_slot;
 
@@ -849,6 +1238,10 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
         DOCA_LOG_ERR("ENQUEUE rejected: desc is NULL");
         return -1;
     }
+
+    int is_hdr_ring = (desc->flags & OP_HDR_BATCH) != 0;
+    struct dma_ring *ring = is_hdr_ring ? ctx->hdr_dma_ring : ctx->dma_ring;
+    pthread_mutex_t *rlock = is_hdr_ring ? &ctx->hdr_ring_lock : &ctx->ring_lock;
 
     /* Phase 1: pool dispatch. desc->src_body_pool_type tells us which TX
      * pool holds the bytes; defaults to body for legacy callers. The
@@ -870,32 +1263,24 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     }
 
     /* Lock ring access: serializes get_next_dma_desc + descriptor fill + valid=1.
-     *
-     * Flow control: end-to-end via slot-based admission only. dpumesh_tx_alloc
-     * has already gated this call on slot_bitmap availability, and num_slots ×
-     * slot_size = DPU_BUFFER_SIZE, so total in-flight bytes inside DPU's
-     * buffer can never exceed buffer size. DPU/DPA do no FC of their own. */
-    pthread_mutex_lock(&ctx->ring_lock);
+     * Phase 4: separate ring per hdr/body so backoff doesn't cross paths. */
+    pthread_mutex_lock(rlock);
 
-    /* Block with exponential backoff until a DMA ring slot frees. DPA
-     * advances the ring tail as it consumes descriptors. backoff capped at
-     * 50µs (was 1ms — at 44K RPS, 1ms = 44 requests-worth of latency
-     * stalled in this loop while DPA is actively draining the ring). */
     {
         struct timespec backoff = {0, 1000}; /* 1µs initial */
         while (1) {
-            dma = get_next_dma_desc(ctx->dma_ring);
+            dma = get_next_dma_desc(ring);
             if (dma)
                 break;
-            pthread_mutex_unlock(&ctx->ring_lock);
+            pthread_mutex_unlock(rlock);
             nanosleep(&backoff, NULL);
             if (backoff.tv_nsec < 50000) /* cap at 50µs */
                 backoff.tv_nsec *= 2;
-            pthread_mutex_lock(&ctx->ring_lock);
+            pthread_mutex_lock(rlock);
         }
     }
 
-    ring_slot = (uint32_t)(dma - ctx->dma_ring->descs);
+    ring_slot = (uint32_t)(dma - ring->descs);
 
     /* TX slot lifetime is owned by the pending mechanism for BOTH OP_REQUEST
      * (gateway) and OP_RESPONSE (server transport):
@@ -904,20 +1289,18 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
      *   - OP_RESPONSE: caller registers + attach_tx + release_async; TX_ACK
      *     handler frees the TX slot via the deferred state -2 → -1 path. */
 
-    /* Phase 1: src override via desc->mmap. DPA's forward kernel picks
-     *   src_mmap = desc->mmap ? desc->mmap : ring->host_mmap
-     * and skips the default range check when desc->mmap != 0. Body path
-     * keeps desc->mmap = 0 to preserve the original behavior (DPA falls
-     * back to ring->host_mmap = body DPA handle) — pre-Phase-1 code
-     * always wrote ctx->dpa_mmap_handle here, but the DPA kernel never
-     * read it, so this is a no-op semantically. HDR path writes the
-     * dedicated hdr DPA handle. */
+    /* Phase 3: DPA-side handles are device-locality bound, so we never
+     * write host's hdr_tx_dpa_handle into desc.mmap (the DPU device
+     * resolves a different handle, propagated via ring->host_hdr_mmap).
+     * For HDR pool we leave desc.mmap = 0 and rely on the OP_HDR_BATCH
+     * flag bit + ring->host_hdr_mmap in the DPA forward kernel. desc.addr
+     * is the absolute VA inside hdr_tx_buffer — the DPA-side hdr mmap
+     * exports the same VA range. */
+    dma->mmap = 0;
     if (is_hdr_pool) {
-        dma->mmap = ctx->hdr_tx_dpa_handle;
         dma->addr = (uint64_t)ctx->hdr_tx_buffer +
                     ((size_t)desc->body_buf_slot * ctx->hdr_slot_size);
     } else {
-        dma->mmap = 0;
         dma->addr = (uint64_t)ctx->dma_buffer +
                     ((size_t)desc->body_buf_slot * ctx->slot_size);
     }
@@ -925,20 +1308,26 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     dma->idx  = desc->req_id;
     dma->dst_pod_id = desc->dst_pod_id;
     dma->flags = desc->flags;
-    /* Phase 2: forward path never uses dst override. Explicit 0 in case
-     * a previous occupant of this ring slot left stale bytes here. */
-    dma->dst_mmap = 0;
-    dma->dst_addr = 0;
+    /* Phase 4: dst override fields. dpumesh_enqueue (legacy) passes zeros;
+     * chunk_flush direct path passes peer's mmap + addr + pos. */
+    dma->dst_mmap = dst_mmap_override;
+    dma->dst_addr = dst_addr_override;
+    dma->dst_pos  = dst_pos_override;
 
     __sync_synchronize();
     dma->valid = 1;
 
-    DOCA_LOG_DBG("ENQUEUE: req_id=%u slot=%u len=%u",
-                 desc->req_id, ring_slot, desc->body_len);
+    DOCA_LOG_DBG("ENQUEUE: req_id=%u slot=%u len=%u ring=%s",
+                 desc->req_id, ring_slot, desc->body_len,
+                 is_hdr_ring ? "HDR" : "BODY");
 
-    pthread_mutex_unlock(&ctx->ring_lock);
+    pthread_mutex_unlock(rlock);
 
     return 0;
+}
+
+int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
+    return dpumesh_enqueue_ex(ctx, desc, 0, 0, 0);
 }
 
 /* ====================================================================
@@ -988,17 +1377,25 @@ uint8_t *dpumesh_rx_buf(dpumesh_ctx_t *ctx, int slot) {
     return (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
 }
 
+/* Phase 4 fix: staging-only free. The rx_buffer staging slot's lifecycle is
+ * per-body (deliver_one_body alloc → user free); decoupled from the
+ * rx_dma_buffer slot which is per-chunk. Credit return for rx_dma_buffer
+ * happens via rx_dma_credit_return() at chunk-release time only, so 1
+ * rx_dma slot maps to exactly 1 credit++, not 1+N. */
 void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot) {
     if (slot < 0 || slot >= ctx->num_slots) return;
-    /* Flow control ensures no overwrite of unconsumed data — no memset needed */
+    atomic_fetch_add(&ctx->stat_rx_free, 1);
     pthread_mutex_lock(&ctx->rx_slot_lock);
     ctx->rx_slot_bitmap[slot] = 0;
     pthread_mutex_unlock(&ctx->rx_slot_lock);
+}
 
-    /* DPA-poll credit return: bump the counter at the LAST (extra) slot of
-     * the dma_ring buffer. DPA polls this slot via the same buf_arr it
-     * already uses for forward dma_desc reads — no separate buf_arr, no
-     * extra PCIe read mechanism. ~10ns on host hot path. */
+/* Phase 4: 1 rx_dma_buffer slot released → credit ++ by 1. Called from
+ * (a) process_chunk match path (consume_chunk consumes 1 chunk),
+ * (b) drain_parked match path,
+ * (c) sweep_fn parked-timeout path,
+ * (d) legacy process_rx_dma_entry path (1 RPC = 1 chunk-equivalent). */
+static inline void rx_dma_credit_return(dpumesh_ctx_t *ctx) {
     if (ctx->dma_ring && ctx->dma_ring->descs) {
         volatile uint64_t *credit =
             (volatile uint64_t *)(ctx->dma_ring->descs + ctx->dma_ring->size);
@@ -1041,46 +1438,36 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
 
     pthread_mutex_lock(&p->lock);
 
-    /* If slot is occupied, wait briefly for previous request to complete */
-    if (p->state != -1) {
+    /* If slot is occupied, wait briefly for previous request to complete. */
+    if (atomic_load(&p->state) != -1) {
         struct timespec wait_ts;
         clock_gettime(CLOCK_REALTIME, &wait_ts);
         wait_ts.tv_sec += 2; /* 2-second collision wait budget */
 
-        while (p->state != -1) {
-            int rc = pthread_cond_timedwait(&p->cond, &p->lock, &wait_ts);
-            if (rc != 0) {
-                /* Stuck. If the previous request is in state -2 (timed out,
-                 * TX deferred), the DPU owes us a TX_ACK — if it has not
-                 * arrived after (wait_response timeout + 2s), the link is
-                 * effectively dead. Reclaim the slot to keep the pending
-                 * table from wedging the whole gateway; the late TX_ACK
-                 * (if ever) will find state=-1 and no-op. */
-                if (p->state == -2) {
-                    if (p->tx_slot >= 0) {
-                        dpumesh_tx_free(ctx, p->tx_slot);
-                        p->tx_slot = -1;
-                    }
-                    if (p->hdr_tx_slot >= 0) {
-                        dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
-                        p->hdr_tx_slot = -1;
-                    }
+        while (atomic_load(&p->state) != -1) {
+            int s = atomic_load(&p->state);
+            int rc = pending_wait_state(p, s, &wait_ts);
+            if (rc == -1) {
+                int s2 = atomic_load(&p->state);
+                if (s2 == -2) {
+                    if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+                    if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
                     DOCA_LOG_WARN("Pending slot %u reclaimed after -2 timeout (req_id=%u)",
                                   idx, req_id);
-                    break;  /* fall through to claim the slot */
+                    break;
                 }
                 pthread_mutex_unlock(&p->lock);
                 DOCA_LOG_ERR("Pending slot collision: req_id=%u idx=%u stuck state=%d",
-                             req_id, idx, p->state);
+                             req_id, idx, s2);
                 return -1;
             }
         }
     }
 
-    p->state = 0;
     p->tx_slot = -1;
     p->hdr_tx_slot = -1;
     memset(&p->desc, 0, sizeof(p->desc));
+    atomic_store_explicit(&p->state, 0, memory_order_release);
     pthread_mutex_unlock(&p->lock);
     return 0;
 }
@@ -1102,6 +1489,7 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
     pthread_mutex_lock(&p->lock);
 
     struct timespec ts;
+    int have_deadline = 0;
     if (timeout_ms > 0) {
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec  += timeout_ms / 1000;
@@ -1110,88 +1498,43 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
+        have_deadline = 1;
     }
 
-    while (p->state == 0) {
-        if (timeout_ms < 0) {
-            pthread_cond_wait(&p->cond, &p->lock);
-        } else if (timeout_ms == 0) {
+    while (atomic_load(&p->state) == 0) {
+        if (timeout_ms == 0) {
             pthread_mutex_unlock(&p->lock);
             return -1;
-        } else {
-            int rc = pthread_cond_timedwait(&p->cond, &p->lock, &ts);
-            if (rc != 0) {
-                /* Check if response arrived during timeout boundary */
-                if (p->state == 1)
-                    break; /* fall through to success path below */
-                /* Timeout: force-free the TX slot here.
-                 *
-                 * The previous design deferred the free to TX_ACK arrival
-                 * out of fear that DPA might still be reading the slot.
-                 * That fear is unfounded at the wait_response timeout
-                 * scale (RESPONSE_TIMEOUT_MS, default 30s) — DPA forward
-                 * DMA completes in microseconds. Deferring instead caused
-                 * a real problem: TX_ACK can be permanently lost when the
-                 * DPU's deferred-ack queue overflows under sustained
-                 * comch backpressure (see deferred_tx_acks DROP path in
-                 * dpu_worker.c). A lost TX_ACK leaked the slot until
-                 * either cancel_pending was invoked or req_id wrapped
-                 * MAX_PENDING (~65k requests later) — the slow drift
-                 * behind the intermittent test hangs. By 30s, regardless
-                 * of TX_ACK delivery, the DPA has long finished, so
-                 * reclaiming here is safe.
-                 *
-                 * State stays at -2 so a late RX of OP_RESPONSE still
-                 * cleans up the rx_slot path (rx_deliver_desc handles
-                 * state=-2). A late TX_ACK now finds tx_slot=-1 and
-                 * no-ops — non-load-bearing for slot lifetime. */
-                if (p->tx_slot >= 0) {
-                    dpumesh_tx_free(ctx, p->tx_slot);
-                    p->tx_slot = -1;
-                }
-                if (p->hdr_tx_slot >= 0) {
-                    dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
-                    p->hdr_tx_slot = -1;
-                }
-                p->state = -2;
-                pthread_cond_broadcast(&p->cond);
-                pthread_mutex_unlock(&p->lock);
-                return -1;
-            }
+        }
+        int rc = pending_wait_state(p, 0, have_deadline ? &ts : NULL);
+        if (rc == -1) {
+            if (atomic_load(&p->state) == 1) break; /* response arrived at boundary */
+            /* Timeout: force-free the TX slots; mark state=-2 (late TX_ACK
+             * will find tx_slot=-1 and no-op). */
+            if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+            if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
+            atomic_store(&p->state, -2);
+            pending_wake_all(p);
+            pthread_mutex_unlock(&p->lock);
+            return -1;
         }
     }
 
-    if (p->state == 1) {
+    if (atomic_load(&p->state) == 1) {
         *resp = p->desc;
-        /* Response arrived = DPA finished reading TX buffers. Free both
-         * pools now to return slots ASAP under high load. */
-        if (p->tx_slot >= 0) {
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
-        }
-        if (p->hdr_tx_slot >= 0) {
-            dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
-            p->hdr_tx_slot = -1;
-        }
-        p->state = -1;
-        pthread_cond_broadcast(&p->cond);
+        if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+        if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
+        atomic_store(&p->state, -1);
+        pending_wake_all(p);
         pthread_mutex_unlock(&p->lock);
         return 0;
     }
 
-    /* Unreachable in practice — state left the wait loop without being 1
-     * only via the timeout/-2 branch above. Clear both pool slots defensively. */
-    if (p->state != -2) {
-        if (p->tx_slot >= 0) {
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
-        }
-        if (p->hdr_tx_slot >= 0) {
-            dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
-            p->hdr_tx_slot = -1;
-        }
-        p->state = -1;
-        pthread_cond_broadcast(&p->cond);
+    if (atomic_load(&p->state) != -2) {
+        if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+        if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
+        atomic_store(&p->state, -1);
+        pending_wake_all(p);
     }
     pthread_mutex_unlock(&p->lock);
     return -1;
@@ -1202,53 +1545,24 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
     dpumesh_pending_t *p = &ctx->pending[idx];
 
     pthread_mutex_lock(&p->lock);
-    if (p->state == 1) {
-        /* Response arrived but was never consumed — free RX + TX (both pools) */
+    int s = atomic_load(&p->state);
+    if (s == 1) {
         if (p->desc.body_buf_slot >= 0) {
             pthread_mutex_lock(&ctx->rx_slot_lock);
             ctx->rx_slot_bitmap[p->desc.body_buf_slot] = 0;
             pthread_mutex_unlock(&ctx->rx_slot_lock);
         }
-        if (p->tx_slot >= 0) {
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
-        }
-        if (p->hdr_tx_slot >= 0) {
-            dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
-            p->hdr_tx_slot = -1;
-        }
-        p->state = -1;
-        pthread_cond_broadcast(&p->cond);
-    } else if (p->state == 0) {
-        /* In-flight, no timeout yet — caller gave up; free TX (both pools) now. */
-        if (p->tx_slot >= 0) {
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
-        }
-        if (p->hdr_tx_slot >= 0) {
-            dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
-            p->hdr_tx_slot = -1;
-        }
-        p->state = -1;
-        pthread_cond_broadcast(&p->cond);
-    } else if (p->state == -2) {
-        /* Timeout path: force-free both pools (see body-only comment above
-         * for the rationale on why 30s after enqueue is always safe). */
-        if (p->tx_slot >= 0) {
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
-        }
-        if (p->hdr_tx_slot >= 0) {
-            dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
-            p->hdr_tx_slot = -1;
-        }
-        p->state = -1;
-        pthread_cond_broadcast(&p->cond);
-        pthread_mutex_unlock(&p->lock);
-        return;
-    } else {
-        /* state == -1, already clean — nothing to do. */
+        if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+        if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
+        atomic_store(&p->state, -1);
+        pending_wake_all(p);
+    } else if (s == 0 || s == -2) {
+        if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+        if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
+        atomic_store(&p->state, -1);
+        pending_wake_all(p);
     }
+    /* else: state == -1, already clean. */
     pthread_mutex_unlock(&p->lock);
 }
 
@@ -1270,20 +1584,814 @@ void dpumesh_pending_release_async(dpumesh_ctx_t *ctx, uint32_t req_id) {
     dpumesh_pending_t *p = &ctx->pending[idx];
 
     pthread_mutex_lock(&p->lock);
-    if (p->state == 0) {
-        /* Phase 1: BOTH pool slots must be free before we can transition
-         * to -1 (a single user RPC may have owned both). If either is
-         * still attached, defer to TX_ACK via state=-2. */
+    if (atomic_load(&p->state) == 0) {
         if (p->tx_slot < 0 && p->hdr_tx_slot < 0) {
-            p->state = -1;
-            pthread_cond_broadcast(&p->cond);
+            atomic_store(&p->state, -1);
+            pending_wake_all(p);
         } else {
-            /* TX_ACK still pending on at least one pool — switch to deferred
-             * release. TX_ACK handler tracks both slots and flips to -1 when
-             * both are back. */
-            p->state = -2;
+            /* TX_ACK still pending on at least one pool — defer to -2. */
+            atomic_store(&p->state, -2);
         }
     }
-    /* state ∈ {-1, -2, 1}: someone else is finishing the entry — no-op. */
     pthread_mutex_unlock(&p->lock);
+}
+
+/* ====================================================================
+ * Phase 3: header/body split path
+ * ==================================================================== */
+
+uint32_t dpumesh_get_src_id(dpumesh_ctx_t *ctx) { return ctx->src_id; }
+
+int dpumesh_resolve(dpumesh_ctx_t *ctx, const char *service) {
+    (void)ctx;
+    /* Phase 3 static table. Phase 4+ swaps to a DPU-pushed snapshot. */
+    if (!service) return -1;
+    if (strcmp(service, "bench") == 0) return 10;
+    if (strcmp(service, "echo")  == 0) return 11;
+    return -1;
+}
+
+/* Get / register a pending entry for a 64-bit req_id. The slot index is
+ * seq % MAX_PENDING. Multiple srcs cannot collide because each src only
+ * registers its own (src_id, seq) pairs in its own ctx — incoming
+ * responses from other srcs are matched by full mesh_req_id. */
+static int register_pending_v2(dpumesh_ctx_t *ctx, struct mesh_req_id req_id) {
+    uint32_t idx = req_id.seq % MAX_PENDING;
+    dpumesh_pending_t *p = &ctx->pending[idx];
+
+    pthread_mutex_lock(&p->lock);
+    int s = atomic_load(&p->state);
+    if (s == -2) {
+        /* -2 means a prior RPC at this idx timed out. By the time we hit
+         * this idx again (>=2s later by seq advance), DPA is long done with
+         * the slots — reclaim immediately. */
+        if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+        if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
+        atomic_store(&p->state, -1);
+        s = -1;
+    }
+    if (s != -1) {
+        struct timespec wait_ts;
+        clock_gettime(CLOCK_REALTIME, &wait_ts);
+        wait_ts.tv_sec += 2;
+        while (atomic_load(&p->state) != -1) {
+            int wv = atomic_load(&p->state);
+            int rc = pending_wait_state(p, wv, &wait_ts);
+            if (rc == -1) {
+                if (atomic_load(&p->state) == -2) {
+                    if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+                    if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
+                    DOCA_LOG_WARN("Pending v2 slot %u reclaimed after -2 timeout (seq=%u)",
+                                  idx, req_id.seq);
+                    break;
+                }
+                pthread_mutex_unlock(&p->lock);
+                return -1;
+            }
+        }
+    }
+    /* req_id_v2 + slot fields must be visible BEFORE state=0 transitions
+     * happen, because PE (lock-free) does an acquire-load on state then
+     * uses req_id_v2 for the match check. Release-store on state
+     * synchronizes with PE's acquire-load. */
+    p->tx_slot = -1;
+    p->hdr_tx_slot = -1;
+    p->req_id_v2 = req_id;
+    memset(&p->desc, 0, sizeof(p->desc));
+    atomic_store_explicit(&p->state, 0, memory_order_release);
+    pthread_mutex_unlock(&p->lock);
+    return 0;
+}
+
+/* Attach an HDR or BODY tx_slot to a v2-keyed pending entry. */
+static void pending_attach_tx_v2(dpumesh_ctx_t *ctx, struct mesh_req_id req_id,
+                                 int slot, int is_hdr) {
+    uint32_t idx = req_id.seq % MAX_PENDING;
+    dpumesh_pending_t *p = &ctx->pending[idx];
+    pthread_mutex_lock(&p->lock);
+    if (is_hdr) p->hdr_tx_slot = slot;
+    else        p->tx_slot     = slot;
+    pthread_mutex_unlock(&p->lock);
+}
+
+/* === Builder flush — caller holds the per-builder lock (hb->lock / cb->lock) === */
+
+static int dst_pod_to_idx(int dst_pod_id) {
+    if (dst_pod_id < 0 || dst_pod_id >= MAX_DST_PODS) return -1;
+    return dst_pod_id;
+}
+
+static uint64_t now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000);
+}
+
+#define BUILDER_FLUSH_TIMEOUT_US  1000   /* 1 ms */
+
+/* Snapshot hdr+chunk state, reset, drop the builder lock, and enqueue both
+ * descriptors. Caller holds b->lock. On return b->lock is re-acquired.
+ *
+ * Pairing: both are flushed in a single critical-section snapshot so that
+ * the hdr batch's order matches the chunk's body order — required for the
+ * dst's expected-ring match to succeed. Either or both may be empty: any
+ * side with no entries is skipped. */
+static void builder_flush_locked(dpumesh_ctx_t *ctx, mesh_builder_t *b) {
+    if ((b->hdr_tx_slot < 0 || b->hdr_num == 0) &&
+        (b->chunk_tx_slot < 0 || b->chunk_num == 0)) {
+        return;
+    }
+
+    /* Snapshot hdr side. */
+    int      hdr_slot     = b->hdr_tx_slot;
+    uint32_t hdr_len      = b->hdr_cursor;
+    uint32_t hdr_num      = b->hdr_num;
+
+    /* Snapshot chunk side. Write the on-wire chunk_header (12B) before we
+     * release the lock so the slot's content matches the desc we're about
+     * to enqueue. */
+    int      chunk_slot   = b->chunk_tx_slot;
+    uint32_t chunk_len    = b->chunk_cursor;
+    uint32_t chunk_num    = b->chunk_num;
+    uint32_t chunk_fseq   = b->chunk_first_seq;
+    if (chunk_slot >= 0 && chunk_num > 0) {
+        struct mesh_chunk_header *ch =
+            (struct mesh_chunk_header *)dpumesh_tx_buf(ctx, chunk_slot);
+        ch->src_id     = b->owner_req_id.src_id;
+        ch->first_seq  = chunk_fseq;
+        ch->num_bodies = chunk_num;
+    }
+
+    /* Shared metadata. */
+    int32_t            dst_pod  = b->dst_pod_id;
+    struct mesh_req_id owner    = b->owner_req_id;
+    uint8_t            bflags   = b->builder_flags;
+
+    /* Reset builder. */
+    b->dst_pod_id      = -1;
+    b->first_us        = 0;
+    b->hdr_tx_slot     = -1;
+    b->hdr_cursor      = 0;
+    b->hdr_num         = 0;
+    b->chunk_tx_slot   = -1;
+    b->chunk_cursor    = 0;
+    b->chunk_num       = 0;
+    b->chunk_first_seq = 0;
+
+    /* Peer presence is checked once for chunk path (CASE_DIRECT vs staging). */
+    pthread_rwlock_rdlock(&ctx->peer_lock);
+    peer_info_t *peer = (dst_pod >= 0 && dst_pod < MAX_PEERS_TABLE)
+                            ? &ctx->peers[dst_pod] : NULL;
+    int direct_ok = (peer && peer->pod_id == dst_pod);
+    pthread_rwlock_unlock(&ctx->peer_lock);
+
+    pthread_mutex_unlock(&b->lock);
+
+    /* Hdr first, then chunk. Both enqueues are independent of b->lock so
+     * other workers can keep appending to a fresh batch. */
+    if (hdr_slot >= 0 && hdr_num > 0) {
+        sw_descriptor_t desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.header_buf_slot     = -1;
+        desc.body_buf_slot       = hdr_slot;
+        desc.body_len            = hdr_len;
+        desc.req_id              = owner.seq;
+        desc.dst_pod_id          = dst_pod;
+        desc.src_pod_id          = ctx->pod_id;
+        desc.flags               = (bflags & OP_RESPONSE) | OP_HDR_BATCH | CASE_EXTERNAL;
+        desc.valid               = 1;
+        desc.src_body_pool_type  = POOL_HOST_TX_HDR;
+        desc.src_body_pod_id     = ctx->pod_id;
+        desc.src_body_buf_slot   = hdr_slot;
+        desc.src_header_buf_slot = -1;
+        pending_attach_tx_v2(ctx, owner, hdr_slot, /*is_hdr=*/1);
+        if (dpumesh_enqueue(ctx, &desc) != 0) {
+            uint32_t pidx = owner.seq % MAX_PENDING;
+            dpumesh_pending_t *pp = &ctx->pending[pidx];
+            pthread_mutex_lock(&pp->lock);
+            if (pp->hdr_tx_slot == hdr_slot) pp->hdr_tx_slot = -1;
+            pthread_mutex_unlock(&pp->lock);
+            dpumesh_hdr_tx_free(ctx, hdr_slot);
+        }
+    }
+    if (chunk_slot >= 0 && chunk_num > 0) {
+        sw_descriptor_t desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.header_buf_slot     = -1;
+        desc.body_buf_slot       = chunk_slot;
+        desc.body_len            = chunk_len;
+        desc.req_id              = owner.seq;
+        desc.dst_pod_id          = dst_pod;
+        desc.src_pod_id          = ctx->pod_id;
+        desc.flags               = (bflags & OP_RESPONSE) | OP_CHUNK |
+                                   (direct_ok ? CASE_DIRECT : CASE_EXTERNAL);
+        desc.valid               = 1;
+        desc.src_body_pool_type  = POOL_HOST_TX_BODY;
+        desc.src_body_pod_id     = ctx->pod_id;
+        desc.src_body_buf_slot   = chunk_slot;
+        desc.src_header_buf_slot = -1;
+        atomic_fetch_add(direct_ok ? &ctx->stat_chunk_direct : &ctx->stat_chunk_staging, 1);
+        pending_attach_tx_v2(ctx, owner, chunk_slot, /*is_hdr=*/0);
+        if (dpumesh_enqueue(ctx, &desc) != 0) {
+            uint32_t pidx = owner.seq % MAX_PENDING;
+            dpumesh_pending_t *pp = &ctx->pending[pidx];
+            pthread_mutex_lock(&pp->lock);
+            if (pp->tx_slot == chunk_slot) pp->tx_slot = -1;
+            pthread_mutex_unlock(&pp->lock);
+            dpumesh_tx_free(ctx, chunk_slot);
+        }
+    }
+
+    pthread_mutex_lock(&b->lock);
+}
+
+/* Append one (hdr_entry, body) pair atomically under b->lock. The single
+ * critical section is what guarantees hdr append order matches chunk body
+ * order. Caller holds b->lock. Returns 0 on success, -1 on alloc failure. */
+static int builder_append_locked(dpumesh_ctx_t *ctx,
+                                 mesh_builder_t *b,
+                                 struct mesh_req_id req_id,
+                                 const char *service,
+                                 int dst_pod_id,
+                                 const uint8_t *body,
+                                 uint32_t body_len,
+                                 uint8_t flags) {
+    /* If chunk side can't fit this body, flush the pair (both sides) and
+     * start fresh. We check chunk only; hdr cap is high enough that chunk
+     * always fills first at typical body sizes. */
+    if (b->chunk_tx_slot >= 0) {
+        uint32_t after = b->chunk_cursor + body_len;
+        if (b->chunk_num >= MESH_CHUNK_MAX_BODIES ||
+            after > (uint32_t)ctx->slot_size) {
+            builder_flush_locked(ctx, b);
+        }
+    }
+
+    /* Allocate hdr slot if needed. */
+    if (b->hdr_tx_slot < 0) {
+        int slot = dpumesh_hdr_tx_alloc(ctx);
+        if (slot < 0) return -1;
+        b->hdr_tx_slot = slot;
+        b->hdr_cursor  = 0;
+        b->hdr_num     = 0;
+    }
+    /* Allocate chunk slot if needed. */
+    if (b->chunk_tx_slot < 0) {
+        int slot = dpumesh_tx_alloc(ctx);
+        if (slot < 0) {
+            /* leave hdr_tx_slot held; it'll flush on next append or timeout */
+            return -1;
+        }
+        b->chunk_tx_slot   = slot;
+        b->chunk_cursor    = sizeof(struct mesh_chunk_header);
+        b->chunk_num       = 0;
+        b->chunk_first_seq = req_id.seq;
+    }
+    /* First append into a fresh pair initializes shared metadata. */
+    if (b->dst_pod_id < 0) {
+        b->dst_pod_id     = dst_pod_id;
+        b->owner_req_id   = req_id;
+        b->first_us       = now_us();
+        b->builder_flags  = flags;
+    }
+
+    /* Write hdr entry. */
+    uint8_t *hbuf = dpumesh_hdr_tx_buf(ctx, b->hdr_tx_slot);
+    struct mesh_hdr_req *e = (struct mesh_hdr_req *)(hbuf + b->hdr_cursor);
+    memset(e, 0, sizeof(*e));
+    e->req_id = req_id;
+    if (service) {
+        size_t n = strlen(service);
+        if (n >= sizeof(e->dst_service)) n = sizeof(e->dst_service) - 1;
+        memcpy(e->dst_service, service, n);
+    }
+    e->dst_pod_id_hint = dst_pod_id;
+    e->body_size = body_len;
+    e->flags = flags;
+    b->hdr_cursor += sizeof(struct mesh_hdr_req);
+    b->hdr_num++;
+
+    /* Write body into chunk. */
+    if (body_len > 0) {
+        uint8_t *cbuf = dpumesh_tx_buf(ctx, b->chunk_tx_slot);
+        memcpy(cbuf + b->chunk_cursor, body, body_len);
+    }
+    b->chunk_cursor += body_len;
+    b->chunk_num++;
+
+    /* Flush if hdr cap reached (hdr_num cap or hdr_slot would overflow on
+     * next append). Chunk cap is handled at the top of the next call. */
+    if (b->hdr_num >= MESH_HDR_BATCH_MAX_ENTRIES ||
+        b->hdr_cursor + sizeof(struct mesh_hdr_req) > (uint32_t)ctx->hdr_slot_size) {
+        builder_flush_locked(ctx, b);
+    }
+    return 0;
+}
+
+/* Per-tick timeout flush: each builder uses its own lock. No global lock. */
+static void *flush_timer_fn(void *arg) {
+    dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)arg;
+    while (ctx->mesh_running) {
+        struct timespec ts = {0, 250 * 1000};  /* 250 µs */
+        nanosleep(&ts, NULL);
+        uint64_t now = now_us();
+        for (int i = 0; i < MAX_DST_PODS; i++) {
+            for (int s = 0; s < MESH_BUILDER_SHARDS; s++) {
+                mesh_builder_t *b = &ctx->builders[i][s];
+                pthread_mutex_lock(&b->lock);
+                if (b->dst_pod_id >= 0 && now - b->first_us >= BUILDER_FLUSH_TIMEOUT_US) {
+                    builder_flush_locked(ctx, b);
+                }
+                pthread_mutex_unlock(&b->lock);
+            }
+        }
+    }
+    return NULL;
+}
+
+/* ====== Public: send_request / send_response ====== */
+
+/* TLS-cached shard id: each thread sticks to one (dst, shard) pair to amortize
+ * the hash. Workers from the same thread serialize on the same per-shard lock,
+ * but threads are spread across MESH_BUILDER_SHARDS shards. */
+static inline int builder_shard(void) {
+    static __thread int cached = -1;
+    if (__builtin_expect(cached < 0, 0)) {
+        uint64_t h = (uint64_t)pthread_self();
+        h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+        cached = (int)(h % MESH_BUILDER_SHARDS);
+    }
+    return cached;
+}
+
+int dpumesh_send_request(dpumesh_ctx_t *ctx, const char *service,
+                         const uint8_t *body, uint32_t body_len, uint8_t flags,
+                         struct mesh_req_id *out_req_id) {
+    if (!ctx || !service) return -1;
+    int dst = dpumesh_resolve(ctx, service);
+    if (dst < 0) return -1;
+    if (body_len > MESH_CHUNK_BODY_BUDGET) return -1;
+    int idx = dst_pod_to_idx(dst);
+    if (idx < 0) return -1;
+    int sh = builder_shard();
+
+    uint32_t seq = atomic_fetch_add(&ctx->next_seq, 1);
+    struct mesh_req_id rid = { .src_id = ctx->src_id, .seq = seq };
+
+    if (register_pending_v2(ctx, rid) < 0) return -1;
+
+    mesh_builder_t *b = &ctx->builders[idx][sh];
+    pthread_mutex_lock(&b->lock);
+    if (builder_append_locked(ctx, b, rid, service, dst, body, body_len, flags) < 0) {
+        pthread_mutex_unlock(&b->lock);
+        return -1;
+    }
+    pthread_mutex_unlock(&b->lock);
+
+    if (out_req_id) *out_req_id = rid;
+    atomic_fetch_add(&ctx->stat_send_req, 1);
+    return 0;
+}
+
+int dpumesh_send_response(dpumesh_ctx_t *ctx, int dst_pod_id,
+                          struct mesh_req_id req_id,
+                          const uint8_t *body, uint32_t body_len, uint8_t flags) {
+    if (!ctx || dst_pod_id < 0) return -1;
+    if (body_len > MESH_CHUNK_BODY_BUDGET) return -1;
+    int idx = dst_pod_to_idx(dst_pod_id);
+    if (idx < 0) return -1;
+    int sh = builder_shard();
+
+    mesh_builder_t *b = &ctx->builders[idx][sh];
+    pthread_mutex_lock(&b->lock);
+    if (builder_append_locked(ctx, b, req_id, /*service*/NULL, dst_pod_id,
+                              body, body_len, flags) < 0) {
+        pthread_mutex_unlock(&b->lock);
+        return -1;
+    }
+    pthread_mutex_unlock(&b->lock);
+    return 0;
+}
+
+/* ====== Public: wait_response_v2 / cancel_v2 / release_async_v2 ====== */
+
+int dpumesh_wait_response_v2(dpumesh_ctx_t *ctx, struct mesh_req_id req_id,
+                             sw_descriptor_t *resp, int timeout_ms) {
+    uint32_t idx = req_id.seq % MAX_PENDING;
+    dpumesh_pending_t *p = &ctx->pending[idx];
+
+    /* 1) Spin briefly. Catches sub-100µs responses with zero syscalls. */
+    for (int i = 0; i < PENDING_SPIN_ITER; i++) {
+        if (atomic_load_explicit(&p->state, memory_order_acquire) != 0) goto check;
+        cpu_pause();
+    }
+
+    /* 2) Slow path: futex_wait until state changes or absolute deadline. */
+    struct timespec deadline = {0, 0};
+    int have_deadline = 0;
+    if (timeout_ms > 0) {
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec  += timeout_ms / 1000;
+        deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+        have_deadline = 1;
+    } else if (timeout_ms == 0) {
+        if (atomic_load(&p->state) != 0) goto check;
+        return -1;
+    }
+
+    while (atomic_load_explicit(&p->state, memory_order_acquire) == 0) {
+        atomic_fetch_add_explicit(&p->waiters, 1, memory_order_seq_cst);
+        /* Recheck state under the waiters count so PE either sees us, or we
+         * see PE's store. */
+        if (atomic_load_explicit(&p->state, memory_order_acquire) != 0) {
+            atomic_fetch_sub_explicit(&p->waiters, 1, memory_order_relaxed);
+            break;
+        }
+        int rc = futex_wait_abs(&p->state, 0, have_deadline ? &deadline : NULL);
+        int err = errno;
+        atomic_fetch_sub_explicit(&p->waiters, 1, memory_order_relaxed);
+        if (rc == -1 && err == ETIMEDOUT) {
+            /* Race: state may have flipped 0→1 between our check and futex_wait
+             * timing out. CAS-claim state=-2; if it fails state isn't 0 anymore
+             * and we'll observe it via goto check. */
+            int expected = 0;
+            if (atomic_compare_exchange_strong(&p->state, &expected, -2)) {
+                pthread_mutex_lock(&p->lock);
+                if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+                if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
+                pthread_mutex_unlock(&p->lock);
+                atomic_fetch_add(&ctx->stat_wait_timeout, 1);
+                return -1;
+            }
+            /* CAS lost: PE delivered, state is now 1 (or already cancelled). */
+            break;
+        }
+        /* rc==0 or EAGAIN/EINTR: re-evaluate state. */
+    }
+
+check:
+    {
+        int s = atomic_load_explicit(&p->state, memory_order_acquire);
+        if (s == 1 && MESH_REQ_ID_EQ(p->req_id_v2, req_id)) {
+            *resp = p->desc;
+            pthread_mutex_lock(&p->lock);
+            if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+            if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
+            pthread_mutex_unlock(&p->lock);
+            atomic_store_explicit(&p->state, -1, memory_order_release);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void dpumesh_cancel_pending_v2(dpumesh_ctx_t *ctx, struct mesh_req_id req_id) {
+    dpumesh_cancel_pending(ctx, req_id.seq);  /* same slot lookup */
+}
+
+void dpumesh_pending_release_async_v2(dpumesh_ctx_t *ctx, struct mesh_req_id req_id) {
+    dpumesh_pending_release_async(ctx, req_id.seq);
+}
+
+/* ====== Expected ring + parked chunks ====== */
+
+static void expected_ring_push(expected_ring_t *r, const expected_entry_t *e) {
+    if (r->count >= EXPECTED_RING_CAP) return;  /* drop on overflow; sweep will warn */
+    r->buf[r->tail] = *e;
+    r->tail = (r->tail + 1) % EXPECTED_RING_CAP;
+    r->count++;
+}
+
+static void expected_ring_pop(expected_ring_t *r) {
+    if (r->count == 0) return;
+    r->head = (r->head + 1) % EXPECTED_RING_CAP;
+    r->count--;
+}
+
+static expected_entry_t *expected_ring_head(expected_ring_t *r) {
+    if (r->count == 0) return NULL;
+    return &r->buf[r->head];
+}
+
+static void parked_push(parked_list_t *l, parked_chunk_node_t *node) {
+    node->next = NULL;
+    if (!l->head) l->head = node;
+    else          l->tail->next = node;
+    l->tail = node;
+    l->count++;
+}
+
+static parked_chunk_node_t *parked_pop_front(parked_list_t *l) {
+    parked_chunk_node_t *n = l->head;
+    if (!n) return NULL;
+    l->head = n->next;
+    if (!l->head) l->tail = NULL;
+    l->count--;
+    n->next = NULL;
+    return n;
+}
+
+/* Deliver one body from a chunk to the application via the v2 pending or
+ * RX queue, identical to the legacy rx_deliver_desc but keyed on
+ * mesh_req_id. */
+static void deliver_one_body(dpumesh_ctx_t *ctx, struct mesh_req_id rid,
+                             const uint8_t *body, uint32_t size,
+                             int32_t src_pod_id, uint8_t flags) {
+    int slot = rx_slot_alloc(ctx);
+    if (slot < 0) {
+        DOCA_LOG_ERR("deliver_one_body: no free rx slot (src=%u seq=%u)",
+                     rid.src_id, rid.seq);
+        return;
+    }
+    uint8_t *dst = (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
+    if (size > 0) memcpy(dst, body, size);
+
+    sw_descriptor_t desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.req_id          = rid.seq;
+    desc.src_pod_id      = src_pod_id;
+    desc.dst_pod_id      = ctx->pod_id;
+    desc.flags           = flags;
+    desc.header_buf_slot = -1;
+    desc.body_buf_slot   = slot;
+    desc.body_len        = size;
+    desc.valid           = 1;
+
+    if (flags & OP_RESPONSE) {
+        uint32_t idx = rid.seq % MAX_PENDING;
+        dpumesh_pending_t *p = &ctx->pending[idx];
+
+        /* Fast path: lock-free CAS state 0 → 1. Writes desc before CAS so
+         * the worker (acquiring after seeing state==1) observes a fully
+         * populated desc. The CAS and the waiters check are both seq_cst
+         * to form the Dekker-style pair with worker's add(waiters) +
+         * load(state). If waiters==0 (worker still spinning or hasn't
+         * called futex_wait), skip the syscall entirely. */
+        int s = atomic_load(&p->state);
+        if (s == 0 && MESH_REQ_ID_EQ(p->req_id_v2, rid)) {
+            p->desc = desc;
+            int expected = 0;
+            if (atomic_compare_exchange_strong(&p->state, &expected, 1)) {
+                if (atomic_load(&p->waiters) > 0) {
+                    futex_wake_one(&p->state);
+                }
+                return;
+            }
+            s = expected;
+        }
+
+        if (s == -2 && MESH_REQ_ID_EQ(p->req_id_v2, rid)) {
+            /* Worker already timed out. Release everything. */
+            pthread_mutex_lock(&p->lock);
+            if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+            if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
+            pthread_mutex_unlock(&p->lock);
+            pthread_mutex_lock(&ctx->rx_slot_lock);
+            ctx->rx_slot_bitmap[slot] = 0;
+            pthread_mutex_unlock(&ctx->rx_slot_lock);
+            int expected = -2;
+            if (atomic_compare_exchange_strong(&p->state, &expected, -1)) {
+                if (atomic_load_explicit(&p->waiters, memory_order_seq_cst) > 0) {
+                    futex_wake_all(&p->state);
+                }
+            }
+            return;
+        }
+        /* No matching waiter — fall through to RX queue. */
+    }
+
+    pthread_mutex_lock(&ctx->rx_lock);
+    if (ctx->rx_count >= RX_QUEUE_SIZE) {
+        pthread_mutex_unlock(&ctx->rx_lock);
+        DOCA_LOG_ERR("deliver_one_body: RX queue full (seq=%u)", rid.seq);
+        pthread_mutex_lock(&ctx->rx_slot_lock);
+        ctx->rx_slot_bitmap[slot] = 0;
+        pthread_mutex_unlock(&ctx->rx_slot_lock);
+        return;
+    }
+    ctx->rx_queue[ctx->rx_tail] = desc;
+    ctx->rx_tail = (ctx->rx_tail + 1) % RX_QUEUE_SIZE;
+    ctx->rx_count++;
+    pthread_cond_signal(&ctx->rx_cond);
+    pthread_mutex_unlock(&ctx->rx_lock);
+}
+
+/* Consume `num` bodies from the head of expected[src] and deliver them
+ * from `chunk_buf` (which starts with the 12B chunk header). Caller holds
+ * the matching expected_lock. */
+static void consume_chunk(dpumesh_ctx_t *ctx, expected_ring_t *r,
+                          const uint8_t *chunk_buf, uint32_t num) {
+    uint32_t cursor = sizeof(struct mesh_chunk_header);
+    for (uint32_t i = 0; i < num; i++) {
+        expected_entry_t e = r->buf[r->head];
+        expected_ring_pop(r);
+        const uint8_t *body = chunk_buf + cursor;
+        cursor += e.size;
+        deliver_one_body(ctx, e.req_id, body, e.size, e.src_pod_id, e.flags);
+    }
+}
+
+/* Try to drain parked chunks for `src_idx`. Caller holds expected_locks[src_idx]. */
+static void drain_parked_locked(dpumesh_ctx_t *ctx, int src_idx) {
+    expected_ring_t *r = &ctx->expected[src_idx];
+    parked_list_t   *l = &ctx->parked[src_idx];
+    while (l->head) {
+        parked_chunk_node_t *n = l->head;
+        if (r->count < n->num_bodies) break;
+        expected_entry_t *head = expected_ring_head(r);
+        if (!head || head->req_id.seq != n->first_seq) break;
+        const uint8_t *chunk_buf =
+            (const uint8_t *)ctx->rx_dma_buffer + ((size_t)n->rx_slot * ctx->slot_size);
+        consume_chunk(ctx, r, chunk_buf, n->num_bodies);
+        /* Phase 4 fix: 1 parked chunk drained → 1 credit ++. */
+        rx_dma_credit_return(ctx);
+        parked_pop_front(l);
+        free(n);
+    }
+}
+
+/* OP_HDR_BATCH handler: parse N × mesh_hdr_req entries (Phase 3 keeps the
+ * src's wire format unchanged through DPU — no conversion to mesh_hdr_fwd
+ * yet) and enqueue each into expected[src_id]. src_pod_id comes from the
+ * comch DMA_COMPLETION msg because the whole batch shares one src. */
+static void process_hdr_batch(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_len, int32_t src_pod_id) {
+    atomic_fetch_add(&ctx->stat_process_hdr, 1);
+    /* Phase 3: hdr batches land in the dedicated hdr_rx_buffer (not body RX).
+     * DPU's dpu_enqueue_reverse_dma sets desc.dst_pos so comp.pos == offset
+     * within hdr_rx_buffer. No credit return: hdr_rx is a wrap cursor. */
+    if (!ctx->hdr_rx_buffer || pos + dma_len > ctx->hdr_rx_buf_size) {
+        DOCA_LOG_ERR("process_hdr_batch: bounds fail pos=%u len=%u buf=%zu",
+                     pos, dma_len, ctx->hdr_rx_buf_size);
+        return;
+    }
+    const uint8_t *p = (const uint8_t *)ctx->hdr_rx_buffer + pos;
+    uint32_t n_entries = dma_len / sizeof(struct mesh_hdr_req);
+    uint16_t touched = 0;
+
+    for (uint32_t i = 0; i < n_entries; i++) {
+        const struct mesh_hdr_req *e =
+            (const struct mesh_hdr_req *)(p + i * sizeof(struct mesh_hdr_req));
+        uint32_t sid = e->req_id.src_id;
+        if (sid >= MAX_DST_PODS) continue;
+        pthread_mutex_lock(&ctx->expected_locks[sid]);
+        expected_entry_t entry = {
+            .req_id     = e->req_id,
+            .size       = e->body_size,
+            .src_pod_id = src_pod_id,
+            .trace_id   = e->trace_id,
+            .span_id    = e->span_id,
+            .flags      = e->flags,
+            .arrived_us = now_us(),
+        };
+        expected_ring_push(&ctx->expected[sid], &entry);
+        pthread_mutex_unlock(&ctx->expected_locks[sid]);
+        touched |= (uint16_t)(1u << sid);
+    }
+
+    /* hdr_rx_buffer is a wrap cursor; no slot bitmap to release. */
+
+    /* Drain parked chunks for each src whose expected ring grew. */
+    for (int sid = 0; sid < MAX_DST_PODS; sid++) {
+        if (!(touched & (1u << sid))) continue;
+        pthread_mutex_lock(&ctx->expected_locks[sid]);
+        drain_parked_locked(ctx, sid);
+        pthread_mutex_unlock(&ctx->expected_locks[sid]);
+    }
+}
+
+/* OP_CHUNK handler: try to match head of expected[src_id] against chunk
+ * header. Match → consume + release rx slot. Miss → park (zero-copy). */
+static void process_chunk(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_len) {
+    atomic_fetch_add(&ctx->stat_process_chunk, 1);
+    if (!ctx->rx_dma_buffer || pos + dma_len > ctx->rx_dma_buf_size ||
+        dma_len < sizeof(struct mesh_chunk_header)) {
+        DOCA_LOG_ERR("process_chunk: bounds fail pos=%u len=%u", pos, dma_len);
+        return;
+    }
+    const uint8_t *chunk_buf = (const uint8_t *)ctx->rx_dma_buffer + pos;
+    const struct mesh_chunk_header *h = (const struct mesh_chunk_header *)chunk_buf;
+    uint32_t sid = h->src_id;
+    if (sid >= MAX_DST_PODS) {
+        DOCA_LOG_ERR("process_chunk: src_id=%u out of range", sid);
+        return;
+    }
+    uint32_t rx_slot = pos / (uint32_t)ctx->slot_size;
+
+    pthread_mutex_lock(&ctx->expected_locks[sid]);
+    expected_ring_t *r = &ctx->expected[sid];
+    expected_entry_t *head = expected_ring_head(r);
+    if (head && r->count >= h->num_bodies && head->req_id.seq == h->first_seq) {
+        consume_chunk(ctx, r, chunk_buf, h->num_bodies);
+        /* Sharding-safety: consume advances the expected head; whatever
+         * parked chunk was waiting on the previous head (e.g., another
+         * shard's chunk that arrived earlier) may now be matchable. */
+        drain_parked_locked(ctx, sid);
+        pthread_mutex_unlock(&ctx->expected_locks[sid]);
+        /* Phase 4 fix: 1 chunk released → 1 credit ++ (not N — staging
+         * slot frees do NOT bump credit). */
+        rx_dma_credit_return(ctx);
+        return;
+    }
+    /* Park: keep the rx_slot's bytes intact. credit NOT returned until
+     * matching hdr arrives (or sweep reclaims). */
+    parked_chunk_node_t *n = (parked_chunk_node_t *)calloc(1, sizeof(*n));
+    if (!n) {
+        pthread_mutex_unlock(&ctx->expected_locks[sid]);
+        DOCA_LOG_ERR("process_chunk: park alloc failed; dropping");
+        rx_dma_credit_return(ctx);
+        return;
+    }
+    n->rx_slot    = rx_slot;
+    n->total_size = dma_len;
+    n->first_seq  = h->first_seq;
+    n->num_bodies = h->num_bodies;
+    n->arrived_us = now_us();
+    parked_push(&ctx->parked[sid], n);
+    atomic_fetch_add(&ctx->stat_park, 1);
+    pthread_mutex_unlock(&ctx->expected_locks[sid]);
+}
+
+/* 1-second sweep: GC parked chunks and orphan expected entries older than
+ * the budget. Releases rx_slot credit for each evicted parked chunk so
+ * DPA can resume writing. */
+#define MESH_TIMEOUT_US  1000000ULL
+
+static void *sweep_fn(void *arg) {
+    dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)arg;
+    uint64_t last_stat_us = 0;
+    uint64_t prev[8] = {0};
+    while (ctx->mesh_running) {
+        struct timespec ts = {0, 100 * 1000 * 1000}; /* 100ms */
+        nanosleep(&ts, NULL);
+        uint64_t now = now_us();
+        if (now - last_stat_us >= 1000000) {
+            uint64_t cur[8] = {
+                atomic_load(&ctx->stat_send_req),
+                atomic_load(&ctx->stat_wait_timeout),
+                atomic_load(&ctx->stat_chunk_direct),
+                atomic_load(&ctx->stat_chunk_staging),
+                atomic_load(&ctx->stat_process_chunk),
+                atomic_load(&ctx->stat_process_hdr),
+                atomic_load(&ctx->stat_rx_free),
+                atomic_load(&ctx->stat_park),
+            };
+            uint64_t any = 0;
+            for (int i = 0; i < 8; i++) any |= (cur[i] - prev[i]);
+            if (any) {
+                /* Diag: snapshot current resource usage. */
+                int tx_used = 0, hdr_used = 0, rx_used = 0;
+                pthread_mutex_lock(&ctx->slot_lock);
+                for (int i = 0; i < ctx->num_slots; i++)
+                    if (ctx->slot_bitmap[i]) tx_used++;
+                pthread_mutex_unlock(&ctx->slot_lock);
+                pthread_mutex_lock(&ctx->hdr_slot_lock);
+                for (int i = 0; i < ctx->hdr_num_slots; i++)
+                    if (ctx->hdr_tx_bitmap[i]) hdr_used++;
+                pthread_mutex_unlock(&ctx->hdr_slot_lock);
+                pthread_mutex_lock(&ctx->rx_slot_lock);
+                for (int i = 0; i < ctx->num_slots; i++)
+                    if (ctx->rx_slot_bitmap[i]) rx_used++;
+                pthread_mutex_unlock(&ctx->rx_slot_lock);
+                int pending_active = 0;
+                for (int i = 0; i < MAX_PENDING; i++) {
+                    int st = ctx->pending[i].state;
+                    if (st != -1) pending_active++;
+                }
+                int expected_total = 0, parked_total = 0;
+                for (int sid = 0; sid < MAX_DST_PODS; sid++) {
+                    expected_total += (int)ctx->expected[sid].count;
+                    parked_total   += (int)ctx->parked[sid].count;
+                }
+                fprintf(stderr, "[dpumesh] stat/sec: send=%lu wait_to=%lu c_dir=%lu c_stg=%lu p_chk=%lu p_hdr=%lu rxfree=%lu park=%lu | tx=%d hdr=%d rx=%d pend=%d exp=%d prk=%d\n",
+                        cur[0]-prev[0], cur[1]-prev[1], cur[2]-prev[2], cur[3]-prev[3],
+                        cur[4]-prev[4], cur[5]-prev[5], cur[6]-prev[6], cur[7]-prev[7],
+                        tx_used, hdr_used, rx_used, pending_active, expected_total, parked_total);
+            }
+            for (int i = 0; i < 8; i++) prev[i] = cur[i];
+            last_stat_us = now;
+        }
+        for (int sid = 0; sid < MAX_DST_PODS; sid++) {
+            pthread_mutex_lock(&ctx->expected_locks[sid]);
+            parked_list_t *l = &ctx->parked[sid];
+            while (l->head && now - l->head->arrived_us > MESH_TIMEOUT_US) {
+                parked_chunk_node_t *n = parked_pop_front(l);
+                DOCA_LOG_WARN("parked chunk timeout src=%d first_seq=%u num=%u",
+                              sid, n->first_seq, n->num_bodies);
+                /* Phase 4 fix: 1 parked chunk evicted → 1 credit ++. */
+                rx_dma_credit_return(ctx);
+                free(n);
+            }
+            expected_ring_t *r = &ctx->expected[sid];
+            while (r->count > 0 &&
+                   now - r->buf[r->head].arrived_us > MESH_TIMEOUT_US &&
+                   (!l->head || l->head->first_seq != r->buf[r->head].req_id.seq)) {
+                DOCA_LOG_WARN("orphan expected timeout src=%d seq=%u",
+                              sid, r->buf[r->head].req_id.seq);
+                expected_ring_pop(r);
+            }
+            pthread_mutex_unlock(&ctx->expected_locks[sid]);
+        }
+    }
+    return NULL;
 }

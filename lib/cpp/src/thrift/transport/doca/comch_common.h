@@ -22,6 +22,7 @@ enum dmesh_msg_type {
     DMESH_MSG_TX_ACK,            /* DPU→Host: forward DMA consumed, sender can free TX slot */
     DMESH_MSG_POD_CONSUMER_ID,   /* Host→DPU: advertise host datapath consumer ID */
     DMESH_MSG_DMA_COMPLETION,    /* DPU→Host: reverse DMA completed, data in Host RX buffer */
+    DMESH_MSG_PEER_TOPOLOGY,     /* DPU→Host: peer's host_rx_buffer export desc (Phase 4) */
 };
 
 /* DPU→Host: tell the client what consumer ID to use for producer */
@@ -36,6 +37,7 @@ enum mmap_type {
     DMA_HOST_RX_BUFFER = 3, /* Host RX buffer for DPU→CPU reverse DMA */
     DMA_HOST_TX_HDR_BUFFER = 4, /* Phase 1: independent host TX pool for hdr batches */
     DMA_HOST_RX_HDR_BUFFER = 5, /* Phase 2: independent host RX buffer for hdr forwards */
+    DMA_HDR_RING = 6,           /* Phase 4: independent forward dma_ring for hdr batches */
 };
 
 struct dmesh_mmap_msg {
@@ -103,6 +105,25 @@ struct dmesh_dma_completion_msg {
     int32_t src_pod_id;
     int32_t dst_pod_id;
     int8_t flags;
+};
+
+/* DPU→Host: peer topology broadcast (Phase 4). Carries two export descs:
+ *   - rx export: peer's host_rx_buffer (where src will DMA chunks into)
+ *   - ring export: peer's dma_ring (last slot at DMA_RING_SIZE is the credit
+ *     counter for v1.0.0-style lazy-refresh admission gate)
+ * Layout: [struct fields] [rx_export_desc bytes][ring_export_desc bytes].
+ * Use rx_export_off / ring_export_off / *_len to slice the trailing array. */
+struct dmesh_peer_topology_msg {
+    enum dmesh_msg_type type;   /* = DMESH_MSG_PEER_TOPOLOGY */
+    int32_t  pod_id;            /* peer's pod_id */
+    uint32_t src_id;            /* peer's src_id (Phase 3 = pod_id) */
+    void    *rx_addr;           /* peer's rx_dma_buffer base VA (host VA) */
+    uint64_t rx_buf_size;       /* total bytes of peer's rx_dma_buffer */
+    uint32_t rq_depth;          /* num_slots in peer's rx_dma_buffer */
+    uint32_t slot_size;         /* peer's rx slot_size */
+    uint32_t rx_export_len;     /* bytes of rx export desc */
+    uint32_t ring_export_len;   /* bytes of ring (credit) export desc */
+    uint8_t  desc_data[];       /* rx_export_desc then ring_export_desc */
 };
 
 

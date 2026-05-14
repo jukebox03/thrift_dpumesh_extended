@@ -50,6 +50,59 @@ export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer
 /* Forward declaration — implemented in dpa.c */
 doca_error_t setup_pod_dma(struct objects *objs, struct pod_state *pod);
 
+#ifdef DOCA_ARCH_DPU
+/* Phase 4: broadcast peer topology. For every ordered pair (recv, peer)
+ * of fully-registered pods, send recv the export descs of peer's
+ * rx_dma_buffer and forward dma_ring. recv's host then mmap_create_from_export
+ * both and stores them in its peer table for direct host→host chunk DMA. */
+void broadcast_peer_topology(struct objects *objs)
+{
+	uint8_t buf[1024 + 1024 + sizeof(struct dmesh_peer_topology_msg) + 64];
+	for (int i = 0; i < objs->num_pods; i++) {
+		struct pod_state *recv = &objs->pods[i];
+		if (!recv->registered || !recv->dma_ready || !recv->connection) continue;
+		for (int j = 0; j < objs->num_pods; j++) {
+			if (i == j) continue;
+			struct pod_state *peer = &objs->pods[j];
+			if (!peer->registered || !peer->dma_ready) continue;
+			if (peer->host_rx_export_desc_len == 0 ||
+			    peer->ring_export_desc_len == 0)
+				continue;
+
+			size_t msg_size = sizeof(struct dmesh_peer_topology_msg) +
+			                  peer->host_rx_export_desc_len +
+			                  peer->ring_export_desc_len;
+			if (msg_size > sizeof(buf)) {
+				DOCA_LOG_ERR("broadcast_peer_topology: msg too large (%zu)",
+					     msg_size);
+				continue;
+			}
+			struct dmesh_peer_topology_msg *m = (struct dmesh_peer_topology_msg *)buf;
+			m->type = DMESH_MSG_PEER_TOPOLOGY;
+			m->pod_id = peer->pod_id;
+			m->src_id = (uint32_t)peer->pod_id;
+			m->rx_addr = peer->host_rx_addr;
+			m->rx_buf_size = peer->host_rx_buf_size;
+			m->rq_depth = peer->rq_depth;
+			m->slot_size = DPUMESH_SLOT_SIZE;
+			m->rx_export_len = (uint32_t)peer->host_rx_export_desc_len;
+			m->ring_export_len = (uint32_t)peer->ring_export_desc_len;
+			memcpy(m->desc_data, peer->host_rx_export_desc,
+			       peer->host_rx_export_desc_len);
+			memcpy(m->desc_data + peer->host_rx_export_desc_len,
+			       peer->ring_export_desc, peer->ring_export_desc_len);
+
+			doca_error_t r = server_send_msg_to_conn(objs, recv->connection,
+			                                          (const char *)m, msg_size);
+			DOCA_LOG_INFO("PEER_TOPOLOGY: %d -> recv %d (rx=%p size=%zu) rc=%s",
+			              peer->pod_id, recv->pod_id,
+			              peer->host_rx_addr, peer->host_rx_buf_size,
+			              doca_error_get_descr(r));
+		}
+	}
+}
+#endif
+
 doca_error_t
 process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
                  struct dmesh_mmap_msg *mmap_msg)
@@ -81,6 +134,8 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		mmap = &pod->remote_hdr_mmap;
 	} else if (mmap_msg->mmap_type == DMA_HOST_RX_HDR_BUFFER) {
 		mmap = &pod->host_hdr_rx_mmap;
+	} else if (mmap_msg->mmap_type == DMA_HDR_RING) {
+		mmap = &pod->hdr_ring_mmap;
 	} else {
 		DOCA_LOG_ERR("Invalid mmap type received: %d", mmap_msg->mmap_type);
 		return DOCA_ERROR_INVALID_VALUE;
@@ -107,6 +162,14 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		pod->host_rx_buf_size = buf_size;
 		/* rq_depth derived from host_rx buffer size: num_slots × slot_size. */
 		pod->rq_depth = (uint32_t)(buf_size / DPUMESH_SLOT_SIZE);
+		/* Phase 4: cache the raw export desc for peer broadcast. */
+		if (export_desc_len <= sizeof(pod->host_rx_export_desc)) {
+			memcpy(pod->host_rx_export_desc, mmap_msg->export_desc, export_desc_len);
+			pod->host_rx_export_desc_len = export_desc_len;
+		} else {
+			DOCA_LOG_ERR("Pod %d: host_rx export_desc too large (%zu > %zu) — broadcast disabled",
+				     pod->pod_id, export_desc_len, sizeof(pod->host_rx_export_desc));
+		}
 		DOCA_LOG_INFO("Pod %d: Host RX buffer stored (addr=%p, size=%zu, rq_depth=%u)",
 			      pod->pod_id, remote_addr, buf_size, pod->rq_depth);
 	} else if (mmap_msg->mmap_type == DMA_HOST_TX_HDR_BUFFER) {
@@ -140,23 +203,50 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		DOCA_LOG_INFO("Pod %d: Host RX HDR buffer stored (addr=%p, size=%zu, dpa_handle=0x%lx)",
 			      pod->pod_id, remote_addr, buf_size,
 			      (unsigned long)pod->host_hdr_rx_dpa_handle);
+	} else if (mmap_msg->mmap_type == DMA_HDR_RING) {
+		pod->hdr_ring_addr = remote_addr;
+		pod->hdr_ring_buf_size = buf_size;
+		DOCA_LOG_INFO("Pod %d: HDR DMA ring stored (addr=%p, size=%zu)",
+			      pod->pod_id, remote_addr, buf_size);
 	} else {
 		pod->remote_addr = remote_addr;
 		pod->remote_buf_size = buf_size;
+		/* Phase 4: cache the dma_ring export desc too (DMA_RING case lands
+		 * here too; mmap_type check below — we cache both BODY and RING but
+		 * the broadcast only uses ring's). */
+		if (mmap_msg->mmap_type == DMA_RING &&
+		    export_desc_len <= sizeof(pod->ring_export_desc)) {
+			memcpy(pod->ring_export_desc, mmap_msg->export_desc, export_desc_len);
+			pod->ring_export_desc_len = export_desc_len;
+		}
 	}
 
 	DOCA_LOG_INFO("Pod %d: mmap_type=%d stored (ring_mmap=%p, remote_mmap=%p, host_rx_mmap=%p)",
 		      pod->pod_id, mmap_msg->mmap_type,
 		      (void *)pod->ring_mmap, (void *)pod->remote_mmap, (void *)pod->host_rx_mmap);
 
-	/* Trigger per-pod DMA setup when both forward-direction mmaps have arrived */
-	if (pod->ring_mmap && pod->remote_mmap && !pod->dma_ready) {
+	/* Trigger per-pod DMA setup when all forward-direction mmaps have arrived.
+	 * Phase 3: include hdr_tx + host_hdr_rx so the ring info pushed to DPA
+	 * carries the DPU-resolved hdr mmap handles. Without this, OP_HDR_BATCH
+	 * forwards / reverses fall back to body mmap, which doesn't cover the
+	 * hdr buffer VA range — DMAs fail silently.
+	 * Phase 4: also wait for host_rx_mmap so broadcast_peer_topology can
+	 * send the rx export desc to peers as soon as setup completes. */
+	if (pod->ring_mmap && pod->remote_mmap && pod->remote_hdr_mmap &&
+	    pod->host_hdr_rx_mmap && pod->host_rx_mmap && pod->hdr_ring_mmap &&
+	    !pod->dma_ready) {
 		result = setup_pod_dma(objs, pod);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("setup_pod_dma failed for pod %d: %s",
 				     pod->pod_id, doca_error_get_descr(result));
 			return result;
 		}
+		/* Phase 4: now that this pod is fully set up, broadcast its
+		 * topology to other ready pods AND send other pods' topology to
+		 * this one. Direct host→host DMA needs each src to have the
+		 * peer's rx_dma_buffer export desc + ring credit slot. */
+		DOCA_LOG_INFO("setup_pod_dma done for pod %d → broadcast_peer_topology", pod->pod_id);
+		broadcast_peer_topology(objs);
 	}
 
 	/* If Host RX buffer arrived after DMA setup, update the DPA reverse ring info */

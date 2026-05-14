@@ -40,6 +40,11 @@ uint64_t dpa_cached_freed[MAX_DPA_RINGS] = {0};
  * drain_all_rings can use it for lazy-refresh decisions. */
 uint64_t dpa_sent_count[MAX_DPA_RINGS] = {0};
 
+/* Phase 4: per-peer counters for CASE_DIRECT admission gate. Mirror the
+ * reverse-path pattern but keyed by dst_pod_id instead of ring index. */
+uint64_t dpa_direct_sent[MAX_DPA_PEERS] = {0};
+uint64_t dpa_direct_cached_freed[MAX_DPA_PEERS] = {0};
+
 /* Lazy-refresh margin: refresh credit when computed inflight is within
  * this many slots of the cap. Smaller = fewer PCIe reads but tighter
  * margin; larger = more reads, more headroom. 64 leaves enough buffer
@@ -186,6 +191,18 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             }
             break;
         }
+        case COMCH_MSG_TYPE_ADD_PEER: {
+            struct comch_add_peer_msg *add_msg = (struct comch_add_peer_msg *)msg;
+            int32_t pid = add_msg->peer.pod_id;
+            if (pid >= 0 && pid < MAX_DPA_PEERS) {
+                thread_arg->peers[pid] = add_msg->peer;
+                thread_arg->peer_write_cursor[pid] = 0;
+                DOCA_DPA_DEV_LOG_INFO("ADD_PEER: pod_id=%d rx_addr=0x%lx size=%lu\n",
+                                     pid, (unsigned long)add_msg->peer.rx_addr,
+                                     (unsigned long)add_msg->peer.rx_buf_size);
+            }
+            break;
+        }
         case COMCH_MSG_TYPE_TRIGGER:
             break;
         default:
@@ -321,27 +338,43 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         return 1;
     }
 
-    /* Phase 1 (v2 plan): src override via desc->mmap. When desc->mmap != 0,
-     * the host has selected a non-default TX pool (e.g. hdr_tx_buffer) and
-     * desc->addr lies inside that pool, NOT inside ring->host_addr. Skip the
-     * default-range check in that case; caller is trusted. The default pool
-     * (body) keeps desc->mmap == 0 and is range-checked as before. */
-    doca_dpa_dev_mmap_t src_mmap = desc->mmap ? desc->mmap : ring->host_mmap;
+    /* Phase 3 (v2 plan): src override based on desc->flags.
+     *  - OP_HDR_BATCH: read from host's hdr_tx_buffer via ring->host_hdr_mmap.
+     *    Both the mmap handle and the base VA come from ring info because
+     *    DPA-side handles are device-locality-bound — host's resolved value
+     *    is not valid on the DPU device. Range check uses host_hdr_addr.
+     *  - desc->mmap != 0: legacy Phase 1 override path (kept for backward
+     *    compat; no current caller writes a non-zero desc->mmap on forward).
+     *  - default (body): ring->host_mmap, range-check host_addr. */
+    doca_dpa_dev_mmap_t src_mmap;
+    uint64_t src_range_base;
+    uint64_t src_range_size;
+    if (desc->flags & OP_HDR_BATCH) {
+        src_mmap = ring->host_hdr_mmap ? ring->host_hdr_mmap : ring->host_mmap;
+        src_range_base = ring->host_hdr_mmap ? ring->host_hdr_addr : ring->host_addr;
+        src_range_size = ring->host_hdr_mmap ? (uint64_t)8388608ULL : ring->host_buf_size;
+    } else if (desc->mmap) {
+        src_mmap = desc->mmap;
+        src_range_base = 0;
+        src_range_size = 0;
+    } else {
+        src_mmap = ring->host_mmap;
+        src_range_base = ring->host_addr;
+        src_range_size = ring->host_buf_size;
+    }
 
-    if (desc->mmap == 0) {
+    if (src_range_size != 0) {
         uint64_t src_addr = desc->addr;
         uint64_t src_len = (uint64_t)desc->size;
-        uint64_t host_base = ring->host_addr;
-        uint64_t host_size = ring->host_buf_size;
-        uint64_t host_end = host_base + host_size;
+        uint64_t host_end = src_range_base + src_range_size;
         uint64_t src_end = src_addr + src_len;
 
-        if (host_size == 0 || host_end < host_base || src_end < src_addr ||
-            src_addr < host_base || src_end > host_end) {
+        if (host_end < src_range_base || src_end < src_addr ||
+            src_addr < src_range_base || src_end > host_end) {
             DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Remote Access Error]: src out of host mmap range\n");
             DOCA_DPA_DEV_LOG_INFO("Descriptor source out of host range: ring=%u slot=%u req_id=%u src=[0x%lx..0x%lx) host=[0x%lx..0x%lx) len=%u\n",
                                  r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
-                                 src_addr, src_end, host_base, host_end, desc->size);
+                                 src_addr, src_end, src_range_base, host_end, desc->size);
             desc->valid = 0;
             __dpa_thread_window_writeback();
             thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
@@ -375,27 +408,70 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
      * so the actual space consumed in the DPU buffer is the rounded-up total. */
     uint32_t padded_total = ALIGN_UP_128(desc->size);
 
-    /* Check if padded descriptor fits in DPU buffer at all */
-    if (padded_total > ring->dpu_buf_size) {
-        DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Length Error]: requested length exceeds DPU destination buffer\n");
-        DOCA_DPA_DEV_LOG_INFO("Descriptor too large for DPU buffer: ring=%u slot=%u req_id=%u size=%u padded=%u dpu_buf_size=%u\n",
-                             r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
-                             desc->size, padded_total, ring->dpu_buf_size);
-        desc->valid = 0;
-        __dpa_thread_window_writeback();
-        thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
-        return 1;
+    /* Phase 4: CASE_DIRECT path — single-shot dma_copy from src host's body
+     * mmap directly to dst host's rx_dma_buffer. Host doesn't import the
+     * peer's mmap (DOCA driver rejects host→host peer access); instead
+     * DPU pushes the peer's DPU-device DPA handle via ADD_PEER and DPA
+     * looks it up here by dst_pod_id. DMA path bypasses both DPU staging
+     * and reverse-DMA — single dma_copy, no DPU memory occupancy. */
+    int is_direct = 0;
+    doca_dpa_dev_mmap_t dst_mmap_used = 0;
+    uint64_t dst_base = 0;
+    uint32_t dst_pos_for_comp = 0;
+    if ((desc->flags & CASE_DIRECT) &&
+        desc->dst_pod_id >= 0 && desc->dst_pod_id < MAX_DPA_PEERS &&
+        thread_arg->peers[desc->dst_pod_id].pod_id == desc->dst_pod_id &&
+        thread_arg->peers[desc->dst_pod_id].rx_mmap != 0) {
+        struct dpa_peer_info *pe = &thread_arg->peers[desc->dst_pod_id];
+
+        /* Phase 4 admission gate (v1.0.0 pattern): inflight = sent - freed.
+         * If at or above peer's rq_depth, defer — leave desc->valid set so
+         * we retry next iteration after drain_all_rings refreshes cached
+         * freed counter via PCIe read of peer's credit slot. */
+        if (pe->credit_buf_arr != 0 && pe->rq_depth != 0) {
+            uint64_t inflight = dpa_direct_sent[desc->dst_pod_id] -
+                                dpa_direct_cached_freed[desc->dst_pod_id];
+            if (inflight >= (uint64_t)pe->rq_depth) {
+                return 0;
+            }
+        }
+
+        uint32_t aligned = ALIGN_UP_128(desc->size);
+        uint64_t cursor = thread_arg->peer_write_cursor[desc->dst_pod_id];
+        if (cursor + aligned > pe->rx_buf_size)
+            cursor = 0;
+        dst_mmap_used = pe->rx_mmap;
+        dst_base = pe->rx_addr + cursor;
+        dst_pos_for_comp = (uint32_t)cursor;
+        thread_arg->peer_write_cursor[desc->dst_pod_id] = cursor + aligned;
+        is_direct = 1;
     }
 
-    /* Wrap around if padded DMA would exceed DPU buffer boundary */
-    if (thread_arg->pos[r] + padded_total > ring->dpu_buf_size)
-        thread_arg->pos[r] = 0;
+    if (is_direct) {
+        /* nothing extra to do — dst_mmap_used / dst_base already set above. */
+    } else {
+        /* Check if padded descriptor fits in DPU buffer at all */
+        if (padded_total > ring->dpu_buf_size) {
+            DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Length Error]: requested length exceeds DPU destination buffer\n");
+            DOCA_DPA_DEV_LOG_INFO("Descriptor too large for DPU buffer: ring=%u slot=%u req_id=%u size=%u padded=%u dpu_buf_size=%u\n",
+                                 r, thread_arg->desc_idx[r], (uint32_t)desc->idx,
+                                 desc->size, padded_total, ring->dpu_buf_size);
+            desc->valid = 0;
+            __dpa_thread_window_writeback();
+            thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
+            return 1;
+        }
+        if (thread_arg->pos[r] + padded_total > ring->dpu_buf_size)
+            thread_arg->pos[r] = 0;
+        dst_mmap_used = ring->dpu_mmap;
+        dst_base = ring->dpu_addr + thread_arg->pos[r];
+    }
 
     /* Build completion message with routing info.
      * Use comch_dma_comp_msg directly (25 bytes) instead of comch_msg union (~52 bytes)
      * to stay within the 32-byte immediate data limit of doca_dpa_dev_comch_producer_dma_copy(). */
     comp.type = COMCH_MSG_TYPE_DMA_COMPLETED;
-    comp.pos = thread_arg->pos[r];
+    comp.pos = is_direct ? dst_pos_for_comp : thread_arg->pos[r];
     comp.length = desc->size;
     comp.req_id = (uint32_t)desc->idx;
     comp.src_pod_id = ring->pod_id;
@@ -451,8 +527,8 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
             if (remaining <= chunk) {
                 doca_dpa_dev_comch_producer_dma_copy(producer,
                                             dpu_consumer_id,
-                                            ring->dpu_mmap,
-                                            ring->dpu_addr + thread_arg->pos[r] + offset,
+                                            dst_mmap_used,
+                                            dst_base + offset,
                                             src_mmap,
                                             desc->addr + offset,
                                             chunk,
@@ -462,8 +538,8 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
             } else {
                 doca_dpa_dev_comch_producer_dma_copy(producer,
                                             dpu_consumer_id,
-                                            ring->dpu_mmap,
-                                            ring->dpu_addr + thread_arg->pos[r] + offset,
+                                            dst_mmap_used,
+                                            dst_base + offset,
                                             src_mmap,
                                             desc->addr + offset,
                                             chunk,
@@ -481,11 +557,16 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
      * On abort: don't advance pos (partial DMA data is abandoned in DPU buffer).
      * No final completion sent, so host will timeout — better than corrupt data.
      * Advance pos by padded_total (128B-aligned) to keep DPU buffer positions
-     * aligned for subsequent dma_copy calls. */
-    if (!aborted) {
+     * aligned for subsequent dma_copy calls. CASE_DIRECT bypasses DPU staging,
+     * so no pos cursor to advance. */
+    if (!aborted && !is_direct) {
         thread_arg->pos[r] += padded_total;
         if (thread_arg->pos[r] >= ring->dpu_buf_size)
             thread_arg->pos[r] = 0;
+    }
+    if (!aborted && is_direct) {
+        /* Phase 4: account direct DMA toward peer's rq_depth. */
+        dpa_direct_sent[desc->dst_pod_id]++;
     }
 
     __dpa_thread_window_writeback();
@@ -496,6 +577,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     desc->dst_pod_id = 0;
     desc->flags = 0;
     desc->dst_mmap = 0;
+    desc->dst_pos = 0;
     desc->dst_addr = 0;
     __dpa_thread_window_writeback();
     desc->valid = 0;
@@ -546,13 +628,24 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     doca_dpa_dev_mmap_t src_mmap = desc->mmap ? desc->mmap : ring->dpu_mmap;
     uint64_t src_base = desc->mmap ? desc->addr : (ring->dpu_addr + desc->addr);
 
-    /* Phase 2 (v2 plan): destination override via desc->dst_mmap. When set,
-     * the descriptor carries an absolute virtual address inside that mmap
-     * (e.g. host_hdr_rx_dpa_handle for hdr forward) and the DPA-managed
-     * rev_pos[r] cursor is bypassed. Default reverse path keeps cursor
-     * management against ring->host_mmap (the body RX). */
-    doca_dpa_dev_mmap_t dst_mmap_used = desc->dst_mmap ? desc->dst_mmap : ring->host_mmap;
-    int dst_overridden = (desc->dst_mmap != 0);
+    /* Phase 3: destination override based on desc->flags.
+     *  - OP_HDR_BATCH: write into dst's hdr_rx_buffer via ring->host_hdr_rx_mmap
+     *    (DPU-side resolved handle). desc->dst_addr already holds the absolute
+     *    VA inside that buffer; desc->dst_pos echoes the offset to host's comp.
+     *  - desc->dst_mmap != 0: legacy Phase 2 override.
+     *  - default: ring->host_mmap (body RX). */
+    doca_dpa_dev_mmap_t dst_mmap_used;
+    int dst_overridden;
+    if (desc->flags & OP_HDR_BATCH) {
+        dst_mmap_used = ring->host_hdr_rx_mmap ? ring->host_hdr_rx_mmap : ring->host_mmap;
+        dst_overridden = (ring->host_hdr_rx_mmap != 0);
+    } else if (desc->dst_mmap) {
+        dst_mmap_used = desc->dst_mmap;
+        dst_overridden = 1;
+    } else {
+        dst_mmap_used = ring->host_mmap;
+        dst_overridden = 0;
+    }
 
     if (desc->size == 0 || dst_mmap_used == 0 || src_mmap == 0) {
         desc->valid = 0;
@@ -618,7 +711,10 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
      * the original sender identity, which the receiving host needs for
      * routing. */
     comp.type = COMCH_MSG_TYPE_REV_DMA_COMPLETED;
-    comp.pos = thread_arg->rev_pos[r];
+    /* Phase 3: when dst is overridden (e.g. hdr forward → hdr_rx_buffer),
+     * the host can't derive the offset from rev_pos[r] because rev_pos is
+     * the body-RX cursor. DPU supplies the offset via desc->dst_pos. */
+    comp.pos = dst_overridden ? desc->dst_pos : thread_arg->rev_pos[r];
     comp.length = desc->size;
     comp.req_id = (uint32_t)desc->idx;
     comp.src_pod_id = desc->src_pod_id;
@@ -715,6 +811,7 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     desc->dst_pod_id = 0;
     desc->flags = 0;
     desc->dst_mmap = 0;
+    desc->dst_pos = 0;
     desc->dst_addr = 0;
     __dpa_thread_window_writeback();
     desc->valid = 0;
@@ -784,6 +881,24 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
                 found++;
                 total_dma_calls += chunks;
             }
+        }
+
+        /* Phase 4: lazy refresh of peer credit slots (CASE_DIRECT admission
+         * gate). Same shape as the reverse-ring refresh above — only PCIe-
+         * read peer's credit counter when inflight is near the cap. */
+        for (uint32_t pid = 0; pid < MAX_DPA_PEERS; pid++) {
+            struct dpa_peer_info *pe = &thread_arg->peers[pid];
+            if (pe->pod_id < 0 || pe->credit_buf_arr == 0 || pe->rq_depth == 0)
+                continue;
+            uint64_t inflight = dpa_direct_sent[pid] - dpa_direct_cached_freed[pid];
+            if (inflight + CREDIT_REFRESH_MARGIN < (uint64_t)pe->rq_depth)
+                continue;
+            doca_dpa_dev_buf_t cbuf =
+                doca_dpa_dev_buf_array_get_buf(pe->credit_buf_arr, DMA_RING_SIZE);
+            doca_dpa_dev_uintptr_t cptr = doca_dpa_dev_buf_get_external_ptr(cbuf);
+            volatile uint64_t *fp = (volatile uint64_t *)cptr;
+            __dpa_thread_window_read_inv();
+            dpa_direct_cached_freed[pid] = *fp;
         }
     } while (found > 0);
 

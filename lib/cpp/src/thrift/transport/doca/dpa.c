@@ -1160,6 +1160,13 @@ dmesh_fill_dpa_ring_info(struct objects *objs, struct pod_state *pod,
     ring_info->dpu_addr = (uint64_t)pod->dma_buffer;
     ring_info->dpu_buf_size = DPU_BUFFER_SIZE;
     ring_info->pod_id = pod->pod_id;
+    /* Phase 3: hdr mmaps. Already resolved against DPU device in
+     * comch_common.c process_mmap_msg. If they aren't yet available
+     * (mmap_msg arrived after setup_pod_dma) they stay 0, and the
+     * forward kernel falls back to body mmap — degraded but safe. */
+    ring_info->host_hdr_mmap = pod->remote_hdr_dpa_handle;
+    ring_info->host_hdr_rx_mmap = pod->host_hdr_rx_dpa_handle;
+    ring_info->host_hdr_addr = (uint64_t)pod->remote_hdr_addr;
 
     return DOCA_SUCCESS;
 }
@@ -1187,6 +1194,15 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
     result = setup_dpa_buf_array_pod(objs, DMA_RING_SIZE + 1, pod->ring_mmap, &pod->buf_arr);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("setup_pod_dma: buf_arr failed for pod %d: %s",
+                     pod->pod_id, doca_error_get_descr(result));
+        return result;
+    }
+
+    /* Phase 4: separate buf_arr for hdr_ring_mmap so DPA handles two
+     * independent forward rings (body + hdr) per pod. */
+    result = setup_dpa_buf_array_pod(objs, DMA_RING_SIZE + 1, pod->hdr_ring_mmap, &pod->hdr_buf_arr);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("setup_pod_dma: hdr buf_arr failed for pod %d: %s",
                      pod->pod_id, doca_error_get_descr(result));
         return result;
     }
@@ -1219,17 +1235,40 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         return result;
     }
 
+    /* Phase 4: hdr ring info — same shape as body ring info but with hdr
+     * buf_arr / addr. dpu_mmap is shared with body's local_mmap since hdr
+     * forward DMA still uses DPU staging (only chunk uses CASE_DIRECT). */
+    struct dpa_ring_info hdr_ring_info = ring_info;  /* copy shared fields */
+    doca_dpa_dev_buf_arr_t hdr_buf_arr_h = 0;
+    result = doca_buf_arr_get_dpa_handle(pod->hdr_buf_arr, &hdr_buf_arr_h);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("setup_pod_dma: hdr buf_arr DPA handle failed: %s",
+                     doca_error_get_descr(result));
+        return result;
+    }
+    hdr_ring_info.buf_arr = hdr_buf_arr_h;
+    /* hdr ring's host_mmap is the host's hdr_tx_buffer (Phase 1 pool),
+     * already resolved earlier. host_addr same as body's? No — body ring
+     * uses pod->remote_addr (body buffer base); hdr ring uses pod->remote_hdr_addr. */
+    hdr_ring_info.host_mmap = pod->remote_hdr_dpa_handle;
+    hdr_ring_info.host_addr = (uint64_t)pod->remote_hdr_addr;
+    hdr_ring_info.host_buf_size = (uint64_t)pod->remote_hdr_buf_size;
+    /* hdr ring's host_hdr_mmap is the body's host_mmap fallback — unused
+     * for OP_HDR_BATCH on this ring because src_mmap derivation in the
+     * forward kernel already uses host_hdr_mmap. */
+
     /* 5. Update DPA thread arg: write ring info first, then increment num_rings */
     struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_thread;
     struct dpa_thread_arg arg;
 
     if (!objs->dpa_thread_running) {
-        /* First pod: fill shared handles + first ring, write via h2d_memcpy */
+        /* First pod: fill shared handles + body ring + hdr ring, write via h2d_memcpy */
         result = dmesh_fill_dpa_thread_arg(objs, &arg);
         if (result != DOCA_SUCCESS)
             return result;
         arg.rings[0] = ring_info;
-        arg.num_rings = 1;
+        arg.rings[1] = hdr_ring_info;
+        arg.num_rings = 2;
 
         result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg,
                                       &arg, sizeof(struct dpa_thread_arg));
@@ -1238,22 +1277,29 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
             return result;
         }
     } else {
-        /* Subsequent pods: send ADD_RING message via comch msgq to DPA thread.
-         * This avoids DPA local memory cache coherency issues with h2d_memcpy
-         * — the DPA thread updates its own data structures directly. */
+        /* Subsequent pods: send two ADD_RING messages (body + hdr). */
         struct comch_add_ring_msg add_msg;
         memset(&add_msg, 0, sizeof(add_msg));
         add_msg.type = COMCH_MSG_TYPE_ADD_RING;
         add_msg.ring = ring_info;
-
         result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
                                            &add_msg, sizeof(add_msg));
         if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("setup_pod_dma: send ADD_RING to DPA failed: %s",
+            DOCA_LOG_ERR("setup_pod_dma: send body ADD_RING to DPA failed: %s",
                          doca_error_get_descr(result));
             return result;
         }
-        DOCA_LOG_INFO("Sent ADD_RING to DPA for pod_id=%d", pod->pod_id);
+        memset(&add_msg, 0, sizeof(add_msg));
+        add_msg.type = COMCH_MSG_TYPE_ADD_RING;
+        add_msg.ring = hdr_ring_info;
+        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+                                           &add_msg, sizeof(add_msg));
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("setup_pod_dma: send hdr ADD_RING to DPA failed: %s",
+                         doca_error_get_descr(result));
+            return result;
+        }
+        DOCA_LOG_INFO("Sent ADD_RING (body + hdr) to DPA for pod_id=%d", pod->pod_id);
     }
 
     /* 6. If first pod, run DPA thread */
@@ -1377,6 +1423,11 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         rev_ring_info.pod_id = pod->pod_id;
         rev_ring_info.host_credit_buf_arr = fwd_buf_arr_h;  /* same buf_arr, slot DMA_RING_SIZE */
         rev_ring_info.rq_depth = pod->rq_depth;
+        /* Phase 3: hdr-side mmap for reverse path. dst is the pod that
+         * receives hdr forwards, so host_hdr_rx_dpa_handle / addr are the
+         * destination of OP_HDR_BATCH reverse DMA. */
+        rev_ring_info.host_hdr_rx_mmap = pod->host_hdr_rx_dpa_handle;
+        rev_ring_info.host_hdr_addr = (uint64_t)pod->host_hdr_rx_addr;
 
         struct comch_add_rev_ring_msg rev_msg;
         memset(&rev_msg, 0, sizeof(rev_msg));
@@ -1391,6 +1442,32 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         } else {
             DOCA_LOG_INFO("Sent ADD_REV_RING to DPA for pod_id=%d (rq_depth=%u, credit_at_slot=%d)",
                           pod->pod_id, pod->rq_depth, DMA_RING_SIZE);
+        }
+
+        /* Phase 4: register this pod's host_rx_mmap with the DPA peer table
+         * so any other pod can DMA directly into it via CASE_DIRECT.
+         * Also wire the v1.0.0-style credit return: peer's forward dma_ring
+         * (fwd_buf_arr_h) carries a credit counter at slot DMA_RING_SIZE
+         * that the peer's host increments on rx_free. DPA uses it to gate
+         * direct DMAs against the peer's rx_dma_buffer cap. */
+        struct comch_add_peer_msg ap_msg;
+        memset(&ap_msg, 0, sizeof(ap_msg));
+        ap_msg.type = COMCH_MSG_TYPE_ADD_PEER;
+        ap_msg.peer.pod_id = pod->pod_id;
+        ap_msg.peer.rx_mmap = host_rx_mmap_h;
+        ap_msg.peer.rx_addr = (uint64_t)pod->host_rx_addr;
+        ap_msg.peer.rx_buf_size = pod->host_rx_buf_size;
+        ap_msg.peer.credit_buf_arr = fwd_buf_arr_h;
+        ap_msg.peer.rq_depth = pod->rq_depth;
+        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+                                           &ap_msg, sizeof(ap_msg));
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_WARN("setup_pod_dma: send ADD_PEER failed: %s",
+                          doca_error_get_descr(result));
+        } else {
+            DOCA_LOG_INFO("Sent ADD_PEER to DPA for pod_id=%d (rx_addr=0x%lx size=%lu, rq_depth=%u)",
+                          pod->pod_id, (unsigned long)pod->host_rx_addr,
+                          (unsigned long)pod->host_rx_buf_size, pod->rq_depth);
         }
     }
 
@@ -1457,6 +1534,9 @@ update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod)
     rev_ring_info.pod_id = pod->pod_id;
     rev_ring_info.host_credit_buf_arr = credit_buf_arr_h;
     rev_ring_info.rq_depth = pod->rq_depth;
+    /* Phase 3: hdr-side mmap for reverse path. */
+    rev_ring_info.host_hdr_rx_mmap = pod->host_hdr_rx_dpa_handle;
+    rev_ring_info.host_hdr_addr = (uint64_t)pod->host_hdr_rx_addr;
 
     struct comch_add_rev_ring_msg rev_msg;
     memset(&rev_msg, 0, sizeof(rev_msg));

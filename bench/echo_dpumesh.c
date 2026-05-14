@@ -21,10 +21,12 @@
 #include <pthread.h>
 
 #include <thrift/transport/dpumesh.h>
+#include <thrift/transport/doca/mesh.h>
 
 #define ECHO_THREADS_DEFAULT 32
 
 static dpumesh_ctx_t *g_ctx = NULL;
+static int            g_split = 0;
 
 static void process_one(const sw_descriptor_t *req) {
     /* Pull request body */
@@ -36,6 +38,23 @@ static void process_one(const sw_descriptor_t *req) {
     uint8_t *rx_buf = dpumesh_rx_buf(g_ctx, req->body_buf_slot);
     if (!rx_buf) {
         dpumesh_rx_free(g_ctx, req->body_buf_slot);
+        return;
+    }
+
+    /* Phase 3 split path: echo via dpumesh_send_response. Mesh layer
+     * handles req_id, dst_pod, and the dual hdr/chunk write. */
+    if (g_split) {
+        /* Copy body locally so we can release rx slot ASAP. */
+        uint8_t body[MESH_CHUNK_BODY_BUDGET];
+        uint32_t blen = req->body_len > sizeof(body) ? (uint32_t)sizeof(body) : req->body_len;
+        if (blen > 0) memcpy(body, rx_buf, blen);
+        dpumesh_rx_free(g_ctx, req->body_buf_slot);
+
+        struct mesh_req_id rid = { .src_id = (uint32_t)req->src_pod_id,
+                                   .seq    = req->req_id };
+        uint8_t flags = (req->flags & ~OP_REQUEST) | OP_RESPONSE;
+        (void)dpumesh_send_response(g_ctx, req->src_pod_id, rid,
+                                    body, blen, flags);
         return;
     }
 
@@ -115,6 +134,9 @@ int main(int argc, char **argv) {
         n_threads = atoi(getenv("ECHO_THREADS"));
         if (n_threads < 1) n_threads = 1;
     }
+    if (getenv("BENCH_SPLIT"))
+        g_split = atoi(getenv("BENCH_SPLIT")) ? 1 : 0;
+    fprintf(stderr, "[echo] path: %s\n", g_split ? "SPLIT (Phase 3)" : "LEGACY");
 
     dpumesh_config_t cfg = DPUMESH_CONFIG_DEFAULT;
     int rc = dpumesh_init(&g_ctx, "echo-dpumesh", worker_id, &cfg);

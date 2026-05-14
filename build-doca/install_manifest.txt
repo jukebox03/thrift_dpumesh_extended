@@ -71,6 +71,7 @@
 /usr/local/include/thrift/transport/doca/comch_msgq.h
 /usr/local/include/thrift/transport/doca/comch_server.h
 /usr/local/include/thrift/transport/doca/dpa.h
+/usr/local/include/thrift/transport/doca/mesh.h
 /usr/local/include/thrift/transport/doca/common.h
 /usr/local/include/thrift/transport/doca/dpa_common.h
 /usr/local/include/thrift/transport/doca/dpumesh_common.h

@@ -26,7 +26,7 @@ extern "C" {
  * Bumped 1024 → 2048 (16 MB per buffer): provides 2× headroom which lets
  * the DPA-side admission gate's lazy-refresh tolerate larger cache lag
  * without false-positive defers, smoothing the latency curve at cap. */
-#define DPUMESH_NUM_SLOTS_DEFAULT       2048
+#define DPUMESH_NUM_SLOTS_DEFAULT       4096
 #define DPUMESH_DESCRIPTOR_SIZE         64
 #define DPUMESH_MAX_DESCRIPTORS_DEFAULT 2048
 #define DPUMESH_PREFIX_DEFAULT          "dpumesh"
@@ -143,6 +143,62 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
  *
  * Idempotent. Safe to call concurrently with TX_ACK arrival. */
 void dpumesh_pending_release_async(dpumesh_ctx_t *ctx, uint32_t req_id);
+
+/* ====== Phase 3: Header/Body split API ======
+ *
+ * The split path replaces the legacy "alloc + raw enqueue" flow with a
+ * mesh-aware send: header batches travel src→DPU→dst (control plane),
+ * body chunks travel src→dst (data plane; via DPU staging in Phase 3,
+ * direct in Phase 4). req_id is the 64-bit (src_id, seq) pair from mesh.h
+ * — globally unique across pods.
+ *
+ * Phase 3 unified entry point: dpumesh_send_request().
+ *   - Allocates a new req_id (src_id, seq).
+ *   - Registers the pending entry.
+ *   - Appends one hdr entry to the single hdr_builder.
+ *   - Appends one body to chunk_builder[dst_pod].
+ *   - Both appends happen under the same critical section so the order of
+ *     hdr entries (per dst) matches the order of body entries in the
+ *     corresponding chunk_builder. DPU's strict-FIFO per-dst outbound
+ *     staging preserves that order to the dst.
+ *   - Returns 0 on success; *out_req_id holds the assigned req_id.
+ *
+ * Caller then waits via dpumesh_wait_response_v2(req_id, ...). */
+
+/* mesh.h's struct mesh_req_id, declared here so callers don't have to
+ * pull in the doca/ private header. */
+struct mesh_req_id;
+
+/* Resolve a service name to a destination pod_id. Phase 3 ships a static
+ * "bench"→10, "echo"→11 mapping; Phase 4+ swaps for a DPU-pushed table. */
+int dpumesh_resolve(dpumesh_ctx_t *ctx, const char *service);
+
+/* Send one request (header + body) to the named service. The mesh layer
+ * resolves the service, allocates a req_id, registers the pending entry,
+ * and enqueues both the hdr and chunk for background flush. On success
+ * *out_req_id is set and the caller must subsequently wait_response. */
+int dpumesh_send_request(dpumesh_ctx_t *ctx, const char *service,
+                         const uint8_t *body, uint32_t body_len, uint8_t flags,
+                         struct mesh_req_id *out_req_id);
+
+/* Send a response back to a previously-known src pod. Used by responders
+ * (server transport / echo) that already have the request's req_id and
+ * src_pod_id. flags should set OP_RESPONSE. */
+int dpumesh_send_response(dpumesh_ctx_t *ctx, int dst_pod_id,
+                          struct mesh_req_id req_id,
+                          const uint8_t *body, uint32_t body_len, uint8_t flags);
+
+/* Block waiting for the matching response. Returns 0 + fills resp on
+ * success, -1 on timeout. Caller frees resp->body_buf_slot via rx_free. */
+int dpumesh_wait_response_v2(dpumesh_ctx_t *ctx, struct mesh_req_id req_id,
+                             sw_descriptor_t *resp, int timeout_ms);
+
+/* Cancel / async-release variants for the v2 req_id keying. */
+void dpumesh_cancel_pending_v2(dpumesh_ctx_t *ctx, struct mesh_req_id req_id);
+void dpumesh_pending_release_async_v2(dpumesh_ctx_t *ctx, struct mesh_req_id req_id);
+
+/* Query this pod's src_id (= pod_id in Phase 3). */
+uint32_t dpumesh_get_src_id(dpumesh_ctx_t *ctx);
 
 #ifdef __cplusplus
 }

@@ -423,7 +423,7 @@
 ]]>
 </script>
 <rect x="0.0" y="0" width="1600.0" height="430.0" fill="url(#background)"  />
-<text id="title" x="800.00" y="24" >DPUmesh</text>
+<text id="title" x="800.00" y="24" >DPUmesh-baseline</text>
 <text id="subtitle" x="800.00" y="48" ></text>
 <text id="details" x="10.00" y="413" > </text>
 <text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>

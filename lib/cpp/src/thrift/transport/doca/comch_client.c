@@ -138,6 +138,14 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
 
+	case DMESH_MSG_PEER_TOPOLOGY:
+		/* Phase 4: DPU forwarding a peer's host_rx_buffer + ring export
+		 * descriptors so we can DMA directly into the peer. */
+		DOCA_LOG_DBG("Client received DMESH_MSG_PEER_TOPOLOGY len=%u", msg_len);
+		if (objs->rx_data_hook)
+			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
+		break;
+
 	case DMESH_MSG_CONSUMER_ID: {
 		struct dmesh_consumer_id_msg *cid_msg = (struct dmesh_consumer_id_msg *)recv_buffer;
 		if (msg_len < sizeof(struct dmesh_consumer_id_msg)) {

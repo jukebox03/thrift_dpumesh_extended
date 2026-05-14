@@ -57,6 +57,50 @@ int setup_dma_ring(struct objects *objs, size_t size)
     return 0;
 }
 
+int setup_hdr_dma_ring(struct objects *objs, size_t size,
+                       struct dma_ring **out_ring, struct doca_mmap **out_mmap)
+{
+    doca_error_t result;
+    struct dma_ring *ring;
+
+    ring = (struct dma_ring *)malloc(sizeof(struct dma_ring));
+    if (!ring) return DOCA_ERROR_NO_MEMORY;
+
+    ring->size = size;
+    ring->head = 0;
+    ring->descs = NULL;
+
+    /* Same layout as body dma_ring: DMA_RING_SIZE normal slots + 1 credit
+     * slot at index size. Even though Phase 4 hdr path doesn't actually
+     * use the credit slot (hdr_rx_buffer is wrap-only), keep the +1 layout
+     * symmetric with the body ring so DPA code can be generic. */
+    size_t alloc_slots = ring->size + 1;
+    result = alloc_buffer_and_set_mmap(&ring->mmap, objs->dev,
+                           (void **)&ring->descs,
+                           alloc_slots * sizeof(struct dma_desc),
+                           DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to allocate HDR DMA ring: %s", doca_error_get_descr(result));
+        free(ring);
+        return result;
+    }
+    memset(ring->descs, 0, alloc_slots * sizeof(struct dma_desc));
+
+    result = export_mmap_to_remote(objs, ring->mmap,
+                                   ring->descs,
+                                   alloc_slots * sizeof(struct dma_desc),
+                                   DMA_HDR_RING, HOST_TO_DPU);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to export HDR DMA ring to DPU: %s", doca_error_get_descr(result));
+        destroy_mmap_and_free_buffer(ring->mmap, ring->descs);
+        free(ring);
+        return result;
+    }
+    *out_ring = ring;
+    *out_mmap = ring->mmap;
+    return 0;
+}
+
 int setup_dpu_tx_ring(struct doca_dev *dev, size_t size,
                       struct dma_ring **out_ring, struct doca_mmap **out_mmap)
 {

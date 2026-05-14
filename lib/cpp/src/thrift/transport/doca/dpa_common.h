@@ -7,15 +7,52 @@
 
 #include "dpumesh_common.h"
 
+/* OP flag bits (Phase 3) — shared between host, DPU, and the DPA kernel.
+ * Mirrors mesh.h; duplicated here because the DPA kernel build doesn't
+ * include mesh.h. Keep in sync with mesh.h. */
+#ifndef OP_HDR_BATCH
+#define OP_HDR_BATCH 0x40
+#endif
+#ifndef OP_CHUNK
+#define OP_CHUNK     0x20
+#endif
+#ifndef CASE_DIRECT
+#define CASE_DIRECT  4
+#endif
+
 typedef uint64_t doca_dpa_dev_uintptr_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
 
 /* ====== Multi-ring DPA thread arg ====== */
 
+#define MAX_DPA_PEERS  16
+
+/* Phase 4: peer info pushed from DPU to DPA. DPA forward kernel looks up
+ * by dst_pod_id when desc.flags & CASE_DIRECT, then performs single-shot
+ * dma_copy from src host's body mmap to peer host's rx_mmap (both DPU-
+ * device DPA handles — no host→host PCIe peer access needed).
+ *
+ * Flow control (v1.0.0 pattern): peer's dma_ring buf_arr is re-used as a
+ * credit pipe. Slot index DMA_RING_SIZE in that buf_arr is a uint64_t
+ * "freed_cumulative" counter that the peer host increments on rx_free.
+ * DPA lazily refreshes its cached copy and admits new direct DMAs only
+ * when sent - cached_freed < rq_depth. */
+struct dpa_peer_info {
+	int32_t  pod_id;        /* -1 = empty slot */
+	uint32_t _pad;
+	doca_dpa_dev_mmap_t rx_mmap;
+	uint32_t _pad2;
+	uint64_t rx_addr;
+	uint64_t rx_buf_size;
+	doca_dpa_dev_buf_arr_t credit_buf_arr;  /* peer's dma_ring buf_arr (slot DMA_RING_SIZE = credit) */
+	uint32_t rq_depth;                       /* peer's rx_dma_buffer num_slots */
+	uint32_t _pad3;
+} __attribute__((__packed__, aligned(8)));
+
 struct dpa_ring_info {
 	doca_dpa_dev_buf_arr_t buf_arr;
 	uint32_t buf_arr_size;
-	doca_dpa_dev_mmap_t host_mmap;   /* Host DMA buffer mmap */
+	doca_dpa_dev_mmap_t host_mmap;   /* Host DMA buffer mmap (body pool) */
 	uint64_t host_addr;              /* Host DMA buffer base address */
 	uint64_t host_buf_size;          /* Host DMA buffer size */
 	doca_dpa_dev_mmap_t dpu_mmap;    /* DPU local buffer mmap */
@@ -30,7 +67,17 @@ struct dpa_ring_info {
 	 * or not yet wired). */
 	doca_dpa_dev_buf_arr_t host_credit_buf_arr;
 	uint32_t rq_depth;
-	uint32_t _pad_credit;
+	/* Phase 3: hdr-side mmap handles resolved against the DPU device.
+	 *   host_hdr_mmap    — forward rings: host's hdr_tx_buffer (DPA reads
+	 *                      from it when desc.flags & OP_HDR_BATCH).
+	 *   host_hdr_rx_mmap — reverse rings: host's hdr_rx_buffer (DPA writes
+	 *                      to it when desc.flags & OP_HDR_BATCH).
+	 * Both are 0 until the matching DMA_HOST_TX_HDR_BUFFER / RX_HDR_BUFFER
+	 * mmap_msg lands; before that the forward/reverse path for hdr would
+	 * fall back to body mmap (degraded, but legacy keeps working). */
+	doca_dpa_dev_mmap_t host_hdr_mmap;
+	doca_dpa_dev_mmap_t host_hdr_rx_mmap;
+	uint64_t host_hdr_addr;          /* host_hdr_tx base VA (forward) or host_hdr_rx base VA (reverse) */
 } __attribute__((__packed__, aligned(8)));
 
 struct dpa_thread_arg {
@@ -55,6 +102,13 @@ struct dpa_thread_arg {
 	struct dpa_ring_info rev_rings[MAX_DPA_RINGS];
 	uint32_t rev_desc_idx[MAX_DPA_RINGS];
 	uint32_t rev_pos[MAX_DPA_RINGS];
+
+	/* Phase 4: peer table — indexed by pod_id (sparse). Populated via
+	 * COMCH_MSG_TYPE_ADD_PEER from DPU after setup_pod_dma completes.
+	 * Forward kernel CASE_DIRECT looks up peers[dst_pod_id] and issues
+	 * single-shot dma_copy directly to peer's rx_mmap. */
+	struct dpa_peer_info peers[MAX_DPA_PEERS];
+	uint64_t peer_write_cursor[MAX_DPA_PEERS];
 } __attribute__((__packed__, aligned(8)));
 
 /* ====== Per-message payload layout ======
@@ -80,7 +134,16 @@ enum comch_msg_type {
 	COMCH_MSG_TYPE_DMA_CHUNK = 5, /* DPA→DPU: intermediate DMA chunk landed (no action needed) */
 	COMCH_MSG_TYPE_ADD_REV_RING = 6, /* DPU→DPA: add reverse (DPU→CPU) ring */
 	COMCH_MSG_TYPE_REV_DMA_COMPLETED = 7, /* DPA→DPU: reverse DMA completed (DPU→CPU) */
+	COMCH_MSG_TYPE_ADD_PEER = 8, /* DPU→DPA (Phase 4): register peer host_rx_mmap for CASE_DIRECT */
 };
+
+/* struct dpa_peer_info / MAX_DPA_PEERS moved above struct dpa_ring_info. */
+
+struct comch_add_peer_msg {
+	enum comch_msg_type type;
+	uint32_t _pad;
+	struct dpa_peer_info peer;
+} __attribute__((__packed__, aligned(8)));
 
 struct comch_dma_comp_msg {
 	enum comch_msg_type type;
@@ -155,7 +218,12 @@ struct dma_desc {
 	                                * means DPA reverse kernel writes into this mmap
 	                                * (e.g. host_hdr_rx_dpa_handle) instead of
 	                                * ring->host_mmap. Forward kernel ignores. */
-	uint8_t _pad_dst[4];           /* 4B align dst_addr to 8B */
+	uint32_t dst_pos;              /* 4B (Phase 3) - offset within the dst buffer
+	                                * for the host to read from. DPA echoes this
+	                                * into comp.pos when dst_overridden so the
+	                                * host knows where in hdr_rx_buffer the data
+	                                * landed. (When dst_mmap == 0, comp.pos is
+	                                * derived from rev_pos[r] as before.) */
 	uint64_t dst_addr;             /* 8B (Phase 2) - absolute virtual address in
 	                                * dst_mmap. Only used when dst_mmap != 0. */
 	uint8_t reserved[11];          /* 11B */
@@ -171,6 +239,7 @@ _Static_assert(offsetof(struct dma_desc, dst_pod_id) == 24, "dma_desc.dst_pod_id
 _Static_assert(offsetof(struct dma_desc, flags) == 28, "dma_desc.flags offset mismatch");
 _Static_assert(offsetof(struct dma_desc, src_pod_id) == 32, "dma_desc.src_pod_id offset mismatch");
 _Static_assert(offsetof(struct dma_desc, dst_mmap) == 36, "dma_desc.dst_mmap offset mismatch");
+_Static_assert(offsetof(struct dma_desc, dst_pos)  == 40, "dma_desc.dst_pos offset mismatch");
 _Static_assert(offsetof(struct dma_desc, dst_addr) == 44, "dma_desc.dst_addr offset mismatch");
 _Static_assert(offsetof(struct dma_desc, valid) == 63, "dma_desc.valid offset mismatch");
 

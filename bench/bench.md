@@ -532,10 +532,10 @@ baseline (separate buffer + memcpy), 우측 = new (in-place forward):
         ┃         (54,748 RPS × 4 dma_copy, +2.2 %)
 ```
 
-| | dma_copy ops/sec | vs Method 0 | vs Method 1 |
+| | dma_copy ops/sec | vs Method 0 | vs Method 2 |
 |---|---:|---:|---:|
 | dpumesh baseline @ overload (53,553 RPS) | 214,212 | 67 % | 69 % |
-| **dpumesh remove memcpy @ overload (54,748 RPS)** | **218,992** | **68 %** | **71 %** |
+| **dpumesh new @ overload (54,748 RPS)** | **218,992** | **68 %** | **71 %** |
 | dpumesh new @ sustainable (53,636 RPS, p99 12.4 ms) | 214,544 | 67 % | 69 % |
 
 Method 2 (DMA + completion) baseline 대비 69 % → **71 %**. ceiling 까지 남은

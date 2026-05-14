@@ -30,6 +30,7 @@
 #include <arpa/inet.h>
 
 #include <thrift/transport/dpumesh.h>
+#include <thrift/transport/doca/mesh.h>
 
 #define CTRL_PORT          9092
 /* MAX_WORKERS sets the upper bound on closed-loop concurrency. With wrk2-style
@@ -46,6 +47,8 @@
 
 static dpumesh_ctx_t *g_ctx = NULL;
 static int            g_dst_pod_id = 11;
+static int            g_split = 0;            /* BENCH_SPLIT=1 enables Phase 3 path */
+static char           g_service[64] = "echo"; /* default target service for split path */
 
 /* ------------------------------------------------------------ time helpers */
 
@@ -101,6 +104,37 @@ static void *worker_fn(void *arg) {
         sleep_until(scheduled);
 
         double t0 = scheduled;
+
+        /* Phase 3 split path: dpumesh_send_request + wait_response_v2.
+         * Mesh layer resolves service → dst_pod_id, allocates 64-bit req_id,
+         * appends hdr+body in one critical section, and returns immediately;
+         * the bench loop only waits for the matching response. */
+        if (g_split) {
+            uint8_t bb[MESH_CHUNK_BODY_BUDGET];
+            uint32_t blen = (uint32_t)w->msg_size;
+            if (blen > sizeof(bb)) blen = sizeof(bb);
+            memset(bb, (int)('A' + (i & 0xf)), blen);
+
+            struct mesh_req_id rid;
+            if (dpumesh_send_request(g_ctx, g_service, bb, blen,
+                                     OP_REQUEST, &rid) < 0) {
+                atomic_fetch_add(w->fail, 1);
+                continue;
+            }
+            sw_descriptor_t resp;
+            if (dpumesh_wait_response_v2(g_ctx, rid, &resp, WAIT_TIMEOUT_MS) < 0) {
+                dpumesh_cancel_pending_v2(g_ctx, rid);
+                atomic_fetch_add(w->fail, 1);
+                continue;
+            }
+            if (resp.body_buf_slot >= 0)
+                dpumesh_rx_free(g_ctx, resp.body_buf_slot);
+            double lat_us = (now_sec() - t0) * 1e6;
+            if (w->n_samples < w->cap)
+                w->samples[w->n_samples++] = lat_us;
+            atomic_fetch_add(w->ok, 1);
+            continue;
+        }
 
         uint32_t req_id = dpumesh_alloc_req_id(g_ctx);
         int tx_slot = dpumesh_tx_alloc(g_ctx);
@@ -395,6 +429,13 @@ int main(int argc, char **argv) {
         worker_id = atoi(getenv("BENCH_WORKER_ID"));
     if (getenv("BENCH_DST_POD_ID"))
         g_dst_pod_id = atoi(getenv("BENCH_DST_POD_ID"));
+    if (getenv("BENCH_SPLIT"))
+        g_split = atoi(getenv("BENCH_SPLIT")) ? 1 : 0;
+    if (getenv("BENCH_SERVICE"))
+        snprintf(g_service, sizeof(g_service), "%s", getenv("BENCH_SERVICE"));
+    fprintf(stderr, "[bench] path: %s, service=%s, dst_pod=%d\n",
+            g_split ? "SPLIT (Phase 3)" : "LEGACY",
+            g_service, g_dst_pod_id);
 
     dpumesh_config_t cfg = DPUMESH_CONFIG_DEFAULT;
     int rc = dpumesh_init(&g_ctx, "bench-dpumesh", worker_id, &cfg);

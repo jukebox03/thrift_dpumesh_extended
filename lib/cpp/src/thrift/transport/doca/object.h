@@ -139,6 +139,14 @@ struct pod_state {
     void *remote_addr;
     size_t remote_buf_size;
 
+    /* Phase 4: independent forward DMA ring for hdr batches. Same shape
+     * as ring_mmap (DMA_RING_SIZE + 1 slot for credit), but kept distinct
+     * so hdr/body never share ring-slot backpressure or credit accounting. */
+    struct doca_mmap *hdr_ring_mmap;
+    void *hdr_ring_addr;
+    size_t hdr_ring_buf_size;
+    struct doca_buf_arr *hdr_buf_arr;
+
     /* Phase 1 (v2 plan): independent host TX hdr pool. DPA forward kernel
      * picks src mmap via desc->mmap override; when host enqueues a hdr
      * batch, dma_desc.mmap = remote_hdr_dpa_handle below. */
@@ -179,6 +187,13 @@ struct pod_state {
     struct doca_mmap *host_rx_mmap;
     void *host_rx_addr;
     size_t host_rx_buf_size;
+    /* Phase 4: cache raw PCI export descriptors for host's rx_dma_buffer
+     * and forward dma_ring so DPU can rebroadcast them to other pods for
+     * direct host→host DMA (with v1.0.0-style credit at ring's last slot). */
+    uint8_t host_rx_export_desc[1024];
+    size_t  host_rx_export_desc_len;
+    uint8_t ring_export_desc[1024];
+    size_t  ring_export_desc_len;
 
     /* Phase 2 (v2 plan): independent host RX hdr buffer. DPU sets
      * dma_desc.dst_mmap = host_hdr_rx_dpa_handle when flushing hdr
@@ -188,6 +203,12 @@ struct pod_state {
     void *host_hdr_rx_addr;
     size_t host_hdr_rx_buf_size;
     doca_dpa_dev_mmap_t host_hdr_rx_dpa_handle;
+
+    /* Phase 3: monotonic cursor into host_hdr_rx_buffer for in-place
+     * forwarding of OP_HDR_BATCH batches. DPU advances by ALIGN_UP_128
+     * per batch and wraps. No credit return — Phase 3 trusts that the
+     * 8MB ring is large enough relative to host hdr drain rate. */
+    uint32_t hdr_rx_cursor;
 
     /* Host's RX RQ depth (= num_slots), derived from host_rx_buf_size.
      * Used by DPA admission gate as the cap on in-flight reverse DMAs. */

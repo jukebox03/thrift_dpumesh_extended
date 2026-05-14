@@ -7,6 +7,10 @@
 #define CASE_EXTERNAL  1
 #define CASE_INGRESS   2
 #define CASE_LOCAL     3
+/* Phase 4 (v2 plan): host→host direct DMA. Set on chunk descriptors when
+ * the DPA forward kernel should bypass DPU staging and write straight
+ * into the peer's rx_dma_buffer using dst override fields. */
+#define CASE_DIRECT    4
 
 /* OpFlag (match Python OpFlag) */
 #define OP_REQUEST     0x00
@@ -46,7 +50,7 @@
  * from ALL source pods that target it. With N concurrent sources targeting
  * one dst, worst-case dst staging occupancy is N × this size. Single-source
  * workloads fit exactly; multi-source needs a scaled DPU_BUFFER_SIZE. */
-#define DPU_BUFFER_SIZE     (16 * 1024 * 1024)  /* 16MB = 2048 × 8KB */
+#define DPU_BUFFER_SIZE     (32 * 1024 * 1024)  /* 32MB = 4096 × 8KB (Phase 4: bigger headroom for parked chunks under 10k load) */
 #define DPUMESH_SLOT_SIZE   8192               /* matches DPUMESH_SLOT_SIZE_DEFAULT */
 /* DMA descriptor ring depth (host→DPU forward). Mirrored from ring.h so
  * the DPA kernel — which can't include ring.h — knows the ring length.

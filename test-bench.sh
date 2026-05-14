@@ -230,9 +230,19 @@ stop_dpu() {
 start_dpu() {
     step "=== Starting dpumesh_dpu on DPU ==="
     stop_dpu
+    # Truncate old DPU log + any stray copies BEFORE start, so a /tmp blow-up
+    # from a previous run can't wedge the next deploy's rsync. Memory rule:
+    # "No DPU log raise" — but if a regression slips in, the partition must
+    # not be the failure surface.
+    # Pre-clean DPU /tmp so a /tmp-fill regression from a previous run
+    # can't wedge the next deploy's rsync. -l 30 = ERROR-only (drop WARN);
+    # memory rule "No DPU log raise" — hot path is silent now (see
+    # dpu_worker.c). Truncate the live log on every restart.
     ssh "$DPU_HOST" "cat > /tmp/start_dpu_bench.sh << 'LAUNCHER'
 #!/bin/bash
-screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && ./dpumesh_dpu $DPU_PCI -l 40 > $DPU_LOG 2>&1\"
+: > $DPU_LOG
+rm -f /tmp/dpumesh_dpu_*.log.old /tmp/dpumesh_dpu_*.log.* 2>/dev/null
+screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && ./dpumesh_dpu $DPU_PCI -l 30 > $DPU_LOG 2>&1\"
 sleep 2
 pgrep -f 'dpumesh_dpu.*03:00' || echo NO_PID
 LAUNCHER
@@ -391,6 +401,8 @@ spec:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
         - { name: BENCH_WORKER_ID, value: "10" }
         - { name: BENCH_DST_POD_ID, value: "11" }
+        - { name: BENCH_SPLIT, value: "${BENCH_SPLIT:-0}" }
+        - { name: BENCH_SERVICE, value: "echo" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리 (CFS quota 미사용).
         volumeMounts:
@@ -425,7 +437,8 @@ spec:
         env:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
         - { name: BENCH_WORKER_ID, value: "11" }
-        - { name: ECHO_THREADS, value: "64" }
+        - { name: ECHO_THREADS, value: "16" }
+        - { name: BENCH_SPLIT, value: "${BENCH_SPLIT:-0}" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리.
         volumeMounts:
