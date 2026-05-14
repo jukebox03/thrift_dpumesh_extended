@@ -18,6 +18,9 @@
 #define POOL_HOST_RX_BODY   4
 #define POOL_DPU_TX_BODY    6
 #define POOL_DPU_RX_BODY    7
+/* Phase 1 (v2 plan): independent host TX pool for header batches. Tracked
+ * in TX_ACK.pool_type so the host frees the correct slot. */
+#define POOL_HOST_TX_HDR    8
 
 /* ====== DOCA / DPA limits ====== */
 #define MAX_DPA_RINGS       8

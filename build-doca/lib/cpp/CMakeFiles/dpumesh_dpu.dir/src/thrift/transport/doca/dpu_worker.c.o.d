@@ -1,8 +1,8 @@
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.c \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.c \
  /usr/include/stdc-predef.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/object.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpu_worker.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/object.h \
  /usr/include/pthread.h /usr/include/features.h \
  /usr/include/features-time64.h \
  /usr/include/x86_64-linux-gnu/bits/wordsize.h \
@@ -41,6 +41,7 @@ lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o: \
  /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
  /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
  /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
+ /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
  /opt/mellanox/doca/include/doca_dev.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdint.h /usr/include/stdint.h \
  /usr/include/x86_64-linux-gnu/bits/libc-header-start.h \
@@ -78,20 +79,21 @@ lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o: \
  /opt/mellanox/doca/include/doca_pe.h \
  /opt/mellanox/doca/include/doca_comch.h \
  /opt/mellanox/doca/include/doca_ctx.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_consumer.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_consumer.h \
  /opt/mellanox/doca/include/doca_comch_consumer.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h \
  /opt/mellanox/doca/include/doca_mmap.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa.h \
  /opt/mellanox/doca/include/doca_dpa.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdarg.h \
  /opt/mellanox/doca/include/doca_buf_array.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa_common.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa_common.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.h \
  /opt/mellanox/doca/include/doca_comch_msgq.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/buffer.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/buffer.h \
  /opt/mellanox/doca/include/doca_buf.h \
  /opt/mellanox/doca/include/doca_buf_pool.h \
  /opt/mellanox/doca/include/doca_buf_inventory.h \
@@ -103,9 +105,10 @@ lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/dpu_worker.c.o: \
  /usr/include/x86_64-linux-gnu/bits/types/FILE.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
  /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/ring.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dma.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/../dpumesh.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/ring.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dma.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/../dpumesh.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/../doca/dpumesh_common.h \
  /usr/include/unistd.h /usr/include/x86_64-linux-gnu/bits/posix_opt.h \
  /usr/include/x86_64-linux-gnu/bits/environments.h \
  /usr/include/x86_64-linux-gnu/bits/confname.h \

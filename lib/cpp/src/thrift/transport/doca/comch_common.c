@@ -77,6 +77,8 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		mmap = &pod->remote_mmap;
 	} else if (mmap_msg->mmap_type == DMA_HOST_RX_BUFFER) {
 		mmap = &pod->host_rx_mmap;
+	} else if (mmap_msg->mmap_type == DMA_HOST_TX_HDR_BUFFER) {
+		mmap = &pod->remote_hdr_mmap;
 	} else {
 		DOCA_LOG_ERR("Invalid mmap type received: %d", mmap_msg->mmap_type);
 		return DOCA_ERROR_INVALID_VALUE;
@@ -105,6 +107,21 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		pod->rq_depth = (uint32_t)(buf_size / DPUMESH_SLOT_SIZE);
 		DOCA_LOG_INFO("Pod %d: Host RX buffer stored (addr=%p, size=%zu, rq_depth=%u)",
 			      pod->pod_id, remote_addr, buf_size, pod->rq_depth);
+	} else if (mmap_msg->mmap_type == DMA_HOST_TX_HDR_BUFFER) {
+		pod->remote_hdr_addr = remote_addr;
+		pod->remote_hdr_buf_size = buf_size;
+		/* Resolve DPA handle once now so the forward kernel can use it via
+		 * desc->mmap override without doing a per-request lookup. */
+		result = doca_mmap_dev_get_dpa_handle(pod->remote_hdr_mmap, objs->dev,
+		                                      &pod->remote_hdr_dpa_handle);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Pod %d: failed to get DPA handle for hdr mmap: %s",
+				     pod->pod_id, doca_error_get_name(result));
+			return result;
+		}
+		DOCA_LOG_INFO("Pod %d: Host TX HDR buffer stored (addr=%p, size=%zu, dpa_handle=0x%lx)",
+			      pod->pod_id, remote_addr, buf_size,
+			      (unsigned long)pod->remote_hdr_dpa_handle);
 	} else {
 		pod->remote_addr = remote_addr;
 		pod->remote_buf_size = buf_size;

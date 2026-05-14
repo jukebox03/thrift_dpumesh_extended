@@ -1,7 +1,7 @@
 lib/cpp/CMakeFiles/dpumesh_dpu.dir/src/thrift/transport/doca/config.c.o: \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/config.c \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/config.c \
  /usr/include/stdc-predef.h \
- /home/jukebox/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/config.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/config.h \
  /opt/mellanox/doca/include/doca_dev.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdint.h /usr/include/stdint.h \
  /usr/include/x86_64-linux-gnu/bits/libc-header-start.h \

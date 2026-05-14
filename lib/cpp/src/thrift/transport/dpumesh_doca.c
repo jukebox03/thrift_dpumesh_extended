@@ -41,6 +41,12 @@ static const char *doca_err_str(doca_error_t rc) {
 
 static void cleanup_ctx(struct dpumesh_ctx *ctx);
 
+/* Phase 1: HDR TX pool API — declared early because cleanup_ctx uses
+ * dpumesh_hdr_tx_free during pending teardown (mirror of dpumesh_tx_free). */
+int      dpumesh_hdr_tx_alloc(dpumesh_ctx_t *ctx);
+uint8_t *dpumesh_hdr_tx_buf(dpumesh_ctx_t *ctx, int slot);
+void     dpumesh_hdr_tx_free(dpumesh_ctx_t *ctx, int slot);
+
 /* ====================================================================
  * dpumesh_ctx — internal state
  * ==================================================================== */
@@ -64,7 +70,14 @@ typedef struct {
     pthread_cond_t cond;
     sw_descriptor_t desc;
     volatile int state;   /* -1=unused, -2=cancelled(tx deferred), 0=waiting, 1=arrived */
-    int tx_slot;          /* TX buffer slot owned by this request, -1 if none */
+    int tx_slot;          /* BODY TX buffer slot owned by this request, -1 if none.
+                           * Kept named `tx_slot` for legacy compat; semantically
+                           * this is the body pool slot (POOL_HOST_TX_BODY). */
+    /* Phase 1 (v2 plan): independent HDR TX pool. Same lifecycle rules as
+     * tx_slot but tracked separately so a single user RPC can simultaneously
+     * own a body slot and a hdr slot without clobbering. TX_ACK.pool_type
+     * tells the handler which one to free. */
+    int hdr_tx_slot;      /* HDR TX buffer slot, -1 if none */
 } dpumesh_pending_t;
 
 struct dpumesh_ctx {
@@ -90,10 +103,25 @@ struct dpumesh_ctx {
     struct dmesh_register_msg reg_msg;
     struct dmesh_pod_consumer_id_msg pod_cid_msg;
 
-    /* TX slot management */
+    /* TX slot management (body pool) */
     uint8_t *slot_bitmap;
     pthread_mutex_t slot_lock;
     pthread_cond_t  slot_cond;  /* Signaled when a TX slot is freed */
+
+    /* Phase 1 (v2 plan): independent HDR TX pool. DOCA mmap exported to DPU
+     * as DMA_HOST_TX_HDR_BUFFER. DPA forward kernel picks src mmap via
+     * desc->mmap override (= hdr_tx_dpa_handle when src_body_pool_type ==
+     * POOL_HOST_TX_HDR), so hdr DMAs read out of this pool instead of
+     * dma_buffer. Independent bitmap / cond means hdr alloc never blocks
+     * on a body-saturated bitmap (Hard Rule #6). */
+    void                 *hdr_tx_buffer;
+    struct doca_mmap     *hdr_tx_mmap;
+    doca_dpa_dev_mmap_t   hdr_tx_dpa_handle;
+    uint8_t              *hdr_tx_bitmap;
+    pthread_mutex_t       hdr_slot_lock;
+    pthread_cond_t        hdr_slot_cond;
+    int                   hdr_num_slots;
+    int                   hdr_slot_size;
 
     /* RX buffer pool (independent from TX) */
     void *rx_buffer;
@@ -174,10 +202,14 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
             p->state = 1;
             pthread_cond_signal(&p->cond);
         } else if (p->state == -2) {
-            /* Cancelled request — DPA finished, now safe to free TX + RX */
+            /* Cancelled request — DPA finished, now safe to free both pools + RX */
             if (p->tx_slot >= 0) {
                 dpumesh_tx_free(ctx, p->tx_slot);
                 p->tx_slot = -1;
+            }
+            if (p->hdr_tx_slot >= 0) {
+                dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
+                p->hdr_tx_slot = -1;
             }
             pthread_mutex_lock(&ctx->rx_slot_lock);
             ctx->rx_slot_bitmap[slot] = 0;
@@ -276,22 +308,34 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
 
         uint32_t idx = ack.req_id % MAX_PENDING;
         dpumesh_pending_t *p = &ctx->pending[idx];
+        /* Phase 1: pool_type tells us which pool. Legacy DPUs send pool_type=0
+         * (POOL_NONE) which we map to BODY for compat. */
+        int is_hdr = (ack.pool_type == POOL_HOST_TX_HDR);
         pthread_mutex_lock(&p->lock);
-        if ((p->state == 0 || p->state == -2) && p->tx_slot >= 0) {
-            /* state 0: request still waiting — free TX slot early.
-             * state -2: wait_response gave up on timeout but deferred the TX
-             *           free until DPA finished the forward DMA; this ACK
-             *           confirms that, so we can release the slot now. */
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
-            if (p->state == -2) {
+        if (p->state == 0 || p->state == -2) {
+            if (is_hdr) {
+                if (p->hdr_tx_slot >= 0) {
+                    dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
+                    p->hdr_tx_slot = -1;
+                }
+            } else {
+                if (p->tx_slot >= 0) {
+                    dpumesh_tx_free(ctx, p->tx_slot);
+                    p->tx_slot = -1;
+                }
+            }
+            /* state=-2 transitions to -1 only when BOTH slots are free —
+             * a single user RPC may have owned both pools, so a partial
+             * ACK leaves the entry deferred. */
+            if (p->state == -2 && p->tx_slot < 0 && p->hdr_tx_slot < 0) {
                 p->state = -1;
                 pthread_cond_broadcast(&p->cond);
             }
         }
         pthread_mutex_unlock(&p->lock);
 
-        DOCA_LOG_DBG("TX_ACK: freed TX slot for req_id=%u", ack.req_id);
+        DOCA_LOG_DBG("TX_ACK: freed %s slot for req_id=%u",
+                     is_hdr ? "HDR" : "BODY", ack.req_id);
         return;
     }
 
@@ -483,6 +527,36 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
         DOCA_LOG_WARN("Failed to export Host RX buffer to DPU: %s", doca_err_str(result));
     }
 
+    /* Phase 1: HDR TX pool. Smaller than the body pool — hdr batches are
+     * tiny (96 entries × 80B = 7.5KB max per slot). 1024 × 8KB = 8MB total. */
+    ctx->hdr_num_slots = 1024;
+    ctx->hdr_slot_size = DPUMESH_SLOT_SIZE_DEFAULT;
+    size_t hdr_buf_size = (size_t)ctx->hdr_num_slots * ctx->hdr_slot_size;
+    result = alloc_buffer_and_set_mmap(&ctx->hdr_tx_mmap,
+                                       ctx->doca_objs.dev,
+                                       &ctx->hdr_tx_buffer,
+                                       hdr_buf_size,
+                                       DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to allocate HDR TX buffer: %s", doca_err_str(result));
+        return result;
+    }
+
+    result = export_mmap_to_remote(&ctx->doca_objs, ctx->hdr_tx_mmap,
+                                   ctx->hdr_tx_buffer, hdr_buf_size,
+                                   DMA_HOST_TX_HDR_BUFFER, HOST_TO_DPU);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to export HDR TX buffer to DPU: %s", doca_err_str(result));
+        return result;
+    }
+
+    result = doca_mmap_dev_get_dpa_handle(ctx->hdr_tx_mmap, ctx->doca_objs.dev,
+                                          &ctx->hdr_tx_dpa_handle);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get DPA handle for HDR TX mmap: %s", doca_err_str(result));
+        return result;
+    }
+
     return DOCA_SUCCESS;
 }
 
@@ -502,6 +576,12 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     pthread_mutex_init(&ctx->slot_lock, NULL);
     pthread_cond_init(&ctx->slot_cond, NULL);
     pthread_mutex_init(&ctx->ring_lock, NULL);
+
+    /* Phase 1: HDR TX bitmap + slot lock (independent from body pool). */
+    ctx->hdr_tx_bitmap = (uint8_t *)calloc(ctx->hdr_num_slots, 1);
+    if (!ctx->hdr_tx_bitmap) goto fail;
+    pthread_mutex_init(&ctx->hdr_slot_lock, NULL);
+    pthread_cond_init(&ctx->hdr_slot_cond, NULL);
 
     /* rx_buffer is the STAGING area for delivered messages — must be separate
      * from rx_dma_buffer (the DMA landing zone). If they share memory, DPU
@@ -531,6 +611,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         pthread_cond_init(&ctx->pending[i].cond, NULL);
         ctx->pending[i].state = -1;
         ctx->pending[i].tx_slot = -1;
+        ctx->pending[i].hdr_tx_slot = -1;
     }
 
     ctx->doca_objs.rx_data_hook = rx_data_hook;
@@ -571,6 +652,10 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
             dpumesh_tx_free(ctx, p->tx_slot);
             p->tx_slot = -1;
         }
+        if (p->hdr_tx_slot >= 0) {
+            dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
+            p->hdr_tx_slot = -1;
+        }
         p->state = -1;
         pthread_mutex_unlock(&p->lock);
         pthread_mutex_destroy(&p->lock);
@@ -588,12 +673,27 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
         ctx->rx_dma_buffer = NULL;
     }
 
+    /* Phase 1: HDR TX pool teardown — must come before cleanup_objects()
+     * destroys the device that the mmap belongs to. */
+    if (ctx->hdr_tx_mmap) {
+        doca_mmap_destroy(ctx->hdr_tx_mmap);
+        ctx->hdr_tx_mmap = NULL;
+    }
+    if (ctx->hdr_tx_buffer) {
+        free(ctx->hdr_tx_buffer);
+        ctx->hdr_tx_buffer = NULL;
+    }
+
     cleanup_objects(&ctx->doca_objs);
 
     pthread_mutex_destroy(&ctx->ring_lock);
     pthread_cond_destroy(&ctx->slot_cond);
     pthread_mutex_destroy(&ctx->slot_lock);
     if (ctx->slot_bitmap) free(ctx->slot_bitmap);
+
+    pthread_mutex_destroy(&ctx->hdr_slot_lock);
+    pthread_cond_destroy(&ctx->hdr_slot_cond);
+    if (ctx->hdr_tx_bitmap) free(ctx->hdr_tx_bitmap);
 
     pthread_mutex_destroy(&ctx->rx_slot_lock);
     if (ctx->rx_slot_bitmap) free(ctx->rx_slot_bitmap);
@@ -664,6 +764,45 @@ void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
     pthread_mutex_unlock(&ctx->slot_lock);
 }
 
+/* ====================================================================
+ * Phase 1: HDR TX pool — body's mirror, independent bitmap/lock/cond
+ * ==================================================================== */
+
+int dpumesh_hdr_tx_alloc(dpumesh_ctx_t *ctx) {
+    pthread_mutex_lock(&ctx->hdr_slot_lock);
+    for (;;) {
+        for (int i = 0; i < ctx->hdr_num_slots; i++) {
+            if (ctx->hdr_tx_bitmap[i] == 0) {
+                ctx->hdr_tx_bitmap[i] = 1;
+                pthread_mutex_unlock(&ctx->hdr_slot_lock);
+                return i;
+            }
+        }
+        /* 50µs re-poll backstop — matches body pool. */
+        struct timespec abs_ts;
+        clock_gettime(CLOCK_REALTIME, &abs_ts);
+        abs_ts.tv_nsec += 50000;
+        if (abs_ts.tv_nsec >= 1000000000) {
+            abs_ts.tv_nsec -= 1000000000;
+            abs_ts.tv_sec += 1;
+        }
+        pthread_cond_timedwait(&ctx->hdr_slot_cond, &ctx->hdr_slot_lock, &abs_ts);
+    }
+}
+
+uint8_t *dpumesh_hdr_tx_buf(dpumesh_ctx_t *ctx, int slot) {
+    if (slot < 0 || slot >= ctx->hdr_num_slots) return NULL;
+    return (uint8_t *)ctx->hdr_tx_buffer + ((size_t)slot * ctx->hdr_slot_size);
+}
+
+void dpumesh_hdr_tx_free(dpumesh_ctx_t *ctx, int slot) {
+    if (slot < 0 || slot >= ctx->hdr_num_slots) return;
+    pthread_mutex_lock(&ctx->hdr_slot_lock);
+    ctx->hdr_tx_bitmap[slot] = 0;
+    pthread_cond_signal(&ctx->hdr_slot_cond);
+    pthread_mutex_unlock(&ctx->hdr_slot_lock);
+}
+
 int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     struct dma_desc *dma;
     uint32_t ring_slot;
@@ -673,15 +812,22 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
         return -1;
     }
 
-    if (desc->body_buf_slot < 0 || desc->body_buf_slot >= ctx->num_slots) {
-        DOCA_LOG_ERR("ENQUEUE rejected: invalid body_buf_slot=%d (num_slots=%d)",
-                     desc->body_buf_slot, ctx->num_slots);
+    /* Phase 1: pool dispatch. desc->src_body_pool_type tells us which TX
+     * pool holds the bytes; defaults to body for legacy callers. The
+     * body_buf_slot field names the slot in whichever pool was selected. */
+    int is_hdr_pool = (desc->src_body_pool_type == POOL_HOST_TX_HDR);
+    int pool_slots = is_hdr_pool ? ctx->hdr_num_slots : ctx->num_slots;
+    int pool_slot_size = is_hdr_pool ? ctx->hdr_slot_size : ctx->slot_size;
+
+    if (desc->body_buf_slot < 0 || desc->body_buf_slot >= pool_slots) {
+        DOCA_LOG_ERR("ENQUEUE rejected: invalid body_buf_slot=%d (pool=%s slots=%d)",
+                     desc->body_buf_slot, is_hdr_pool ? "HDR" : "BODY", pool_slots);
         return -1;
     }
 
-    if (desc->body_len > (uint32_t)ctx->slot_size) {
-        DOCA_LOG_ERR("ENQUEUE rejected: body_len=%u exceeds slot_size=%d",
-                     desc->body_len, ctx->slot_size);
+    if (desc->body_len > (uint32_t)pool_slot_size) {
+        DOCA_LOG_ERR("ENQUEUE rejected: body_len=%u exceeds slot_size=%d (pool=%s)",
+                     desc->body_len, pool_slot_size, is_hdr_pool ? "HDR" : "BODY");
         return -1;
     }
 
@@ -720,9 +866,23 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
      *   - OP_RESPONSE: caller registers + attach_tx + release_async; TX_ACK
      *     handler frees the TX slot via the deferred state -2 → -1 path. */
 
-    dma->mmap = ctx->dpa_mmap_handle;
-    dma->addr = (uint64_t)ctx->dma_buffer +
-                ((size_t)desc->body_buf_slot * ctx->slot_size);
+    /* Phase 1: src override via desc->mmap. DPA's forward kernel picks
+     *   src_mmap = desc->mmap ? desc->mmap : ring->host_mmap
+     * and skips the default range check when desc->mmap != 0. Body path
+     * keeps desc->mmap = 0 to preserve the original behavior (DPA falls
+     * back to ring->host_mmap = body DPA handle) — pre-Phase-1 code
+     * always wrote ctx->dpa_mmap_handle here, but the DPA kernel never
+     * read it, so this is a no-op semantically. HDR path writes the
+     * dedicated hdr DPA handle. */
+    if (is_hdr_pool) {
+        dma->mmap = ctx->hdr_tx_dpa_handle;
+        dma->addr = (uint64_t)ctx->hdr_tx_buffer +
+                    ((size_t)desc->body_buf_slot * ctx->hdr_slot_size);
+    } else {
+        dma->mmap = 0;
+        dma->addr = (uint64_t)ctx->dma_buffer +
+                    ((size_t)desc->body_buf_slot * ctx->slot_size);
+    }
     dma->size = desc->body_len;
     dma->idx  = desc->req_id;
     dma->dst_pod_id = desc->dst_pod_id;
@@ -859,6 +1019,10 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
                         dpumesh_tx_free(ctx, p->tx_slot);
                         p->tx_slot = -1;
                     }
+                    if (p->hdr_tx_slot >= 0) {
+                        dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
+                        p->hdr_tx_slot = -1;
+                    }
                     DOCA_LOG_WARN("Pending slot %u reclaimed after -2 timeout (req_id=%u)",
                                   idx, req_id);
                     break;  /* fall through to claim the slot */
@@ -873,6 +1037,7 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
 
     p->state = 0;
     p->tx_slot = -1;
+    p->hdr_tx_slot = -1;
     memset(&p->desc, 0, sizeof(p->desc));
     pthread_mutex_unlock(&p->lock);
     return 0;
@@ -942,6 +1107,10 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
                     dpumesh_tx_free(ctx, p->tx_slot);
                     p->tx_slot = -1;
                 }
+                if (p->hdr_tx_slot >= 0) {
+                    dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
+                    p->hdr_tx_slot = -1;
+                }
                 p->state = -2;
                 pthread_cond_broadcast(&p->cond);
                 pthread_mutex_unlock(&p->lock);
@@ -952,11 +1121,15 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
 
     if (p->state == 1) {
         *resp = p->desc;
-        /* Response arrived = DPA finished reading TX buffer. Free TX now
-         * to return the slot to the pool ASAP under high load. */
+        /* Response arrived = DPA finished reading TX buffers. Free both
+         * pools now to return slots ASAP under high load. */
         if (p->tx_slot >= 0) {
             dpumesh_tx_free(ctx, p->tx_slot);
             p->tx_slot = -1;
+        }
+        if (p->hdr_tx_slot >= 0) {
+            dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
+            p->hdr_tx_slot = -1;
         }
         p->state = -1;
         pthread_cond_broadcast(&p->cond);
@@ -965,11 +1138,15 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
     }
 
     /* Unreachable in practice — state left the wait loop without being 1
-     * only via the timeout/-2 branch above. Clear the slot defensively. */
+     * only via the timeout/-2 branch above. Clear both pool slots defensively. */
     if (p->state != -2) {
         if (p->tx_slot >= 0) {
             dpumesh_tx_free(ctx, p->tx_slot);
             p->tx_slot = -1;
+        }
+        if (p->hdr_tx_slot >= 0) {
+            dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
+            p->hdr_tx_slot = -1;
         }
         p->state = -1;
         pthread_cond_broadcast(&p->cond);
@@ -984,7 +1161,7 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
 
     pthread_mutex_lock(&p->lock);
     if (p->state == 1) {
-        /* Response arrived but was never consumed — free RX + TX */
+        /* Response arrived but was never consumed — free RX + TX (both pools) */
         if (p->desc.body_buf_slot >= 0) {
             pthread_mutex_lock(&ctx->rx_slot_lock);
             ctx->rx_slot_bitmap[p->desc.body_buf_slot] = 0;
@@ -994,33 +1171,34 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
             dpumesh_tx_free(ctx, p->tx_slot);
             p->tx_slot = -1;
         }
+        if (p->hdr_tx_slot >= 0) {
+            dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
+            p->hdr_tx_slot = -1;
+        }
         p->state = -1;
         pthread_cond_broadcast(&p->cond);
     } else if (p->state == 0) {
-        /* In-flight, no timeout yet — caller gave up; free TX now.
-         * (No DPA-in-progress risk because 0 means DPA hasn't had a chance
-         * to signal completion, i.e. request was cancelled pre-enqueue
-         * path or immediately after enqueue failure.) */
+        /* In-flight, no timeout yet — caller gave up; free TX (both pools) now. */
         if (p->tx_slot >= 0) {
             dpumesh_tx_free(ctx, p->tx_slot);
             p->tx_slot = -1;
         }
+        if (p->hdr_tx_slot >= 0) {
+            dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
+            p->hdr_tx_slot = -1;
+        }
         p->state = -1;
         pthread_cond_broadcast(&p->cond);
     } else if (p->state == -2) {
-        /* Timeout path: wait_response already returned -1 to the caller and
-         * left state=-2 hoping a late TX_ACK would free the slot. Under
-         * sustained DPU overload the TX_ACK can be lost, leaving the slot
-         * leaked across the test boundary.
-         *
-         * gateway's wait_response timeout is RESPONSE_TIMEOUT_MS = 30s,
-         * many orders of magnitude longer than any DPA forward DMA
-         * (microseconds). By the time we reach this branch the DPA is
-         * guaranteed not to be reading the slot anymore, so it is safe to
-         * force-free here. */
+        /* Timeout path: force-free both pools (see body-only comment above
+         * for the rationale on why 30s after enqueue is always safe). */
         if (p->tx_slot >= 0) {
             dpumesh_tx_free(ctx, p->tx_slot);
             p->tx_slot = -1;
+        }
+        if (p->hdr_tx_slot >= 0) {
+            dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot);
+            p->hdr_tx_slot = -1;
         }
         p->state = -1;
         pthread_cond_broadcast(&p->cond);
@@ -1051,15 +1229,16 @@ void dpumesh_pending_release_async(dpumesh_ctx_t *ctx, uint32_t req_id) {
 
     pthread_mutex_lock(&p->lock);
     if (p->state == 0) {
-        if (p->tx_slot < 0) {
-            /* TX_ACK already arrived between attach_tx and now — TX slot is
-             * back in the pool; the entry just needs to be released so a
-             * future register_pending can claim this idx. */
+        /* Phase 1: BOTH pool slots must be free before we can transition
+         * to -1 (a single user RPC may have owned both). If either is
+         * still attached, defer to TX_ACK via state=-2. */
+        if (p->tx_slot < 0 && p->hdr_tx_slot < 0) {
             p->state = -1;
             pthread_cond_broadcast(&p->cond);
         } else {
-            /* TX_ACK still pending — switch to the deferred-release state
-             * the TX_ACK handler already knows how to finish. */
+            /* TX_ACK still pending on at least one pool — switch to deferred
+             * release. TX_ACK handler tracks both slots and flips to -1 when
+             * both are back. */
             p->state = -2;
         }
     }

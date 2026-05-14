@@ -103,6 +103,8 @@ typedef struct {
     struct doca_comch_connection *conn;
     uint32_t  req_id;
     int32_t   dst_pod_id;
+    uint8_t   pool_type;   /* Phase 1: which TX pool the host should free */
+    uint8_t   _pad[3];
 } deferred_tx_ack_t;
 
 /* ====== DOCA task pool capacity tracking (check-first model) ======
@@ -133,9 +135,17 @@ struct pod_state {
 
     /* Per-pod mmap (Host에서 export, CPU→DPU forward direction) */
     struct doca_mmap *ring_mmap;
-    struct doca_mmap *remote_mmap;   /* Host TX buffer mmap */
+    struct doca_mmap *remote_mmap;   /* Host TX buffer mmap (body pool) */
     void *remote_addr;
     size_t remote_buf_size;
+
+    /* Phase 1 (v2 plan): independent host TX hdr pool. DPA forward kernel
+     * picks src mmap via desc->mmap override; when host enqueues a hdr
+     * batch, dma_desc.mmap = remote_hdr_dpa_handle below. */
+    struct doca_mmap *remote_hdr_mmap;
+    void *remote_hdr_addr;
+    size_t remote_hdr_buf_size;
+    doca_dpa_dev_mmap_t remote_hdr_dpa_handle;
 
     /* Per-pod DPA buffer array (forward ring에 매핑) */
     struct doca_buf_arr *buf_arr;

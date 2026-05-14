@@ -62,12 +62,14 @@ server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn
 
 /* Send TX ACK to a specific host connection (req_id + dst_pod_id key).
  * Pure per-request notification that forward DMA finished; no flow-control
- * piggyback. */
+ * piggyback. pool_type identifies which TX pool (BODY vs HDR) the host
+ * should free; 0 (POOL_NONE) is interpreted as BODY for legacy compat. */
 doca_error_t
 server_send_tx_ack_to(struct objects *objs,
 					  struct doca_comch_connection *conn,
 					  uint32_t req_id,
-					  int32_t dst_pod_id);
+					  int32_t dst_pod_id,
+					  uint8_t pool_type);
 
 /* Find a pod by pod_id. Returns NULL if not found. */
 struct pod_state *

@@ -321,7 +321,14 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         return 1;
     }
 
-    {
+    /* Phase 1 (v2 plan): src override via desc->mmap. When desc->mmap != 0,
+     * the host has selected a non-default TX pool (e.g. hdr_tx_buffer) and
+     * desc->addr lies inside that pool, NOT inside ring->host_addr. Skip the
+     * default-range check in that case; caller is trusted. The default pool
+     * (body) keeps desc->mmap == 0 and is range-checked as before. */
+    doca_dpa_dev_mmap_t src_mmap = desc->mmap ? desc->mmap : ring->host_mmap;
+
+    if (desc->mmap == 0) {
         uint64_t src_addr = desc->addr;
         uint64_t src_len = (uint64_t)desc->size;
         uint64_t host_base = ring->host_addr;
@@ -446,7 +453,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                             dpu_consumer_id,
                                             ring->dpu_mmap,
                                             ring->dpu_addr + thread_arg->pos[r] + offset,
-                                            ring->host_mmap,
+                                            src_mmap,
                                             desc->addr + offset,
                                             chunk,
                                             (uint8_t *)&comp,
@@ -457,7 +464,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                             dpu_consumer_id,
                                             ring->dpu_mmap,
                                             ring->dpu_addr + thread_arg->pos[r] + offset,
-                                            ring->host_mmap,
+                                            src_mmap,
                                             desc->addr + offset,
                                             chunk,
                                             (uint8_t *)&chunk_type,

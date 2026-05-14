@@ -34,6 +34,7 @@ enum mmap_type {
     DMA_BUFFER = 1,
     DMA_RING = 2,
     DMA_HOST_RX_BUFFER = 3, /* Host RX buffer for DPU→CPU reverse DMA */
+    DMA_HOST_TX_HDR_BUFFER = 4, /* Phase 1: independent host TX pool for hdr batches */
 };
 
 struct dmesh_mmap_msg {
@@ -87,6 +88,9 @@ struct dmesh_tx_ack_msg {
     enum dmesh_msg_type type;   /* = DMESH_MSG_TX_ACK */
     uint32_t req_id;
     int32_t dst_pod_id;
+    uint8_t pool_type;          /* Phase 1: POOL_HOST_TX_BODY or POOL_HOST_TX_HDR.
+                                 * 0 (POOL_NONE) interpreted as BODY for legacy compat. */
+    uint8_t pad[3];
 };
 
 /* DPU→Host: reverse DMA (DPU→CPU) completion — data landed in Host RX buffer */

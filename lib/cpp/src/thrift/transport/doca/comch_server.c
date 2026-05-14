@@ -572,12 +572,15 @@ doca_error_t
 server_send_tx_ack_to(struct objects *objs,
                       struct doca_comch_connection *conn,
                       uint32_t req_id,
-                      int32_t dst_pod_id)
+                      int32_t dst_pod_id,
+                      uint8_t pool_type)
 {
 	struct dmesh_tx_ack_msg ack;
 	ack.type = DMESH_MSG_TX_ACK;
 	ack.req_id = req_id;
 	ack.dst_pod_id = dst_pod_id;
+	ack.pool_type = pool_type;
+	ack.pad[0] = ack.pad[1] = ack.pad[2] = 0;
 	return server_send_msg_to_conn(objs, conn, (const char *)&ack, sizeof(ack));
 }
 
