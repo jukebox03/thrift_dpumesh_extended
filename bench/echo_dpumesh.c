@@ -1,16 +1,20 @@
 /*
- * echo_dpumesh.c — DPUmesh echo server daemon (A안)
+ * echo_dpumesh.c — Single-thread echo server (v5).
  *
- * Lifecycle:
- *   1. dpumesh_init() once at startup, register as pod_id=11.
- *   2. Loop: dequeue request descriptor → enqueue OP_RESPONSE back to
- *      desc.src_pod_id with the same body.
+ * Why single-thread:
+ *   Old echo ran 32 worker threads to serve 200k RPS. Flame analysis
+ *   (plan.md §3) showed echo-side CPU was 45% kernel + 44% scheduler,
+ *   only 2.5% in dpumesh-code. The thread pool was the bottleneck, not
+ *   the transport. With 1 worker + 1 PE thread on a shared core, CFS
+ *   alternates between just two threads — no wake/sleep cycle storm.
  *
- * No Thrift parsing. Pure transport echo for fair latency measurement.
+ *   Per-request server work in the split path is small (builder lock +
+ *   memcpy + atomic release_async). One thread can sustain >200k RPS
+ *   for small bodies; only large-body memcpy might push us to add a
+ *   second thread (ECHO_THREADS env still honored as escape hatch).
  *
- * Response uses the same TX-slot pending pattern the server transport uses
- * (register_pending + attach_tx + release_async), so the host's TX slot is
- * released by the TX_ACK from DPU.
+ * Always uses the Phase 3 split path. Legacy g_split=0 mode is no
+ * longer exercised; transport-side code stays per Hard Rule #2.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -19,17 +23,16 @@
 #include <unistd.h>
 #include <signal.h>
 #include <pthread.h>
+#include <stdint.h>
 
 #include <thrift/transport/dpumesh.h>
 #include <thrift/transport/doca/mesh.h>
 
-#define ECHO_THREADS_DEFAULT 32
+#define ECHO_THREADS_DEFAULT 1
 
 static dpumesh_ctx_t *g_ctx = NULL;
-static int            g_split = 0;
 
 static void process_one(const sw_descriptor_t *req) {
-    /* Pull request body */
     if (req->body_buf_slot < 0 || req->body_len == 0) {
         if (req->body_buf_slot >= 0)
             dpumesh_rx_free(g_ctx, req->body_buf_slot);
@@ -41,79 +44,25 @@ static void process_one(const sw_descriptor_t *req) {
         return;
     }
 
-    /* Phase 3 split path: echo via dpumesh_send_response. Mesh layer
-     * handles req_id, dst_pod, and the dual hdr/chunk write. */
-    if (g_split) {
-        /* Copy body locally so we can release rx slot ASAP. */
-        uint8_t body[MESH_CHUNK_BODY_BUDGET];
-        uint32_t blen = req->body_len > sizeof(body) ? (uint32_t)sizeof(body) : req->body_len;
-        if (blen > 0) memcpy(body, rx_buf, blen);
-        dpumesh_rx_free(g_ctx, req->body_buf_slot);
-
-        struct mesh_req_id rid = { .src_id = (uint32_t)req->src_pod_id,
-                                   .seq    = req->req_id };
-        uint8_t flags = (req->flags & ~OP_REQUEST) | OP_RESPONSE;
-        (void)dpumesh_send_response(g_ctx, req->src_pod_id, rid,
-                                    body, blen, flags);
-        return;
-    }
-
-    /* Allocate TX slot for response */
-    int tx_slot = dpumesh_tx_alloc(g_ctx);
-    if (tx_slot < 0) {
-        dpumesh_rx_free(g_ctx, req->body_buf_slot);
-        return;
-    }
-
-    uint8_t *tx_buf = dpumesh_tx_buf(g_ctx, tx_slot);
-    memcpy(tx_buf, rx_buf, req->body_len);
-
-    /* Done with RX — free now (data copied into TX slot) */
+    uint8_t body[MESH_CHUNK_BODY_BUDGET];
+    uint32_t blen = req->body_len > sizeof(body)
+                    ? (uint32_t)sizeof(body) : req->body_len;
+    if (blen > 0) memcpy(body, rx_buf, blen);
     dpumesh_rx_free(g_ctx, req->body_buf_slot);
 
-    /* Server-side pending lifecycle (mirror of TDpumeshTransport flush) */
-    if (dpumesh_register_pending(g_ctx, req->req_id) < 0) {
-        dpumesh_tx_free(g_ctx, tx_slot);
-        return;
-    }
-    dpumesh_pending_attach_tx(g_ctx, req->req_id, tx_slot);
-
-    sw_descriptor_t resp;
-    memset(&resp, 0, sizeof(resp));
-    resp.header_buf_slot     = -1;
-    resp.body_buf_slot       = tx_slot;
-    resp.body_len            = req->body_len;
-    resp.req_id              = req->req_id;
-    resp.dst_pod_id          = req->src_pod_id;        /* back to sender */
-    resp.src_pod_id          = dpumesh_get_pod_id(g_ctx);
-    resp.flags               = (req->flags & ~OP_REQUEST) | OP_RESPONSE;
-    resp.valid               = 1;
-    resp.src_body_pool_type  = POOL_HOST_TX_BODY;
-    resp.src_body_pod_id     = dpumesh_get_pod_id(g_ctx);
-    resp.src_body_buf_slot   = tx_slot;
-    resp.src_header_buf_slot = -1;
-
-    if (dpumesh_enqueue(g_ctx, &resp) < 0) {
-        dpumesh_cancel_pending(g_ctx, req->req_id);
-        return;
-    }
-    /* Fire-and-forget: TX_ACK from DPU will free the TX slot */
-    dpumesh_pending_release_async(g_ctx, req->req_id);
+    struct mesh_req_id rid = { .src_id = (uint32_t)req->src_pod_id,
+                               .seq    = req->req_id };
+    uint8_t flags = (req->flags & ~OP_REQUEST) | OP_RESPONSE;
+    (void)dpumesh_send_response(g_ctx, req->src_pod_id, rid,
+                                body, blen, flags);
 }
 
-/* Worker thread: dequeue + echo loop. Multiple of these run concurrently —
- * dpumesh_dequeue serializes on rx_lock briefly to grab one descriptor,
- * then process_one runs outside the lock so workers parallelize. dpumesh
- * tx/rx/pending APIs are all internally locked (proven thread-safe by the
- * multi-threaded gateway). Without this, a single dequeue thread caps
- * throughput at 1 / per_msg_cost — observed as ~25K RPS at 8KB payloads
- * with 3+ms client-side queueing. */
+/* Worker: block on dequeue (cond_wait under empty), then echo. */
 static void *worker(void *arg) {
     (void)arg;
     while (1) {
         sw_descriptor_t req;
-        if (dpumesh_dequeue(g_ctx, &req, -1) < 0)
-            continue;
+        if (dpumesh_dequeue(g_ctx, &req, -1) < 0) continue;
         if (!req.valid) continue;
         process_one(&req);
     }
@@ -122,7 +71,6 @@ static void *worker(void *arg) {
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
-
     signal(SIGPIPE, SIG_IGN);
 
     int worker_id = 11;
@@ -134,9 +82,7 @@ int main(int argc, char **argv) {
         n_threads = atoi(getenv("ECHO_THREADS"));
         if (n_threads < 1) n_threads = 1;
     }
-    if (getenv("BENCH_SPLIT"))
-        g_split = atoi(getenv("BENCH_SPLIT")) ? 1 : 0;
-    fprintf(stderr, "[echo] path: %s\n", g_split ? "SPLIT (Phase 3)" : "LEGACY");
+    fprintf(stderr, "[echo] mode=single-thread split, threads=%d\n", n_threads);
 
     dpumesh_config_t cfg = DPUMESH_CONFIG_DEFAULT;
     int rc = dpumesh_init(&g_ctx, "echo-dpumesh", worker_id, &cfg);
@@ -144,8 +90,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[echo] dpumesh_init failed: %d\n", rc);
         return 1;
     }
-    fprintf(stderr, "[echo] ready: pod_id=%d, threads=%d\n",
-            dpumesh_get_pod_id(g_ctx), n_threads);
+    fprintf(stderr, "[echo] ready: pod_id=%d\n", dpumesh_get_pod_id(g_ctx));
 
     pthread_t *tids = calloc((size_t)n_threads, sizeof(pthread_t));
     if (!tids) return 1;
@@ -155,7 +100,6 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    /* Block forever */
     for (int i = 0; i < n_threads; i++)
         pthread_join(tids[i], NULL);
     return 0;

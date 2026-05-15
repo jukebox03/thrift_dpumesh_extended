@@ -111,10 +111,17 @@ build_host() {
     if [ ! -f "$BUILD_DOCA/Makefile" ]; then
         info "Running cmake..."
         mkdir -p "$BUILD_DOCA"
+        # RelWithDebInfo + -fno-omit-frame-pointer so perf -g (frame-pointer
+        # unwinding) can walk into libthriftd.so. Without these, perf's call
+        # stacks collapse to [unknown] in the dpumesh transport and the flame
+        # graph cannot tell us where CPU is spent.
         (cd "$BUILD_DOCA" && cmake "$PROJ_ROOT" -DWITH_DOCA=ON -DWITH_CPP=ON -DWITH_C_GLIB=ON \
             -DWITH_SHARED_LIB=ON -DWITH_STATIC_LIB=ON -DWITH_LIBEVENT=ON -DWITH_OPENSSL=ON -DWITH_ZLIB=ON \
             -DBUILD_COMPILER=OFF -DBUILD_TESTING=OFF -DBUILD_TUTORIALS=OFF -DBUILD_EXAMPLES=OFF \
-            -DWITH_JAVA=OFF -DWITH_PYTHON=OFF -DWITH_HASKELL=OFF)
+            -DWITH_JAVA=OFF -DWITH_PYTHON=OFF -DWITH_HASKELL=OFF \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS="-fno-omit-frame-pointer" \
+            -DCMAKE_CXX_FLAGS="-fno-omit-frame-pointer")
     fi
     if ! (cd "$BUILD_DOCA" && make -j"$(nproc)" 2>&1 | tail -20); then
         err "Host build failed"; exit 1
@@ -154,12 +161,17 @@ build_bench_binaries() {
     if [ ! -e "$BUILD_DOCA/lib/libthriftd.so" ] && [ ! -e "$BUILD_DOCA/lib/libthriftd.a" ]; then
         THRIFT_LINK_LIB="-lthrift"
     fi
-    gcc -O2 -o "$BENCH_DIR/bench_dpumesh" "$BENCH_DIR/bench_dpumesh.c" \
+    # -g + -fno-omit-frame-pointer so perf -g (frame-pointer unwinding)
+    # produces real symbols instead of [unknown] inside worker_fn. -O2
+    # stays for production-shaped CPU. ~1-3% perf cost; required for
+    # any flame graph we want to trust.
+    local PROFILE_FLAGS="-g -fno-omit-frame-pointer"
+    gcc -O2 $PROFILE_FLAGS -o "$BENCH_DIR/bench_dpumesh" "$BENCH_DIR/bench_dpumesh.c" \
         -I"$PROJ_ROOT/lib/cpp/src" \
         -L"$BUILD_DOCA/lib" -L"$DOCA_LIB_DIR" \
         $THRIFT_LINK_LIB -lpthread -ldoca_common -ldoca_comch \
         -Wl,-rpath,/usr/local/lib -Wl,-rpath,"$DOCA_LIB_DIR"
-    gcc -O2 -o "$BENCH_DIR/echo_dpumesh" "$BENCH_DIR/echo_dpumesh.c" \
+    gcc -O2 $PROFILE_FLAGS -o "$BENCH_DIR/echo_dpumesh" "$BENCH_DIR/echo_dpumesh.c" \
         -I"$PROJ_ROOT/lib/cpp/src" \
         -L"$BUILD_DOCA/lib" -L"$DOCA_LIB_DIR" \
         $THRIFT_LINK_LIB -lpthread -ldoca_common -ldoca_comch \
@@ -270,28 +282,40 @@ chmod +x /tmp/start_dpu_bench.sh"
 
 #
 # Pin profiles:
-#   fair (default): 1 host core per pod. dpumesh side gets 1 core for app
-#                   (transport on DPU/DPA), tcp side gets 1 core shared
-#                   between app + sidecar. This is the apples-to-apples
-#                   Istio-like comparison.
-#   hw            : multi-core for dpumesh side. Goal is to remove host
-#                   software bottleneck so dpumesh can approach the
-#                   chain ceiling (Method 2 = 66K RPS). TCP side untouched
-#                   since that comparison only makes sense in fair mode.
+#   shared (default): 1 host core per dpumesh pod. worker thread + dpumesh
+#                     PE thread + flush/sweep timers all share that one
+#                     core. TCP pods get 1 core for app+sidecar. Apples-
+#                     to-apples 1-core baseline for TCP vs DPUmesh.
+#   split           : 2 host cores per dpumesh pod, with per-thread pin —
+#                     worker thread on one core, dpumesh PE thread on the
+#                     other (flush/sweep timers ride with worker, they're
+#                     low-rate periodic timers). Removes intra-pod CFS
+#                     rotation between worker and the libdoca poller so
+#                     transport RTT and throughput are no longer bound by
+#                     scheduler quantum. TCP pods untouched (still 1 core)
+#                     since they have no equivalent thread to split.
+#
+# Thread-name table (set via pthread_setname_np inside libthrift):
+#   bench_dpumesh   — worker (main thread)
+#   echo_dpumesh    — worker (main thread; multiple workers share name)
+#   dpumesh_pe      — PE progress thread
+#   dpumesh_flush   — builder timeout flush
+#   dpumesh_sweep   — orphan/parked sweep + 1s stat printer
 #
 get_pod_cores() {
-    local app="$1" profile="${2:-fair}"
+    # Returns "cpuset" for shared mode, "cpuset:worker_core:pe_core" for split.
+    local app="$1" profile="${2:-shared}"
     case "$profile" in
-        hw)
+        split)
             case "$app" in
-                bench-dpumesh) echo "0,4" ;;
-                echo-dpumesh)  echo "1,5" ;;
+                bench-dpumesh) echo "0,4:0:4" ;;
+                echo-dpumesh)  echo "1,5:1:5" ;;
                 bench-tcp)     echo "2" ;;   # untouched
                 echo-tcp)      echo "3" ;;   # untouched
                 *) echo "" ;;
             esac
             ;;
-        fair|*)
+        shared|fair|*)
             case "$app" in
                 bench-dpumesh) echo "0" ;;
                 echo-dpumesh)  echo "1" ;;
@@ -303,8 +327,30 @@ get_pod_cores() {
     esac
 }
 
+# In split mode, pin individual threads by name to their dedicated cores.
+# In shared mode, this is a no-op (single cpuset covers everything).
+pin_threads_in_pid() {
+    local pid="$1" worker_core="$2" pe_core="$3"
+    # /proc/$pid/task/* enumerates threads of the process. comm is set by
+    # pthread_setname_np (or, for the main thread, by the binary name).
+    for tid in $(echo "$HOST_PASS" | sudo -S ls "/proc/$pid/task" 2>/dev/null); do
+        local comm
+        comm=$(echo "$HOST_PASS" | sudo -S cat "/proc/$pid/task/$tid/comm" 2>/dev/null)
+        local target=""
+        case "$comm" in
+            dpumesh_pe)             target="$pe_core"     ;;
+            dpumesh_flush|dpumesh_sweep)
+                                    target="$worker_core" ;;
+            bench_dpumesh|echo_dpumesh)
+                                    target="$worker_core" ;;
+            *)                      target="$worker_core" ;;  # unnamed threads ride with worker
+        esac
+        echo "$HOST_PASS" | sudo -S taskset -pc "$target" "$tid" >/dev/null 2>&1 || true
+    done
+}
+
 pin_pods() {
-    local profile="${1:-fair}"
+    local profile="${1:-shared}"
     step "=== Pinning pods to dedicated cores (taskset, profile=$profile) ==="
     if ! command -v jq >/dev/null 2>&1; then
         err "jq not found — needed to parse crictl output. apt install jq"
@@ -320,30 +366,51 @@ pin_pods() {
     fi
 
     for app in bench-dpumesh echo-dpumesh bench-tcp echo-tcp; do
-        local cores pod_id
-        cores=$(get_pod_cores "$app" "$profile")
-        [ -z "$cores" ] && continue
+        local spec cpuset worker_core pe_core pod_id
+        spec=$(get_pod_cores "$app" "$profile")
+        [ -z "$spec" ] && continue
+
+        # spec is either "cpuset" (shared, tcp) or "cpuset:worker:pe" (split, dpumesh)
+        cpuset=$(echo "$spec" | cut -d: -f1)
+        worker_core=$(echo "$spec" | cut -d: -f2)
+        pe_core=$(echo "$spec" | cut -d: -f3)
+        [ "$worker_core" = "$cpuset" ] && worker_core=""
+        [ "$pe_core" = "$cpuset" ] && pe_core=""
 
         pod_id=$(echo "$HOST_PASS" | sudo -S crictl pods --label "app=$app" -q 2>/dev/null | head -n 1)
         if [ -z "$pod_id" ]; then
             warn "$app: pod not found, skipping"
             continue
         fi
-        info "$app → core(s) $cores (pod=$pod_id)"
+        if [ -n "$worker_core" ]; then
+            info "$app → cpuset=$cpuset worker=$worker_core pe=$pe_core (pod=$pod_id)"
+        else
+            info "$app → core(s) $cpuset (pod=$pod_id)"
+        fi
 
         for cid in $(echo "$HOST_PASS" | sudo -S crictl ps --pod "$pod_id" -q 2>/dev/null); do
             local cname pid
             cname=$(echo "$HOST_PASS" | sudo -S crictl inspect "$cid" 2>/dev/null | jq -r '.status.metadata.name' 2>/dev/null)
             pid=$(echo "$HOST_PASS"   | sudo -S crictl inspect "$cid" 2>/dev/null | jq -r '.info.pid'              2>/dev/null)
             if [ -z "$pid" ] || [ "$pid" = "null" ]; then continue; fi
-            info "  $cname (PID $pid) → $cores"
-            # -a = all threads; -p = pid; -c = cpu list. Includes the main
-            # process and any pre-existing kernel-side threads. New child
-            # processes inherit affinity automatically.
-            echo "$HOST_PASS" | sudo -S taskset -apc "$cores" "$pid" >/dev/null
+
+            # Step 1: cgroup-style affinity covers the cpuset (lets the
+            # kernel run any of our threads on those cores). For shared
+            # mode this is the entire pin. For split mode it's the
+            # superset; per-thread pin below narrows it.
+            info "  $cname (PID $pid) → cpuset=$cpuset"
+            echo "$HOST_PASS" | sudo -S taskset -apc "$cpuset" "$pid" >/dev/null
             for child in $(pgrep -P "$pid" 2>/dev/null); do
-                echo "$HOST_PASS" | sudo -S taskset -apc "$cores" "$child" >/dev/null 2>&1 || true
+                echo "$HOST_PASS" | sudo -S taskset -apc "$cpuset" "$child" >/dev/null 2>&1 || true
             done
+
+            # Step 2 (split only): pin each thread by comm name.
+            if [ -n "$worker_core" ] && [ -n "$pe_core" ]; then
+                pin_threads_in_pid "$pid" "$worker_core" "$pe_core"
+                for child in $(pgrep -P "$pid" 2>/dev/null); do
+                    pin_threads_in_pid "$child" "$worker_core" "$pe_core"
+                done
+            fi
         done
     done
     info "Pinning done"
@@ -739,39 +806,41 @@ case "$CMD" in
         ensure_envoy_image
         start_dpu
         start_pods
-        pin_pods fair
+        pin_pods shared
         info "=== Deploy complete ==="
         echo
-        echo "  Run (fair 1-core/pod, TCP vs DPUmesh 비교용):"
-        echo "    $0 dpumesh    <RPS> <DUR> <SIZE> [<CONNS>]"
-        echo "    $0 tcp        <RPS> <DUR> <SIZE> [<CONNS>]"
-        echo "  Run (HW limit chase, dpumesh 측만 multi-core):"
-        echo "    $0 dpumesh-hw <RPS> <DUR> <SIZE> [<CONNS>]"
-        echo "  If pods restart, re-pin: $0 pin (or pin-hw)"
+        echo "  Run (shared 1-core/pod, TCP vs DPUmesh 비교용):"
+        echo "    $0 dpumesh       <RPS> <DUR> <SIZE> [<CONNS>]"
+        echo "    $0 tcp           <RPS> <DUR> <SIZE> [<CONNS>]"
+        echo "  Run (split: worker/PE per-thread pin to dedicated cores):"
+        echo "    $0 dpumesh-split <RPS> <DUR> <SIZE> [<CONNS>]"
+        echo "  If pods restart, re-pin: $0 pin (shared) or pin-split"
         ;;
     dpumesh)
-        # fair-mode가 묵시적 default. 직전이 hw-mode였으면 fair로 되돌리는 게
-        # 안전함 — re-pin 비용은 한 번 작은 taskset 호출들이라 무시 가능.
-        pin_pods fair >/dev/null
+        # shared-mode가 묵시적 default. 직전이 split-mode였으면 shared로
+        # 되돌림 — re-pin 비용은 작은 taskset 호출들이라 무시 가능.
+        pin_pods shared >/dev/null
         run_bench "dpumesh" "${@:2}"
         ;;
-    dpumesh-hw)
-        # HW limit chase: dpumesh 측만 multi-core. echo-dpumesh "1,5", bench
-        # "0,4". 이 모드의 결과는 TCP와 직접 비교 불가 (자원 비대칭) — 오직
-        # chain ceiling 까지 dpumesh 가 도달하는지 보는 용도.
-        pin_pods hw >/dev/null
+    dpumesh-split)
+        # split mode: dpumesh 측 worker 와 PE thread 를 별도 코어에 pin.
+        # bench-dpumesh worker=core 0, PE=core 4. echo-dpumesh worker=core 1,
+        # PE=core 5. TCP 와 직접 비교 불가 (자원 비대칭) — transport 자체의
+        # libdoca-polling-with-its-own-core 한계 측정용.
+        pin_pods split >/dev/null
         run_bench "dpumesh" "${@:2}"
         ;;
     tcp)
-        # TCP는 항상 fair-mode로 강제 (B안 자체가 1-core 비교 전제)
-        pin_pods fair >/dev/null
+        # TCP는 항상 shared-mode로 강제 (B안 자체가 1-core 비교 전제)
+        pin_pods shared >/dev/null
         run_bench "tcp" "${@:2}"
         ;;
-    pin|pin-fair)
-        pin_pods fair
+    pin|pin-shared|pin-fair)
+        # pin-fair는 옛 이름. shared의 alias로 유지.
+        pin_pods shared
         ;;
-    pin-hw)
-        pin_pods hw
+    pin-split)
+        pin_pods split
         ;;
     logs)
         show_logs
@@ -783,19 +852,19 @@ case "$CMD" in
         cleanup
         ;;
     *)
-        echo "Usage: $0 {deploy|dpumesh|tcp|dpumesh-hw|pin|pin-hw|logs|status|cleanup}"
+        echo "Usage: $0 {deploy|dpumesh|tcp|dpumesh-split|pin|pin-split|logs|status|cleanup}"
         echo
-        echo "  deploy                                    # 전체 배포 (fair 핀 자동)"
-        echo "  dpumesh     <RPS> <DUR> <SIZE> [<CONNS>]  # 1-core fair (TCP 대조군용)"
-        echo "  tcp         <RPS> <DUR> <SIZE> [<CONNS>]  # 1-core fair (sidecar 모델)"
-        echo "  dpumesh-hw  <RPS> <DUR> <SIZE> [<CONNS>]  # multi-core (HW 한계 측정)"
-        echo "  pin / pin-fair                            # fair 모드 재핀"
-        echo "  pin-hw                                    # hw 모드 재핀 (수동 토글)"
-        echo "  logs                                      # bench/echo pod 로그"
-        echo "  status                                    # 상태"
-        echo "  cleanup                                   # ns 삭제 + DPU 중지"
+        echo "  deploy                                       # 전체 배포 (shared 핀 자동)"
+        echo "  dpumesh        <RPS> <DUR> <SIZE> [<CONNS>]  # 1-core shared (TCP 대조군용)"
+        echo "  tcp            <RPS> <DUR> <SIZE> [<CONNS>]  # 1-core shared (sidecar 모델)"
+        echo "  dpumesh-split  <RPS> <DUR> <SIZE> [<CONNS>]  # 2-core, worker/PE thread 별도 코어"
+        echo "  pin / pin-shared                             # shared 모드 재핀 (pin-fair = alias)"
+        echo "  pin-split                                    # split 모드 재핀"
+        echo "  logs                                         # bench/echo pod 로그"
+        echo "  status                                       # 상태"
+        echo "  cleanup                                      # ns 삭제 + DPU 중지"
         echo
         echo "Note: 같은 DPU를 사용하므로 test-dpumesh.sh와 동시 deploy 불가"
-        echo "      pin profile은 dpumesh/dpumesh-hw/tcp 명령마다 자동으로 맞춰줌"
+        echo "      pin profile은 dpumesh/dpumesh-split/tcp 명령마다 자동으로 맞춰줌"
         ;;
 esac

@@ -6,5 +6,5 @@ C_DEFINES = -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL
 
 C_INCLUDES = -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3
 
-C_FLAGS = 
+C_FLAGS = -fno-omit-frame-pointer -O2 -g -DNDEBUG
 

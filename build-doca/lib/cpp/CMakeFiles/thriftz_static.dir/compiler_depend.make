@@ -42,6 +42,8 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/protocol/THeaderProtocol.cpp.o:
   /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
   /usr/include/x86_64-linux-gnu/bits/floatn.h \
   /usr/include/x86_64-linux-gnu/bits/floatn-common.h \
+  /usr/include/x86_64-linux-gnu/bits/stdio.h \
+  /usr/include/x86_64-linux-gnu/bits/stdio2.h \
   /usr/include/assert.h \
   /usr/include/x86_64-linux-gnu/sys/types.h \
   /usr/include/x86_64-linux-gnu/bits/types/clock_t.h \
@@ -60,6 +62,7 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/protocol/THeaderProtocol.cpp.o:
   /usr/include/x86_64-linux-gnu/bits/types/__sigset_t.h \
   /usr/include/x86_64-linux-gnu/bits/types/struct_timeval.h \
   /usr/include/x86_64-linux-gnu/bits/types/struct_timespec.h \
+  /usr/include/x86_64-linux-gnu/bits/select2.h \
   /usr/include/x86_64-linux-gnu/bits/pthreadtypes.h \
   /usr/include/x86_64-linux-gnu/bits/thread-shared-types.h \
   /usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h \
@@ -85,6 +88,7 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/protocol/THeaderProtocol.cpp.o:
   /usr/include/x86_64-linux-gnu/asm/sockios.h \
   /usr/include/asm-generic/sockios.h \
   /usr/include/x86_64-linux-gnu/bits/types/struct_osockaddr.h \
+  /usr/include/x86_64-linux-gnu/bits/socket2.h \
   /usr/include/x86_64-linux-gnu/bits/in.h \
   /usr/include/inttypes.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdint.h \
@@ -121,6 +125,7 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/protocol/THeaderProtocol.cpp.o:
   /usr/include/x86_64-linux-gnu/bits/types/mbstate_t.h \
   /usr/include/x86_64-linux-gnu/bits/types/locale_t.h \
   /usr/include/x86_64-linux-gnu/bits/types/__locale_t.h \
+  /usr/include/x86_64-linux-gnu/bits/wchar2.h \
   /usr/include/c++/11/cstdint \
   /usr/include/c++/11/bits/allocator.h \
   /usr/include/x86_64-linux-gnu/c++/11/bits/c++allocator.h \
@@ -169,7 +174,9 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/protocol/THeaderProtocol.cpp.o:
   /usr/include/x86_64-linux-gnu/bits/waitflags.h \
   /usr/include/x86_64-linux-gnu/bits/waitstatus.h \
   /usr/include/alloca.h \
+  /usr/include/x86_64-linux-gnu/bits/stdlib-bsearch.h \
   /usr/include/x86_64-linux-gnu/bits/stdlib-float.h \
+  /usr/include/x86_64-linux-gnu/bits/stdlib.h \
   /usr/include/c++/11/bits/std_abs.h \
   /usr/include/c++/11/cstdio \
   /usr/include/c++/11/cerrno \
@@ -222,6 +229,7 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/protocol/THeaderProtocol.cpp.o:
   /usr/include/x86_64-linux-gnu/bits/confname.h \
   /usr/include/x86_64-linux-gnu/bits/getopt_posix.h \
   /usr/include/x86_64-linux-gnu/bits/getopt_core.h \
+  /usr/include/x86_64-linux-gnu/bits/unistd.h \
   /usr/include/x86_64-linux-gnu/bits/unistd_ext.h \
   /usr/include/linux/close_range.h \
   /usr/include/boost/config/detail/select_platform_config.hpp \
@@ -503,6 +511,8 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/protocol/THeaderProtocol.cpp.o:
   /usr/include/c++/11/cstring \
   /usr/include/string.h \
   /usr/include/strings.h \
+  /usr/include/x86_64-linux-gnu/bits/strings_fortified.h \
+  /usr/include/x86_64-linux-gnu/bits/string_fortified.h \
   ../lib/cpp/src/thrift/transport/TVirtualTransport.h \
   ../lib/cpp/src/thrift/protocol/TCompactProtocol.h \
   /usr/include/c++/11/stack \
@@ -567,6 +577,7 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.
   /usr/include/x86_64-linux-gnu/bits/types/FILE.h \
   /usr/include/x86_64-linux-gnu/bits/types/locale_t.h \
   /usr/include/x86_64-linux-gnu/bits/types/__locale_t.h \
+  /usr/include/x86_64-linux-gnu/bits/wchar2.h \
   /usr/include/c++/11/cstdint \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdint.h \
   /usr/include/stdint.h \
@@ -643,8 +654,11 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.
   /usr/include/x86_64-linux-gnu/sys/select.h \
   /usr/include/x86_64-linux-gnu/bits/select.h \
   /usr/include/x86_64-linux-gnu/bits/types/sigset_t.h \
+  /usr/include/x86_64-linux-gnu/bits/select2.h \
   /usr/include/alloca.h \
+  /usr/include/x86_64-linux-gnu/bits/stdlib-bsearch.h \
   /usr/include/x86_64-linux-gnu/bits/stdlib-float.h \
+  /usr/include/x86_64-linux-gnu/bits/stdlib.h \
   /usr/include/c++/11/bits/std_abs.h \
   /usr/include/c++/11/cstdio \
   /usr/include/stdio.h \
@@ -653,6 +667,8 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.
   /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
   /usr/include/x86_64-linux-gnu/bits/types/cookie_io_functions_t.h \
   /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
+  /usr/include/x86_64-linux-gnu/bits/stdio.h \
+  /usr/include/x86_64-linux-gnu/bits/stdio2.h \
   /usr/include/c++/11/cerrno \
   /usr/include/errno.h \
   /usr/include/x86_64-linux-gnu/bits/errno.h \
@@ -705,6 +721,7 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.
   /usr/include/x86_64-linux-gnu/bits/confname.h \
   /usr/include/x86_64-linux-gnu/bits/getopt_posix.h \
   /usr/include/x86_64-linux-gnu/bits/getopt_core.h \
+  /usr/include/x86_64-linux-gnu/bits/unistd.h \
   /usr/include/x86_64-linux-gnu/bits/unistd_ext.h \
   /usr/include/linux/close_range.h \
   /usr/include/boost/config/detail/select_platform_config.hpp \
@@ -744,6 +761,8 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.
   /usr/include/c++/11/cstring \
   /usr/include/string.h \
   /usr/include/strings.h \
+  /usr/include/x86_64-linux-gnu/bits/strings_fortified.h \
+  /usr/include/x86_64-linux-gnu/bits/string_fortified.h \
   ../lib/cpp/src/thrift/transport/TTransport.h \
   ../lib/cpp/src/thrift/Thrift.h \
   ../lib/cpp/src/thrift/transport/PlatformSocket.h \
@@ -767,6 +786,7 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/THeaderTransport.cpp.
   /usr/include/x86_64-linux-gnu/asm/sockios.h \
   /usr/include/asm-generic/sockios.h \
   /usr/include/x86_64-linux-gnu/bits/types/struct_osockaddr.h \
+  /usr/include/x86_64-linux-gnu/bits/socket2.h \
   /usr/include/x86_64-linux-gnu/bits/in.h \
   /usr/include/inttypes.h \
   /usr/include/c++/11/list \
@@ -1052,6 +1072,8 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
   /usr/include/x86_64-linux-gnu/bits/types/locale_t.h \
   /usr/include/x86_64-linux-gnu/bits/types/__locale_t.h \
   /usr/include/strings.h \
+  /usr/include/x86_64-linux-gnu/bits/strings_fortified.h \
+  /usr/include/x86_64-linux-gnu/bits/string_fortified.h \
   /usr/include/c++/11/algorithm \
   /usr/include/c++/11/utility \
   /usr/include/c++/11/bits/stl_relops.h \
@@ -1100,6 +1122,7 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
   /usr/include/x86_64-linux-gnu/bits/types/__sigset_t.h \
   /usr/include/x86_64-linux-gnu/bits/types/struct_timeval.h \
   /usr/include/x86_64-linux-gnu/bits/types/struct_timespec.h \
+  /usr/include/x86_64-linux-gnu/bits/select2.h \
   /usr/include/x86_64-linux-gnu/bits/pthreadtypes.h \
   /usr/include/x86_64-linux-gnu/bits/thread-shared-types.h \
   /usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h \
@@ -1107,7 +1130,9 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
   /usr/include/x86_64-linux-gnu/bits/struct_mutex.h \
   /usr/include/x86_64-linux-gnu/bits/struct_rwlock.h \
   /usr/include/alloca.h \
+  /usr/include/x86_64-linux-gnu/bits/stdlib-bsearch.h \
   /usr/include/x86_64-linux-gnu/bits/stdlib-float.h \
+  /usr/include/x86_64-linux-gnu/bits/stdlib.h \
   /usr/include/c++/11/bits/std_abs.h \
   /usr/include/c++/11/bits/algorithmfwd.h \
   /usr/include/c++/11/bits/stl_heap.h \
@@ -1139,6 +1164,8 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
   /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
   /usr/include/x86_64-linux-gnu/bits/types/cookie_io_functions_t.h \
   /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
+  /usr/include/x86_64-linux-gnu/bits/stdio.h \
+  /usr/include/x86_64-linux-gnu/bits/stdio2.h \
   /usr/include/netinet/in.h \
   /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
   /usr/include/x86_64-linux-gnu/sys/socket.h \
@@ -1158,6 +1185,7 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
   /usr/include/x86_64-linux-gnu/asm/sockios.h \
   /usr/include/asm-generic/sockios.h \
   /usr/include/x86_64-linux-gnu/bits/types/struct_osockaddr.h \
+  /usr/include/x86_64-linux-gnu/bits/socket2.h \
   /usr/include/x86_64-linux-gnu/bits/in.h \
   /usr/include/inttypes.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdint.h \
@@ -1172,6 +1200,7 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
   /usr/include/wchar.h \
   /usr/include/x86_64-linux-gnu/bits/types/wint_t.h \
   /usr/include/x86_64-linux-gnu/bits/types/mbstate_t.h \
+  /usr/include/x86_64-linux-gnu/bits/wchar2.h \
   /usr/include/c++/11/cstdint \
   /usr/include/c++/11/bits/allocator.h \
   /usr/include/x86_64-linux-gnu/c++/11/bits/c++allocator.h \
@@ -1260,6 +1289,7 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
   /usr/include/x86_64-linux-gnu/bits/confname.h \
   /usr/include/x86_64-linux-gnu/bits/getopt_posix.h \
   /usr/include/x86_64-linux-gnu/bits/getopt_core.h \
+  /usr/include/x86_64-linux-gnu/bits/unistd.h \
   /usr/include/x86_64-linux-gnu/bits/unistd_ext.h \
   /usr/include/linux/close_range.h \
   /usr/include/boost/config/detail/select_platform_config.hpp \
@@ -1530,19 +1560,25 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
 
 /usr/include/c++/11/ostream:
 
-/usr/include/c++/11/bits/locale_facets.tcc:
-
 /usr/include/x86_64-linux-gnu/c++/11/bits/ctype_inline.h:
 
 /usr/include/c++/11/bits/streambuf_iterator.h:
 
-../lib/cpp/src/thrift/TOutput.h:
+/usr/include/x86_64-linux-gnu/c++/11/bits/ctype_base.h:
 
-/usr/include/x86_64-linux-gnu/bits/time64.h:
+/usr/include/x86_64-linux-gnu/bits/wctype-wchar.h:
 
-/usr/include/boost/type_traits/add_lvalue_reference.hpp:
+/usr/include/wctype.h:
 
-/usr/include/x86_64-linux-gnu/asm/errno.h:
+/usr/include/c++/11/cwctype:
+
+/usr/include/c++/11/bits/locale_facets.h:
+
+/usr/include/c++/11/bits/basic_ios.h:
+
+/usr/include/c++/11/streambuf:
+
+/usr/include/x86_64-linux-gnu/c++/11/bits/error_constants.h:
 
 /usr/include/boost/type_traits/is_arithmetic.hpp:
 
@@ -1564,15 +1600,9 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
 
 /usr/include/zconf.h:
 
-/usr/include/boost/type_traits/add_reference.hpp:
-
-/usr/include/boost/type_traits/integral_constant.hpp:
-
 /usr/include/boost/type_traits/intrinsics.hpp:
 
 /usr/include/boost/config/platform/linux.hpp:
-
-/usr/include/c++/11/exception:
 
 /usr/include/boost/mpl/aux_/config/preprocessor.hpp:
 
@@ -1594,8 +1624,6 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
 
 /usr/include/sched.h:
 
-/usr/include/wctype.h:
-
 /usr/include/time.h:
 
 /usr/include/boost/mpl/limits/arity.hpp:
@@ -1606,13 +1634,13 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
 
 /usr/include/c++/11/deque:
 
-/usr/include/boost/utility/enable_if.hpp:
-
 /usr/include/boost/mpl/aux_/is_msvc_eti_arg.hpp:
 
 /usr/include/c++/11/bits/nested_exception.h:
 
 /usr/include/c++/11/typeinfo:
+
+/usr/include/c++/11/exception:
 
 /usr/include/c++/11/bits/stl_vector.h:
 
@@ -1652,15 +1680,9 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
 
 /usr/include/c++/11/bits/stl_relops.h:
 
-/usr/include/boost/type_traits/is_abstract.hpp:
-
 /usr/include/c++/11/bits/stl_map.h:
 
 /usr/include/boost/mpl/aux_/na_fwd.hpp:
-
-/usr/include/boost/type_traits/is_integral.hpp:
-
-/usr/include/boost/config/detail/suffix.hpp:
 
 /usr/include/c++/11/bits/basic_string.tcc:
 
@@ -1682,6 +1704,12 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
 
 /usr/include/c++/11/bits/stl_heap.h:
 
+/usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h:
+
+/usr/include/x86_64-linux-gnu/bits/types/clockid_t.h:
+
+/usr/include/c++/11/bits/stl_bvector.h:
+
 /usr/include/alloca.h:
 
 /usr/include/x86_64-linux-gnu/bits/waitflags.h:
@@ -1699,12 +1727,6 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
 /usr/include/stdc-predef.h:
 
 /usr/include/x86_64-linux-gnu/c++/11/bits/atomic_word.h:
-
-/usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h:
-
-/usr/include/x86_64-linux-gnu/bits/types/clockid_t.h:
-
-/usr/include/c++/11/bits/stl_bvector.h:
 
 /usr/include/c++/11/bits/invoke.h:
 
@@ -1727,6 +1749,10 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
 /usr/include/x86_64-linux-gnu/bits/types/struct_sched_param.h:
 
 /usr/include/asm-generic/errno.h:
+
+/usr/include/boost/config/detail/suffix.hpp:
+
+/usr/include/boost/type_traits/is_integral.hpp:
 
 /usr/include/x86_64-linux-gnu/c++/11/bits/gthr-default.h:
 
@@ -1767,6 +1793,12 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
 /usr/include/c++/11/cctype:
 
 /usr/include/boost/smart_ptr/detail/sp_noexcept.hpp:
+
+/usr/include/c++/11/bits/localefwd.h:
+
+/usr/include/c++/11/bits/exception.h:
+
+/usr/include/boost/scoped_array.hpp:
 
 /usr/include/c++/11/backward/binders.h:
 
@@ -1810,6 +1842,14 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
 
 /usr/include/boost/throw_exception.hpp:
 
+/usr/include/c++/11/bits/locale_facets.tcc:
+
+/usr/include/x86_64-linux-gnu/bits/stdio.h:
+
+/usr/include/boost/mpl/aux_/config/dtp.hpp:
+
+/usr/include/boost/numeric/conversion/converter_policies.hpp:
+
 /usr/include/x86_64-linux-gnu/bits/types/struct_itimerspec.h:
 
 /usr/include/boost/preprocessor/tuple/detail/is_single_return.hpp:
@@ -1822,6 +1862,12 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
 
 /usr/include/c++/11/bits/cxxabi_init_exception.h:
 
+/usr/include/x86_64-linux-gnu/bits/time64.h:
+
+/usr/include/boost/type_traits/integral_constant.hpp:
+
+/usr/include/boost/type_traits/add_reference.hpp:
+
 /usr/include/boost/mpl/bool_fwd.hpp:
 
 /usr/include/x86_64-linux-gnu/bits/endianness.h:
@@ -1833,6 +1879,12 @@ lib/cpp/CMakeFiles/thriftz_static.dir/src/thrift/transport/TZlibTransport.cpp.o:
 /usr/include/x86_64-linux-gnu/bits/errno.h:
 
 /usr/lib/gcc/x86_64-linux-gnu/11/include/syslimits.h:
+
+/usr/include/x86_64-linux-gnu/bits/socket2.h:
+
+/usr/include/boost/mpl/numeric_cast.hpp:
+
+/usr/include/linux/param.h:
 
 /usr/include/c++/11/bits/stl_multimap.h:
 
@@ -1864,15 +1916,25 @@ thrift/config.h:
 
 /usr/include/x86_64-linux-gnu/bits/wordsize.h:
 
-/usr/include/boost/mpl/identity.hpp:
-
 /usr/include/x86_64-linux-gnu/asm/sockios.h:
+
+/usr/include/x86_64-linux-gnu/bits/unistd.h:
 
 /usr/include/boost/numeric/conversion/detail/meta.hpp:
 
 /usr/include/boost/mpl/aux_/config/ctps.hpp:
 
 /usr/include/boost/mpl/void.hpp:
+
+/usr/include/x86_64-linux-gnu/bits/types/__mbstate_t.h:
+
+/usr/include/c++/11/bits/charconv.h:
+
+/usr/include/c++/11/bits/exception_ptr.h:
+
+/usr/include/x86_64-linux-gnu/c++/11/bits/c++allocator.h:
+
+/usr/include/math.h:
 
 /usr/include/c++/11/cstring:
 
@@ -1881,8 +1943,6 @@ thrift/config.h:
 /usr/include/boost/mpl/aux_/has_apply.hpp:
 
 /usr/include/c++/11/ios:
-
-/usr/include/x86_64-linux-gnu/c++/11/bits/error_constants.h:
 
 /usr/include/c++/11/bits/alloc_traits.h:
 
@@ -1893,14 +1953,6 @@ thrift/config.h:
 /usr/include/asm-generic/posix_types.h:
 
 /usr/include/boost/preprocessor/identity.hpp:
-
-/usr/include/boost/type_traits/is_function.hpp:
-
-/usr/include/boost/mpl/aux_/preprocessor/params.hpp:
-
-/usr/include/boost/mpl/aux_/preprocessed/gcc/less.hpp:
-
-/usr/include/x86_64-linux-gnu/bits/types/struct_timeval.h:
 
 /usr/include/boost/mpl/aux_/yes_no.hpp:
 
@@ -1914,10 +1966,6 @@ thrift/config.h:
 
 /usr/include/linux/limits.h:
 
-/usr/include/x86_64-linux-gnu/bits/mathcalls.h:
-
-/usr/include/x86_64-linux-gnu/bits/endian.h:
-
 /usr/include/c++/11/set:
 
 /usr/include/x86_64-linux-gnu/gnu/stubs.h:
@@ -1925,10 +1973,6 @@ thrift/config.h:
 /usr/include/c++/11/bits/stl_deque.h:
 
 /usr/include/asm-generic/bitsperlong.h:
-
-../lib/cpp/src/thrift/TLogging.h:
-
-/usr/include/c++/11/bits/concept_check.h:
 
 /usr/include/boost/config/helper_macros.hpp:
 
@@ -1942,9 +1986,25 @@ thrift/config.h:
 
 /usr/include/boost/numeric/conversion/converter.hpp:
 
-/usr/include/boost/type_traits/is_floating_point.hpp:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:
 
-../lib/cpp/src/thrift/transport/TBufferTransports.h:
+/usr/include/boost/mpl/if.hpp:
+
+/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h:
+
+/usr/include/boost/mpl/identity.hpp:
+
+/usr/include/boost/type_traits/is_function.hpp:
+
+/usr/include/boost/mpl/aux_/preprocessor/params.hpp:
+
+/usr/include/boost/mpl/aux_/preprocessed/gcc/less.hpp:
+
+/usr/include/x86_64-linux-gnu/asm/errno.h:
+
+/usr/include/boost/type_traits/add_lvalue_reference.hpp:
+
+/usr/include/x86_64-linux-gnu/bits/types/struct_timeval.h:
 
 /usr/include/c++/11/bits/range_access.h:
 
@@ -1978,7 +2038,15 @@ thrift/config.h:
 
 /usr/include/c++/11/debug/assertions.h:
 
-/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h:
+/usr/include/boost/utility/enable_if.hpp:
+
+/usr/include/x86_64-linux-gnu/bits/select2.h:
+
+/usr/include/c++/11/cwchar:
+
+/usr/include/boost/mpl/aux_/config/arrays.hpp:
+
+/usr/include/x86_64-linux-gnu/bits/floatn-common.h:
 
 /usr/include/c++/11/ext/new_allocator.h:
 
@@ -2072,17 +2140,13 @@ thrift/config.h:
 
 /usr/include/boost/preprocessor/tuple/elem.hpp:
 
+/usr/include/x86_64-linux-gnu/bits/stdlib-bsearch.h:
+
 /usr/include/x86_64-linux-gnu/bits/mathcalls-narrow.h:
 
 /usr/include/x86_64-linux-gnu/asm/socket.h:
 
 /usr/include/x86_64-linux-gnu/bits/wchar.h:
-
-/usr/include/c++/11/bits/exception.h:
-
-/usr/include/boost/scoped_array.hpp:
-
-/usr/include/c++/11/bits/locale_facets.h:
 
 /usr/include/x86_64-linux-gnu/bits/confname.h:
 
@@ -2097,6 +2161,8 @@ thrift/config.h:
 /usr/include/boost/config/workaround.hpp:
 
 /usr/include/x86_64-linux-gnu/bits/fp-fast.h:
+
+/usr/include/x86_64-linux-gnu/bits/stdlib.h:
 
 /usr/include/x86_64-linux-gnu/bits/getopt_core.h:
 
@@ -2134,29 +2200,39 @@ thrift/config.h:
 
 /usr/include/x86_64-linux-gnu/bits/sockaddr.h:
 
-/usr/include/c++/11/cwchar:
+/usr/include/c++/11/system_error:
 
-/usr/include/boost/mpl/aux_/config/arrays.hpp:
+/usr/include/features-time64.h:
 
-/usr/include/x86_64-linux-gnu/bits/floatn-common.h:
+/usr/include/x86_64-linux-gnu/bits/types/locale_t.h:
 
-/usr/include/x86_64-linux-gnu/bits/types/__mbstate_t.h:
+/usr/include/x86_64-linux-gnu/bits/wchar2.h:
 
-/usr/include/c++/11/bits/charconv.h:
+/usr/include/x86_64-linux-gnu/bits/fp-logb.h:
 
-/usr/include/c++/11/bits/exception_ptr.h:
+/usr/include/boost/type_traits/is_floating_point.hpp:
 
-/usr/include/math.h:
+../lib/cpp/src/thrift/transport/TBufferTransports.h:
 
-/usr/include/x86_64-linux-gnu/c++/11/bits/c++allocator.h:
+/usr/include/boost/type_traits/is_abstract.hpp:
 
-/usr/include/c++/11/bits/localefwd.h:
+/usr/include/x86_64-linux-gnu/bits/endian.h:
+
+/usr/include/x86_64-linux-gnu/bits/mathcalls.h:
+
+/usr/include/c++/11/bits/concept_check.h:
+
+../lib/cpp/src/thrift/TLogging.h:
+
+../lib/cpp/src/thrift/TOutput.h:
 
 /usr/include/asm-generic/sockios.h:
 
 /usr/include/c++/11/bits/stl_tempbuf.h:
 
 /usr/include/c++/11/memory:
+
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:
 
 /usr/include/c++/11/bits/stl_raw_storage_iter.h:
 
@@ -2193,8 +2269,6 @@ thrift/config.h:
 /usr/include/boost/type.hpp:
 
 /usr/include/boost/type_traits/remove_cv.hpp:
-
-/usr/include/boost/mpl/if.hpp:
 
 /usr/include/boost/mpl/aux_/static_cast.hpp:
 
@@ -2242,8 +2316,6 @@ thrift/config.h:
 
 /usr/include/boost/preprocessor/array/data.hpp:
 
-/usr/include/c++/11/streambuf:
-
 /usr/include/boost/mpl/aux_/nttp_decl.hpp:
 
 /usr/include/boost/mpl/aux_/integral_wrapper.hpp:
@@ -2258,11 +2330,13 @@ thrift/config.h:
 
 /usr/include/boost/preprocessor/config/config.hpp:
 
-/usr/include/boost/mpl/aux_/config/dtp.hpp:
-
-/usr/include/boost/numeric/conversion/converter_policies.hpp:
-
 /usr/include/boost/preprocessor/comma_if.hpp:
+
+/usr/include/c++/11/bits/streambuf.tcc:
+
+/usr/include/c++/11/bits/stl_iterator_base_funcs.h:
+
+/usr/include/boost/preprocessor/control/if.hpp:
 
 /usr/include/boost/mpl/aux_/largest_int.hpp:
 
@@ -2336,9 +2410,9 @@ thrift/config.h:
 
 /usr/include/boost/preprocessor/control/expr_iif.hpp:
 
-/usr/include/boost/mpl/aux_/type_wrapper.hpp:
-
 ../lib/cpp/src/thrift/transport/TVirtualTransport.h:
+
+/usr/include/boost/mpl/aux_/type_wrapper.hpp:
 
 /usr/include/boost/preprocessor/list/adt.hpp:
 
@@ -2382,6 +2456,8 @@ thrift/config.h:
 
 /usr/include/boost/assert.hpp:
 
+/usr/include/x86_64-linux-gnu/bits/strings_fortified.h:
+
 /usr/include/boost/mpl/aux_/lambda_support.hpp:
 
 /usr/include/boost/mpl/eval_if.hpp:
@@ -2401,10 +2477,6 @@ thrift/config.h:
 /usr/include/boost/mpl/aux_/numeric_op.hpp:
 
 /usr/include/x86_64-linux-gnu/bits/types/sigval_t.h:
-
-/usr/include/boost/mpl/numeric_cast.hpp:
-
-/usr/include/linux/param.h:
 
 /usr/include/boost/mpl/apply_wrap.hpp:
 
@@ -2490,8 +2562,6 @@ thrift/config.h:
 
 /usr/include/x86_64-linux-gnu/bits/flt-eval-method.h:
 
-/usr/include/x86_64-linux-gnu/bits/fp-logb.h:
-
 /usr/include/boost/assert/source_location.hpp:
 
 /usr/include/boost/cstdint.hpp:
@@ -2574,12 +2644,6 @@ thrift/config.h:
 
 /usr/include/string.h:
 
-/usr/include/c++/11/bits/stl_iterator_base_funcs.h:
-
-/usr/include/boost/preprocessor/control/if.hpp:
-
-/usr/include/c++/11/bits/streambuf.tcc:
-
 /usr/include/c++/11/stack:
 
 /usr/include/boost/mpl/aux_/config/msvc_typename.hpp:
@@ -2598,8 +2662,6 @@ thrift/config.h:
 
 /usr/include/c++/11/bits/uniform_int_dist.h:
 
-/usr/include/c++/11/bits/basic_ios.h:
-
 /usr/include/boost/numeric/conversion/udt_builtin_mixture_enum.hpp:
 
 ../lib/cpp/src/thrift/transport/TZlibTransport.h:
@@ -2608,16 +2670,4 @@ thrift/config.h:
 
 ../lib/cpp/src/thrift/TToString.h:
 
-/usr/include/x86_64-linux-gnu/bits/wctype-wchar.h:
-
 /usr/include/c++/11/bits/locale_classes.h:
-
-/usr/include/features-time64.h:
-
-/usr/include/x86_64-linux-gnu/bits/types/locale_t.h:
-
-/usr/include/c++/11/system_error:
-
-/usr/include/c++/11/cwctype:
-
-/usr/include/x86_64-linux-gnu/c++/11/bits/ctype_base.h:

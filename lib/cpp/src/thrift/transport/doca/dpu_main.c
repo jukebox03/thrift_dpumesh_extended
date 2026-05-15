@@ -50,14 +50,12 @@ int main(int argc, char **argv)
     /* Parse command-line arguments (-p, -r) */
     result = init_argp(NULL, &gcfg, argc, argv);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to parse arguments: %s", doca_error_get_descr(result));
         goto exit;
     }
 
     /* Open DOCA device */
     result = open_doca_device_with_pci(gcfg.dev_pci_addr, NULL, &(objs.dev));
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to open DOCA device at %s", gcfg.dev_pci_addr);
         goto argp_cleanup;
     }
 
@@ -68,15 +66,11 @@ int main(int argc, char **argv)
                                                gcfg.dev_rep_pci_addr,
                                                &(objs.rep_dev));
         if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to open representor device at %s",
-                         gcfg.dev_rep_pci_addr);
             cleanup_objects(&objs);
             goto argp_cleanup;
         }
     }
 
-    DOCA_LOG_INFO("Starting %s application",
-                  gcfg.mode == DPU_MODE ? "DPU" : "Host");
 
     /* Run DPU worker (blocking) */
     run_dpu_worker(&objs);

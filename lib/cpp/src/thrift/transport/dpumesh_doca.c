@@ -400,6 +400,10 @@ struct dpumesh_ctx {
 
 static void *pe_progress_fn(void *arg) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)arg;
+    /* Distinct thread name so external pinning (test-bench.sh split mode)
+     * can find this thread via /proc/$pid/task/$tid/comm and taskset it to
+     * a dedicated core. Linux comm is 15 chars + NUL. */
+    pthread_setname_np(pthread_self(), "dpumesh_pe");
     struct timespec ts = {0, 1000}; /* 1 µs */
     (void)ts;
 
@@ -1432,36 +1436,24 @@ uint32_t dpumesh_alloc_req_id(dpumesh_ctx_t *ctx) {
     return atomic_fetch_add(&ctx->next_req_id, 1);
 }
 
+/* Legacy register (v1, uint32_t req_id). Same ownership model as the v2
+ * variant: caller owns the register/release lifecycle and there is no
+ * defensive wait — if the slot is busy, the call fails fast. */
 int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
     uint32_t idx = req_id % MAX_PENDING;
     dpumesh_pending_t *p = &ctx->pending[idx];
 
     pthread_mutex_lock(&p->lock);
-
-    /* If slot is occupied, wait briefly for previous request to complete. */
-    if (atomic_load(&p->state) != -1) {
-        struct timespec wait_ts;
-        clock_gettime(CLOCK_REALTIME, &wait_ts);
-        wait_ts.tv_sec += 2; /* 2-second collision wait budget */
-
-        while (atomic_load(&p->state) != -1) {
-            int s = atomic_load(&p->state);
-            int rc = pending_wait_state(p, s, &wait_ts);
-            if (rc == -1) {
-                int s2 = atomic_load(&p->state);
-                if (s2 == -2) {
-                    if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
-                    if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
-                    DOCA_LOG_WARN("Pending slot %u reclaimed after -2 timeout (req_id=%u)",
-                                  idx, req_id);
-                    break;
-                }
-                pthread_mutex_unlock(&p->lock);
-                DOCA_LOG_ERR("Pending slot collision: req_id=%u idx=%u stuck state=%d",
-                             req_id, idx, s2);
-                return -1;
-            }
-        }
+    int s = atomic_load(&p->state);
+    if (s == -2) {
+        if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
+        if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
+        atomic_store(&p->state, -1);
+        s = -1;
+    }
+    if (s != -1) {
+        pthread_mutex_unlock(&p->lock);
+        return -1;
     }
 
     p->tx_slot = -1;
@@ -1615,6 +1607,22 @@ int dpumesh_resolve(dpumesh_ctx_t *ctx, const char *service) {
  * seq % MAX_PENDING. Multiple srcs cannot collide because each src only
  * registers its own (src_id, seq) pairs in its own ctx — incoming
  * responses from other srcs are matched by full mesh_req_id. */
+/* Register a pending entry for a v2-keyed RPC.
+ *
+ * Ownership model: the caller (send_request) acquires the slot here and
+ * is responsible for releasing it via wait_response_v2 (response or
+ * timeout) or cancel_pending_v2. Slots are indexed by `seq % MAX_PENDING`.
+ *
+ * If the slot is busy, register fails fast. Two cases:
+ *   (a) state == -2: a prior RPC at this idx timed out. Reclaim it now
+ *       (PE already handled rx_slot cleanup; only TX-side slots may need
+ *       freeing) and proceed.
+ *   (b) state == 0 or 1: a prior caller didn't release. With seq advancing
+ *       monotonically, the wraparound to the same idx is naturally spaced
+ *       (MAX_PENDING / RPS), so this means another worker is still
+ *       holding the slot — return -1 and let the caller surface the
+ *       capacity error. There is no defensive wait: callers must own the
+ *       full register/release lifecycle. */
 static int register_pending_v2(dpumesh_ctx_t *ctx, struct mesh_req_id req_id) {
     uint32_t idx = req_id.seq % MAX_PENDING;
     dpumesh_pending_t *p = &ctx->pending[idx];
@@ -1622,34 +1630,16 @@ static int register_pending_v2(dpumesh_ctx_t *ctx, struct mesh_req_id req_id) {
     pthread_mutex_lock(&p->lock);
     int s = atomic_load(&p->state);
     if (s == -2) {
-        /* -2 means a prior RPC at this idx timed out. By the time we hit
-         * this idx again (>=2s later by seq advance), DPA is long done with
-         * the slots — reclaim immediately. */
         if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
         if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
         atomic_store(&p->state, -1);
         s = -1;
     }
     if (s != -1) {
-        struct timespec wait_ts;
-        clock_gettime(CLOCK_REALTIME, &wait_ts);
-        wait_ts.tv_sec += 2;
-        while (atomic_load(&p->state) != -1) {
-            int wv = atomic_load(&p->state);
-            int rc = pending_wait_state(p, wv, &wait_ts);
-            if (rc == -1) {
-                if (atomic_load(&p->state) == -2) {
-                    if (p->tx_slot >= 0)     { dpumesh_tx_free(ctx, p->tx_slot);     p->tx_slot = -1; }
-                    if (p->hdr_tx_slot >= 0) { dpumesh_hdr_tx_free(ctx, p->hdr_tx_slot); p->hdr_tx_slot = -1; }
-                    DOCA_LOG_WARN("Pending v2 slot %u reclaimed after -2 timeout (seq=%u)",
-                                  idx, req_id.seq);
-                    break;
-                }
-                pthread_mutex_unlock(&p->lock);
-                return -1;
-            }
-        }
+        pthread_mutex_unlock(&p->lock);
+        return -1;
     }
+
     /* req_id_v2 + slot fields must be visible BEFORE state=0 transitions
      * happen, because PE (lock-free) does an acquire-load on state then
      * uses req_id_v2 for the match check. Release-store on state
@@ -1891,6 +1881,7 @@ static int builder_append_locked(dpumesh_ctx_t *ctx,
 /* Per-tick timeout flush: each builder uses its own lock. No global lock. */
 static void *flush_timer_fn(void *arg) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)arg;
+    pthread_setname_np(pthread_self(), "dpumesh_flush");
     while (ctx->mesh_running) {
         struct timespec ts = {0, 250 * 1000};  /* 250 µs */
         nanosleep(&ts, NULL);
@@ -1944,6 +1935,9 @@ int dpumesh_send_request(dpumesh_ctx_t *ctx, const char *service,
     pthread_mutex_lock(&b->lock);
     if (builder_append_locked(ctx, b, rid, service, dst, body, body_len, flags) < 0) {
         pthread_mutex_unlock(&b->lock);
+        /* Append failed after register succeeded: release the pending slot
+         * so the next wraparound at this idx can register cleanly. */
+        dpumesh_cancel_pending_v2(ctx, rid);
         return -1;
     }
     pthread_mutex_unlock(&b->lock);
@@ -2158,9 +2152,24 @@ static void deliver_one_body(dpumesh_ctx_t *ctx, struct mesh_req_id rid,
             }
             return;
         }
-        /* No matching waiter — fall through to RX queue. */
+
+        /* Orphan OP_RESPONSE: no matching waiter (state=-1 after cancel,
+         * state=1 duplicate, or req_id mismatch from slot reuse). Drop
+         * the rx_slot — the pending API is the only response consumer
+         * and rx_queue is not drained for responses. Mirrors the
+         * rx_deliver_desc (legacy) no-waiter handling.
+         *
+         * Without this drop, slots accumulated whenever a worker timed
+         * out then received its response late: at >=1024B body the
+         * back-pressure made timeouts routine and the leak exhausted the
+         * 4096-slot rx pool within seconds. */
+        pthread_mutex_lock(&ctx->rx_slot_lock);
+        ctx->rx_slot_bitmap[slot] = 0;
+        pthread_mutex_unlock(&ctx->rx_slot_lock);
+        return;
     }
 
+    /* OP_REQUEST: push to rx_queue for echo-side workers. */
     pthread_mutex_lock(&ctx->rx_lock);
     if (ctx->rx_count >= RX_QUEUE_SIZE) {
         pthread_mutex_unlock(&ctx->rx_lock);
@@ -2177,12 +2186,106 @@ static void deliver_one_body(dpumesh_ctx_t *ctx, struct mesh_req_id rid,
     pthread_mutex_unlock(&ctx->rx_lock);
 }
 
+/* Batched OP_REQUEST delivery: pops `num` entries from `r`, allocates rx
+ * slots, copies bodies, builds descriptors, then pushes the whole batch
+ * into rx_queue under ONE mutex acquire and signals workers with ONE
+ * pthread_cond_broadcast.
+ *
+ * Why: previous deliver_one_body acquired ctx->rx_lock and called
+ * pthread_cond_signal per body. At ~25 bodies/chunk × ~7k chunks/sec =
+ * ~170k mutex+signal pairs/sec, kernel scheduler bookkeeping (psi_group,
+ * update_load, sched_clock, mark_wake_futex) dominated echo CPU — flame
+ * graph at 150k load showed 89% of echo CPU spent there vs <3% in our
+ * own code. Batching collapses N×{lock,unlock,signal} to 1×{lock,unlock,
+ * broadcast}, returning the scheduler-overhead budget to actual work.
+ *
+ * Pending (OP_RESPONSE) path is untouched — it already uses lock-free CAS
+ * + futex_wake_one and is not the bottleneck.
+ *
+ * Caller holds ctx->expected_locks[r's src_id]. */
+static void deliver_chunk_to_rxq(dpumesh_ctx_t *ctx,
+                                 expected_ring_t *r,
+                                 const uint8_t *chunk_buf,
+                                 uint32_t cursor,
+                                 uint32_t num)
+{
+    /* num is bounded by MESH_CHUNK_MAX_BODIES (64). Stack-allocate. */
+    sw_descriptor_t descs[MESH_CHUNK_MAX_BODIES];
+    int slots[MESH_CHUNK_MAX_BODIES];
+    uint32_t built = 0;
+
+    /* Phase 1 (no rx_lock): pop expected entries, alloc rx slots, memcpy
+     * bodies, build descriptors. rx_slot_alloc still takes rx_slot_lock
+     * per body — that mutex is uncontended in steady state. */
+    for (uint32_t i = 0; i < num; i++) {
+        expected_entry_t e = r->buf[r->head];
+        expected_ring_pop(r);
+        int slot = rx_slot_alloc(ctx);
+        if (slot < 0) {
+            /* Out of rx slots: skip this body. Logs intentionally absent
+             * per the project-wide DPU/host log strip. */
+            cursor += e.size;
+            continue;
+        }
+        const uint8_t *body = chunk_buf + cursor;
+        cursor += e.size;
+        if (e.size > 0) {
+            uint8_t *dst = (uint8_t *)ctx->rx_buffer +
+                           ((size_t)slot * ctx->slot_size);
+            memcpy(dst, body, e.size);
+        }
+        sw_descriptor_t *d = &descs[built];
+        memset(d, 0, sizeof(*d));
+        d->req_id          = e.req_id.seq;
+        d->src_pod_id      = e.src_pod_id;
+        d->dst_pod_id      = ctx->pod_id;
+        d->flags           = e.flags;
+        d->header_buf_slot = -1;
+        d->body_buf_slot   = slot;
+        d->body_len        = e.size;
+        d->valid           = 1;
+        slots[built] = slot;
+        built++;
+    }
+    if (built == 0) return;
+
+    /* Phase 2 (single rx_lock critical section): batch push + one broadcast. */
+    pthread_mutex_lock(&ctx->rx_lock);
+    uint32_t fit = RX_QUEUE_SIZE - ctx->rx_count;
+    uint32_t push = built <= fit ? built : fit;
+    for (uint32_t i = 0; i < push; i++) {
+        ctx->rx_queue[ctx->rx_tail] = descs[i];
+        ctx->rx_tail = (ctx->rx_tail + 1) % RX_QUEUE_SIZE;
+    }
+    ctx->rx_count += push;
+    if (push > 0) pthread_cond_broadcast(&ctx->rx_cond);
+    pthread_mutex_unlock(&ctx->rx_lock);
+
+    /* Phase 3 (overflow only — rare with RX_QUEUE_SIZE=65536): release the
+     * rx slots whose descriptors couldn't fit. */
+    if (push < built) {
+        pthread_mutex_lock(&ctx->rx_slot_lock);
+        for (uint32_t i = push; i < built; i++)
+            ctx->rx_slot_bitmap[slots[i]] = 0;
+        pthread_mutex_unlock(&ctx->rx_slot_lock);
+    }
+}
+
 /* Consume `num` bodies from the head of expected[src] and deliver them
  * from `chunk_buf` (which starts with the 12B chunk header). Caller holds
  * the matching expected_lock. */
 static void consume_chunk(dpumesh_ctx_t *ctx, expected_ring_t *r,
                           const uint8_t *chunk_buf, uint32_t num) {
     uint32_t cursor = sizeof(struct mesh_chunk_header);
+    /* All bodies in a chunk share flags (builder_flags is set once on first
+     * append and persists), so OP_RESPONSE and OP_REQUEST never mix here.
+     * Peek the head once and pick the path: pending/futex (already optimal)
+     * for responses, batched rx_queue push for requests. */
+    expected_entry_t *head = expected_ring_head(r);
+    if (head && !(head->flags & OP_RESPONSE)) {
+        deliver_chunk_to_rxq(ctx, r, chunk_buf, cursor, num);
+        return;
+    }
     for (uint32_t i = 0; i < num; i++) {
         expected_entry_t e = r->buf[r->head];
         expected_ring_pop(r);
@@ -2319,6 +2422,7 @@ static void process_chunk(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_len) {
 
 static void *sweep_fn(void *arg) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)arg;
+    pthread_setname_np(pthread_self(), "dpumesh_sweep");
     uint64_t last_stat_us = 0;
     uint64_t prev[8] = {0};
     while (ctx->mesh_running) {

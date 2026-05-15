@@ -28,8 +28,6 @@ init_dma_resources(struct objects *objs)
                                    &objs->dma_buffer, 1024 * 1024,
                                    DOCA_ACCESS_FLAG_LOCAL_READ_WRITE);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to setup DMA mmap and buffer - %s",
-                doca_error_get_name(result));
         return result;
     }
 
@@ -38,7 +36,6 @@ init_dma_resources(struct objects *objs)
         doca_pe_progress(objs->pe);
     }
 
-    DOCA_LOG_INFO("Remote mmap is ready for DMA operations");
     return DOCA_SUCCESS;
 }
 
@@ -56,16 +53,12 @@ send_dma_request_to_dpa(struct objects *objs)
 
     result = doca_mmap_dev_get_dpa_handle(objs->remote_mmap, objs->dev, &src_mmap);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get local mmap DPA handle: %s",
-                     doca_error_get_descr(result));
         return result;
     }
 #endif
 
     result = doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &dst_mmap);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get remote mmap DPA handle: %s",
-                     doca_error_get_descr(result));
         return result;
     }
 
@@ -74,8 +67,6 @@ send_dma_request_to_dpa(struct objects *objs)
     doca_dpa_dev_completion_t tmp_comp;
     result = doca_dpa_completion_get_dpa_handle(objs->dpa_comch->producer_comp, &tmp_comp);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get producer_comp DPA handle: %s",
-                     doca_error_get_descr(result));
         return result;
     }
     dma_req_msg.dpa_producer_comp = tmp_comp;
@@ -84,24 +75,14 @@ send_dma_request_to_dpa(struct objects *objs)
     dma_req_msg.src_addr = (uint64_t)objs->remote_addr;
     dma_req_msg.dst_addr = (uint64_t)objs->dma_buffer;
     dma_req_msg.length = 1024;
-    DOCA_LOG_INFO("Sending DMA request to DPA: producer: 0x%lx, src_mmap=%u, dst_mmap=%u, src_addr=0x%lx, dst_addr=0x%lx, length=%u",
-                    dma_req_msg.dpa_producer,          
-                    dma_req_msg.src_mmap,
-                  dma_req_msg.dst_mmap,
-                  dma_req_msg.src_addr,
-                  dma_req_msg.dst_addr,
-                  dma_req_msg.length);
 
     result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
                               &dma_req_msg,
                               sizeof(dma_req_msg));
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to send DMA request to DPA: %s",
-                     doca_error_get_descr(result));
         return result;
     }
 
-    DOCA_LOG_INFO("DMA request sent to DPA successfully");
     return DOCA_SUCCESS;
 }
 #endif /* DOCA_ARCH_DPU */

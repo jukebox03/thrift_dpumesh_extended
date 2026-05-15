@@ -7,11 +7,11 @@ C_DEFINES = -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL
 
 C_INCLUDES = -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3
 
-C_FLAGS = -fPIC
+C_FLAGS = -fno-omit-frame-pointer -O2 -g -DNDEBUG -fPIC
 
 CXX_DEFINES = -DBOOST_ALL_DYN_LINK -DBOOST_TEST_DYN_LINK -DDOCA_ALLOW_EXPERIMENTAL_API -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -Dthrift_EXPORTS
 
 CXX_INCLUDES = -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca -I/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src -isystem /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca -isystem /opt/mellanox/doca/include -isystem /usr/include/libnl3
 
-CXX_FLAGS =  -Wno-variadic-macros -Wno-long-long -fPIC -std=c++11
+CXX_FLAGS = -fno-omit-frame-pointer -Wno-variadic-macros -Wno-long-long -O2 -g -DNDEBUG -fPIC -std=c++11
 

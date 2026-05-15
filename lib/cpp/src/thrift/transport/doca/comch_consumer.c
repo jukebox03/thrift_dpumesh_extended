@@ -30,20 +30,17 @@ void server_new_consumer_callback(struct doca_comch_event_consumer *event,
 	(void)event;
 	comch_server = doca_comch_server_get_server_ctx(comch_connection);
 	if (comch_server == NULL) {
-		DOCA_LOG_ERR("Failed to get comch server from connection");
 		return;
 	}
 
 	result = doca_ctx_get_user_data(doca_comch_server_as_ctx(comch_server), &user_data);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get user data from ctx with error = %s", doca_error_get_name(result));
 		return;
 	}
 
 	objs = (struct objects *)(user_data.ptr);
 	objs->remote_consumer_id = id;
 
-	DOCA_LOG_INFO("Got a new remote consumer with ID = [%d]", id);
 }
 
 void client_new_consumer_callback(struct doca_comch_event_consumer *event,
@@ -59,20 +56,17 @@ void client_new_consumer_callback(struct doca_comch_event_consumer *event,
 	(void)event;
 	comch_client = doca_comch_client_get_client_ctx(comch_connection);
 	if (comch_client == NULL) {
-		DOCA_LOG_ERR("Failed to get comch server from connection");
 		return;
 	}
 
 	result = doca_ctx_get_user_data(doca_comch_client_as_ctx(comch_client), &user_data);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get user data from ctx with error = %s", doca_error_get_name(result));
 		return;
 	}
 
 	objs = (struct objects *)(user_data.ptr);
 	objs->remote_consumer_id = id;
 
-	DOCA_LOG_INFO("Got a new remote consumer with ID = [%d]", id);
 }
 
 /**
@@ -96,18 +90,12 @@ void clean_comch_consumer(struct doca_comch_consumer *consumer, struct doca_pe *
 {
 	doca_error_t result;
 
-	if (consumer != NULL) {
-		result = doca_comch_consumer_destroy(consumer);
-		if (result != DOCA_SUCCESS)
-			DOCA_LOG_ERR("Failed to destroy consumer properly with error = %s",
-				     doca_error_get_name(result));
-	}
+	if (consumer != NULL)
+		(void)doca_comch_consumer_destroy(consumer);
 
-	if (pe != NULL) {
-		result = doca_pe_destroy(pe);
-		if (result != DOCA_SUCCESS)
-			DOCA_LOG_ERR("Failed to destroy pe properly with error = %s", doca_error_get_name(result));
-	}
+	if (pe != NULL)
+		(void)doca_pe_destroy(pe);
+	(void)result;
 }
 
 doca_error_t init_comch_consumer(struct doca_comch_connection *connection,
@@ -121,35 +109,29 @@ doca_error_t init_comch_consumer(struct doca_comch_connection *connection,
 	union doca_data user_data;
 
 	if (*pe == NULL) {
-		DOCA_LOG_INFO("Creating new PE for consumer");
 		result = doca_pe_create(pe);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed creating pe with error = %s", doca_error_get_name(result));
 			return result;
 		}
 	}
 
 	result = doca_comch_consumer_create(connection, user_mmap, consumer);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to create consumer with error = %s", doca_error_get_name(result));
 		goto destroy_pe;
 	}
 
 	uint32_t id;
 	doca_comch_consumer_get_id(*consumer, &id);
-	DOCA_LOG_INFO("Created consumer with ID = [%d]", id);
 
 	ctx = doca_comch_consumer_as_ctx(*consumer);
 
 	result = doca_pe_connect_ctx(*pe, ctx);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed adding pe context to server with error = %s", doca_error_get_name(result));
 		goto destroy_consumer;
 	}
 
 	result = doca_ctx_set_state_changed_cb(ctx, cfg->ctx_state_changed_cb);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed setting state change callback with error = %s", doca_error_get_name(result));
 		goto destroy_consumer;
 	}
 
@@ -158,20 +140,17 @@ doca_error_t init_comch_consumer(struct doca_comch_connection *connection,
 							     cfg->recv_task_comp_err_cb,
 							     CC_DATA_PATH_TASK_NUM);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed setting consumer recv task cbs with error = %s", doca_error_get_name(result));
 		goto destroy_consumer;
 	}
 
 	user_data.ptr = cfg->ctx_user_data;
 	result = doca_ctx_set_user_data(ctx, user_data);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to set ctx user data with error = %s", doca_error_get_name(result));
 		goto destroy_consumer;
 	}
 
 	result = doca_ctx_start(ctx);
 	if (result != DOCA_ERROR_IN_PROGRESS) {
-		DOCA_LOG_ERR("Failed to start consumer context with error = %s", doca_error_get_name(result));
 		goto destroy_consumer;
 	}
 
@@ -216,20 +195,15 @@ static void consumer_recv_task_comp_cb(struct doca_comch_consumer_task_post_recv
 
 	objs->consumer_result = doca_buf_get_data(buf, &recv_msg);
 	if (objs->consumer_result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get data address from DOCA buf with error = %s",
-			     doca_error_get_name(objs->consumer_result));
 		goto err_out;
 	}
 
 	objs->consumer_result = doca_buf_get_data_len(buf, &recv_msg_len);
 	if (objs->consumer_result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get data length from DOCA buf with error = %s",
-			     doca_error_get_name(objs->consumer_result));
 		goto err_out;
 	}
 
 	if (recv_msg_len > 0 && objs->rx_data_hook != NULL) {
-		DOCA_LOG_DBG("Datapath RX received: len=%zu, dispatching to rx_data_hook", recv_msg_len);
 		objs->rx_data_hook(objs->rx_hook_ctx, (const uint8_t *)recv_msg, (uint32_t)recv_msg_len);
 	}
 
@@ -253,8 +227,6 @@ static void consumer_recv_task_comp_cb(struct doca_comch_consumer_task_post_recv
 	/* Rare: capacity had room but submit still failed. Release our count
 	 * and stash for later. */
 	doca_pool_release(&objs->recv_tasks_in_flight);
-	DOCA_LOG_WARN("Recv resubmit gated-submit failed: %s; stashing",
-	              doca_error_get_name(result));
 
 stash:
 	pthread_mutex_lock(&objs->consumer_retry_lock);
@@ -264,8 +236,6 @@ stash:
 		return;
 	}
 	pthread_mutex_unlock(&objs->consumer_retry_lock);
-	DOCA_LOG_ERR("consumer_retry full (%d); dropping recv task — capacity bug",
-	             MAX_CONSUMER_RETRY);
 	/* fall through to err_out; this really shouldn't happen */
 
 err_out:
@@ -294,8 +264,6 @@ static void consumer_recv_task_comp_err_cb(struct doca_comch_consumer_task_post_
 	doca_pool_release(&objs->recv_tasks_in_flight);
 
 	objs->consumer_result = doca_task_get_status(doca_comch_consumer_task_post_recv_as_task(task));
-	DOCA_LOG_ERR("Consumer failed to recv message with error = %s (non-fatal, continuing)",
-		     doca_error_get_name(objs->consumer_result));
 
 	buf = doca_comch_consumer_task_post_recv_get_buf(task);
 	(void)doca_buf_dec_refcount(buf, NULL);
@@ -320,12 +288,10 @@ static doca_error_t prepare_consumer_tasks(struct objects *objs, struct doca_com
 	for (i = 0; i < CC_DATA_PATH_TASK_NUM; i++) {
 		result = doca_buf_pool_buf_alloc(cmem->bpool, &buf);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to allocate buf from bpool with error = %s", doca_error_get_name(result));
 			return result;
 		}
 		result = doca_comch_consumer_task_post_recv_alloc_init(consumer, buf, &consumer_task);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to allocate task for consumer with error = %s", doca_error_get_name(result));
 			return result;
 		}
 		task_obj = doca_comch_consumer_task_post_recv_as_task(consumer_task);
@@ -340,7 +306,6 @@ static doca_error_t prepare_consumer_tasks(struct objects *objs, struct doca_com
 			atomic_fetch_sub(&objs->recv_tasks_in_flight, 1);
 			(void)doca_buf_dec_refcount(buf, NULL);
 			doca_task_free(task_obj);
-			DOCA_LOG_ERR("Failed submitting recv task with error = %s", doca_error_get_name(result));
 			return result;
 		}
 	}
@@ -368,7 +333,6 @@ static void consumer_state_changed_cb(const union doca_data user_data,
 	
 	switch (next_state) {
 	case DOCA_CTX_STATE_IDLE:
-		DOCA_LOG_INFO("CC consumer context has been stopped");
 
 		/* A move to stop from non running/stopping state means there's been an error */
 		if ((prev_state != DOCA_CTX_STATE_RUNNING) && (prev_state != DOCA_CTX_STATE_STOPPING))
@@ -381,14 +345,10 @@ static void consumer_state_changed_cb(const union doca_data user_data,
 		/**
 		 * The context is in starting state.
 		 */
-		DOCA_LOG_INFO("CC consumer context entered into starting state. Waiting consumer producer negotiation finish");
 		break;
 	case DOCA_CTX_STATE_RUNNING:
-		DOCA_LOG_INFO("CC consumer context is running, pref_state:%d, Receiving message from producer, waiting finish", prev_state);
 		objs->consumer_result = prepare_consumer_tasks(objs, objs->consumer, objs->consumer_mem);
 		if (objs->consumer_result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to submit consumer recv task with error = %s",
-				     doca_error_get_name(objs->consumer_result));
 			(void)doca_ctx_stop(doca_comch_consumer_as_ctx(objs->consumer));
 		}
 		break;
@@ -397,7 +357,6 @@ static void consumer_state_changed_cb(const union doca_data user_data,
 		 * The context is in stopping, this can happen when fatal error encountered or when stopping context.
 		 * doca_pe_progress() will cause all tasks to be flushed, and finally transition state to idle
 		 */
-		DOCA_LOG_INFO("CC consumer context entered into stopping state");
 		break;
 	default:
 		break;
@@ -422,7 +381,6 @@ init_comch_datapath_consumer(struct objects *objs)
 
     objs->consumer_mem = calloc(1, sizeof(struct local_mem_bufs));
     if (!objs->consumer_mem) {
-        DOCA_LOG_ERR("Failed to allocate memory for consumer mem buffers");
         return DOCA_ERROR_NO_MEMORY;
     }
     cmem = objs->consumer_mem;
@@ -431,32 +389,22 @@ init_comch_datapath_consumer(struct objects *objs)
     cmem->need_alloc_mem = true;
     result = init_local_mem_bufs(cmem, objs->dev, BUF_INV_TYPE_POOL, CC_DATA_PATH_MSG_SIZE, CC_DATA_PATH_TASK_NUM);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to init consumer memory with error = %s", doca_error_get_name(result));
         return result;
     }
 	uint32_t max_consumers;
 	doca_comch_consumer_cap_get_max_consumers(doca_dev_as_devinfo(objs->dev), &max_consumers);
-	DOCA_LOG_INFO("Device supports max %u concurrent consumers", max_consumers);
 
 	uint32_t consumer_max_buf_size;
 	result = doca_comch_consumer_cap_get_max_buf_size(doca_dev_as_devinfo(objs->dev), &consumer_max_buf_size);
 	if (result == DOCA_SUCCESS) {
-		DOCA_LOG_INFO("Consumer HW max_buf_size: %u, configured: %u",
-			      consumer_max_buf_size, (unsigned int)CC_DATA_PATH_MSG_SIZE);
 		if (consumer_max_buf_size < CC_DATA_PATH_MSG_SIZE) {
-			DOCA_LOG_WARN("Consumer HW max_buf_size(%u) < CC_DATA_PATH_MSG_SIZE(%u)",
-				      consumer_max_buf_size, (unsigned int)CC_DATA_PATH_MSG_SIZE);
 		}
 	}
 
 	uint32_t consumer_max_tasks;
 	result = doca_comch_consumer_cap_get_max_num_tasks(doca_dev_as_devinfo(objs->dev), &consumer_max_tasks);
 	if (result == DOCA_SUCCESS) {
-		DOCA_LOG_INFO("Consumer max_num_tasks: %u, configured: %u",
-			      consumer_max_tasks, (unsigned int)CC_DATA_PATH_TASK_NUM);
 		if (consumer_max_tasks < CC_DATA_PATH_TASK_NUM) {
-			DOCA_LOG_WARN("Consumer HW max_num_tasks(%u) < CC_DATA_PATH_TASK_NUM(%u)",
-				      consumer_max_tasks, (unsigned int)CC_DATA_PATH_TASK_NUM);
 		}
 	}
 
@@ -466,7 +414,6 @@ init_comch_datapath_consumer(struct objects *objs)
 					&(objs->consumer),
 					&(objs->consumer_pe));
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to init a consumer with error = %s", doca_error_get_name(result));
         clean_local_mem_bufs(cmem); 
         free(cmem);
         objs->consumer_mem = NULL;

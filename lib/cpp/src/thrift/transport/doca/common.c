@@ -57,7 +57,6 @@ doca_error_t open_doca_device_with_pci_and_callback(const char *pci_addr,
 
 	res = doca_devinfo_create_list(&dev_list, &nb_devs);
 	if (res != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to load doca devices list: %s", doca_error_get_descr(res));
 		return res;
 	}
 
@@ -85,7 +84,6 @@ doca_error_t open_doca_device_with_pci_and_callback(const char *pci_addr,
 		}
 	}
 
-	DOCA_LOG_WARN("Matching device not found");
 	res = DOCA_ERROR_NOT_FOUND;
 
 	doca_devinfo_destroy_list(dev_list);
@@ -114,14 +112,12 @@ doca_error_t open_doca_device_with_ibdev_name(const uint8_t *value,
 
 	/* Setup */
 	if (val_size > DOCA_DEVINFO_IBDEV_NAME_SIZE) {
-		DOCA_LOG_ERR("Value size too large. Failed to locate device");
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 	memcpy(val_copy, value, val_size);
 
 	res = doca_devinfo_create_list(&dev_list, &nb_devs);
 	if (res != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to load doca devices list: %s", doca_error_get_descr(res));
 		return res;
 	}
 
@@ -142,7 +138,6 @@ doca_error_t open_doca_device_with_ibdev_name(const uint8_t *value,
 		}
 	}
 
-	DOCA_LOG_WARN("Matching device not found");
 	res = DOCA_ERROR_NOT_FOUND;
 
 	doca_devinfo_destroy_list(dev_list);
@@ -166,14 +161,12 @@ doca_error_t open_doca_device_with_iface_name(const uint8_t *value,
 
 	/* Setup */
 	if (val_size > DOCA_DEVINFO_IFACE_NAME_SIZE) {
-		DOCA_LOG_ERR("Value size too large. Failed to locate device");
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 	memcpy(val_copy, value, val_size);
 
 	res = doca_devinfo_create_list(&dev_list, &nb_devs);
 	if (res != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to load doca devices list: %s", doca_error_get_descr(res));
 		return res;
 	}
 
@@ -194,7 +187,6 @@ doca_error_t open_doca_device_with_iface_name(const uint8_t *value,
 		}
 	}
 
-	DOCA_LOG_WARN("Matching device not found");
 	res = DOCA_ERROR_NOT_FOUND;
 
 	doca_devinfo_destroy_list(dev_list);
@@ -215,7 +207,6 @@ doca_error_t open_doca_device_with_sf_index(uint32_t sf_index, tasks_check func,
 
 	res = doca_devinfo_create_list(&dev_list, &nb_devs);
 	if (res != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to load doca devices list: %s", doca_error_get_descr(res));
 		return res;
 	}
 
@@ -237,14 +228,10 @@ doca_error_t open_doca_device_with_sf_index(uint32_t sf_index, tasks_check func,
 			/* if device can be opened */
 			res = doca_dev_open(dev_list[i], retval);
 			if (res != DOCA_SUCCESS)
-				DOCA_LOG_WARN("Failed open device with SF index %u: %s",
-					      sf_index,
-					      doca_error_get_descr(res));
 			goto end;
 		}
 	}
 
-	DOCA_LOG_WARN("Matching device not found");
 	res = DOCA_ERROR_NOT_FOUND;
 
 end:
@@ -264,7 +251,6 @@ doca_error_t open_doca_device_with_capabilities(tasks_check func, struct doca_de
 
 	result = doca_devinfo_create_list(&dev_list, &nb_devs);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to load doca devices list: %s", doca_error_get_descr(result));
 		return result;
 	}
 
@@ -281,7 +267,6 @@ doca_error_t open_doca_device_with_capabilities(tasks_check func, struct doca_de
 		}
 	}
 
-	DOCA_LOG_WARN("Matching device not found");
 	doca_devinfo_destroy_list(dev_list);
 	return DOCA_ERROR_NOT_FOUND;
 }
@@ -304,7 +289,6 @@ doca_error_t open_doca_device_rep_with_vuid(struct doca_dev *local,
 
 	/* Setup */
 	if (val_size > DOCA_DEVINFO_REP_VUID_SIZE) {
-		DOCA_LOG_ERR("Value size too large. Ignored");
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 	memcpy(val_copy, value, val_size);
@@ -312,8 +296,6 @@ doca_error_t open_doca_device_rep_with_vuid(struct doca_dev *local,
 	/* Search */
 	result = doca_devinfo_rep_create_list(local, filter, &rep_dev_list, &nb_rdevs);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR(
-			"Failed to create devinfo representor list. Representor devices are available only on DPU, do not run on Host");
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 
@@ -326,7 +308,6 @@ doca_error_t open_doca_device_rep_with_vuid(struct doca_dev *local,
 		}
 	}
 
-	DOCA_LOG_WARN("Matching device not found");
 	doca_devinfo_rep_destroy_list(rep_dev_list);
 	return DOCA_ERROR_NOT_FOUND;
 }
@@ -349,8 +330,6 @@ doca_error_t open_doca_device_rep_with_pci(struct doca_dev *local,
 	/* Search */
 	result = doca_devinfo_rep_create_list(local, filter, &rep_dev_list, &nb_rdevs);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR(
-			"Failed to create devinfo representors list. Representor devices are available only on DPU, do not run on Host");
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 	// DOCA_LOG_INFO("Number of representors found: %u, pci_addr: %s", nb_rdevs, pci_addr);
@@ -358,13 +337,10 @@ doca_error_t open_doca_device_rep_with_pci(struct doca_dev *local,
 
 		result = doca_devinfo_rep_get_pci_addr_str(rep_dev_list[i], rep_pci_addr);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to get representor pci addr string: %s",
-				     doca_error_get_descr(result));
 			continue;
 		}
 		result = doca_devinfo_rep_get_iface_name(rep_dev_list[i], if_name, DOCA_DEVINFO_IFACE_NAME_SIZE);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to get representor iface name: %s", doca_error_get_descr(result));
 			continue;
 		}
 		// DOCA_LOG_INFO("Checking representor rep[%zu]: %s, name: %s", i, rep_pci_addr, if_name);
@@ -377,7 +353,6 @@ doca_error_t open_doca_device_rep_with_pci(struct doca_dev *local,
 		}
 	}
 
-	DOCA_LOG_WARN("Matching device not found");
 	doca_devinfo_rep_destroy_list(rep_dev_list);
 	return DOCA_ERROR_NOT_FOUND;
 }
@@ -388,43 +363,36 @@ doca_error_t create_core_objects(struct program_core_objects *state, uint32_t ma
 
 	res = doca_mmap_create(&state->src_mmap);
 	if (res != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Unable to create source mmap: %s", doca_error_get_descr(res));
 		return res;
 	}
 	res = doca_mmap_add_dev(state->src_mmap, state->dev);
 	if (res != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Unable to add device to source mmap: %s", doca_error_get_descr(res));
 		goto destroy_src_mmap;
 	}
 
 	res = doca_mmap_create(&state->dst_mmap);
 	if (res != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Unable to create destination mmap: %s", doca_error_get_descr(res));
 		goto destroy_src_mmap;
 	}
 	res = doca_mmap_add_dev(state->dst_mmap, state->dev);
 	if (res != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Unable to add device to destination mmap: %s", doca_error_get_descr(res));
 		goto destroy_dst_mmap;
 	}
 
 	if (max_bufs != 0) {
 		res = doca_buf_inventory_create(max_bufs, &state->buf_inv);
 		if (res != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Unable to create buffer inventory: %s", doca_error_get_descr(res));
 			goto destroy_dst_mmap;
 		}
 
 		res = doca_buf_inventory_start(state->buf_inv);
 		if (res != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Unable to start buffer inventory: %s", doca_error_get_descr(res));
 			goto destroy_buf_inv;
 		}
 	}
 
 	res = doca_pe_create(&state->pe);
 	if (res != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Unable to create progress engine: %s", doca_error_get_descr(res));
 		goto destroy_buf_inv;
 	}
 
@@ -460,13 +428,11 @@ doca_error_t request_stop_ctx(struct doca_pe *pe, struct doca_ctx *ctx)
 			tmp_result = doca_ctx_get_state(ctx, &ctx_state);
 			if (tmp_result != DOCA_SUCCESS) {
 				DOCA_ERROR_PROPAGATE(result, tmp_result);
-				DOCA_LOG_ERR("Failed to get state from ctx: %s", doca_error_get_descr(tmp_result));
 				break;
 			}
 		} while (ctx_state != DOCA_CTX_STATE_IDLE);
 	} else if (tmp_result != DOCA_SUCCESS) {
 		DOCA_ERROR_PROPAGATE(result, tmp_result);
-		DOCA_LOG_ERR("Failed to stop ctx: %s", doca_error_get_descr(tmp_result));
 	}
 
 	return result;
@@ -480,7 +446,6 @@ doca_error_t destroy_core_objects(struct program_core_objects *state)
 		tmp_result = doca_pe_destroy(state->pe);
 		if (tmp_result != DOCA_SUCCESS) {
 			DOCA_ERROR_PROPAGATE(result, tmp_result);
-			DOCA_LOG_ERR("Failed to destroy pe: %s", doca_error_get_descr(tmp_result));
 		}
 		state->pe = NULL;
 	}
@@ -489,7 +454,6 @@ doca_error_t destroy_core_objects(struct program_core_objects *state)
 		tmp_result = doca_buf_inventory_destroy(state->buf_inv);
 		if (tmp_result != DOCA_SUCCESS) {
 			DOCA_ERROR_PROPAGATE(result, tmp_result);
-			DOCA_LOG_ERR("Failed to destroy buf inventory: %s", doca_error_get_descr(tmp_result));
 		}
 		state->buf_inv = NULL;
 	}
@@ -498,7 +462,6 @@ doca_error_t destroy_core_objects(struct program_core_objects *state)
 		tmp_result = doca_mmap_destroy(state->dst_mmap);
 		if (tmp_result != DOCA_SUCCESS) {
 			DOCA_ERROR_PROPAGATE(result, tmp_result);
-			DOCA_LOG_ERR("Failed to destroy destination mmap: %s", doca_error_get_descr(tmp_result));
 		}
 		state->dst_mmap = NULL;
 	}
@@ -507,7 +470,6 @@ doca_error_t destroy_core_objects(struct program_core_objects *state)
 		tmp_result = doca_mmap_destroy(state->src_mmap);
 		if (tmp_result != DOCA_SUCCESS) {
 			DOCA_ERROR_PROPAGATE(result, tmp_result);
-			DOCA_LOG_ERR("Failed to destroy source mmap: %s", doca_error_get_descr(tmp_result));
 		}
 		state->src_mmap = NULL;
 	}
@@ -516,7 +478,6 @@ doca_error_t destroy_core_objects(struct program_core_objects *state)
 		tmp_result = doca_dev_close(state->dev);
 		if (tmp_result != DOCA_SUCCESS) {
 			DOCA_ERROR_PROPAGATE(result, tmp_result);
-			DOCA_LOG_ERR("Failed to close device: %s", doca_error_get_descr(tmp_result));
 		}
 		state->dev = NULL;
 	}
@@ -645,32 +606,26 @@ doca_error_t allocat_doca_buf_list(struct doca_buf_inventory *buf_inv,
 
 	if (buf_inv == NULL) {
 		result = DOCA_ERROR_INVALID_VALUE;
-		DOCA_LOG_ERR("Invalid value found, doca_buf_inventory is NULL: %s", doca_error_get_descr(result));
 		return result;
 	}
 	if (mmap == NULL) {
 		result = DOCA_ERROR_INVALID_VALUE;
-		DOCA_LOG_ERR("Invalid value found, doca_mmap is NULL: %s", doca_error_get_descr(result));
 		return result;
 	}
 	if (buf_addr == NULL) {
 		result = DOCA_ERROR_INVALID_VALUE;
-		DOCA_LOG_ERR("Invalid value found, buf_addr is NULL: %s", doca_error_get_descr(result));
 		return result;
 	}
 	if (buf_len == 0) {
 		result = DOCA_ERROR_INVALID_VALUE;
-		DOCA_LOG_ERR("Invalid value found, buf_len is 0: %s", doca_error_get_descr(result));
 		return result;
 	}
 	if (num_buf <= 0) {
 		result = DOCA_ERROR_INVALID_VALUE;
-		DOCA_LOG_ERR("Invalid value found, num_buf is <= 0: %s", doca_error_get_descr(result));
 		return result;
 	}
 	if (dbuf == NULL) {
 		result = DOCA_ERROR_INVALID_VALUE;
-		DOCA_LOG_ERR("Invalid value found, dbuf is NULL: %s", doca_error_get_descr(result));
 		return result;
 	}
 
@@ -684,13 +639,11 @@ doca_error_t allocat_doca_buf_list(struct doca_buf_inventory *buf_inv,
 		}
 		result = doca_buf_inventory_buf_get_by_addr(buf_inv, mmap, seg_addr, seg_len, &tmp_dbuf);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Unable to acquire DOCA buffer: %s", doca_error_get_descr(result));
 			return result;
 		}
 		if (set_data_pos == true) {
 			result = doca_buf_set_data(tmp_dbuf, seg_addr, seg_len);
 			if (result != DOCA_SUCCESS) {
-				DOCA_LOG_ERR("Failed to set data for DOCA buffer: %s", doca_error_get_descr(result));
 				return result;
 			}
 		}
@@ -699,7 +652,6 @@ doca_error_t allocat_doca_buf_list(struct doca_buf_inventory *buf_inv,
 		} else {
 			result = doca_buf_chain_list(*dbuf, tmp_dbuf);
 			if (result != DOCA_SUCCESS) {
-				DOCA_LOG_ERR("Failed to construct doca_buf chain: %s", doca_error_get_descr(result));
 				return result;
 			}
 		}

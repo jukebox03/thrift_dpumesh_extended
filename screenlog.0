@@ -472,4 +472,221 @@ HW watchdog dis[    4.542988] mlxbf3_gpio MLNXBF33:01: IRQ index 0 not found
 
 Ubuntu 22.04.5 LTS localhost.localdomain hvc0
 
+localhost login: Nvidia BlueField-3 rev1 BL1 V1.0
+NOTICE:  Running as 9009D3B600CVAA system
+NOTICE:  BL2: v2.2(release):4.12.0-27-gd9bafc95f
+NOTICE:  BL2: Built : 20:36:13, Jul 30 2025
+NOTICE:  BL2 built for hw (ver 2)
+NOTICE:  # Finished initializing DDR MSS0
+NOTICE:  # Finished initializing DDR MSS1
+NOTICE:  DDR POST passed.
+NOTICE:  HW watchdog disabled.
+NOTICE:  BL31: v2.2(release):4.12.0-27-gd9bafc95f
+NOTICE:  BL31: Built : 20:36:13, Jul 30 2025
+NOTICE:  BL31 built for hw (ver 2), lifecycle GA Secured
+UEFI firmware (version BlueField:4.12.0-19-gdd4c9d8a10-BId13720 built at 20:36:55 on Jul 30 2025)
+[2J[01;01H[=3h[2J[01;01HMellanox BlueField-3 [A1] A78(D42) 16 Cores r0p1
+
+Memory Information:
+DDR5 Memory Available: 32 GB Operating Frequency: 5200 MT/s
+
+Storage Device Information:
+NVMe Device Address: 06:00.0 Vendor ID: 1E0F Device ID: 1
+Current Link Speed: 8.0 GT/s Negotiated Link Width: x2
+
+[Pcm] Profile Root Key found (type: RSA, size: 4096 bits)
+[Pcm] Profile CA certificate found (NVIDIA certificate)
+Current Secure Boot State: enabled
+Secure Boot Mode         : User Mode
+PK is  configured
+Redfish enabled
+DPU BMC version: BF-24.10-17
+Getting BMC Credentials...
+ DHCP Session Start 
+[2J[01;01H
+Press ESC/F2/DEL twice    to enter UEFI Menu.
+Press ENTER               to skip countdown.
+
+3  seconds remain...
+2  seconds remain...
+1  seconds remain...
+0  seconds remain...
+** Redfish GET https://192.168.240.1/redfish/v1/, Success
+ProcessVendorIdentification: Vendor: Nvidia
+** XAUTH POST https://192.168.240.1/redfish/v1/SessionService/Sessions, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Oem/Nvidia/SystemConfigProfile/Status, Not Found
+** Redfish GET https://192.168.240.1/redfish/v1/Registries/BiosAttributeRegistry/BiosAttributeRegistry, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings, Success
+** Redfish PATCH https://192.168.240.1/redfish/v1/Systems/Bluefield, Success
+** Redfish PATCH https://192.168.240.1/redfish/v1/Systems/Bluefield, Success
+** Redfish POST https://192.168.240.1/redfish/v1/Systems/Bluefield/Actions/Oem/NvidiaComputerSystem.PushSmbiosTable, Not Found
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Bios/Settings, Success
+** Redfish PATCH https://192.168.240.1/redfish/v1/Systems/Bluefield/Bios, Success
+** Redfish PATCH https://192.168.240.1/redfish/v1/UpdateService/FirmwareInventory, Access Denied
+** Redfish GET https://192.168.240.1/redfish/v1/TaskService/Tasks/, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Oem/Nvidia/Truststore/Certificates, Success
+** Redfish GET https://192.168.240.1/redfish/v1/TaskService/Tasks/, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/PK/Certificates, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/PK/Certificates/1, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/KEK/Certificates, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/KEK/Certificates/1, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/db/Certificates, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/db/Certificates/1, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/db/Certificates/2, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/db/Certificates/3, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/db/Certificates/4, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/db/Certificates/5, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/db/Certificates/6, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/db/Certificates/7, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Certificates, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/1, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/10, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/11, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/12, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/13, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/14, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/15, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/16, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/17, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/18, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/19, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/2, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/20, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/21, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/22, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/23, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/24, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/25, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/26, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/27, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/28, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/29, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/3, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/30, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/31, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/32, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/33, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/34, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/35, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/36, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/37, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/38, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/39, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/4, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/40, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/41, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/42, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/43, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/44, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/45, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/46, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/47, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/48, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/49, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/5, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/50, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/51, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/52, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/53, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/54, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/55, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/56, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/57, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/58, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/59, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/6, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/60, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/61, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/62, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/63, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/64, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/65, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/66, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/67, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/68, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/69, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/7, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/70, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/71, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/72, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/73, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/74, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/75, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/76, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/77, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/8, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot/SecureBootDatabases/dbx/Signatures/9, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot, Success
+** Redfish PATCH https://192.168.240.1/redfish/v1/Systems/Bluefield/SecureBoot, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0000, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0001, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0002, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0003, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0004, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0005, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0006, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0007, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0008, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0009, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot000A, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot000B, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot000C, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot000D, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot000E, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot000F, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0010, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0011, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0012, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0013, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0014, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0015, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0016, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0017, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0018, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot0019, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot001A, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot001B, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/BootOptions/Boot001C, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0003, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0000, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0001, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0002, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0005, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0006, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0007, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0008, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0009, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot000A, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot000B, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot000C, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot000D, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot000E, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot000F, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0010, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0011, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0012, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0013, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0014, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0015, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0016, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0017, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0018, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0019, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot0004, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot001A, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot001B, Success
+** Redfish GET https://192.168.240.1/redfish/v1/Systems/Bluefield/Settings/BootOptions/Boot001C, Success
+[01;01H2    [01;01H1    [01;01H0    [0m[30m[40m[2J[01;01H[0m[37m[40mEFI stub: Booting Linux Kernel...
+EFI stub: UEFI Secure Boot is enabled.
+EFI stub: Using DTB from configuration table
+EFI stub: Exiting boot services...
+EFI stub: UEFI Secure Boot is enabled.
+HW watchdog disab[    4.615598] mlxbf3_gpio MLNXBF33:01: IRQ index 0 not found
+
+Ubuntu 22.04.5 LTS localhost.localdomain hvc0
+
 localhost login: 

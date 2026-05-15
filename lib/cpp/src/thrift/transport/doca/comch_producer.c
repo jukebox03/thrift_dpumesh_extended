@@ -29,7 +29,6 @@ static void producer_send_task_completion_callback(struct doca_comch_producer_ta
 	objs = (struct objects *)(ctx_user_data.ptr);
 	objs->producer_result = DOCA_SUCCESS;
 	objs->sent_msg_cnt++;
-	DOCA_LOG_DBG("Datapath producer send completed (sent_msg_cnt=%d)", objs->sent_msg_cnt);
 
 	buf = doca_comch_producer_task_send_get_buf(task);
 	if (buf)
@@ -55,14 +54,11 @@ static void producer_send_task_completion_err_callback(struct doca_comch_produce
 
 	objs = (struct objects *)(ctx_user_data.ptr);
 	objs->producer_result = doca_task_get_status(doca_comch_producer_task_send_as_task(task));
-	DOCA_LOG_ERR("Producer message failed to send with error = %s",
-		     doca_error_get_name(objs->producer_result));
 
 	buf = doca_comch_producer_task_send_get_buf(task);
 	if (buf)
 		(void)doca_buf_dec_refcount((struct doca_buf *)buf, NULL);
 	doca_task_free(doca_comch_producer_task_send_as_task(task));
-	DOCA_LOG_ERR("Producer send task cleaned after error");
 }
 
 /**
@@ -85,7 +81,6 @@ static void producer_state_changed_callback(const union doca_data user_data,
 
 	switch (next_state) {
 	case DOCA_CTX_STATE_IDLE:
-		DOCA_LOG_INFO("CC producer context has been stopped");
 		/* We can stop progressing the PE */
 		objs->producer_finish = true;
 		break;
@@ -93,10 +88,8 @@ static void producer_state_changed_callback(const union doca_data user_data,
 		/**
 		 * The context is in starting state.
 		 */
-		DOCA_LOG_INFO("CC producer context entered into starting state");
 		break;
 	case DOCA_CTX_STATE_RUNNING:
-		DOCA_LOG_INFO("CC producer context is running");
 		// objs->producer_result = prepare_producer_tasks(objs->producer, objs->producer_mem, objs->remote_consumer_id);
 		// if (objs->producer_result != DOCA_SUCCESS) {
 		// 	DOCA_LOG_ERR("Failed to submit producer send task with error = %s",
@@ -109,7 +102,6 @@ static void producer_state_changed_callback(const union doca_data user_data,
 		 * The context is in stopping, this can happen when fatal error encountered or when stopping context.
 		 * doca_pe_progress() will cause all tasks to be flushed, and finally transition state to idle
 		 */
-		DOCA_LOG_INFO("CC producer context entered into stopping state");
 		break;
 	default:
 		break;
@@ -125,17 +117,14 @@ doca_error_t init_comch_producer(struct doca_comch_connection *connection,
 	struct doca_ctx *ctx;
 	union doca_data user_data;
 
-	DOCA_LOG_INFO("Initializing CC producer");
 
 	result = doca_pe_create(pe);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed creating pe with error = %s", doca_error_get_name(result));
 		return result;
 	}
 
 	result = doca_comch_producer_create(connection, producer);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to create producer with error = %s", doca_error_get_name(result));
 		goto destroy_pe;
 	}
 
@@ -143,13 +132,11 @@ doca_error_t init_comch_producer(struct doca_comch_connection *connection,
 
 	result = doca_pe_connect_ctx(*pe, ctx);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed adding pe context to producer with error = %s", doca_error_get_name(result));
 		goto destroy_producer;
 	}
 
 	result = doca_ctx_set_state_changed_cb(ctx, cfg->ctx_state_changed_cb);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed setting state change callback with error = %s", doca_error_get_name(result));
 		goto destroy_producer;
 	}
 
@@ -158,20 +145,17 @@ doca_error_t init_comch_producer(struct doca_comch_connection *connection,
 							cfg->send_task_comp_err_cb,
 							CC_DATA_PATH_TASK_NUM);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed setting producer send task cbs with error = %s", doca_error_get_name(result));
 		goto destroy_producer;
 	}
 
 	user_data.ptr = cfg->ctx_user_data;
 	result = doca_ctx_set_user_data(ctx, user_data);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to set ctx user data with error = %s", doca_error_get_name(result));
 		goto destroy_producer;
 	}
 
 	result = doca_ctx_start(ctx);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to start producer context with error = %s", doca_error_get_name(result));
 		goto destroy_producer;
 	}
 

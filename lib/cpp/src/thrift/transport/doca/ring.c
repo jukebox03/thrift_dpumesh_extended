@@ -35,7 +35,6 @@ int setup_dma_ring(struct objects *objs, size_t size)
                            alloc_slots * sizeof(struct dma_desc),
                            DOCA_ACCESS_FLAG_PCI_READ_WRITE);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to allocate DMA resources: %s", doca_error_get_descr(result));
         free(objs->dma_ring);
         return result;
     }
@@ -49,7 +48,6 @@ int setup_dma_ring(struct objects *objs, size_t size)
                                    alloc_slots * sizeof(struct dma_desc),
                                    DMA_RING, HOST_TO_DPU);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to export mmap and buffer to DPU: %s", doca_error_get_descr(result));
         free(objs->dma_ring);
         destroy_mmap_and_free_buffer(ring->mmap, ring->descs);
         return result;
@@ -80,7 +78,6 @@ int setup_hdr_dma_ring(struct objects *objs, size_t size,
                            alloc_slots * sizeof(struct dma_desc),
                            DOCA_ACCESS_FLAG_PCI_READ_WRITE);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to allocate HDR DMA ring: %s", doca_error_get_descr(result));
         free(ring);
         return result;
     }
@@ -91,7 +88,6 @@ int setup_hdr_dma_ring(struct objects *objs, size_t size,
                                    alloc_slots * sizeof(struct dma_desc),
                                    DMA_HDR_RING, HOST_TO_DPU);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to export HDR DMA ring to DPU: %s", doca_error_get_descr(result));
         destroy_mmap_and_free_buffer(ring->mmap, ring->descs);
         free(ring);
         return result;
@@ -119,7 +115,6 @@ int setup_dpu_tx_ring(struct doca_dev *dev, size_t size,
                            ring->size * sizeof(struct dma_desc),
                            DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_READ_WRITE);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to allocate DPU TX ring: %s", doca_error_get_descr(result));
         free(ring);
         return result;
     }
@@ -137,12 +132,10 @@ struct dma_desc *get_next_dma_desc(struct dma_ring *ring)
     struct dma_desc *desc = ring->descs + ring->head;
 
     if (desc->valid) {
-        DOCA_LOG_WARN("DMA ring busy at head=%u (size=%u)", ring->head, ring->size);
         return NULL;
     }
 
     uint32_t next_head = (ring->head + 1) % ring->size;
     ring->head = next_head;
-    DOCA_LOG_DBG("Get next DMA desc - head: %u, desc: %p", ring->head, desc);
     return desc;
 }

@@ -147,8 +147,6 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *src_pod,
     __sync_synchronize();
     dma->valid = 1;
 
-    DOCA_LOG_DBG("dpu_enqueue_reverse_dma: src_pod=%d dst_pod=%d offset=%u body_len=%u",
-                 src_pod->pod_id, dst_pod->pod_id, src_buf_offset, body_len);
     return DOCA_SUCCESS;
 }
 
@@ -255,9 +253,6 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
         return -1;
     }
 
-    DOCA_LOG_DBG("%s %u bytes to pod %d for req_id=%u via reverse DMA",
-                 echo_mode ? "Echo" : "Forwarded",
-                 payload_len, echo_mode ? src_pod_id : dst_pod_id, req_id);
 
     /* Success: TX_ACK will fire from process_rev_notify_entry on reverse
      * completion. The src dma_buffer slot stays held until then. */
@@ -374,8 +369,6 @@ process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
                                           : find_pod_by_id(objs, entry->src_pod_id);
     send_or_defer_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id, ack_pool);
 
-    DOCA_LOG_DBG("REV_NOTIFY: sent DMA_COMPLETION to pod %d (req_id=%u pos=%u len=%u)",
-                 target_id, entry->req_id, entry->buf_offset, entry->length);
     return 1;
 }
 
@@ -434,7 +427,6 @@ run_dpu_worker(struct objects *objs)
     double elapsed = 0.0;
     double kick_elapsed = 0.0;
 
-    DOCA_LOG_INFO("Starting DPU worker");
 
     /* Init pods table */
     memset(objs->pods, 0, sizeof(objs->pods));
@@ -449,8 +441,6 @@ run_dpu_worker(struct objects *objs)
     /* 1. comch control path server (waits for first connection) */
     result = init_comch_ctrl_path_server("DPUMesh", objs, true);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to init comch control path server: %s",
-                     doca_error_get_descr(result));
         cleanup_objects(objs);
         return;
     }
@@ -458,8 +448,6 @@ run_dpu_worker(struct objects *objs)
     /* 2. comch datapath consumer (for DPA → DPU messages) */
     result = init_comch_datapath_consumer(objs);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to init comch datapath consumer: %s",
-                     doca_error_get_descr(result));
         cleanup_objects(objs);
         return;
     }
@@ -467,8 +455,6 @@ run_dpu_worker(struct objects *objs)
     /* 3. DPA app init (shared) */
     result = init_dpa_objects(objs);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to init DPA objects: %s",
-                     doca_error_get_descr(result));
         cleanup_objects(objs);
         return;
     }
@@ -476,8 +462,6 @@ run_dpu_worker(struct objects *objs)
     /* 4. DPA thread create (shared, not run yet — started on first pod) */
     result = dmesh_doca_dpa_thread_create(objs->dpa_thread);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create DPA thread: %s",
-                     doca_error_get_descr(result));
         cleanup_objects(objs);
         return;
     }
@@ -485,8 +469,6 @@ run_dpu_worker(struct objects *objs)
     /* 5. comch DPA message queue (shared) */
     result = init_comch_dpa_msgq(objs, objs->consumer_pe);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to init comch DPA msgq: %s",
-                     doca_error_get_descr(result));
         cleanup_objects(objs);
         return;
     }
@@ -496,7 +478,6 @@ run_dpu_worker(struct objects *objs)
      *    setup_pod_dma() is called automatically, which sets up buf_arr,
      *    local DMA buffer, DPA ring info, and starts DPA thread on first pod. */
 
-    DOCA_LOG_INFO("DPU worker initialized (event-based), entering main loop");
 
     /* Main loop: poll consumer PE + ctrl path PE + per-pod producer PE */
     clock_gettime(CLOCK_MONOTONIC, &last);
@@ -537,14 +518,9 @@ run_dpu_worker(struct objects *objs)
                 } else {
                     doca_pool_release(&objs->recv_tasks_in_flight);
                     objs->deferred_recv[remaining++] = t;
-                    DOCA_LOG_WARN("Deferred recv resubmit failed: %s; retaining",
-                                  doca_error_get_descr(rs));
                 }
             }
             objs->num_deferred_recv = remaining;
-            if (resubmitted > 0)
-                DOCA_LOG_INFO("Backpressure release: resubmitted %d/%d deferred recv tasks (retained %d)",
-                              resubmitted, original, remaining);
         }
 
         /* Drain any consumer_retry tasks that were stashed by the consumer
@@ -583,9 +559,6 @@ run_dpu_worker(struct objects *objs)
              * indefinitely with no useful information. */
             if (objs->sent_msg_cnt > 0 || objs->recv_msg_cnt > 0 ||
                 cq_depth > 0 || objs->num_deferred_recv > 0) {
-                DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s, pods: %d, cq_depth: %u, deferred: %d",
-                              elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt, objs->num_pods,
-                              cq_depth, objs->num_deferred_recv);
             }
 
             objs->sent_msg_cnt = 0;

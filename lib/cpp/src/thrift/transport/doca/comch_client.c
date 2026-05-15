@@ -37,7 +37,6 @@ static void client_send_task_completion_callback(struct doca_comch_task_send *ta
 	objs = (struct objects *)(ctx_user_data.ptr);
 	doca_pool_release(&objs->send_tasks_in_flight);
 
-	DOCA_LOG_DBG("Client task sent successfully");
 	if (payload_copy != NULL)
 		free(payload_copy);
 	doca_task_free(doca_comch_task_send_as_task(task));
@@ -90,7 +89,6 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 
 	result = doca_ctx_get_user_data(doca_comch_client_as_ctx(comch_client), &user_data);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get user data from ctx with error = %s", doca_error_get_name(result));
 		return;
 	}
 
@@ -101,31 +99,25 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 	{
 	case DMESH_MSG_EXPORT_DESC:
 		if (msg_len <= sizeof(struct dmesh_mmap_msg)) {
-			DOCA_LOG_ERR("Received invalid MMAP message from server");
 			return;
 		}
 		// result = process_mmap_msg(objs, (struct dmesh_mmap_msg *)recv_buffer);
 		break;
 	case DMESH_MSG_EXPORT_DPA_COMP:
-		DOCA_LOG_INFO("Received DPA completion handles from server");
 		struct dmesh_dpa_comp_msg *dpa_comp_msg = (struct dmesh_dpa_comp_msg *)recv_buffer;
 		result = process_dpa_comp_msg(objs, dpa_comp_msg);
 		break;
 
 	case DMESH_MSG_RX_DATA:
 		if (msg_len < sizeof(struct dmesh_rx_data_msg)) {
-			DOCA_LOG_ERR("Received invalid RX_DATA message: len=%u < header=%zu",
-				     msg_len, sizeof(struct dmesh_rx_data_msg));
 			return;
 		}
-		DOCA_LOG_DBG("Client received DMESH_MSG_RX_DATA len=%u", msg_len);
 		if (objs->rx_data_hook)
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
 
 	case DMESH_MSG_TX_ACK:
 		/* Forward DMA consumed by DPU — sender can free TX buffer slot */
-		DOCA_LOG_DBG("Client received DMESH_MSG_TX_ACK len=%u", msg_len);
 		if (objs->rx_data_hook)
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
@@ -133,7 +125,6 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 	case DMESH_MSG_DMA_COMPLETION:
 		/* Reverse DMA (DPU→CPU) completion: data is already in Host RX DMA buffer.
 		 * The notification carries comch_dma_comp_msg in desc[64] with pos/length. */
-		DOCA_LOG_DBG("Client received DMESH_MSG_DMA_COMPLETION len=%u", msg_len);
 		if (objs->rx_data_hook)
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
@@ -141,7 +132,6 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 	case DMESH_MSG_PEER_TOPOLOGY:
 		/* Phase 4: DPU forwarding a peer's host_rx_buffer + ring export
 		 * descriptors so we can DMA directly into the peer. */
-		DOCA_LOG_DBG("Client received DMESH_MSG_PEER_TOPOLOGY len=%u", msg_len);
 		if (objs->rx_data_hook)
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
@@ -149,16 +139,13 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 	case DMESH_MSG_CONSUMER_ID: {
 		struct dmesh_consumer_id_msg *cid_msg = (struct dmesh_consumer_id_msg *)recv_buffer;
 		if (msg_len < sizeof(struct dmesh_consumer_id_msg)) {
-			DOCA_LOG_ERR("Received invalid CONSUMER_ID message");
 			return;
 		}
 		objs->remote_consumer_id = cid_msg->consumer_id;
-		DOCA_LOG_INFO("Received remote consumer ID = %u from DPU", cid_msg->consumer_id);
 		break;
 	}
 
 	default:
-		DOCA_LOG_INFO("Received unknown message type from server: %u", comch_msg->type);
 		break;
 	}
 }
@@ -187,14 +174,12 @@ doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
 		if (objs->pe)
 			doca_pe_progress(objs->pe);
 		if (++acq_retry > 10000) {
-			DOCA_LOG_ERR("client_send_msg: send pool full after %d PE progresses", acq_retry);
 			return DOCA_ERROR_AGAIN;
 		}
 	}
 
 	msg_copy = malloc(len);
 	if (msg_copy == NULL) {
-		DOCA_LOG_ERR("Failed to allocate client payload copy");
 		doca_pool_release(&objs->send_tasks_in_flight);
 		return DOCA_ERROR_NO_MEMORY;
 	}
@@ -206,7 +191,6 @@ doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
 							len,
 							&task);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to allocate client task with error = %s", doca_error_get_name(result));
 		doca_pool_release(&objs->send_tasks_in_flight);
 		free(msg_copy);
 		return result;
@@ -218,7 +202,6 @@ doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
 
 	result = doca_task_submit(task_obj);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to send client task with error = %s", doca_error_get_name(result));
 		doca_pool_release(&objs->send_tasks_in_flight);
 		free(msg_copy);
 		doca_task_free(task_obj);
@@ -245,13 +228,11 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 
     result = doca_pe_create(&(objs->pe));
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed creating pe with error = %s", doca_error_get_name(result));
         return result;
     }
 
     result = doca_comch_client_create(objs->dev, server_name, &(objs->cc_client));
     if (result != DOCA_SUCCESS) {   
-        DOCA_LOG_ERR("Failed to create client with error = %s", doca_error_get_name(result));
         goto destroy_pe;
     }
 
@@ -259,7 +240,6 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 
     result = doca_pe_connect_ctx(objs->pe, ctx);
     if (result != DOCA_SUCCESS) {   
-        DOCA_LOG_ERR("Failed adding pe context to client with error = %s", doca_error_get_name(result));
         goto destroy_client;
     }
 
@@ -274,14 +254,12 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
                                                   client_send_task_completion_err_callback,
                                                   CC_SEND_TASK_NUM);
     if (result != DOCA_SUCCESS) {   
-        DOCA_LOG_ERR("Failed setting send task cbs with error = %s", doca_error_get_name(result));
         goto destroy_client;
     }
 
     result = doca_comch_client_event_msg_recv_register(objs->cc_client, 
                                                     client_message_recv_callback);
     if (result != DOCA_SUCCESS) {   
-        DOCA_LOG_ERR("Failed adding message recv event cb with error = %s", doca_error_get_name(result));
         goto destroy_client;
     }
 
@@ -290,7 +268,6 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 		result = doca_comch_client_event_consumer_register(objs->cc_client,
 									client_new_consumer_callback, expired_consumer_callback);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed adding consumer event cb with error = %s", doca_error_get_name(result));
 			goto destroy_client;
 		}
 	}
@@ -298,21 +275,17 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
     /* Set client properties */
 	result = doca_comch_cap_get_max_msg_size(doca_dev_as_devinfo(objs->dev), &max_msg_size);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get max message size with error = %s", doca_error_get_name(result));
 		goto destroy_client;
 	}
 
      result = doca_comch_cap_get_max_recv_queue_size(doca_dev_as_devinfo(objs->dev), &max_rq_size);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get max recv queue size with error = %s", doca_error_get_name(result));
         goto destroy_client;
     }
 
-    DOCA_LOG_INFO("CC client max msg size: %u B, max rq size: %u", max_msg_size, max_rq_size);
 
 	result = doca_comch_client_set_max_msg_size(objs->cc_client, max_msg_size);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to set msg size property with error = %s", doca_error_get_name(result));
 		goto destroy_client;
 	}
 
@@ -321,25 +294,21 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 		if (desired_rq < CC_RECV_QUEUE_SIZE) desired_rq = CC_RECV_QUEUE_SIZE;
 		result = doca_comch_client_set_recv_queue_size(objs->cc_client, desired_rq);
 		if (result == DOCA_SUCCESS) {
-			DOCA_LOG_INFO("CC client recv queue size set to %u (cap=%u)", desired_rq, max_rq_size);
 		}
 	}
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to set msg size property with error = %s", doca_error_get_name(result));
 		goto destroy_client;
 	}
 
 	user_data.ptr = (void *)objs;
 	result = doca_ctx_set_user_data(ctx, user_data);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to set ctx user data with error = %s", doca_error_get_name(result));
 		goto destroy_client;
 	}
 
 	/* Client is not started until connection is finished, so getting connection in progress */
 	result = doca_ctx_start(ctx);
 	if (result != DOCA_ERROR_IN_PROGRESS) {
-		DOCA_LOG_ERR("Failed to start client context with error = %s", doca_error_get_name(result));
 		goto destroy_client;
 	}
 
@@ -352,7 +321,6 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 
 	(void)doca_comch_client_get_connection(objs->cc_client, &objs->connection);
 	doca_comch_connection_set_user_data(objs->connection, user_data);
-	DOCA_LOG_INFO("CC client connection established successfully");
 
     return DOCA_SUCCESS;
 

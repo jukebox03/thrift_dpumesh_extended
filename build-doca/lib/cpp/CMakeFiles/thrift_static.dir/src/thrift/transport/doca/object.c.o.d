@@ -59,8 +59,10 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o: \
  /opt/mellanox/doca/include/doca_compat.h \
  /opt/mellanox/doca/include/doca_config.h \
  /opt/mellanox/doca/include/doca_build_config.h /usr/include/string.h \
- /usr/include/strings.h /usr/include/stdlib.h \
- /usr/include/x86_64-linux-gnu/bits/waitflags.h \
+ /usr/include/strings.h \
+ /usr/include/x86_64-linux-gnu/bits/strings_fortified.h \
+ /usr/include/x86_64-linux-gnu/bits/string_fortified.h \
+ /usr/include/stdlib.h /usr/include/x86_64-linux-gnu/bits/waitflags.h \
  /usr/include/x86_64-linux-gnu/bits/waitstatus.h \
  /usr/include/x86_64-linux-gnu/bits/floatn.h \
  /usr/include/x86_64-linux-gnu/bits/floatn-common.h \
@@ -71,8 +73,11 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o: \
  /usr/include/x86_64-linux-gnu/bits/select.h \
  /usr/include/x86_64-linux-gnu/bits/types/sigset_t.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_timeval.h \
- /usr/include/alloca.h /usr/include/x86_64-linux-gnu/bits/stdlib-float.h \
- /usr/include/assert.h /opt/mellanox/doca/include/doca_version.h \
+ /usr/include/x86_64-linux-gnu/bits/select2.h /usr/include/alloca.h \
+ /usr/include/x86_64-linux-gnu/bits/stdlib-bsearch.h \
+ /usr/include/x86_64-linux-gnu/bits/stdlib-float.h \
+ /usr/include/x86_64-linux-gnu/bits/stdlib.h /usr/include/assert.h \
+ /opt/mellanox/doca/include/doca_version.h \
  /opt/mellanox/doca/include/doca_error.h \
  /opt/mellanox/doca/include/doca_common_defines.h \
  /opt/mellanox/doca/include/doca_pe.h \
@@ -89,4 +94,6 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o: \
  /usr/include/x86_64-linux-gnu/bits/types/__FILE.h \
  /usr/include/x86_64-linux-gnu/bits/types/FILE.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
- /usr/include/x86_64-linux-gnu/bits/stdio_lim.h
+ /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
+ /usr/include/x86_64-linux-gnu/bits/stdio.h \
+ /usr/include/x86_64-linux-gnu/bits/stdio2.h

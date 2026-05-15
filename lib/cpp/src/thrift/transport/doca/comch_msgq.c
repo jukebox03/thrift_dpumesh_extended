@@ -19,7 +19,6 @@ init_comch_dpa_msgq(struct objects *objs, struct doca_pe *pe)
 	
 	result = dmesh_doca_dpa_comch_create(objs);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to create DPA comch.");
 		return result;
 	}
 

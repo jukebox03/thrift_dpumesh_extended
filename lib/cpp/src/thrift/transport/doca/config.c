@@ -16,8 +16,6 @@ static doca_error_t pci_addr_callback(void *param, void *config)
 
     len = strnlen(dev_pci_addr, DOCA_DEVINFO_PCI_ADDR_SIZE);
     if (len >= DOCA_DEVINFO_PCI_ADDR_SIZE) {
-        DOCA_LOG_ERR("Device PCI address exceeds max size of %d",
-                     DOCA_DEVINFO_PCI_ADDR_SIZE - 1);
         return DOCA_ERROR_INVALID_VALUE;
     }
 
@@ -33,8 +31,6 @@ static doca_error_t rep_pci_addr_callback(void *param, void *config)
 
     len = strnlen(rep_pci_addr, DOCA_DEVINFO_PCI_ADDR_SIZE);
     if (len >= DOCA_DEVINFO_PCI_ADDR_SIZE) {
-        DOCA_LOG_ERR("Representor PCI address exceeds max size of %d",
-                     DOCA_DEVINFO_PCI_ADDR_SIZE - 1);
         return DOCA_ERROR_INVALID_VALUE;
     }
 
@@ -55,7 +51,6 @@ init_argp(const char *program_name, void *config, int argc, char **argv)
     /* -p / --pci-addr */
     result = doca_argp_param_create(&dev_pci_addr_param);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create ARGP param: %s", doca_error_get_descr(result));
         goto exit;
     }
     doca_argp_param_set_short_name(dev_pci_addr_param, "p");
@@ -66,14 +61,12 @@ init_argp(const char *program_name, void *config, int argc, char **argv)
     doca_argp_param_set_mandatory(dev_pci_addr_param);
     result = doca_argp_register_param(dev_pci_addr_param);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to register param: %s", doca_error_get_descr(result));
         goto exit;
     }
 
     /* -r / --rep-pci */
     result = doca_argp_param_create(&rep_pci_addr_param);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create ARGP param: %s", doca_error_get_descr(result));
         goto exit;
     }
     doca_argp_param_set_short_name(rep_pci_addr_param, "r");
@@ -87,13 +80,11 @@ init_argp(const char *program_name, void *config, int argc, char **argv)
 #endif
     result = doca_argp_register_param(rep_pci_addr_param);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to register param: %s", doca_error_get_descr(result));
         goto exit;
     }
 
     result = doca_argp_start(argc, argv);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to parse arguments: %s", doca_error_get_descr(result));
         goto exit;
     }
 

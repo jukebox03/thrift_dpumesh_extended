@@ -1,30 +1,33 @@
-# DPUmesh — Phase 4 완료 (v4, 2026-05-15)
+# DPUmesh — v5 (2026-05-15)
 
-> v3 (2026-05-14) 폐기. v4는 Phase 4의 모든 fix가 적용된 안정 상태와
-> flame graph 기반 최종 분석을 담는다.
+> v4 폐기. v4의 성능표는 bench 측 worker scheduler 오버헤드가 만든 cap이지
+> dpumesh transport 자체의 cap이 아니었다는 게 오늘 분석으로 확인됨.
+> v5는 (a) transport 로직 정리 상태, (b) 측정 인프라 신뢰성 회복,
+> (c) **dpumesh transport는 1 core CPU의 2.5-2.8%만 쓰며 cap이 아님**,
+> (d) 진짜 transport cap을 보기 위한 bench 단일 스레드 재설계 plan을 담는다.
 
 ---
 
 ## 0. TL;DR
 
-**무엇**: Thrift 아래 깔리는 DPU 가속 mesh layer. App 코드 변경 0.
-Mesh가 hdr (control) + body (data)를 분리해서 운반하며 DPU는 **L7 proxy
-hook 자리** (현재 dummy passthrough — Phase 5에서 resolve / LB를 DPU에
-이식 예정).
+**무엇**: Thrift 아래 깔리는 DPU-가속 mesh transport. App 코드 변경 0.
+mesh가 hdr (control) + body (data)를 분리 운반. DPU는 L7 proxy hook 자리
+(현재 dummy passthrough — Phase 5에서 resolve/LB 이식 예정).
 
-**최종 성능** (256B body, fair 1-core/pod):
+**오늘 정리한 것 (v4 → v5)**:
+1. 측정 인프라: flame graph `[unknown]` 비율 82% → 7%. DWARF unwinding + 빌드 플래그 패치.
+2. DPU/DPA runtime log 전면 제거 (439 call). DPU log 283 byte 유지.
+3. Pending ownership 깔끔하게: 방어적 2초 wait 제거, caller가 lifecycle 책임.
+4. rx_queue batch wake: chunk당 N개 cond_signal → 1번 cond_broadcast.
+5. Orphan OP_RESPONSE drop: cancel 후 늦게 도착한 응답이 rx_slot 점유 채 rx_queue로 가던 누수 차단.
 
-| RPS | Achieved | p99 | Fails | 평가 |
-|---|---:|---:|---:|---|
-| 100k | 98.4k | 9.4 ms | 0 | 안정 |
-| 130k | 127.6k | 14.3 ms | 0 | 안정 |
-| 150k | 147.2k | 15.3 ms | 0 | 안정 |
-| **170k** | **166.7k** | **16.7 ms** | **0** | **권장 한계** |
-| 200k | 168.8k | 817 ms | 0 | plateau, latency 폭증 |
+**측정 결과 (200k load, 1 core/pod)**:
+- **dpumesh transport 자체 = bench 2.8%, echo 2.5% CPU**
+- 나머지: libdoca polling 42% + scheduler overhead 50%+
+- → transport는 cap이 아니다. cap은 bench-side worker thread scheduler thrash 또는 vendor libdoca 폴링.
 
-Plan v3 baseline (130k, p99 18.4 ms, back-to-back 10k cliff) 대비:
-- Stable RPS **+30%**, p99 **−22%**, back-to-back 회귀 **해소**
-- Chain HW 한계 17.35 Gbps 중 **2% 사용** (256B × 170k = 0.35 Gbps)
+**다음 일**: bench를 단일 스레드 load generator로 재작성. 그래야 transport의
+진짜 cap (libdoca 폴링 + DMA throughput)을 isolating해서 측정 가능.
 
 ---
 
@@ -52,10 +55,8 @@ Plan v3 baseline (130k, p99 18.4 ms, back-to-back 10k cliff) 대비:
    └─────────────┘ (1 hop)    └─────────┘    └──────────────────┘
 ```
 
-- **hdr path** (2-hop, DPU 매개): src `hdr_tx_buffer` → DPU staging →
-  reverse DMA → dst `hdr_rx_buffer`. DPU L7 proxy hook 자리.
-- **body path** (1-hop, CASE_DIRECT): DPA가 양쪽 host BAR을 직접 access.
-  DPU staging 미사용. DPU ARM은 DMA_COMPLETION + TX_ACK 1회만 발사.
+- **hdr path** (2-hop, DPU 매개): src `hdr_tx_buffer` → DPU staging → reverse DMA → dst `hdr_rx_buffer`.
+- **body path** (1-hop, CASE_DIRECT): DPA가 양쪽 host BAR을 직접 access. DPU staging 미사용.
 
 ### 1.2 핵심 구성요소
 
@@ -63,146 +64,239 @@ Plan v3 baseline (130k, p99 18.4 ms, back-to-back 10k cliff) 대비:
 |---|---|
 | Thrift app | RPC 호출만 (`send_request` / `wait_response_v2`) |
 | Mesh (host C) | 통합 builder (hdr+chunk pair, single lock, 8-way shard), peer table, expected ring + parked chunks |
-| DPU ARM | hdr forward 매개, TX_ACK + DMA_COMPLETION 발사. **body 안 봄**. 미래 L7 proxy 자리 |
-| DPA EU | DMA engine. forward (hdr: src host→DPU staging / body: src host→dst host 직접), reverse (hdr: DPU→dst hdr_rx). peer table + admission gate 보유 |
+| DPU ARM | hdr forward 매개, TX_ACK + DMA_COMPLETION 발사. body는 안 봄 |
+| DPA EU | DMA engine. forward (hdr→DPU staging / body 직접), reverse (hdr→dst hdr_rx). peer table + admission gate |
 
 ### 1.3 Per-RPC 메시지 흐름
 
 ```
-bench worker (1 RPC):
+caller (1 RPC):
   ├─ resolve(svc) → dst_pod_id
   ├─ atomic seq++
   ├─ register_pending_v2(rid) → state=0
+  │   └─ 슬롯 busy면 즉시 -1 return (방어적 wait 없음)
   ├─ builder[dst][shard].lock              ← single lock; hdr+chunk atomic
   │   ├─ hdr_builder_append (mesh_hdr_req 80B)
   │   ├─ chunk_builder_append (body N bytes)
   │   └─ if cap: paired flush (hdr_tx 슬롯 + chunk_tx 슬롯 둘 다 enqueue)
+  │   └─ append 실패면 register한 pending 즉시 cancel
   └─ wait_response_v2:
-      ├─ futex_wait on p->state           ← spin 없음. 다이렉트 sleep.
-      └─ on wake: read p->desc, return
+      ├─ futex_wait on p->state
+      └─ wake 시 desc read, state=-1로 release
+   (cancel_pending_v2도 동일하게 release하는 경로)
 
 PE thread (RX):
   doca_pe_progress → rx_data_hook
-   ├─ if OP_HDR_BATCH: process_hdr_batch
+   ├─ OP_HDR_BATCH: process_hdr_batch
    │   └─ for each entry: expected[src_id].push; touched bitmap
    │   └─ drain_parked_locked for touched src_ids
-   └─ if OP_CHUNK:    process_chunk
-       ├─ match: consume_chunk + drain_parked_locked (cross-shard 안전)
+   └─ OP_CHUNK: process_chunk
+       ├─ match: consume_chunk + drain_parked_locked
        └─ miss:  park (zero-copy)
 
-consume_chunk → deliver_one_body × N:
-  rx_slot_alloc + memcpy
-  if OP_RESPONSE && pending matches:
-     write p->desc; CAS state 0→1; if waiters>0 futex_wake_one
-  else: push rx_queue (echo's worker_fn dequeues)
-
-DPU ARM:
-  CASE_DIRECT → DMA_COMPLETION to dst + TX_ACK to src (2 events/chunk)
-  OP_HDR_BATCH → dpu_enqueue_reverse_dma → reverse DMA → REV_NOTIFY
+consume_chunk (chunk 안 모든 body가 같은 flag — builder_flags 보장):
+  ├─ OP_REQUEST: deliver_chunk_to_rxq (batch path, 한 번 cond_broadcast)
+  └─ OP_RESPONSE: deliver_one_body × N
+       ├─ pending matches (state=0): write desc, CAS 0→1, futex_wake_one
+       ├─ pending timed-out (state=-2): release everything, state→-1
+       └─ orphan (state=-1, 1, or rid mismatch): drop rx_slot (no rx_queue push)
 ```
 
 ---
 
-## 2. 적용된 최적화 (v3 → v4)
+## 2. 오늘 정리한 dpumesh transport 코드
 
-| # | 변경 | 효과 |
+### 2.1 Pending 슬롯 ownership 모델
+
+**원리**: caller가 register 부터 release까지 lifecycle을 끝까지 책임진다.
+transport는 방어 코드 두지 않는다.
+
+| 동작 | 이전 (dirty) | 이후 (clean) |
 |---|---|---|
-| 1 | Dead routing flow 제거 (`mesh_lock`, `routing_cond`, `resolved_dst_pod_id`, `DMESH_MSG_ROUTING_INFO`) — plan v3 §9.3 폐기 잔재 | 메모리 + 코드 단순화 |
-| 2 | **DPU TX_ACK pool_type fix** — `process_rev_notify_entry`가 OP_HDR_BATCH에도 `POOL_HOST_TX_BODY` 보내던 버그. hdr_tx 슬롯이 echo 측에서 영원히 누수 → 1024/1024 도달 후 back-to-back stall | **Back-to-back 10k cliff 해소** |
-| 3 | Builder 통합 (hdr+chunk single lock) — 분리 락 race로 hdr append 순서 ≠ chunk body 순서 가능했음 | sharding 안전성 확보 |
-| 4 | **Per-dst builder 8-way shard** — worker가 TLS-cached shard로 분산 | 1300 worker 직렬화 완화 |
-| 5 | `process_chunk` match 후 `drain_parked_locked` 추가 — cross-shard interleave 안전 | 정확성 |
-| 6 | **pthread_cond → futex direct + skip-wake-when-no-waiter** — `_Atomic state` + `_Atomic waiters` + atomic CAS 0→1 + waiters>0일 때만 futex_wake. spin 없음 (PE thread starve 방지) | PE thread wake 비용 감소 |
-| 7 | `rx_slot_alloc` / `tx_alloc` round-robin cursor (O(N) → O(1) common) | 150k+ ops/sec에서 mutex hold 시간 단축 |
-| 8 | **DPU hot-path 로그 8군데 silence** (TX_ACK queue full, reverse ring full, REV_NOTIFY 실패 등) — memory rule "No DPU log raise" 회귀 | DPU `/tmp` 폭증 → rsync 18 b/s hang 회귀 영구 차단 |
-| 9 | test-bench.sh: DPU log truncate + `-l 30` (ERROR-only) | 안전망 |
+| `register_pending(_v2)` | state ≠ -1이면 2초 wait, 안 풀리면 -2/-1 reclaim 시도 | state ≠ -1이면 즉시 -1 return |
+| `send_request` | append 실패 시 등록된 pending 누수 | register 성공 후 append 실패 시 pending cancel |
+| `deliver_one_body` | orphan OP_RESPONSE → rx_queue로 push (echo 외엔 안 비움 → 누수) | orphan OP_RESPONSE → rx_slot drop |
+| caller thread teardown | in-flight 그대로 두고 종료 (state=0 누수) | in-flight 전부 cancel (state→-1) |
+
+이 네 개가 같이 일관된 invariant를 형성: **slot은 caller가 잡고, caller가 푼다**.
+
+### 2.2 rx_queue batch wake (echo response delivery)
+
+이전엔 chunk 1개에 25개 body 들어있으면 PE thread가 body당 `pthread_cond_signal` → 25 syscall + 25 mutex acquire. 이제 `deliver_chunk_to_rxq`로 묶음:
+
+```
+Phase 1 (no rx_lock):    chunk의 N body를 미리 rx_slot 할당 + memcpy + desc 빌드
+Phase 2 (single rx_lock): N개 desc 한 번에 push + cond_broadcast 1번
+Phase 3 (rare):          overflow한 rx_slot release
+```
+
+OP_RESPONSE 경로는 그대로 (`deliver_one_body`의 lock-free CAS + futex_wake_one) — 이미 효율적이라 안 건드림.
+
+### 2.3 측정 인프라 — flame graph 신뢰성
+
+전제: dpumesh 자체가 어디서 CPU 쓰는지 보려면 perf stack walk가 끝까지 가야 한다.
+
+| 변경 | 효과 |
+|---|---|
+| bench/echo gcc `-g -fno-omit-frame-pointer` | binary FP 보존 |
+| libthrift cmake `RelWithDebInfo + -fno-omit-frame-pointer` | libthrift FP + debug info |
+| `perf record --call-graph=dwarf,16384` | libc (FP 없음) 통과해서 stack walk |
+
+결과: `[unknown]` 비율 — bench 82.2% → 6.6%, echo 68.7% → 0.6%, DPU 0%.
+
+### 2.4 DPU/DPA runtime log 전면 삭제
+
+`DOCA_LOG_DBG/INFO/WARN/ERR`, `DOCA_DPA_DEV_LOG_*`, `printf`, `fprintf` — runtime emit
+하는 호출 **439개 전부 삭제**. 16개 파일 (DPU/DPA 전용 4 + 공용 12).
+
+남긴 것: `DOCA_LOG_REGISTER`, `doca_log_backend_set_sdk_level`, `doca_dpa_set_log_level` (모두 emit이 아니라 config).
+
+DPU 로그 283 byte 유지 (어떤 부하에서도). 회귀 시 host stderr 추가로 디버그.
 
 ---
 
-## 3. Flame graph 기반 최종 분석
+## 3. dpumesh transport는 cap이 아님 — flame leaf 증거
 
-`bench/final_{bench,echo,dpu}_flame.svg` 참조 (150k load, 10초).
+200k load, DWARF 신뢰 가능한 flame, leaf-only sample 분포 (실제 cycle 소비처):
 
-### 3.1 Bench (요청 발사 측)
-대부분이 `libdoca_comch` 내부 polling. PE thread가 busy poll로 100% CPU.
-나머지: `deliver_one_body` 135M, `futex_wake` 127M. 잘 정돈된 상태.
+### Bench (1 core)
 
-### 3.2 Echo (응답 측)
-**Echo의 echo 로직 자체 (`process_one` + `dpumesh_rx_free` + memcpy +
-`dpumesh_send_response`) = 92M samples = 전체의 <10%**. 즉 **echo 자체는
-한계가 아님**.
+| Bucket | % CPU |
+|---|---:|
+| libdoca polling (vendor anon) | **42.1%** |
+| DOCA symbol (`doca_pe_progress`, `priv_doca_cq_*`) | 15.0% |
+| Kernel/syscall path | 17.0% |
+| Scheduler 내부 (psi_group_change, update_load 등) | 16.7% |
+| libc/pthread (mutex 자체) | 7.1% |
+| **dpumesh-code** | **2.8%** |
 
-나머지 echo CPU의 출처:
-- `pthread_mutex_lock` 464M — `rx_queue` dequeue mutex
-- `futex_wait_queue_me` 281M — worker가 `rx_cond` 대기
-- `__schedule` 223M — context switch
-- libdoca polling 14.6B — DOCA 내부
+### Echo (1 core)
 
-→ Echo bottleneck = **rx_queue 메커니즘 + scheduler overhead**. echo
-연산 로직이 아님. 닫힌 루프 (closed-loop bench)에서 bench 측 wake 비용과
-대칭이므로 양쪽이 동일 cap에 동시 도달.
+| Bucket | % CPU |
+|---|---:|
+| Kernel (spin_lock, sched_clock, exit_to_user 등) | 45.2% |
+| Scheduler 내부 | 43.9% |
+| libc/pthread (cond/mutex) | 7.6% |
+| **dpumesh-code** | **2.5%** |
+| libdoca | 0.4% |
 
-### 3.3 DPU
-거의 idle. `drain_deferred_tx_acks` + `doca_pe_progress`가 균등. DPA EU는
-한가. **chain은 cap이 아님**.
+**결론**: 한 코어 100% 다 쓰는 상태에서 dpumesh 자체가 차지하는 건 3% 이내.
+그 3% 안의 hot frame들 — `pe_progress_fn`, `deliver_one_body`, `consume_chunk`,
+`dpumesh_dequeue`, `builder_append_locked` — 전부 "작은 일을 자주 하는" 정상 패턴.
+알고리즘 비효율 없음.
 
-### 3.4 결론
-현재 cap = **host 측 PE thread CPU + worker scheduler overhead**.
-DPA/DPU/comch 모두 여유. 향후 cap을 올리려면 host 측 wake-batch /
-event-loop architecture 재설계가 필요.
-
----
-
-## 4. 남은 최적화 후보
-
-| # | 항목 | 예상 효과 | 비용 |
-|---|---|---|---|
-| 1 | **Echo `rx_queue` cond → futex batch wake**: chunk당 N번 `cond_signal` → 1번 `futex_wake(N)` | PE syscall 25분의 1 | 1-2일 |
-| 2 | Bench 워커 모델: closed-loop → 파이프라이닝 (worker 적게 + in-flight 다수) | Scheduler 부하 큰 폭 감소 | bench 재설계, 3-5일 |
-| 3 | Multi-core (현재 hw mode = catastrophic) — thread-level explicit pinning (PE는 한 코어 전용, worker는 다른 코어) | 잠재적으로 chain cap 근처 | 복잡, bench까지 손대야 함 |
-| 4 | Phase 5: DPU L7 resolve / LB | 기능 추가 (성능 효과 없음 — RTT 추가) | 별도 |
-
-권장 다음 단계: **#1 (echo rx_queue 배치 wake)**. PE thread만 바뀌고
-wire format 변화 없음. 다른 후보는 모두 큰 재설계.
+실제 cap의 정체:
+- Bench: 50-93개 worker thread가 1코어 위에 wake/sleep cycle → CFS scheduler bookkeeping 90%
+- Echo: PE thread의 libdoca 폴링 + 워커 wake/sleep scheduler
+- 양쪽 다 **dpumesh transport 바깥**에서 결정됨
 
 ---
 
-## 5. Hard Rules 점검
+## 4. Bench는 너무 무거움 — 다음 redesign 대상
+
+### 4.1 현재 bench의 무게
+
+| 요소 | 비용 |
+|---|---|
+| N (50-93)개 worker thread × K=32 pipeline | 워커마다 wake/sleep cycle |
+| 워커당 `sleep_until` (clock_nanosleep) | per-fire syscall |
+| 워커당 `wait_response_v2` (futex_wait) | per-reap syscall |
+| 200k RPS 환산 | ~400k syscall/sec + ~200k context switch/sec |
+
+→ 1코어 CPU의 90%가 bench의 thread scheduling 자체에 들어감. dpumesh transport가
+무엇을 하든 측정값은 이 thread 모델에 막힘.
+
+### 4.2 단일 스레드 load generator (Phase 5)
+
+```
+한 thread:
+  loop:
+    1. ring 가장 오래된 응답 ready? (wait_response_v2 timeout=0, non-blocking)
+       → ready면 reap + record latency = (now - fire_t)
+    2. 시간 됐고 ring 빈 자리 있나? → send_request, ring push, fire_t = now
+    3. 둘 다 아니면 다음 scheduled tick까지 짧게 nanosleep
+```
+
+특성:
+- worker thread = **1**. PE thread랑 1 core 양분.
+- mutex / cond / futex = 0. atomic load만.
+- 코드 100 줄 안쪽 (현재 ~500 줄에서 -80%)
+- 단일 스레드 cap 추정:
+  - send_request 1회 ≈ 2-5 μs (register + builder append + maybe flush)
+  - non-blocking poll ≈ 0.5 μs
+  - cycle ≈ 3-6 μs → **160-330k RPS** 단일 스레드만으로 가능
+- 1 thread cap에 부딪히면 disjoint rid range로 2-4 thread (공유 state 없음)
+
+### 4.3 v4 성능표 폐기 이유
+
+v4 §0 표 (170k 권장 한계, 200k plateau 등) 와 오늘 측정한 숫자들 (256B 300k 등)
+모두 **bench thread 모델의 cap**이지 dpumesh transport cap이 아님. 의미 있는
+transport 측정은 **§4.2 redesign 후** 다시 한다.
+
+---
+
+## 5. 측정 인프라 (재현 가능하게)
+
+### 5.1 빌드 플래그
+
+`test-bench.sh`:
+- cmake: `-DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_FLAGS="-fno-omit-frame-pointer" -DCMAKE_CXX_FLAGS="-fno-omit-frame-pointer"`
+- bench/echo gcc: `-O2 -g -fno-omit-frame-pointer`
+
+### 5.2 Flame 캡쳐
+
+`bench/flame_capture.sh <rps> <dur> <size> <label>`:
+- 호스트 측: `perf record -F 199 --call-graph=dwarf,16384 -p <pid>` (FP 불완전한 libc 통과)
+- DPU 측: `perf record -F 199 -g -p <dpu_pid>` (ARM, FP OK)
+- 렌더: stackcollapse-perf.pl + flamegraph.pl
+
+### 5.3 Leaf-only 분류
+
+분석은 cumulative samples (부모/자식 중복)가 아니라 leaf samples로:
+- `perf script` → `stackcollapse-perf.pl` → 각 스택의 마지막 token만 카운트
+- 카테고리: libdoca / DOCA-symbol / kernel-sched / libc-pthread / **dpumesh-code** / unknown
+
+---
+
+## 6. Hard Rules
 
 | # | 원칙 | 현재 |
 |---|---|---|
 | 1 | Thrift service code diff 0 | ✓ |
-| 2 | Legacy (`BENCH_SPLIT=0`) 회귀 0 | ✓ |
-| 3 | Back-to-back 안정 (10k×N, 50k×N, 170k×N) | ✓ |
-| 4 | Deploy 한 줄 | ✓ `BENCH_SPLIT=1 ./test-bench.sh deploy` |
-| 5 | **DPU log < 10MB** 어떤 부하에서도 | ✓ 전 sweep 통과 후 **283 byte 유지** |
-| 6 | hdr / body pool 독립 (TX/RX/forward ring 모두) | ✓ |
-| 7 | req_id = (src_id, seq) globally unique | ✓ |
-| 8 | Spin 없음, event-driven | ✓ (futex_wait, no spin) |
-| 9 | DPA-side handle device-locality (ADD_PEER 시 DPU device로 resolve) | ✓ |
+| 2 | Legacy (`BENCH_SPLIT=0`) 회귀 0 | ✓ (pending ownership clean 후에도 legacy path 그대로) |
+| 3 | DPU log < 10MB 어떤 부하에서도 | ✓ 283 byte |
+| 4 | hdr / body pool 독립 (TX/RX/forward ring 모두) | ✓ |
+| 5 | req_id = (src_id, seq) globally unique | ✓ |
+| 6 | Spin 없음, event-driven | ✓ (futex 직접, no spin) |
+| 7 | Pending slot ownership = caller (transport는 방어 wait 없음) | ✓ (v5 추가) |
+| 8 | 측정 신뢰성: flame `[unknown]` < 10% | ✓ bench 6.6%, echo 0.6%, DPU 0% |
+| 9 | 성능 cap 평가 = dpumesh transport만 isolating | **펜딩 — bench redesign 후** |
 
 ---
 
-## 6. File index
+## 7. File index
 
 | File | 역할 |
 |---|---|
-| `lib/cpp/src/thrift/transport/dpumesh_doca.c` | Host: unified builder + sharding + futex pending + cursor alloc + sweep |
+| `lib/cpp/src/thrift/transport/dpumesh_doca.c` | Host: builder + sharding + pending (ownership clean) + futex + batch wake |
 | `lib/cpp/src/thrift/transport/doca/mesh.h` | Wire formats (`mesh_req_id`, `mesh_hdr_req`, `mesh_chunk_header`) |
-| `lib/cpp/src/thrift/transport/doca/dpu_worker.c` | DPU: forward + reverse + TX_ACK, hot-path logs silenced |
-| `lib/cpp/src/thrift/transport/doca/device/dpa_kernel.c` | DPA forward (CASE_DIRECT peer lookup), reverse (hdr dst override) |
-| `lib/cpp/src/thrift/transport/doca/dpa.c` | `setup_pod_dma`, ADD_PEER, broadcast peer topology |
-| `bench/flame_capture.sh` | flame 자동 캡쳐 (bench + echo + DPU 동시) |
-| `bench/final_*_flame.svg` | v4 최종 측정 (150k load) |
-| `test-bench.sh` | deploy + DPU log 안전망 (`-l 30`, truncate) |
+| `lib/cpp/src/thrift/transport/doca/dpu_worker.c` | DPU: forward + reverse + TX_ACK (logs 전면 제거됨) |
+| `lib/cpp/src/thrift/transport/doca/device/dpa_kernel.c` | DPA: CASE_DIRECT + reverse (logs 전면 제거됨) |
+| `lib/cpp/src/thrift/transport/doca/dpa.c` | `setup_pod_dma`, ADD_PEER (logs 전면 제거됨) |
+| `bench/bench_dpumesh.c` | 현재 multi-thread pipelined. **§4.2에서 단일 스레드로 재작성 예정** |
+| `bench/echo_dpumesh.c` | echo daemon. 현 worker pool 모델 유지 (서비스 측이라 단순화 우선순위 낮음) |
+| `bench/flame_capture.sh` | DWARF 모드 perf record + flame 렌더 |
+| `bench/final_*_flame.svg` | DWARF 신뢰 가능한 측정 (200k load) |
+| `test-bench.sh` | deploy + FP/debug 빌드 플래그 + DPU log 안전망 |
+| `plan.md` | 이 문서 (v5) |
 
 ---
 
-## 7. Glossary
+## 8. Glossary
 
 | Term | Meaning |
 |---|---|
-| `mesh_req_id` | `{src_id, seq}` 64bit |
+| `mesh_req_id` | `{src_id, seq}` 64bit globally unique |
 | **hdr path** | src → DPU → dst (L7 proxy hook 자리) |
 | **body path / CASE_DIRECT** | src host → dst host 직접 DMA (DPU NIC engine 매개) |
 | **builder shard** | per-dst 8-way shard. worker가 `pthread_self() % 8`로 hash |
@@ -210,7 +304,11 @@ wire format 변화 없음. 다른 후보는 모두 큰 재설계.
 | **expected ring** | per-src queue, hdr batch arrival로 채워짐, chunk가 head 매칭 |
 | **parked chunk** | chunk가 hdr보다 일찍 도착할 때 임시 보관 (zero-copy) |
 | **futex pending** | `_Atomic state` + `_Atomic waiters`. PE는 waiters>0일 때만 wake |
+| **pending ownership** | caller가 register-release lifecycle 책임. transport는 방어 wait 안 함 (v5) |
+| **batch wake** | chunk당 cond_signal N번 → cond_broadcast 1번 (v5) |
+| **orphan response drop** | cancel 후 늦게 도착한 OP_RESPONSE는 rx_slot drop (v5) |
+| **leaf-only sample** | flame 분석 시 cumulative가 아니라 스택의 deepest frame 기준. 실제 CPU 소비처 정확 측정. |
 
 ---
 
-*문서 끝 (v4, 2026-05-15)*
+*문서 끝 (v5, 2026-05-15) — 다음: bench 단일 스레드 재작성*
