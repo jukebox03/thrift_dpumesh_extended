@@ -428,7 +428,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     }
 
     /* Build completion message with routing info.
-     * Use comch_dma_comp_msg directly (25 bytes) instead of comch_msg union (~52 bytes)
+     * Use comch_dma_comp_msg directly (≤32 bytes) instead of comch_msg union (~52 bytes)
      * to stay within the 32-byte immediate data limit of doca_dpa_dev_comch_producer_dma_copy(). */
     comp.type = COMCH_MSG_TYPE_DMA_COMPLETED;
     comp.pos = is_direct ? dst_pos_for_comp : thread_arg->pos[r];
@@ -437,6 +437,12 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     comp.src_pod_id = ring->pod_id;
     comp.dst_pod_id = desc->dst_pod_id;
     comp.flags = desc->flags;
+    /* Phase 4 plumbing: forward chunk slot info from desc → comp so DPU can
+     * issue body DMA itself once the switchover lands. Narrowed to int16/
+     * uint16 to keep comp ≤ 32B (slot cap < 32768, len cap ≤ 8192). */
+    comp.src_chunk_buf_slot = (int16_t)desc->src_chunk_buf_slot;
+    comp.src_chunk_buf_len  = desc->src_chunk_buf_len;
+    comp._pad = 0;
 
     /* Chunked DMA via dma_copy (max 8KB per call, 128B-aligned size).
      * Each dma_copy consumes one producer send slot AND one consumer recv task.
@@ -535,6 +541,8 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     desc->dst_mmap = 0;
     desc->dst_pos = 0;
     desc->dst_addr = 0;
+    desc->src_chunk_buf_slot = -1;
+    desc->src_chunk_buf_len  = 0;
     __dpa_thread_window_writeback();
     desc->valid = 0;
     __dpa_thread_window_writeback();
@@ -676,6 +684,10 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     comp.src_pod_id = desc->src_pod_id;
     comp.dst_pod_id = desc->dst_pod_id;
     comp.flags = desc->flags;
+    /* Reverse path: no paired chunk slot. Leave sentinel so DPU sees "none". */
+    comp.src_chunk_buf_slot = -1;
+    comp.src_chunk_buf_len  = 0;
+    comp._pad = 0;
 
     /* Chunked DMA: src=dpu buffer, dst=host buffer */
     int num_chunks = 0;
@@ -765,6 +777,8 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     desc->dst_mmap = 0;
     desc->dst_pos = 0;
     desc->dst_addr = 0;
+    desc->src_chunk_buf_slot = -1;
+    desc->src_chunk_buf_len  = 0;
     __dpa_thread_window_writeback();
     desc->valid = 0;
     __dpa_thread_window_writeback();

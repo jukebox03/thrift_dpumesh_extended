@@ -1317,6 +1317,11 @@ static int dpumesh_enqueue_ex(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc,
     dma->dst_mmap = dst_mmap_override;
     dma->dst_addr = dst_addr_override;
     dma->dst_pos  = dst_pos_override;
+    /* Phase 4 plumbing: paired chunk slot info for OP_HDR_BATCH (consumed
+     * once DPU starts firing body DMA itself). Non-hdr-batch descriptors
+     * pass through (-1, 0) — DPU ignores unless OP_HDR_BATCH is set. */
+    dma->src_chunk_buf_slot = desc->src_chunk_buf_slot;
+    dma->src_chunk_buf_len  = desc->src_chunk_buf_len;
 
     __sync_synchronize();
     dma->valid = 1;
@@ -1754,6 +1759,10 @@ static void builder_flush_locked(dpumesh_ctx_t *ctx, mesh_builder_t *b) {
         desc.src_body_pod_id     = ctx->pod_id;
         desc.src_body_buf_slot   = hdr_slot;
         desc.src_header_buf_slot = -1;
+        /* Phase 4 plumbing: paired chunk slot (consumed by DPU once it
+         * starts firing body DMA itself; ignored until then). */
+        desc.src_chunk_buf_slot  = chunk_slot;
+        desc.src_chunk_buf_len   = (chunk_slot >= 0 && chunk_num > 0) ? chunk_len : 0;
         pending_attach_tx_v2(ctx, owner, hdr_slot, /*is_hdr=*/1);
         if (dpumesh_enqueue(ctx, &desc) != 0) {
             uint32_t pidx = owner.seq % MAX_PENDING;
@@ -1764,32 +1773,19 @@ static void builder_flush_locked(dpumesh_ctx_t *ctx, mesh_builder_t *b) {
             dpumesh_hdr_tx_free(ctx, hdr_slot);
         }
     }
+    /* Phase 4 (Stage C2): host no longer enqueues a separate chunk
+     * descriptor. The paired chunk_slot info is carried in the hdr_batch
+     * descriptor above (src_chunk_buf_slot / src_chunk_buf_len), and DPU's
+     * process_forward_entry fires the body DMA itself on its own forward
+     * ring. We still attach the chunk_slot to pending so the TX_ACK path
+     * (which DPU sends with POOL_HOST_TX_BODY when DPA reports CASE_DIRECT
+     * body completion) frees the right slot. direct_ok stat counter kept
+     * for visibility; CASE_EXTERNAL counter is now dead — Phase 4 always
+     * goes direct via DPU. */
     if (chunk_slot >= 0 && chunk_num > 0) {
-        sw_descriptor_t desc;
-        memset(&desc, 0, sizeof(desc));
-        desc.header_buf_slot     = -1;
-        desc.body_buf_slot       = chunk_slot;
-        desc.body_len            = chunk_len;
-        desc.req_id              = owner.seq;
-        desc.dst_pod_id          = dst_pod;
-        desc.src_pod_id          = ctx->pod_id;
-        desc.flags               = (bflags & OP_RESPONSE) | OP_CHUNK |
-                                   (direct_ok ? CASE_DIRECT : CASE_EXTERNAL);
-        desc.valid               = 1;
-        desc.src_body_pool_type  = POOL_HOST_TX_BODY;
-        desc.src_body_pod_id     = ctx->pod_id;
-        desc.src_body_buf_slot   = chunk_slot;
-        desc.src_header_buf_slot = -1;
-        atomic_fetch_add(direct_ok ? &ctx->stat_chunk_direct : &ctx->stat_chunk_staging, 1);
+        (void)direct_ok;
+        atomic_fetch_add(&ctx->stat_chunk_direct, 1);
         pending_attach_tx_v2(ctx, owner, chunk_slot, /*is_hdr=*/0);
-        if (dpumesh_enqueue(ctx, &desc) != 0) {
-            uint32_t pidx = owner.seq % MAX_PENDING;
-            dpumesh_pending_t *pp = &ctx->pending[pidx];
-            pthread_mutex_lock(&pp->lock);
-            if (pp->tx_slot == chunk_slot) pp->tx_slot = -1;
-            pthread_mutex_unlock(&pp->lock);
-            dpumesh_tx_free(ctx, chunk_slot);
-        }
     }
 
     pthread_mutex_lock(&b->lock);

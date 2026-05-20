@@ -27,7 +27,12 @@
 #define POOL_HOST_TX_HDR    8
 
 /* ====== DOCA / DPA limits ====== */
-#define MAX_DPA_RINGS       8
+/* MAX_DPA_RINGS sizes the DPA thread arg's per-direction ring tables.
+ * Phase 3 used 2 forward rings per pod (body + hdr). Phase 4 adds a 3rd
+ * forward ring per pod: the DPU-owned body forward ring (DPU enqueues
+ * descriptors itself instead of host writing the chunk path). With
+ * MAX_PODS=8 and 3 rings/pod, 16 entries leaves room for future growth. */
+#define MAX_DPA_RINGS       16
 #define MAX_PODS            8
 
 /* DPU-side DMA buffer size per pod (DPU's intermediate buffers used for

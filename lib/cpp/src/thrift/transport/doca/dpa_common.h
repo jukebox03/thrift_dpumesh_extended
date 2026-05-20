@@ -152,7 +152,16 @@ struct comch_dma_comp_msg {
 	uint32_t req_id;      /* Thrift stream/request ID */
 	int32_t  src_pod_id;  /* originating pod */
 	int32_t  dst_pod_id;  /* destination pod */
+	/* Phase 4: paired chunk_tx slot for OP_HDR_BATCH completion. DPA copies
+	 * from dma_desc.src_chunk_buf_slot/_len so the DPU knows where the
+	 * body bytes live in src host's chunk_tx_buffer once it starts firing
+	 * body DMA itself. Slot fits in int16 (DPUMESH_NUM_SLOTS_DEFAULT=4096,
+	 * cap < 32768); len fits in uint16 (≤ DPUMESH_SLOT_SIZE_DEFAULT 8192).
+	 * (-1, 0) when not present. */
+	uint32_t src_chunk_buf_len; /* 0 if not present */
+	int16_t  src_chunk_buf_slot; /* -1 if not present */
 	int8_t   flags;       /* OP_REQUEST / OP_RESPONSE + CASE_* */
+	int8_t   _pad;
 };
 /* Sent as immediate data via doca_dpa_dev_comch_producer_dma_copy() — max 32 bytes */
 _Static_assert(sizeof(struct comch_dma_comp_msg) <= 32,
@@ -226,7 +235,14 @@ struct dma_desc {
 	                                * derived from rev_pos[r] as before.) */
 	uint64_t dst_addr;             /* 8B (Phase 2) - absolute virtual address in
 	                                * dst_mmap. Only used when dst_mmap != 0. */
-	uint8_t reserved[11];          /* 11B */
+	/* Phase 4: paired chunk_tx slot for OP_HDR_BATCH descriptors. Lets the
+	 * DPU locate the body bytes in src host's chunk_tx_buffer so it can
+	 * issue the body DMA itself (single src→dst dma_copy via DPA). DPA
+	 * copies these into comch_dma_comp_msg so DPU sees them on completion.
+	 * For non-hdr-batch descriptors these are (-1, 0) / 0 / 0 and ignored. */
+	int32_t  src_chunk_buf_slot;   /* 4B (-1 if not present) */
+	uint32_t src_chunk_buf_len;    /* 4B (0 if not present) */
+	uint8_t reserved[3];           /* 3B */
 	volatile uint8_t valid;        /* 1B */
 } __attribute__((__packed__, aligned(8)));
 
@@ -241,6 +257,8 @@ _Static_assert(offsetof(struct dma_desc, src_pod_id) == 32, "dma_desc.src_pod_id
 _Static_assert(offsetof(struct dma_desc, dst_mmap) == 36, "dma_desc.dst_mmap offset mismatch");
 _Static_assert(offsetof(struct dma_desc, dst_pos)  == 40, "dma_desc.dst_pos offset mismatch");
 _Static_assert(offsetof(struct dma_desc, dst_addr) == 44, "dma_desc.dst_addr offset mismatch");
+_Static_assert(offsetof(struct dma_desc, src_chunk_buf_slot) == 52, "dma_desc.src_chunk_buf_slot offset mismatch");
+_Static_assert(offsetof(struct dma_desc, src_chunk_buf_len)  == 56, "dma_desc.src_chunk_buf_len offset mismatch");
 _Static_assert(offsetof(struct dma_desc, valid) == 63, "dma_desc.valid offset mismatch");
 
 #endif

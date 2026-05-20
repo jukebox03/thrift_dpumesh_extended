@@ -689,4 +689,31 @@ HW watchdog disab[    4.615598] mlxbf3_gpio MLNXBF33:01: IRQ index 0 not found
 
 Ubuntu 22.04.5 LTS localhost.localdomain hvc0
 
-localhost login: 
+localhost login: [35102.177694] Out of memory: Killed process 4897 (clx) total-vm:414344kB, anon-rss:24192kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:260kB oom_score_adj:988
+[35102.191904] Out of memory: Killed process 4876 (telemetry-run.s) total-vm:4032kB, anon-rss:272kB, file-rss:4kB, shmem-rss:0kB, UID:0 pgtables:48kB oom_score_adj:988
+[35102.210645] Out of memory: Killed process 4888 (supervisord) total-vm:34204kB, anon-rss:16668kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:104kB oom_score_adj:988
+[35902.440657] Out of memory: Killed process 112678 (unattended-upgr) total-vm:28057776kB, anon-rss:27814748kB, file-rss:6820kB, shmem-rss:0kB, UID:0 pgtables:54692kB oom_score_adj:0
+[35904.732301] systemd[1]: Failed to start Daily apt download activities.
+[79148.041365] Out of memory: Killed process 212157 (clx) total-vm:414344kB, anon-rss:24220kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:252kB oom_score_adj:988
+[79148.055754] Out of memory: Killed process 212139 (telemetry-run.s) total-vm:4032kB, anon-rss:220kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:48kB oom_score_adj:988
+[79148.070940] Out of memory: Killed process 212152 (supervisord) total-vm:34204kB, anon-rss:16664kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:104kB oom_score_adj:988
+[79148.086107] Out of memory: Killed process 212153 (python3) total-vm:1609744kB, anon-rss:23548kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:332kB oom_score_adj:988
+[79148.100863] Out of memory: Killed process 212154 (clx_env.sh) total-vm:2380kB, anon-rss:76kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:44kB oom_score_adj:988
+[79163.975598] Out of memory: Killed process 337462 (unattended-upgr) total-vm:30449088kB, anon-rss:30203192kB, file-rss:6576kB, shmem-rss:0kB, UID:0 pgtables:59348kB oom_score_adj:0
+[135645.719258] Out of memory: Killed process 425893 (clx) total-vm:414344kB, anon-rss:24216kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:252kB oom_score_adj:988
+[135645.733667] Out of memory: Killed process 425707 (telemetry-run.s) total-vm:4032kB, anon-rss:224kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:44kB oom_score_adj:988
+[135645.748689] Out of memory: Killed process 425720 (supervisord) total-vm:34204kB, anon-rss:16668kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:100kB oom_score_adj:988
+[153400.601445] systemd[1]: Failed to start Journal Service.
+[171976.410596] systemd[1]: Failed to start Journal Service.
+[208248.862203] systemd[1]: Failed to start Journal Service.
+[275369.503974] Out of memory: Killed process 703780 (clx) total-vm:414344kB, anon-rss:24228kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:256kB oom_score_adj:988
+[275369.518505] Out of memory: Killed process 703763 (telemetry-run.s) total-vm:4032kB, anon-rss:224kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:44kB oom_score_adj:988
+[275369.543793] Out of memory: Killed process 703775 (supervisord) total-vm:34204kB, anon-rss:16664kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:104kB oom_score_adj:988
+[275369.558908] Out of memory: Killed process 703776 (python3) total-vm:1609744kB, anon-rss:23576kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:332kB oom_score_adj:988
+[275369.573715] Out of memory: Killed process 703777 (clx_env.sh) total-vm:2380kB, anon-rss:76kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:44kB oom_score_adj:988
+[287185.127345] Out of memory: Killed process 937075 (unattended-upgr) total-vm:28008936kB, anon-rss:27764280kB, file-rss:6592kB, shmem-rss:0kB, UID:0 pgtables:54592kB oom_score_adj:0
+[287188.006283] systemd[1]: Failed to start Daily apt download activities.
+[368435.774212] systemd[1]: Failed to start Journal Service.
+[368711.852561] systemd[1]: Failed to start Journal Service.
+[369163.764171] systemd[1]: Failed to start Journal Service.
+[369576.670995] systemd[1]: Failed to start Journal Service.

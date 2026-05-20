@@ -106,6 +106,12 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             entry.req_id = req_id;
             entry.length = payload_len;
             entry.flags = comp_msg->flags;
+            /* Phase 4: forward chunk slot info so DPU's main loop can issue
+             * body DMA itself. */
+            entry.src_chunk_buf_slot = comp_msg->src_chunk_buf_slot;
+            entry.src_chunk_buf_len  = comp_msg->src_chunk_buf_len;
+            entry.body_dma_done    = 0;
+            entry.hdr_rev_dma_done = 0;
 
             /* Zero-copy: record buffer offset instead of heap-copying.
              * End-node slot-based admission keeps in-flight bytes ≤ buf_size
@@ -146,6 +152,11 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             rev_entry.flags = rev_comp->flags;
             rev_entry.buf_offset = rev_comp->pos;  /* position in Host RX buffer */
             rev_entry.pod_idx = -1;
+            /* Reverse path: no chunk slot. */
+            rev_entry.src_chunk_buf_slot = -1;
+            rev_entry.src_chunk_buf_len  = 0;
+            rev_entry.body_dma_done    = 1;  /* not used on rev path */
+            rev_entry.hdr_rev_dma_done = 1;
 
             if (comp_queue_enqueue(&objs->comp_queue, &rev_entry) != 0) {
             } else {
@@ -1133,6 +1144,55 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
             }
         }
     } else {
+    }
+
+    /* === Phase 4: DPU-OWNED forward ring (CPU→host-dst body DMA) === */
+
+    /* Allocate a DPU-local mmap for the ring storage (NO extra credit slot —
+     * this ring doesn't need v1.0.0-style FC: the peer's existing forward
+     * dma_ring already carries the credit counter at index DMA_RING_SIZE and
+     * is shared via the peer table for CASE_DIRECT admission). */
+    result = setup_dpu_tx_ring(objs->dev, DMA_RING_SIZE,
+                               &pod->dpu_fwd_ring, &pod->dpu_fwd_ring_mmap);
+    if (result != DOCA_SUCCESS) {
+        return result;
+    }
+    result = setup_dpa_buf_array_pod(objs, DMA_RING_SIZE, pod->dpu_fwd_ring_mmap,
+                                      &pod->dpu_fwd_buf_arr);
+    if (result != DOCA_SUCCESS) {
+        return result;
+    }
+
+    /* Register the DPU forward ring with DPA. Carries the SAME mmaps as the
+     * host-owned forward ring (this pod's body buffer is the SRC; dpu_mmap
+     * is a non-zero placeholder for DPA's validation, never used by the
+     * CASE_DIRECT path). The only difference: descriptors are written by
+     * DPU (dpu_enqueue_body_dma, added in Stage B3), not by host. */
+    {
+        struct dpa_ring_info dpu_fwd_ring_info = ring_info;
+        doca_dpa_dev_buf_arr_t dpu_fwd_buf_arr_h = 0;
+        result = doca_buf_arr_get_dpa_handle(pod->dpu_fwd_buf_arr, &dpu_fwd_buf_arr_h);
+        if (result != DOCA_SUCCESS) {
+            return result;
+        }
+        dpu_fwd_ring_info.buf_arr      = dpu_fwd_buf_arr_h;
+        dpu_fwd_ring_info.buf_arr_size = DMA_RING_SIZE;
+        /* host_mmap / host_addr / host_buf_size stay = src body buffer.
+         * dpu_mmap / dpu_addr stay = pod local buffer (non-zero validator).
+         * host_hdr_* are unused on this ring (body path only); leave whatever
+         * ring_info has — DPA's forward kernel only consults host_hdr_mmap
+         * when desc->flags & OP_HDR_BATCH, and DPU body enqueues never set
+         * that bit on this ring. */
+
+        struct comch_add_ring_msg add_msg;
+        memset(&add_msg, 0, sizeof(add_msg));
+        add_msg.type = COMCH_MSG_TYPE_ADD_RING;
+        add_msg.ring = dpu_fwd_ring_info;
+        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+                                           &add_msg, sizeof(add_msg));
+        if (result != DOCA_SUCCESS) {
+            return result;
+        }
     }
 
     /* === Reverse direction (DPU→CPU) setup === */

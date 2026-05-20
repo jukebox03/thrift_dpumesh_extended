@@ -143,6 +143,81 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *src_pod,
         dma->dst_pos  = 0;
         dma->dst_addr = 0;
     }
+    /* Phase 4: reverse path doesn't consume chunk slot info — clear so
+     * stale values from a prior reverse-ring use don't propagate. */
+    dma->src_chunk_buf_slot = -1;
+    dma->src_chunk_buf_len  = 0;
+
+    __sync_synchronize();
+    dma->valid = 1;
+
+    return DOCA_SUCCESS;
+}
+
+/* ====== Phase 4: DPU-issued body DMA (forward, src host → dst host) ====== */
+
+/*
+ * Enqueue a forward body DMA descriptor on src_pod's DPU-owned forward ring.
+ *
+ * Source = src_pod->remote_addr + src_buf_offset (= src host's chunk_tx_buffer
+ *          slot at the given offset). DPA's process_one_desc reads from
+ *          ring->host_mmap which was set to src_pod's body buffer at
+ *          setup_pod_dma time, so no per-call src mmap override needed.
+ * Destination = peer host's rx_dma_buffer, resolved by DPA via the peer table
+ *          lookup peers[dst_pod_id].rx_mmap (CASE_DIRECT path). DPA picks the
+ *          dst cursor itself (peer_write_cursor[dst_pod_id]).
+ *
+ * Mirrors the v1.0.0 "DPU asks DPA to do one DMA" pattern except instead of
+ * sending a comch RPC per call we use the descriptor-ring fast path
+ * (amortized cost over 31-body packed chunks).
+ *
+ * Returns DOCA_SUCCESS or DOCA_ERROR_AGAIN (ring full).
+ */
+static doca_error_t
+dpu_enqueue_body_dma(struct objects *objs, struct pod_state *src_pod,
+                     int32_t dst_pod_id, uint32_t src_buf_offset,
+                     uint32_t body_len, uint32_t req_id, uint8_t flags)
+    __attribute__((unused));
+static doca_error_t
+dpu_enqueue_body_dma(struct objects *objs, struct pod_state *src_pod,
+                     int32_t dst_pod_id, uint32_t src_buf_offset,
+                     uint32_t body_len, uint32_t req_id, uint8_t flags)
+{
+    (void)objs;
+
+    if (!src_pod || !src_pod->dpu_fwd_ring)
+        return DOCA_ERROR_NOT_CONNECTED;
+    if (!src_pod->remote_addr)
+        return DOCA_ERROR_NOT_CONNECTED;
+
+    struct dma_desc *dma = get_next_dma_desc(src_pod->dpu_fwd_ring);
+    if (!dma) {
+        /* Ring full — caller retries next iter. NO per-request log (hot path
+         * floods at high RPS, see process_forward_entry pattern). */
+        return DOCA_ERROR_AGAIN;
+    }
+
+    /* desc.mmap = 0 → DPA falls back to ring->host_mmap (= src body buffer,
+     * set at setup_pod_dma). desc.addr is the absolute VA inside that mmap. */
+    dma->mmap        = 0;
+    dma->addr        = (uint64_t)src_pod->remote_addr + src_buf_offset;
+    dma->size        = body_len;
+    dma->idx         = req_id;
+    dma->dst_pod_id  = dst_pod_id;
+    /* CASE_DIRECT triggers DPA's peer-table lookup for dst; OP_CHUNK keeps
+     * the discriminator so the dst host's rx_data_hook (when the
+     * DMA_COMPLETION lands) routes through process_chunk. Preserve
+     * OP_REQUEST / OP_RESPONSE from the originating hdr batch. */
+    dma->flags       = (int8_t)(CASE_DIRECT | OP_CHUNK | (flags & OP_RESPONSE));
+    dma->src_pod_id  = src_pod->pod_id;
+    /* dst override fields stay zero — CASE_DIRECT lookup populates from
+     * peer table on the DPA side. */
+    dma->dst_mmap    = 0;
+    dma->dst_pos     = 0;
+    dma->dst_addr    = 0;
+    /* Body DMA carries no paired chunk slot info itself. */
+    dma->src_chunk_buf_slot = -1;
+    dma->src_chunk_buf_len  = 0;
 
     __sync_synchronize();
     dma->valid = 1;
@@ -202,6 +277,64 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
         return 1;
     }
 
+    /* Phase 4: for OP_HDR_BATCH entries carrying paired chunk_slot info,
+     * fire the body DMA from DPU side (src host chunk_tx → dst host rx via
+     * DPA's CASE_DIRECT). Host no longer enqueues the chunk descriptor
+     * (Stage C2) — DPU is sole enqueuer. Runs in parallel with the reverse
+     * hdr DMA below.
+     *
+     * Critical: on AGAIN we do NOT return 0 (which would gate comp_queue).
+     * The CASE_DIRECT comp entries arriving BEHIND this one carry the
+     * DMA_COMPLETION messages that trigger dst's rx_free → credit return —
+     * the very thing freeing dpu_fwd_ring slots. Blocking here would
+     * deadlock at saturation. Instead, push to the side queue
+     * deferred_body_dmas, drained from the main loop, and proceed. */
+    if (!entry->body_dma_done &&
+        (entry->flags & OP_HDR_BATCH) &&
+        entry->src_chunk_buf_slot >= 0 &&
+        entry->src_chunk_buf_len > 0 &&
+        src_pod) {
+        uint32_t src_off = (uint32_t)entry->src_chunk_buf_slot * (uint32_t)DPUMESH_SLOT_SIZE;
+        doca_error_t br = dpu_enqueue_body_dma(objs, src_pod,
+                                                dst_pod_id, src_off,
+                                                entry->src_chunk_buf_len,
+                                                req_id, (uint8_t)entry->flags);
+        if (br == DOCA_ERROR_AGAIN) {
+            if (objs->num_deferred_body_dmas < MAX_DEFERRED_BODY_DMA) {
+                int n = objs->num_deferred_body_dmas++;
+                objs->deferred_body_dmas[n].src_pod_id     = src_pod_id;
+                objs->deferred_body_dmas[n].dst_pod_id     = dst_pod_id;
+                objs->deferred_body_dmas[n].src_buf_offset = src_off;
+                objs->deferred_body_dmas[n].body_len       = entry->src_chunk_buf_len;
+                objs->deferred_body_dmas[n].req_id         = req_id;
+                objs->deferred_body_dmas[n].flags          = (uint8_t)entry->flags;
+            }
+            /* Queue full: silent drop. Host's wait_response_v2 timeout
+             * (or src's pending-state-2 reclaim) is the safety net.
+             * Per-request log here would flood DPU /tmp under saturation. */
+        } else if (br != DOCA_SUCCESS) {
+            /* Hard failure (e.g., dpu_fwd_ring not wired yet) — free src's
+             * chunk slot now since the CASE_DIRECT comp path won't fire. */
+            send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id, POOL_HOST_TX_BODY);
+        }
+        entry->body_dma_done = 1;
+    }
+
+    if (entry->hdr_rev_dma_done) {
+        /* Reverse hdr DMA already enqueued in a prior iteration; just
+         * confirm by returning success — process_rev_notify_entry handles
+         * the rest when DPA reports completion. */
+        return 1;
+    }
+
+    /* Mirror process_rev_notify_entry: pool type follows OP_HDR_BATCH bit.
+     * OP_HDR_BATCH descriptors were sourced from src's hdr_tx pool; legacy
+     * non-batch entries (OP_REQUEST/OP_RESPONSE without OP_HDR_BATCH) came
+     * from the body pool. Without this, OP_HDR_BATCH error paths would free
+     * the wrong pool and leak hdr_tx slots. */
+    uint8_t err_pool = (entry->flags & OP_HDR_BATCH) ? POOL_HOST_TX_HDR
+                                                     : POOL_HOST_TX_BODY;
+
     /* The forward DMA landed in pods[entry->pod_idx]->dma_buffer at
      * entry->buf_offset. That same offset is the source for reverse DMA. */
     struct pod_state *fwd_buf_pod = NULL;
@@ -212,7 +345,7 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
      * Host's wait_response_v2 timeout is the persistent-failure detector. */
     if (!fwd_buf_pod || !fwd_buf_pod->dma_buffer ||
         fwd_buf_pod->local_mmap_dpa_handle == 0) {
-        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id, POOL_HOST_TX_BODY);
+        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id, err_pool);
         return -1;
     }
 
@@ -221,7 +354,7 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
                                              : find_pod_by_id(objs, dst_pod_id);
 
     if (!target_pod || !target_pod->tx_ring) {
-        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id, POOL_HOST_TX_BODY);
+        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id, err_pool);
         return -1;
     }
 
@@ -247,16 +380,63 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
         return 0;  /* TX descriptor ring full — preserve entry, retry next iter */
     }
     if (fwd_result != DOCA_SUCCESS) {
-        /* Reverse will not fire — release src host's TX slot now so the
-         * caller doesn't stall on 2s reclaim. Silent: host timeout reports. */
-        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id, POOL_HOST_TX_BODY);
+        /* Reverse will not fire — release src's slot now. Silent: host
+         * timeout reports persistent failures. */
+        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id, err_pool);
         return -1;
     }
+    entry->hdr_rev_dma_done = 1;
 
 
     /* Success: TX_ACK will fire from process_rev_notify_entry on reverse
      * completion. The src dma_buffer slot stays held until then. */
     return 1;
+}
+
+/*
+ * Phase 4: drain the deferred body-DMA queue. Side-queue counterpart to
+ * drain_deferred_tx_acks. Called from the main loop AFTER pe_progress and
+ * comp_queue draining so DPA may have advanced and freed dpu_fwd_ring
+ * slots in the interim. Returns the number successfully re-enqueued.
+ */
+static int
+drain_deferred_body_dmas(struct objects *objs)
+{
+    if (objs->num_deferred_body_dmas == 0)
+        return 0;
+
+    int sent = 0;
+    int kept = 0;
+    int total = objs->num_deferred_body_dmas;
+    for (int i = 0; i < total; i++) {
+        deferred_body_dma_t *d = &objs->deferred_body_dmas[i];
+        struct pod_state *sp = find_pod_by_id(objs, d->src_pod_id);
+        if (!sp) {
+            /* Source pod gone — drop, src host's pending will time out. */
+            sent++;
+            continue;
+        }
+        doca_error_t r = dpu_enqueue_body_dma(objs, sp, d->dst_pod_id,
+                                               d->src_buf_offset, d->body_len,
+                                               d->req_id, d->flags);
+        if (r == DOCA_SUCCESS) {
+            sent++;
+            continue;
+        }
+        if (r == DOCA_ERROR_AGAIN) {
+            /* Still full — keep entry. Compact for FIFO ordering. */
+            if (kept != i)
+                objs->deferred_body_dmas[kept] = *d;
+            kept++;
+            continue;
+        }
+        /* Hard error — free src host's chunk slot now (CASE_DIRECT comp
+         * won't fire). Counts as removed from queue. */
+        send_or_defer_tx_ack(objs, sp, d->req_id, d->dst_pod_id, POOL_HOST_TX_BODY);
+        sent++;
+    }
+    objs->num_deferred_body_dmas = kept;
+    return sent;
 }
 
 /*
@@ -437,6 +617,8 @@ run_dpu_worker(struct objects *objs)
     objs->comp_queue.head = 0;
     objs->comp_queue.tail = 0;
     objs->num_deferred_recv = 0;
+    /* Phase 4: deferred body-DMA queue starts empty. */
+    objs->num_deferred_body_dmas = 0;
 
     /* 1. comch control path server (waits for first connection) */
     result = init_comch_ctrl_path_server("DPUMesh", objs, true);
@@ -490,6 +672,14 @@ run_dpu_worker(struct objects *objs)
          * full. Done right after pe_progress so the just-released send-pool
          * slots are available. */
         drain_deferred_tx_acks(objs);
+
+        /* Phase 4: retry body-DMA enqueues that were deferred because
+         * dpu_fwd_ring was full (DPA's CASE_DIRECT admission deferred).
+         * Must run BEFORE process_completion_queue so the deferred-body
+         * progress doesn't gate the comp_queue head — its CASE_DIRECT
+         * completion entries are what produce the credits the deferred
+         * body DMAs are waiting on. */
+        drain_deferred_body_dmas(objs);
 
         /* Drain deferred completion queue (reverse DMA enqueue).
          * 128 entries per batch — safe because consumer_pe is progressed

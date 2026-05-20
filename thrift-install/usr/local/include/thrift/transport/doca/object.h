@@ -41,6 +41,19 @@ typedef struct {
     int8_t   flags;
     uint32_t buf_offset;   /* FORWARD: offset in pod's RX DMA buffer; REV_NOTIFY: pos in Host RX buf */
     int32_t  pod_idx;      /* FORWARD: index into pods[]; REV_NOTIFY: unused (-1) */
+    /* Phase 4: paired chunk_tx slot on src host. Populated on FORWARD
+     * entries whose flags include OP_HDR_BATCH so DPU can issue the body
+     * DMA itself. (-1, 0) when not present. */
+    int16_t  src_chunk_buf_slot;
+    uint32_t src_chunk_buf_len;
+    /* Phase 4: tracks two-action progress in process_forward_entry. On the
+     * hdr_batch path the DPU fires (1) body DMA via dpu_enqueue_body_dma and
+     * (2) reverse hdr DMA via dpu_enqueue_reverse_dma. Either may return
+     * AGAIN (ring full); the entry stays in comp_queue for retry. Without
+     * these flags a retry would re-fire whichever side already succeeded —
+     * double body DMA or double reverse hdr. */
+    uint8_t  body_dma_done;
+    uint8_t  hdr_rev_dma_done;
 } dpu_comp_entry_t;
 
 typedef struct {
@@ -97,6 +110,17 @@ static inline uint32_t comp_queue_usage(const dpu_comp_queue_t *q) {
  * ms of saturation-burst at 40k+ RPS. */
 #define MAX_DEFERRED_TX_ACK  16384
 
+/* Phase 4: max deferred body-DMA enqueues. When DPA's CASE_DIRECT
+ * admission gate defers (dst host's rx credits exhausted), DPU's
+ * dpu_fwd_ring fills and dpu_enqueue_body_dma returns AGAIN. We MUST
+ * NOT block comp_queue on that — the comp_queue carries CASE_DIRECT
+ * completion entries whose DMA_COMPLETION messages are what trigger
+ * dst's rx_free → credit return, the very thing the deferred body DMAs
+ * are waiting on. Blocking comp_queue here would deadlock. Instead,
+ * push the deferred fire to this side queue and drain it from the
+ * main loop after pe_progress (same pattern as deferred_tx_acks). */
+#define MAX_DEFERRED_BODY_DMA  8192
+
 /* TX_ACK we couldn't send synchronously because the comch send pool was
  * full. Stored verbatim so the main loop can retry without recomputing. */
 typedef struct {
@@ -106,6 +130,20 @@ typedef struct {
     uint8_t   pool_type;   /* Phase 1: which TX pool the host should free */
     uint8_t   _pad[3];
 } deferred_tx_ack_t;
+
+/* Phase 4: body-DMA enqueue we couldn't push to src_pod->dpu_fwd_ring
+ * because the ring was full (DPA's CASE_DIRECT admission gate or producer
+ * pool deferred). Drained by the main loop. Stores src_pod_id (not the
+ * pointer) so we resolve fresh on retry — pod table may be repopulated. */
+typedef struct {
+    int32_t  src_pod_id;
+    int32_t  dst_pod_id;
+    uint32_t src_buf_offset;
+    uint32_t body_len;
+    uint32_t req_id;
+    uint8_t  flags;
+    uint8_t  _pad[3];
+} deferred_body_dma_t;
 
 /* ====== DOCA task pool capacity tracking (check-first model) ======
  * DOCA does not expose in-flight task counts, so we mirror them at
@@ -182,6 +220,21 @@ struct pod_state {
     struct dma_ring *tx_ring;
     struct doca_mmap *tx_ring_mmap;
     struct doca_buf_arr *tx_buf_arr;
+
+    /* Phase 4: DPU-OWNED forward (CPU→host-dst) descriptor ring. Lets DPU
+     * issue body DMAs directly, instead of host writing the chunk path
+     * descriptor itself. Same shape as tx_ring (DPU-local mmap exported
+     * to DPA via a buf_arr), but DPA processes it as a FORWARD ring:
+     *   ring->host_mmap = SRC pod's body buffer (this pod is the source
+     *     when its hdr_batch lands and DPU fires body DMA for it)
+     *   ring->dpu_mmap = pod->local_mmap (not actually used for
+     *     CASE_DIRECT path, but kept non-zero so DPA's validation passes)
+     *   CASE_DIRECT path: DPA looks up dst from peers[dst_pod_id].rx_mmap
+     * Stage B introduces the ring + registration; Stage C wires the
+     * actual enqueue from DPU's hdr_batch processing path. */
+    struct dma_ring *dpu_fwd_ring;
+    struct doca_mmap *dpu_fwd_ring_mmap;
+    struct doca_buf_arr *dpu_fwd_buf_arr;
 
     /* Host RX buffer mmap (exported from Host, DPA DMAs into this) */
     struct doca_mmap *host_rx_mmap;
@@ -302,6 +355,11 @@ struct objects {
      * latency cliff at saturation. Deferring keeps the contract intact. */
     deferred_tx_ack_t deferred_tx_acks[MAX_DEFERRED_TX_ACK];
     int num_deferred_tx_acks;
+
+    /* Phase 4: deferred body-DMA enqueues (see comment near
+     * deferred_body_dma_t for why this must not gate comp_queue). */
+    deferred_body_dma_t deferred_body_dmas[MAX_DEFERRED_BODY_DMA];
+    int num_deferred_body_dmas;
 
     /* ====== In-flight counters for DOCA task pools ======
      * Mirror DOCA's internal task pool usage so submits can be gated

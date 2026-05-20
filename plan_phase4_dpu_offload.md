@@ -265,4 +265,218 @@ ADD_PEER 시점에 추가로 공유해야 할 것:
 
 ---
 
-*문서 끝 (Phase 4, 2026-05-15) — 의논용 draft, 아직 구현 안 함*
+*Plan 본문 끝 (Phase 4, 2026-05-15)*
+
+---
+
+# 9. 구현 진행 상황 (2026-05-18 update)
+
+## 9.1 사용자 결정 (위 §8 답)
+
+- **§5.3 body 신호**: option (b) "DPU가 body DMA 완료 후 hdr_fwd 발사" 선택. 그러나 코드 분석 결과 수신측 expected_ring/parked 로직을 **유지**하면 option (b)/(a) 차이가 사라짐 → 실제 구현은 expected_ring 유지하고 body+hdr 병렬 발사 (option a 동작이지만 dst 코드 변경 0). 추후 Stage C3에서 expected_ring 제거 검토.
+- **dual mode**: 건너뛰고 C2에서 단일 path로 직접 전환 (Stage C1+C2 함께).
+- **packing 위치**: worker thread inline 그대로 유지 (변경 없음).
+
+## 9.2 plan 대비 simplification
+
+| plan §3 항목 | plan 의도 | 실제 구현 | 이유 |
+|---|---|---|---|
+| §3.1 mesh.h hdr 확장 | mesh_hdr_req에 src_chunk_slot/offset 추가 | **불필요 — 변경 안 함** | 1 hdr_batch ↔ 1 chunk_slot pairing이 builder_flush_locked에서 보장됨. sw_descriptor_t의 metadata로만 전파하면 충분. |
+| §3.2 process_chunk/expected_ring 제거 | 단순화 | **유지** | option (b) "DPU가 직렬화" 안 하기로 결정. body+hdr 병렬 발사 + race를 expected_ring/parked가 처리. |
+| §3.4 DPU peer 테이블에 src chunk_tx mmap 추가 | DPU가 desc 쓸 때 참고 | **불필요 — 기존 핸들 재사용** | DPU는 이미 pod->remote_mmap (= host body buffer) 보유. DPA forward ring의 host_mmap도 이미 동일. |
+
+→ 변경 LOC가 plan 추산 800 → 실제 ~300 LOC로 축소.
+
+## 9.3 각 단계 상태
+
+| # | 단계 | 상태 | 검증 |
+|---|---|---|---|
+| A1 | sw_descriptor_t 확장 (src_chunk_buf_slot/_len) | ✅ done | host build OK |
+| A2 | dma_desc + comch_dma_comp_msg + dpu_comp_entry_t 전파 | ✅ done | DPU build OK |
+| A3 | src host chunk_tx mmap 노출 | ✅ no-op (기존 핸들 사용) | — |
+| **A 통합** | shared K=1..2048 sweep | ✅ **PASSED** | zero failures, baseline 유지 (K=1: 249RPS/4ms, K=2048: 448k RPS) |
+| B1 | DPU-owned per-pod forward ring + buf_arr + ADD_RING | ✅ done | MAX_DPA_RINGS 8→16 |
+| B2 | DPA kernel polling | ✅ no-op (기존 process_one_desc 재사용, ADD_RING handler 호환) | — |
+| B3 | dpu_enqueue_body_dma 함수 | ✅ done | unused-attr 가드 |
+| **B 통합** | shared K=1..2048 sweep | ✅ **PASSED** | zero failures, baseline 유지 |
+| C1 | process_forward_entry에서 DPU body DMA fire (body_dma_done/hdr_rev_dma_done flags) | ✅ done | |
+| C2 | host builder_flush_locked의 chunk desc enqueue 제거 | ✅ done | pending_attach_tx_v2는 유지 (TX_ACK가 chunk_slot free) |
+| **C1+C2 1차 시도** | shared K-sweep | ❌ **K=1..256 OK, K=1024+ HANG** | 아래 §9.4 |
+| C-fix | deferred_body_dma 큐 추가 (FIFO 데드락 해결) | ✅ code done | 검증됨 (아래) |
+| **C-fix 검증** | shared K-sweep (2026-05-18) | ❌ **K=1..256 OK, K=512 HANG** | 새 failure mode — 아래 §10 |
+| C3 | dst host expected_ring 제거 | ⏸ 재설계 필요 | §10 design 논의 참조 |
+| **C 통합** | shared K-sweep | ❌ 미통과 | C3 (또는 등가 redesign) 필요 |
+| D | 양방향 (이미 echo 응답 path 포함됨), cleanup, split mode | ⏳ 미진행 | C 완료 전 진행 불가 |
+
+## 9.4 K=1024+ HANG 분석 (Stage C 1차 시도)
+
+증상:
+- shared K=1..256: zero failures, baseline RPS/latency 유지
+- shared K=1024, 2048: bench daemon 응답 timeout (>40s)
+- bench host log: `orphan expected timeout src=10 seq=4495843...` 다발
+- bench stat: `pend=1023, p_chk=0, p_hdr=0` → bench가 echo로부터 chunk/hdr를 전혀 받지 못함
+- echo stat: `c_dir=13k/sec, p_chk=13k/sec, park=13k/sec` → echo는 정상 처리 + 응답 발사 중
+
+Root cause: **comp_queue FIFO blocking deadlock**
+
+```
+1. K=1024+ saturation
+2. DPA의 CASE_DIRECT admission gate가 dst rx 크레딧 고갈로 defer
+3. DPU의 dpu_fwd_ring 가득 → dpu_enqueue_body_dma → AGAIN
+4. process_forward_entry가 return 0 → comp_queue front entry stuck
+5. 뒤에 줄 서 있는 CASE_DIRECT comp_entries (DMA_COMPLETION 보내야 할
+   = dst의 process_chunk가 fire 되도록 해야 할) 도 FIFO로 함께 블락
+6. dst host의 process_chunk 안 fire → rx_free 안 일어남 → 크레딧 반환 X
+7. DPA admission 영원히 defer → 2번으로 되돌아감
+```
+
+Stage A/B는 host가 직접 chunk_dma_ring에 enqueue → host 측 path여서 DPU comp_queue 블락 없음 → 데드락 없었음.
+
+## 9.5 Fix (코드 작성 완료, 검증 대기)
+
+`deferred_body_dma_t` 큐를 DPU objs에 추가. process_forward_entry의 body DMA fire가 AGAIN 받으면 큐에 push하고 **return 1**로 comp_queue 진행 허용. main loop에서 `drain_deferred_body_dmas` 호출 (drain_deferred_tx_acks와 동일 패턴).
+
+변경 파일:
+- `lib/cpp/src/thrift/transport/doca/object.h`: `deferred_body_dma_t`, MAX_DEFERRED_BODY_DMA=8192, objs에 큐 추가
+- `lib/cpp/src/thrift/transport/doca/dpu_worker.c`: process_forward_entry의 body DMA AGAIN 경로 변경, `drain_deferred_body_dmas` 함수 추가, main loop에서 호출, init 추가
+
+Host build OK 확인됨. DPU build + deploy + K-sweep 검증 필요.
+
+## 9.6 (해소됨) 이전 deploy blocker
+
+이전 update에서 기록된 `./test-bench.sh deploy`의 TCP image import 실패는 **2026-05-18 재실행 시 발생하지 않음**. transient sudo cache 또는 환경 이슈였던 듯. 이번 deploy는 모든 단계 통과 (DPU register grep timeout warning은 `-l 30` ERROR-only 모드라 spurious).
+
+## 9.7 다음 step — 재설계 필요
+
+C-fix 검증이 K=512에서 fail (§10 상세). 단순 deadlock fix만으론 부족. 재설계 방향은 §10.4 design 논의를 따름. 다음 결정 필요:
+
+1. dst 매칭 자료구조 재설계 (expected_ring/parked → hash-based per-(src,seq))
+2. 또는 host→DPU 인터페이스 변경 (hdr/body 독립 flushing, descriptor에 body 주소 array)
+3. 또는 둘 다
+
+C 통과 전 D는 진행 안 함.
+
+## 9.8 검증 이력
+
+| 단계 | 시각 | 결과 |
+|---|---|---|
+| Stage A K-sweep (256B, K=1..2048) | 2026-05-15 | ✅ zero failures, baseline preserved (K=1:249RPS, K=2048:448k RPS) |
+| Stage B K-sweep | 2026-05-15 | ✅ zero failures, baseline preserved (K=1:248RPS, K=2048:449k RPS) |
+| Stage C 1차 K-sweep | 2026-05-15 | ⚠ K=1..256 OK (K=256:158k RPS), K=1024+ HANG (deadlock) |
+| **Stage C-fix K-sweep** | **2026-05-18** | ❌ **K=1..256 OK (K=256:161k RPS), K=512 HANG** (새 mode, §10) |
+
+---
+
+# 10. Stage C-fix 검증 결과 + 재설계 논의 (2026-05-18 session)
+
+## 10.1 K-sweep 결과
+
+| K | RPS | p50 | p99 | fail | 상태 |
+|---|---:|---:|---:|---:|---|
+| 1 | 249 | 4004 | 4010 | 0 | OK (= Stage A/B baseline) |
+| 2 | 499 | 4004 | 4010 | 0 | OK |
+| 4 | 998 | 4004 | 4010 | 0 | OK |
+| 8 | 1997 | 4004 | 4011 | 0 | OK |
+| 16 | 3993 | 4004 | 4012 | 0 | OK |
+| 32 | 7991 | 4004 | 4012 | 0 | OK |
+| 64 | **29719** | **2008** | 3015 | 0 | OK, latency **2ms로 떨어짐** (batching saturation 효과) |
+| 128 | 53873 | 2116 | 3820 | 0 | OK |
+| 256 | 161128 | 1724 | 1932 | 0 | OK (vs Stage C 1차 158k 거의 동일) |
+| **512** | — | — | — | — | **HANG** (40s timeout) |
+| 1024, 2048 | — | — | — | — | 미실행 (K=512 fail로 stop) |
+
+**K=1 RTT**: 4004us — plan §5.2 예측 "hdr_builder 단독 → ~2ms" 미달성. 단, K=64+ saturation 구간에서는 ~2ms로 떨어짐.
+
+## 10.2 K=512 hang 증상
+
+- pods 모두 Running, no restart
+- DPU log: ERROR 0건 (`-l 30` 모드)
+- **bench-dpumesh stat**:
+  ```
+  send=53755 rxfree=53243 ... pend=512  ← 1초차: 정상 (53k 처리)
+  send=1     ... pend=512                ← 2초차: 거의 정지
+  send=0     ... pend=512→511→500 ...    ← 12초+ 동결, pend가 2초 reclaim으로 1/sec drop
+  ```
+- **echo-dpumesh log**:
+  - `orphan expected timeout src=10 seq=...` (수십~수백 entries) — hdr만 도착, body 매칭 안됨
+  - `parked chunk timeout src=10 first_seq=... num=31` — chunk만 도착, hdr 매칭 안됨
+  - **두 timeout이 동시에 다발** → hdr/body 매칭이 양방향으로 깨짐
+
+## 10.3 Stage C 1차 vs C-fix 비교
+
+| | Stage C 1차 | Stage C-fix |
+|---|---|---|
+| Fail 시작점 | K=1024 | K=512 (악화) |
+| 증상 | bench pend=1023 stuck, echo 정상 처리 중 | bench pend=512 stuck, echo 양방향 timeout |
+| Root cause | comp_queue FIFO deadlock | hdr/body reordering at dst |
+| 일관성 | echo가 chunk/hdr를 정상 처리 | echo 매칭 자체가 깨짐 |
+
+C-fix가 comp_queue deadlock은 해결했지만, defer 도입으로 **body가 hdr 대비 늦게 도착하는 race가 심화**되어 dst의 1초 sweep timeout window를 깨고 cascade.
+
+## 10.4 Design 논의 (재설계 방향 합의)
+
+### 10.4.1 expected_ring 본질
+
+`expected_ring` (CAP=1024, FIFO)은 hdr_rx_buffer에 이미 있는 hdr 데이터를 parsing해서 **복사**한 큐. arrived_us(timestamp) 외엔 새 정보 없음. hdr_rx_buffer가 wrap cursor라 직접 참조 불가해서 복사 보관.
+
+문제:
+- 인공적 capacity 한계 (1024) — overflow 시 `expected_ring_push` line 2050 **silent drop**
+- FIFO matching — chunk가 expected head와 first_seq 매칭해야 deliver. 도착 순서 race에 취약
+- sweep 1초 timeout — 매칭 지연 1초 넘으면 entry drop (cascade trigger)
+
+### 10.4.2 사용자 제안: dst 책임 매칭 + decoupled flushing
+
+**핵심 idea**:
+1. host는 hdr와 body를 **독립적으로** flush (현재 `builder_append_locked`의 1:1 강제 invariant 제거)
+2. hdr DMA 시 descriptor에 **body 주소 array** (그 hdr_batch의 N개 hdr에 해당하는 body들의 src_chunk_buf slot/offset/len 모두) 포함
+3. DPU가 hdr_batch 받으면 descriptor의 body 주소 array를 읽어 **N개 body DMA를 각각 발사**
+4. dst는 도착 순서 무관 hash 매칭 — race 있어도 dst-side에서 handle
+
+근거:
+- hdr ≤ 80B, body 1KB+ → hdr packing은 96/batch, body는 8/batch. 1:1 강제는 hdr slot 활용율 80%+ 낭비
+- dst가 chunk body 자르는 데 이미 **hdr.body_size를 cursor로 사용** (line 2217-2231) → body size 가변 처리 이미 가능
+- 도착 순서 보장은 race + 추가 메커니즘 비용. dst-side 매칭으로 우회
+
+### 10.4.3 사용자 제안 design에 대한 짚을 점
+
+1. **chunk_tx slot 수명 관리** ⚠ 가장 큰 변경
+   - 1:1 폐기 시 한 chunk_tx slot의 bodies가 여러 hdr_batch에 걸쳐 참조됨
+   - 현재 TX_ACK 1번 = chunk_slot 통째 free (1:1 가정)
+   - 변경 후: per-body TX_ACK 또는 host side slot refcount 필요
+
+2. **DPU side burst** (여전히 valid)
+   - 1 hdr_batch → 최대 96 body DMA enqueue → dpu_fwd_ring 채워질 수 있음
+   - C-fix 같은 deferred 메커니즘 또는 host backpressure 여전히 필요
+
+3. **dst side 양쪽 큐 여전히 필요**
+   - hdr 먼저 도착할 수도, body 먼저 도착할 수도 (race 무시 안 함, dst가 handle)
+   - 자료구조 자체는 expected_ring/parked 폐기해도 OK, but hash 두 개 (hdr-side, body-side) **둘 다** 필요
+   - "한쪽 큐만 있으면 충분"은 race 무시한 것
+
+4. **host bookkeeping ↑**
+   - hdr append 시점에 그 RPC의 body가 어느 (slot, offset)에 있는지 per-RPC 기록
+   - hdr_batch flush 시 그 array를 descriptor에 채움
+
+5. **descriptor 크기 ↑**
+   - (slot, offset, len) × 96 ≈ 1.5KB metadata per hdr_batch
+   - hdr_batch payload prefix로 가든 별도 small DMA로 가든 wire 추가 트래픽
+
+### 10.4.4 정리 — 합의된 방향 (high level)
+
+- **dst 자료구조**: expected_ring/parked 폐기, hash-based (src, seq) 매칭 두 개 (hdr-side, body-side)
+- **chunk slicing**: hdr.body_size 그대로 사용 (이미 그렇게 동작)
+- **host builder**: hdr/body 독립 flush, per-RPC body location 기록, hdr_batch descriptor에 body 주소 array
+- **DPU**: hdr_batch 받으면 N body DMA 발사, defer 메커니즘 유지
+- **chunk_tx slot 수명**: per-body TX_ACK 또는 slot refcount (TBD)
+
+추정 변경 규모: 400-600 LOC across host (`dpumesh_doca.c`), DPU (`dpu_worker.c`), 그리고 wire format (`mesh.h`의 mesh_hdr_req 또는 batch descriptor).
+
+## 10.5 다음 step
+
+1. **상세 설계**: §10.4.3의 5가지 issue 각각 해결 방안 명세
+2. **구현 순서 결정**: 한 번에 다 vs 단계별 (capacity bump + hash 매칭만 먼저 → 추후 host decoupling)
+3. **검증 plan**: K=512 통과 후 → K=1024, K=2048 → body size sweep (256B / 1KB / 4KB)
+
+---
+
+*문서 업데이트 (2026-05-18 session 종료) — Stage C-fix 검증 후 K=512 hang 발견 → 재설계 논의 진행*

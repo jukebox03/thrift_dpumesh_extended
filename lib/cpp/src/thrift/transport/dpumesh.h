@@ -58,7 +58,13 @@ typedef struct __attribute__((packed)) {
     int32_t  src_header_pod_id;     /* i  (always 0 for Thrift) */
     int32_t  src_body_buf_slot;     /* i */
     int32_t  src_header_buf_slot;   /* i  (always -1 for Thrift) */
-    uint8_t  _pad[12];             /* 12x */
+    /* Phase 4: paired chunk_tx slot for OP_HDR_BATCH descriptors. Lets the
+     * DPU locate the body bytes in src host's chunk_tx_buffer so it can
+     * issue the body DMA itself (single src→dst dma_copy via DPA). For all
+     * other descriptors these stay (-1, 0) — legacy callers needn't set. */
+    int32_t  src_chunk_buf_slot;    /* i  (-1 = none) */
+    uint32_t src_chunk_buf_len;     /* I  (0 if none; max ~8192) */
+    uint8_t  _pad[4];               /* 4x */
 } sw_descriptor_t;
 
 /* ====== Opaque context ====== */
