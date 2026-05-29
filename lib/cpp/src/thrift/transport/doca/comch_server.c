@@ -36,7 +36,6 @@ static void server_send_task_completion_callback(struct doca_comch_task_send *ta
 
 	objs = (struct objects *)ctx_user_data.ptr;
 	doca_pool_release(&objs->send_tasks_in_flight);
-	DOCA_LOG_DBG("Server task sent successfully");
 	if (payload_copy != NULL)
 		free(payload_copy);
 	doca_task_free(doca_comch_task_send_as_task(task));
@@ -160,7 +159,6 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 
 	comch_msg = (struct dmesh_comch_msg *)recv_buffer;
 
-	DOCA_LOG_DBG("Received message from client with type = %u", comch_msg->type);
 	switch (comch_msg->type) {
 	case DMESH_MSG_EXPORT_DESC:
 
@@ -588,9 +586,11 @@ server_send_tx_ack_to(struct objects *objs,
 int
 pods_add_connection(struct objects *objs, struct doca_comch_connection *conn)
 {
-	pthread_mutex_lock(&objs->pods_lock);
+	/* See object.h pods[] concurrency comment. Single writer (control PE
+	 * callback); registered=0 so readers will skip until pods_register
+	 * publishes the slot. num_pods bump is the visibility gate for the
+	 * slot's existence; do it last. */
 	if (objs->num_pods >= MAX_PODS) {
-		pthread_mutex_unlock(&objs->pods_lock);
 		DOCA_LOG_ERR("pods_add_connection: table full (%d)", MAX_PODS);
 		return -1;
 	}
@@ -599,10 +599,9 @@ pods_add_connection(struct objects *objs, struct doca_comch_connection *conn)
 	objs->pods[idx].connection = conn;
 	objs->pods[idx].pod_id = -1;  /* not yet registered */
 	objs->pods[idx].app_name[0] = '\0';
-	objs->pods[idx].registered = 0;
 	objs->pods[idx].remote_consumer_id = 0;
-	objs->num_pods++;
-	pthread_mutex_unlock(&objs->pods_lock);
+	__atomic_store_n(&objs->pods[idx].registered, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&objs->num_pods, idx + 1, __ATOMIC_RELEASE);
 
 	DOCA_LOG_INFO("pods_add_connection: slot %d", idx);
 	return 0;
@@ -617,30 +616,32 @@ pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn)
 	int32_t pod_id = -1;
 	int found_idx = -1;
 
-	pthread_mutex_lock(&objs->pods_lock);
-	for (int i = 0; i < objs->num_pods; i++) {
+	int n = __atomic_load_n(&objs->num_pods, __ATOMIC_ACQUIRE);
+	for (int i = 0; i < n; i++) {
 		if (objs->pods[i].connection != conn)
 			continue;
 		found_idx = i;
 		pod_id = objs->pods[i].pod_id;
 
 		/* Capture the host-exported mmap views so we can destroy them
-		 * outside the lock. These are local DPU representations of host
-		 * memory exports, created via doca_mmap_create_from_export, so
-		 * destroying them here only releases the DPU-side handle. */
+		 * after tearing the slot down. These are local DPU representations
+		 * of host memory exports, created via doca_mmap_create_from_export,
+		 * so destroying them only releases the DPU-side handle. */
 		ring_mmap    = objs->pods[i].ring_mmap;
 		remote_mmap  = objs->pods[i].remote_mmap;
 		host_rx_mmap = objs->pods[i].host_rx_mmap;
 
-		/* Mark slot dead so find_pod_by_id / find_pod_by_connection skip
-		 * it and dpu_worker error paths route to the empty branch. The
+		/* Mark slot dead. Per the object.h pods[] concurrency comment,
+		 * we tear down in PUBLICATION-INVERSE order: store registered=0
+		 * with RELEASE FIRST so any reader that subsequently observes
+		 * registered=1 is guaranteed to also see a still-valid slot. The
 		 * slot is not compacted out — keeping the index stable means
 		 * any in-flight comp_queue entries with pod_idx == i will hit
-		 * the (data == NULL) branch and ACK the originator instead of
-		 * dereferencing freed memory. Local DPU buffers and the DPA-side
-		 * ring stay registered for now (a follow-up will add REMOVE_RING
-		 * + buffer free once the DPA side is quiesced). */
-		objs->pods[i].registered      = 0;
+		 * the (connection == NULL) branch and ACK the originator instead
+		 * of dereferencing freed memory. Local DPU buffers and the
+		 * DPA-side ring stay registered for now (a follow-up will add
+		 * REMOVE_RING + buffer free once the DPA side is quiesced). */
+		__atomic_store_n(&objs->pods[i].registered, 0, __ATOMIC_RELEASE);
 		objs->pods[i].dma_ready       = 0;
 		objs->pods[i].connection      = NULL;
 		objs->pods[i].pod_id          = -1;
@@ -650,7 +651,6 @@ pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn)
 		objs->pods[i].host_rx_mmap    = NULL;
 		break;
 	}
-	pthread_mutex_unlock(&objs->pods_lock);
 
 	if (found_idx < 0)
 		return -1;
@@ -683,20 +683,23 @@ int
 pods_register(struct objects *objs, struct doca_comch_connection *conn,
               int32_t pod_id, const char *app_name)
 {
-	pthread_mutex_lock(&objs->pods_lock);
-	for (int i = 0; i < objs->num_pods; i++) {
-		if (objs->pods[i].connection == conn) {
-			objs->pods[i].pod_id = pod_id;
-			snprintf(objs->pods[i].app_name, sizeof(objs->pods[i].app_name),
-			         "%s", app_name);
-			objs->pods[i].registered = 1;
-			pthread_mutex_unlock(&objs->pods_lock);
-			DOCA_LOG_INFO("pods_register: slot %d → pod_id=%d app=%s",
-			              i, pod_id, app_name);
-			return 0;
-		}
+	int n = __atomic_load_n(&objs->num_pods, __ATOMIC_ACQUIRE);
+	for (int i = 0; i < n; i++) {
+		if (objs->pods[i].connection != conn)
+			continue;
+
+		/* Publication order: write all fields first, then the gate.
+		 * Readers that observe registered=1 are guaranteed (via ACQUIRE
+		 * load) to see the prior pod_id/app_name writes. */
+		objs->pods[i].pod_id = pod_id;
+		snprintf(objs->pods[i].app_name, sizeof(objs->pods[i].app_name),
+		         "%s", app_name);
+		__atomic_store_n(&objs->pods[i].registered, 1, __ATOMIC_RELEASE);
+
+		DOCA_LOG_INFO("pods_register: slot %d → pod_id=%d app=%s",
+		              i, pod_id, app_name);
+		return 0;
 	}
-	pthread_mutex_unlock(&objs->pods_lock);
 	DOCA_LOG_ERR("pods_register: connection not found for pod_id=%d", pod_id);
 	return -1;
 }
@@ -704,27 +707,29 @@ pods_register(struct objects *objs, struct doca_comch_connection *conn,
 struct pod_state *
 find_pod_by_id(struct objects *objs, int32_t pod_id)
 {
-	pthread_mutex_lock(&objs->pods_lock);
-	for (int i = 0; i < objs->num_pods; i++) {
-		if (objs->pods[i].registered && objs->pods[i].pod_id == pod_id) {
-			pthread_mutex_unlock(&objs->pods_lock);
+	/* Lock-free read. See object.h pods[] concurrency model. */
+	int n = __atomic_load_n(&objs->num_pods, __ATOMIC_ACQUIRE);
+	for (int i = 0; i < n; i++) {
+		if (__atomic_load_n(&objs->pods[i].registered, __ATOMIC_ACQUIRE) &&
+		    objs->pods[i].pod_id == pod_id)
 			return &objs->pods[i];
-		}
 	}
-	pthread_mutex_unlock(&objs->pods_lock);
 	return NULL;
 }
 
 struct pod_state *
 find_pod_by_connection(struct objects *objs, struct doca_comch_connection *conn)
 {
-	pthread_mutex_lock(&objs->pods_lock);
-	for (int i = 0; i < objs->num_pods; i++) {
-		if (objs->pods[i].connection == conn) {
-			pthread_mutex_unlock(&objs->pods_lock);
+	/* Lock-free read. Caller cares about the connection field (not the
+	 * registered gate) since this is used both pre-register (REGISTER
+	 * handler resolving its own conn) and post-register paths. The
+	 * connection pointer is NULL-ed in pods_remove_connection AFTER the
+	 * registered=0 RELEASE store, so observing a non-NULL connection
+	 * always corresponds to a valid slot. */
+	int n = __atomic_load_n(&objs->num_pods, __ATOMIC_ACQUIRE);
+	for (int i = 0; i < n; i++) {
+		if (objs->pods[i].connection == conn)
 			return &objs->pods[i];
-		}
 	}
-	pthread_mutex_unlock(&objs->pods_lock);
 	return NULL;
 }

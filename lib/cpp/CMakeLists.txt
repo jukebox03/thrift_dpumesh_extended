@@ -77,7 +77,6 @@ if(WITH_DOCA)
         src/thrift/transport/doca/comch_consumer.c
         src/thrift/transport/doca/comch_producer.c
         src/thrift/transport/doca/comch_msgq.c
-        src/thrift/transport/doca/dma.c
         src/thrift/transport/doca/dpa.c
     )
 else()

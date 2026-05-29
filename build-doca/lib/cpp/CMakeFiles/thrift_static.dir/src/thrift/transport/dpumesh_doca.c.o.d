@@ -110,5 +110,4 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.h \
  /opt/mellanox/doca/include/doca_comch_msgq.h \
- /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dma.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa_common.h

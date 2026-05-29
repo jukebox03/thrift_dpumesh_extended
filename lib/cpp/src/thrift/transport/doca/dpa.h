@@ -70,9 +70,6 @@ doca_error_t
 init_dpa_objects(struct objects *objs);
 
 doca_error_t
-launch_dpa_kernel(struct dmesh_doca_dpa_thread *dpa_thread);
-
-doca_error_t
 dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                             struct dmesh_doca_dpa_msgq *msgq);
 

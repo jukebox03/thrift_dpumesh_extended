@@ -104,8 +104,6 @@ file(REMOVE_RECURSE
   "CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_server.c.o.d"
   "CMakeFiles/thrift.dir/src/thrift/transport/doca/common.c.o"
   "CMakeFiles/thrift.dir/src/thrift/transport/doca/common.c.o.d"
-  "CMakeFiles/thrift.dir/src/thrift/transport/doca/dma.c.o"
-  "CMakeFiles/thrift.dir/src/thrift/transport/doca/dma.c.o.d"
   "CMakeFiles/thrift.dir/src/thrift/transport/doca/dpa.c.o"
   "CMakeFiles/thrift.dir/src/thrift/transport/doca/dpa.c.o.d"
   "CMakeFiles/thrift.dir/src/thrift/transport/doca/object.c.o"

@@ -30,7 +30,6 @@
 #include "doca/comch_consumer.h"
 #include "doca/comch_common.h"
 #include "doca/comch_msgq.h"
-#include "doca/dma.h"
 #include "doca/dpa_common.h"
 
 DOCA_LOG_REGISTER(DPUMESH_DOCA);

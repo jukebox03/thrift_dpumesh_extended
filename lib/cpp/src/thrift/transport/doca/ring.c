@@ -5,10 +5,16 @@
 #include "dpa_common.h"
 #include "object.h"
 #include "buffer.h"
-#include "dma.h"
 #include "comch_common.h"
 
 DOCA_LOG_REGISTER(RING);
+
+/* Rate-limit the "DMA ring busy" WARN. Transient valid==1 is normal
+ * backpressure; a genuinely stuck slot (head never advances, §5.10 slot leak)
+ * would otherwise flood the host log on every probe and bury the box. We log
+ * the first probe of a stuck head and then once per RING_BUSY_LOG_EVERY probes,
+ * keeping WARN severity. Must be a power of two (used as a mask). */
+#define RING_BUSY_LOG_EVERY 4096u
 
 int setup_dma_ring(struct objects *objs, size_t size)
 {
@@ -93,12 +99,23 @@ struct dma_desc *get_next_dma_desc(struct dma_ring *ring)
     struct dma_desc *desc = ring->descs + ring->head;
 
     if (desc->valid) {
-        DOCA_LOG_WARN("DMA ring busy at head=%u (size=%u)", ring->head, ring->size);
+        /* Rate-limited: reset the probe counter whenever head moves so a
+         * climbing "[stuck xN]" on the SAME head is the slot-leak signature,
+         * while ordinary transient backpressure logs at most once. */
+        static uint32_t busy_head = 0xFFFFFFFFu;
+        static uint64_t busy_probes = 0;
+        if (ring->head != busy_head) {
+            busy_head = ring->head;
+            busy_probes = 0;
+        }
+        if ((busy_probes++ & (RING_BUSY_LOG_EVERY - 1)) == 0)
+            DOCA_LOG_WARN("DMA ring busy at head=%u (size=%u) [stuck x%llu]",
+                          ring->head, ring->size,
+                          (unsigned long long)busy_probes);
         return NULL;
     }
 
     uint32_t next_head = (ring->head + 1) % ring->size;
     ring->head = next_head;
-    DOCA_LOG_DBG("Get next DMA desc - head: %u, desc: %p", ring->head, desc);
     return desc;
 }

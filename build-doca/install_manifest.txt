@@ -79,7 +79,6 @@
 /usr/local/include/thrift/transport/doca/ring.h
 /usr/local/include/thrift/transport/doca/buffer.h
 /usr/local/include/thrift/transport/doca/comch_common.h
-/usr/local/include/thrift/transport/doca/dma.h
 /usr/local/include/thrift/transport/doca/dpu_worker.h
 /usr/local/include/thrift/transport/doca/comch_client.h
 /usr/local/include/thrift/transport/doca/object.h

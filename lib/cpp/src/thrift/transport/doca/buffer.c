@@ -208,7 +208,7 @@ alloc_buffer_and_set_mmap(struct doca_mmap **mmap, struct doca_dev *dev,
 
 free_buffer:
     free(*buffer);
-    buffer = NULL;
+    *buffer = NULL;
 destroy_mmap:
     doca_mmap_destroy(*mmap);
     *mmap = NULL;
