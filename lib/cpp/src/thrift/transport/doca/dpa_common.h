@@ -104,6 +104,10 @@ struct comch_dma_comp_msg {
 /* Sent as immediate data via doca_dpa_dev_comch_producer_dma_copy() — HW max 32 bytes */
 _Static_assert(sizeof(struct comch_dma_comp_msg) == 16,
                "comch_dma_comp_msg must pack to exactly 16 bytes (one WQE BB)");
+/* src/dst_pod_id travel as int8 on the wire (dst==-1 is the echo sentinel), so
+ * pod_id must fit in int8. Fail-fast if MAX_PODS ever outgrows that. */
+_Static_assert(MAX_PODS <= 127,
+               "pod_id wire format is int8 in comch_dma_comp_msg; MAX_PODS must be <= 127");
 
 typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_comch_producer_t;

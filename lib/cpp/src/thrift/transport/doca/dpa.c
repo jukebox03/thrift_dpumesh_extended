@@ -47,7 +47,6 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 				       union doca_data ctx_user_data)
 {
 	(void)task_user_data;
-    static uint64_t recv_cb_count = 0;
 
 	doca_error_t result;
     uint32_t data_len;
@@ -60,7 +59,6 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     /* DPA sends comch_dma_comp_msg directly (<=32 bytes) rather than the full
      * comch_msg union, so read raw bytes and dispatch by the leading type field. */
     uint8_t *raw = (uint8_t *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
-    recv_cb_count++;
 
     if (raw == NULL) {
         DOCA_LOG_ERR("DPA MsgQ recv callback entered with NULL imm data (len=%u)", data_len);
@@ -115,13 +113,11 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
              * End-node slot-based admission keeps in-flight bytes ≤ buf_size
              * so DPA cannot lap unconsumed data. */
             entry.buf_offset = body_offset;
-            entry.pod_idx = -1; /* will be resolved by pod lookup */
-            for (int pi = 0; pi < objs->num_pods; pi++) {
-                if (objs->pods[pi].pod_id == src_pod_id) {
-                    entry.pod_idx = pi;
-                    break;
-                }
-            }
+            /* src_pod was already resolved above via find_pod_by_id (ACQUIRE-
+             * gated); derive its index directly instead of an unguarded re-scan
+             * of pods[] (which could observe a half-published slot and runs on
+             * the per-RTT hot path). */
+            entry.pod_idx = (int)(src_pod - objs->pods);
 
             if (comp_queue_enqueue(&objs->comp_queue, &entry) != 0) {
                 DOCA_LOG_ERR("Completion queue full, dropping req_id=%u (src=%d, dst=%d)",
