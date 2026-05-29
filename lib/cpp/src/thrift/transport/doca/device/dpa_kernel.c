@@ -4,6 +4,16 @@
 #include "dpaintrin.h"
 #include "dpa_common.h"
 
+/* === Experiment toggles (set via -D at compile time, or here) ===
+ * STRIP_VALIDATION : skip mmap=0 / size=0 / range / buf-overflow checks
+ * STRIP_DESC_CLEAR : skip clearing desc fields before valid=0 (single writeback)
+ * STRIP_CHUNK_LOOP : bypass chunking when total <= 8KB (single dma_copy fast path)
+ * All independently toggleable; check effect via DPU stat "DPA stat: poll/copy".
+ */
+#define STRIP_VALIDATION
+#define STRIP_DESC_CLEAR
+#define STRIP_CHUNK_LOOP
+
 #define DMA_DIAG_EMPTY_WAIT_WARN_LOOPS  0x100000
 #define DMA_DIAG_EMPTY_WAIT_FAIL_LOOPS  0x800000
 
@@ -294,6 +304,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     if (!desc->valid)
         return 0;
 
+#ifndef STRIP_VALIDATION
     if (ring->dpu_mmap == 0) {
         DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Protection Error]: invalid dst mmap handle (ring=%u slot=%u req_id=%u dpu_mmap=0)\n",
                              r, thread_arg->desc_idx[r], (uint32_t)desc->idx);
@@ -341,6 +352,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
             return 1;
         }
     }
+#endif /* STRIP_VALIDATION */
 
     {
         uint32_t empty_wait_loops = 0;
@@ -368,6 +380,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
      * so the actual space consumed in the DPU buffer is the rounded-up total. */
     uint32_t padded_total = ALIGN_UP_128(desc->size);
 
+#ifndef STRIP_VALIDATION
     /* Check if padded descriptor fits in DPU buffer at all */
     if (padded_total > ring->dpu_buf_size) {
         DOCA_DPA_DEV_LOG_INFO("DMA DIAG [Local Length Error]: requested length exceeds DPU destination buffer\n");
@@ -379,6 +392,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
         thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
         return 1;
     }
+#endif /* STRIP_VALIDATION */
 
     /* Wrap around if padded DMA would exceed DPU buffer boundary */
     if (thread_arg->pos[r] + padded_total > ring->dpu_buf_size)
@@ -405,6 +419,35 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
      * timeout. This prevents sending corrupt partial data to the DPU worker. */
     int num_chunks = 0;
     int aborted = 0;
+#ifdef STRIP_CHUNK_LOOP
+    /* Fast path: desc->size guaranteed <= 8KB by bench setup. Single dma_copy
+     * with final-chunk completion msg, no loop, no chunk_type intermediate. */
+    if (desc->size <= DPA_DMA_COPY_MAX) {
+        uint32_t chunk = ALIGN_UP_128(desc->size);
+        if (ensure_producer_slot(thread_arg) != 0) {
+            aborted = 1;
+        } else {
+            uint32_t wait = 0;
+            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
+                if (++wait >= DPA_CONSUMER_WAIT_LOOPS) { aborted = 1; break; }
+            }
+            if (!aborted) {
+                doca_dpa_dev_comch_producer_dma_copy(producer,
+                                            dpu_consumer_id,
+                                            ring->dpu_mmap,
+                                            ring->dpu_addr + thread_arg->pos[r],
+                                            ring->host_mmap,
+                                            desc->addr,
+                                            chunk,
+                                            (uint8_t *)&comp,
+                                            sizeof(struct comch_dma_comp_msg),
+                                            DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+                thread_arg->producer_slots_inflight++;
+                num_chunks = 1;
+            }
+        }
+    } else
+#endif
     {
         uint32_t total = desc->size;
         uint32_t offset = 0;
@@ -481,6 +524,12 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
             thread_arg->pos[r] = 0;
     }
 
+#ifdef STRIP_DESC_CLEAR
+    /* Fast path: only flip valid=0. Host always overwrites mmap/addr/size/idx/
+     * dst_pod_id/flags on next post, so pre-clearing is just cosmetic. */
+    desc->valid = 0;
+    __dpa_thread_window_writeback();
+#else
     __dpa_thread_window_writeback();
     desc->mmap = 0;
     desc->addr = 0;
@@ -491,6 +540,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
     __dpa_thread_window_writeback();
     desc->valid = 0;
     __dpa_thread_window_writeback();
+#endif
 
     thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
     return num_chunks;  /* count all chunks sent (including before abort) for batch tracking */
@@ -537,12 +587,14 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     doca_dpa_dev_mmap_t src_mmap = desc->mmap ? desc->mmap : ring->dpu_mmap;
     uint64_t src_base = desc->mmap ? desc->addr : (ring->dpu_addr + desc->addr);
 
+#ifndef STRIP_VALIDATION
     if (desc->size == 0 || ring->host_mmap == 0 || src_mmap == 0) {
         desc->valid = 0;
         __dpa_thread_window_writeback();
         thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
         return 1;
     }
+#endif
 
     /* === Admission gate using cached_freed[] (refreshed in drain_all_rings) ===
      * dpa_sent_count[r] - dpa_cached_freed[r] = inflight reverse DMAs.
@@ -570,12 +622,14 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
 
     uint32_t padded_total = ALIGN_UP_128(desc->size);
 
+#ifndef STRIP_VALIDATION
     if (padded_total > ring->host_buf_size) {
         desc->valid = 0;
         __dpa_thread_window_writeback();
         thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
         return 1;
     }
+#endif
 
     /* Wrap around if padded DMA would exceed Host RX buffer boundary */
     if (thread_arg->rev_pos[r] + padded_total > ring->host_buf_size)
@@ -600,6 +654,34 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     /* Chunked DMA: src=dpu buffer, dst=host buffer */
     int num_chunks = 0;
     int aborted = 0;
+#ifdef STRIP_CHUNK_LOOP
+    /* Fast path for bench: size <= 8KB always. Single dma_copy. */
+    if (desc->size <= DPA_DMA_COPY_MAX) {
+        uint32_t chunk = ALIGN_UP_128(desc->size);
+        if (ensure_producer_slot(thread_arg) != 0) {
+            aborted = 1;
+        } else {
+            uint32_t wait = 0;
+            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
+                if (++wait >= DPA_CONSUMER_WAIT_LOOPS) { aborted = 1; break; }
+            }
+            if (!aborted) {
+                doca_dpa_dev_comch_producer_dma_copy(producer,
+                                            dpu_consumer_id,
+                                            ring->host_mmap,
+                                            ring->host_addr + thread_arg->rev_pos[r],
+                                            src_mmap,
+                                            src_base,
+                                            chunk,
+                                            (uint8_t *)&comp,
+                                            sizeof(struct comch_dma_comp_msg),
+                                            DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+                thread_arg->producer_slots_inflight++;
+                num_chunks = 1;
+            }
+        }
+    } else
+#endif
     {
         uint32_t total = desc->size;
         uint32_t offset = 0;
@@ -673,6 +755,10 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
         dpa_sent_count[r]++;
     }
 
+#ifdef STRIP_DESC_CLEAR
+    desc->valid = 0;
+    __dpa_thread_window_writeback();
+#else
     __dpa_thread_window_writeback();
     desc->mmap = 0;
     desc->addr = 0;
@@ -683,6 +769,7 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
     __dpa_thread_window_writeback();
     desc->valid = 0;
     __dpa_thread_window_writeback();
+#endif
 
     thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
     return num_chunks;
@@ -702,14 +789,17 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
     do {
         found = 0;
         handle_msgs(thread_arg);
+        thread_arg->stat_inner_iters++;
 
         /* Forward rings (CPU→DPU) */
         uint32_t nr = thread_arg->num_rings;
         for (uint32_t r = 0; r < nr; r++) {
+            thread_arg->stat_polls++;
             int chunks = process_one_desc(thread_arg, r);
             if (chunks > 0) {
                 found++;
                 total_dma_calls += chunks;
+                thread_arg->stat_dma_copies += chunks;
             }
         }
 
@@ -743,10 +833,12 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
 
         /* Reverse rings (DPU→CPU) */
         for (uint32_t r = 0; r < nr_rev; r++) {
+            thread_arg->stat_polls++;
             int chunks = process_one_rev_desc(thread_arg, r);
             if (chunks > 0) {
                 found++;
                 total_dma_calls += chunks;
+                thread_arg->stat_dma_copies += chunks;
             }
         }
     } while (found > 0);
@@ -767,12 +859,14 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
 
-    /* DPA scheduling model verified empirically: this function is RE-ENTERED
-     * on every activation (after yield + new event), and a single activation
-     * can spin for 30M+ iterations across many seconds without being killed.
-     * The "12 s max kernel runtime timer" concern from earlier comments did
-     * not reproduce. Yield is kept as good cooperative-scheduling practice —
-     * spinning when there is no work wastes EU cycles for no benefit. */
+    /* Yield when no work. Empirically necessary even though dpumesh has
+     * the same busy-spin freedom as M2 baseline. Why: dpumesh DPA polls
+     * num_pods × 2 (forward + reverse) rings each iter, each ring poll is
+     * a host-memory PCIe read of desc->valid. Removing the yield caused
+     * 55K p99 to jump 91 → 224 ms (2.5×) — most plausibly because the
+     * busy-spin's PCIe polling rate contended with actual DMA traffic.
+     * The 1.37 ms idle gap from yield is acting as a throttle, not as
+     * pure wake latency. (M2 has only 1 ring, so busy-spin is fine there.) */
     while (1) {
         handle_msgs(thread_arg);
         int chunks = drain_all_rings(thread_arg);

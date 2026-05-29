@@ -14,11 +14,13 @@
 #include <doca_log.h>
 #include <doca_dev.h>
 #include <doca_pe.h>
+#include <doca_dpa.h>
 
 #include <time.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stddef.h>
 
 DOCA_LOG_REGISTER(DPU_WORKER);
 
@@ -121,8 +123,6 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *src_pod,
     __sync_synchronize();
     dma->valid = 1;
 
-    DOCA_LOG_DBG("dpu_enqueue_reverse_dma: src_pod=%d dst_pod=%d offset=%u body_len=%u",
-                 src_pod->pod_id, dst_pod->pod_id, src_buf_offset, body_len);
     return DOCA_SUCCESS;
 }
 
@@ -201,10 +201,6 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
         send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id);
         return -1;
     }
-
-    DOCA_LOG_DBG("%s %u bytes to pod %d for req_id=%u via reverse DMA",
-                 echo_mode ? "Echo" : "Forwarded",
-                 payload_len, echo_mode ? src_pod_id : dst_pod_id, req_id);
 
     /* Success: TX_ACK will fire from process_rev_notify_entry on reverse
      * completion. The src dma_buffer slot stays held until then. */
@@ -319,8 +315,6 @@ process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
                                           : find_pod_by_id(objs, entry->src_pod_id);
     send_or_defer_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id);
 
-    DOCA_LOG_DBG("REV_NOTIFY: sent DMA_COMPLETION to pod %d (req_id=%u pos=%u len=%u)",
-                 target_id, entry->req_id, entry->buf_offset, entry->length);
     return 1;
 }
 
@@ -336,20 +330,22 @@ process_completion_queue(struct objects *objs, int max_batch)
 {
     int processed = 0;
 
+    /* Per-batch (not per-entry) PE progress. Rationale:
+     *   Send pool (CC_SEND_TASK_NUM=8192) and consumer recv pool
+     *   (CC_DATA_PATH_TASK_NUM=8192) are both ≫ max_batch=128. A batch
+     *   consumes at most 128 entries × 2 sends (DMA_COMPLETION + TX_ACK)
+     *   = 256 send slots, well inside the pool. Likewise DPA cannot
+     *   exhaust the 8192 consumer recv pool within one batch.
+     *
+     *   The earlier per-entry progress was a leftover from when these
+     *   pools were 1024 slots — at that depth a 128-entry batch could
+     *   plausibly drain the pool mid-batch. With 8192-slot pools the
+     *   cost (256 extra doca_pe_progress calls per main-loop iter,
+     *   dominating the flame in §6.5) outweighs the safety margin. */
     while (processed < max_batch) {
         dpu_comp_entry_t *entry = comp_queue_peek(&objs->comp_queue);
         if (!entry)
             break;
-
-        /* Progress both PEs between entries:
-         * - pe: process send task completions (frees send pool slots)
-         * - consumer_pe: resubmit DPA→DPU recv tasks so DPA doesn't stall
-         *   waiting for consumer availability. Critical at high load where
-         *   forward+reverse share one producer/consumer (20000 dma_copy/s
-         *   at 5000 RPS 8K). Without this, DPA exhausts 1024 recv tasks
-         *   during the batch and stalls. */
-        doca_pe_progress(objs->pe);
-        doca_pe_progress(objs->consumer_pe);
 
         int result;
         if (entry->entry_type == COMP_ENTRY_REV_NOTIFY) {
@@ -381,10 +377,10 @@ run_dpu_worker(struct objects *objs)
 
     DOCA_LOG_INFO("Starting DPU worker");
 
-    /* Init pods table */
+    /* Init pods table. See object.h pods[] concurrency model — lock-free
+     * with atomic publication on `registered`; no mutex needed. */
     memset(objs->pods, 0, sizeof(objs->pods));
     objs->num_pods = 0;
-    pthread_mutex_init(&objs->pods_lock, NULL);
 
     /* Init deferred completion queue + backpressure state */
     objs->comp_queue.head = 0;
@@ -531,6 +527,32 @@ run_dpu_worker(struct objects *objs)
                 DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s, pods: %d, cq_depth: %u, deferred: %d",
                               elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt, objs->num_pods,
                               cq_depth, objs->num_deferred_recv);
+            }
+
+            /* === Diagnostic: read DPA polling counters via d2h_memcpy ===
+             * Computes polls/dma_copy ratio to validate whether dpumesh's
+             * 4-ring pattern actually amortizes polling (~1 read/dma_copy)
+             * or pays full 4 reads per dma_copy. */
+            if (objs->dpa_thread_running && objs->dpa_thread &&
+                objs->dpa_thread->arg && objs->sent_msg_cnt + objs->recv_msg_cnt > 1000) {
+                static uint64_t prev_iters = 0, prev_polls = 0, prev_copies = 0;
+                struct { uint64_t iters; uint64_t polls; uint64_t copies; } s;
+                doca_dpa_dev_uintptr_t addr = objs->dpa_thread->arg +
+                    offsetof(struct dpa_thread_arg, stat_inner_iters);
+                doca_error_t rc = doca_dpa_d2h_memcpy(objs->dpa_thread->dpa,
+                                                     &s, addr, sizeof(s));
+                if (rc == DOCA_SUCCESS) {
+                    uint64_t d_iters = s.iters - prev_iters;
+                    uint64_t d_polls = s.polls - prev_polls;
+                    uint64_t d_copies = s.copies - prev_copies;
+                    double ratio = d_copies > 0
+                        ? (double)d_polls / (double)d_copies : 0.0;
+                    DOCA_LOG_INFO("DPA stat: iters=%lu polls=%lu copies=%lu poll/copy=%.3f",
+                                  d_iters, d_polls, d_copies, ratio);
+                    prev_iters  = s.iters;
+                    prev_polls  = s.polls;
+                    prev_copies = s.copies;
+                }
             }
 
             objs->sent_msg_cnt = 0;

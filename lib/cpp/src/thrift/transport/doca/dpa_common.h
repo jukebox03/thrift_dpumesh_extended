@@ -55,6 +55,11 @@ struct dpa_thread_arg {
 	struct dpa_ring_info rev_rings[MAX_DPA_RINGS];
 	uint32_t rev_desc_idx[MAX_DPA_RINGS];
 	uint32_t rev_pos[MAX_DPA_RINGS];
+
+	/* === Diagnostic counters (DPA writes, ARM reads via d2h_memcpy) === */
+	volatile uint64_t stat_inner_iters;   /* drain_all_rings do-while iter count */
+	volatile uint64_t stat_polls;         /* PCIe desc->valid reads (fwd+rev rings) */
+	volatile uint64_t stat_dma_copies;    /* dma_copy chunks issued */
 } __attribute__((__packed__, aligned(8)));
 
 /* ====== Per-message payload layout ======

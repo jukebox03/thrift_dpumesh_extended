@@ -63,9 +63,6 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     uint8_t *raw = (uint8_t *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
     recv_cb_count++;
 
-    DOCA_LOG_DBG("DPA MsgQ recv callback #%lu: imm_len=%u msg_ptr=%p",
-                 recv_cb_count, data_len, (void *)raw);
-
     if (raw == NULL) {
         DOCA_LOG_ERR("DPA MsgQ recv callback entered with NULL imm data (len=%u)", data_len);
         goto resubmit_recv_task;
@@ -77,7 +74,6 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     }
 
     enum comch_msg_type msg_type = *(enum comch_msg_type *)raw;
-    DOCA_LOG_DBG("DPA MsgQ recv message type: %u", (unsigned int)msg_type);
 
     switch (msg_type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED: {
@@ -102,9 +98,6 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
              * length / pos / req_id / pod ids / flags travel via comp_msg. */
             uint32_t payload_len = comp_msg->length;
             uint32_t body_offset = comp_msg->pos;
-
-            DOCA_LOG_DBG("DMA completed: src_pod=%d, dst_pod=%d, req_id=%u, pos=%u, body_len=%u",
-                         src_pod_id, dst_pod_id, req_id, comp_msg->pos, payload_len);
 
             /* Enqueue for deferred processing in main loop.
              * TX_ACK + reverse DMA routing handled there — never send
@@ -133,9 +126,6 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                 DOCA_LOG_ERR("Completion queue full, dropping req_id=%u (src=%d, dst=%d)",
                              req_id, src_pod_id, dst_pod_id);
                 /* zero-copy: no heap data to free */
-            } else {
-                DOCA_LOG_DBG("Enqueued completion: req_id=%u src=%d dst=%d len=%u",
-                             req_id, src_pod_id, dst_pod_id, payload_len);
             }
             break;
         }
@@ -166,16 +156,10 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             if (comp_queue_enqueue(&objs->comp_queue, &rev_entry) != 0) {
                 DOCA_LOG_ERR("Completion queue full, dropping REV_DMA req_id=%u",
                              rev_comp->req_id);
-            } else {
-                DOCA_LOG_DBG("Enqueued REV_DMA completion: req_id=%u src=%d dst=%d len=%u pos=%u",
-                             rev_comp->req_id, rev_comp->src_pod_id,
-                             rev_comp->dst_pod_id, rev_comp->length, rev_comp->pos);
             }
             break;
         }
         case COMCH_MSG_TYPE_TRIGGER:
-            DOCA_LOG_DBG("DPA MsgQ recv callback ping received (type=%u)",
-                         (unsigned int)msg_type);
             break;
         default:
             DOCA_LOG_ERR("Received unknown message type: %u", msg_type);
@@ -253,7 +237,6 @@ static void dmesh_doca_dpa_msgq_send_cb(struct doca_comch_producer_task_send *se
     struct objects *objs = (struct objects *)ctx_user_data.ptr;
     objs->sent_msg_cnt++;
 
-    DOCA_LOG_DBG("DPA MsgQ send completion callback: sent_msg_cnt=%d", objs->sent_msg_cnt);
 	if (payload_copy != NULL)
 		free(payload_copy);
     

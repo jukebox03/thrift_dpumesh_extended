@@ -49,32 +49,36 @@ typedef struct {
     uint32_t tail;  /* enqueue index */
 } dpu_comp_queue_t;
 
-static inline int comp_queue_full(const dpu_comp_queue_t *q) {
+/* always_inline: -O2 was leaving these as separate call frames in perf;
+ * forcing inline collapses them into the caller. */
+#define CQ_INLINE static inline __attribute__((always_inline))
+
+CQ_INLINE int comp_queue_full(const dpu_comp_queue_t *q) {
     return ((q->tail + 1) % DPU_COMP_QUEUE_SIZE) == q->head;
 }
 
-static inline int comp_queue_empty(const dpu_comp_queue_t *q) {
+CQ_INLINE int comp_queue_empty(const dpu_comp_queue_t *q) {
     return q->head == q->tail;
 }
 
-static inline int comp_queue_enqueue(dpu_comp_queue_t *q, const dpu_comp_entry_t *e) {
+CQ_INLINE int comp_queue_enqueue(dpu_comp_queue_t *q, const dpu_comp_entry_t *e) {
     if (comp_queue_full(q)) return -1;
     q->entries[q->tail] = *e;
     q->tail = (q->tail + 1) % DPU_COMP_QUEUE_SIZE;
     return 0;
 }
 
-static inline dpu_comp_entry_t *comp_queue_peek(dpu_comp_queue_t *q) {
+CQ_INLINE dpu_comp_entry_t *comp_queue_peek(dpu_comp_queue_t *q) {
     if (comp_queue_empty(q)) return NULL;
     return &q->entries[q->head];
 }
 
-static inline void comp_queue_dequeue(dpu_comp_queue_t *q) {
+CQ_INLINE void comp_queue_dequeue(dpu_comp_queue_t *q) {
     if (!comp_queue_empty(q))
         q->head = (q->head + 1) % DPU_COMP_QUEUE_SIZE;
 }
 
-static inline uint32_t comp_queue_usage(const dpu_comp_queue_t *q) {
+CQ_INLINE uint32_t comp_queue_usage(const dpu_comp_queue_t *q) {
     if (q->tail >= q->head)
         return q->tail - q->head;
     return DPU_COMP_QUEUE_SIZE - q->head + q->tail;
@@ -238,10 +242,32 @@ struct objects {
     void (*rx_data_hook)(void *hook_ctx, const uint8_t *data, uint32_t len);
     void *rx_hook_ctx;
 
-    /* Multi-pod table (DPU only) */
+    /* Multi-pod table (DPU only).
+     *
+     * Concurrency model: lock-free with publication ordering on `registered`.
+     *
+     *   1. Slots are append-only: pods_add_connection writes into
+     *      pods[num_pods] then increments num_pods. Slots are NEVER compacted
+     *      or recycled, so &pods[i] is a stable pointer for the lifetime of
+     *      the process. Stale comp_queue entries holding pod_idx remain
+     *      dereferenceable.
+     *   2. `registered` is the publication gate. Writers set every other
+     *      field of pod_state FIRST, then publish via
+     *      __atomic_store_n(&pods[i].registered, 1, __ATOMIC_RELEASE).
+     *      Disconnect tears down in the opposite order: store registered=0
+     *      with RELEASE first, then NULL-ify connection/mmap/etc.
+     *   3. Readers (find_pod_by_id / find_pod_by_connection / hot path)
+     *      observe via __atomic_load_n(&pods[i].registered, __ATOMIC_ACQUIRE).
+     *      Seeing registered=1 guarantees visibility of the prior field
+     *      writes. Seeing registered=0 is treated as "not found".
+     *
+     * Single writer (control PE callbacks) is currently assumed. Multi-writer
+     * pods_add_connection would need __atomic_fetch_add on num_pods to claim
+     * a slot atomically; not needed now since all callbacks dispatch on the
+     * one PE thread that runs doca_pe_progress().
+     */
     struct pod_state pods[MAX_PODS];
     int num_pods;
-    pthread_mutex_t pods_lock;
 
     /* Deferred completion queue (DPU only) */
     dpu_comp_queue_t comp_queue;
