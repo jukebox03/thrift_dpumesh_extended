@@ -55,11 +55,6 @@ struct dpa_thread_arg {
 	struct dpa_ring_info rev_rings[MAX_DPA_RINGS];
 	uint32_t rev_desc_idx[MAX_DPA_RINGS];
 	uint32_t rev_pos[MAX_DPA_RINGS];
-
-	/* === Diagnostic counters (DPA writes, ARM reads via d2h_memcpy) === */
-	volatile uint64_t stat_inner_iters;   /* drain_all_rings do-while iter count */
-	volatile uint64_t stat_polls;         /* PCIe desc->valid reads (fwd+rev rings) */
-	volatile uint64_t stat_dma_copies;    /* dma_copy chunks issued */
 } __attribute__((__packed__, aligned(8)));
 
 /* ====== Per-message payload layout ======
@@ -78,41 +73,40 @@ struct dpa_thread_arg {
 /* ====== Comch message types (DPU ↔ DPA) ====== */
 
 enum comch_msg_type {
-	COMCH_MSG_TYPE_DMA_REQ = 1,
 	COMCH_MSG_TYPE_DMA_COMPLETED = 2,
 	COMCH_MSG_TYPE_ADD_RING = 3,
 	COMCH_MSG_TYPE_TRIGGER = 4,   /* DPU→DPA: wake up thread (no payload) */
-	COMCH_MSG_TYPE_DMA_CHUNK = 5, /* DPA→DPU: intermediate DMA chunk landed (no action needed) */
 	COMCH_MSG_TYPE_ADD_REV_RING = 6, /* DPU→DPA: add reverse (DPU→CPU) ring */
 	COMCH_MSG_TYPE_REV_DMA_COMPLETED = 7, /* DPA→DPU: reverse DMA completed (DPU→CPU) */
 };
 
+/* Packed to exactly 16 bytes (one WQE BB) to minimize PCIe immediate-data cost
+ * on dma_copy. Field widths chosen to preserve semantics:
+ *   type        : 1B  — only 2 values used (DMA_COMPLETED, REV_DMA_COMPLETED)
+ *   flags       : 1B  — OP_REQUEST/OP_RESPONSE + CASE_* (bit-flag set)
+ *   src/dst_pod : 1B  — MAX_PODS=32 + -1 sentinel fits in int8
+ *   pos         : 4B  — buffer offset (DPU buf / Host RX buf)
+ *   length      : 4B  — DMA'd body length (≤ DPUMESH_SLOT_SIZE_DEFAULT)
+ *   req_id      : 4B  — Thrift stream/request ID (wraparound counter)
+ * All 4B fields land on their natural alignment so no __attribute__((packed)) is
+ * needed and DPA accesses stay aligned. Originally 28B (4B enum + 5× uint32 +
+ * int8 + 3B pad); §11.3 E5 showed 12B→24B = -8.6% throughput, so dropping the
+ * struct from 32B HW quantum to 16B HW quantum is the inverse of that. */
 struct comch_dma_comp_msg {
-	enum comch_msg_type type;
-	uint32_t pos;
-	uint32_t length;
-	uint32_t req_id;      /* Thrift stream/request ID */
-	int32_t  src_pod_id;  /* originating pod */
-	int32_t  dst_pod_id;  /* destination pod */
+	uint8_t  type;        /* one of: COMCH_MSG_TYPE_DMA_COMPLETED, _REV_DMA_COMPLETED */
 	int8_t   flags;       /* OP_REQUEST / OP_RESPONSE + CASE_* */
+	int8_t   src_pod_id;  /* originating pod */
+	int8_t   dst_pod_id;  /* destination pod */
+	uint32_t pos;         /* buffer offset (forward: DPU dpu_buf; reverse: Host RX) */
+	uint32_t length;      /* payload length */
+	uint32_t req_id;      /* Thrift stream/request ID */
 };
-/* Sent as immediate data via doca_dpa_dev_comch_producer_dma_copy() — max 32 bytes */
-_Static_assert(sizeof(struct comch_dma_comp_msg) <= 32,
-               "comch_dma_comp_msg must fit in 32-byte immediate data limit");
+/* Sent as immediate data via doca_dpa_dev_comch_producer_dma_copy() — HW max 32 bytes */
+_Static_assert(sizeof(struct comch_dma_comp_msg) == 16,
+               "comch_dma_comp_msg must pack to exactly 16 bytes (one WQE BB)");
 
 typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_comch_producer_t;
-
-struct comch_dma_req_msg {
-	enum comch_msg_type type;
-	doca_dpa_dev_comch_producer_t dpa_producer;
-	doca_dpa_dev_completion_t dpa_producer_comp;
-	doca_dpa_dev_mmap_t src_mmap;
-	doca_dpa_dev_mmap_t dst_mmap;
-	uint64_t src_addr;
-	uint64_t dst_addr;
-	uint32_t length;
-} __attribute__((__packed__, aligned(8)));
 
 struct comch_add_ring_msg {
 	enum comch_msg_type type;
@@ -130,7 +124,6 @@ struct comch_msg {
 	enum comch_msg_type type;
 	union
 	{
-		struct comch_dma_req_msg dma_req_msg;
 		struct comch_dma_comp_msg dma_comp_msg;
 		struct comch_add_ring_msg add_ring_msg;
 		struct comch_add_rev_ring_msg add_rev_ring_msg;

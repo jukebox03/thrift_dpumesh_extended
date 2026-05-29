@@ -34,7 +34,6 @@ srcs = [
     'comch_producer.c',
     'comch_msgq.c',
     'dpa.c',
-    'dma.c',
 ]
 
 # Build DPA kernel via DPACC

@@ -5,7 +5,6 @@
 #include "dpa_common.h"
 #include "object.h"
 #include "buffer.h"
-#include "dma.h"
 #include "comch_common.h"
 
 DOCA_LOG_REGISTER(RING);

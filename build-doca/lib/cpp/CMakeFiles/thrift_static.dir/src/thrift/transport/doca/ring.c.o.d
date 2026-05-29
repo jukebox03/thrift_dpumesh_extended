@@ -96,5 +96,4 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o: \
  /opt/mellanox/doca/include/doca_buf.h \
  /opt/mellanox/doca/include/doca_buf_pool.h \
  /opt/mellanox/doca/include/doca_buf_inventory.h \
- /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dma.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h

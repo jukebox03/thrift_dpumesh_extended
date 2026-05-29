@@ -68,12 +68,14 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
         goto resubmit_recv_task;
     }
 
-    if (data_len < sizeof(enum comch_msg_type)) {
+    /* Type field is the first byte (uint8_t in the packed comch_dma_comp_msg).
+     * Any imm payload of ours has at least the 1-byte type at offset 0. */
+    if (data_len < 1) {
         DOCA_LOG_ERR("DPA MsgQ recv: imm data too short for type field (len=%u)", data_len);
         goto resubmit_recv_task;
     }
 
-    enum comch_msg_type msg_type = *(enum comch_msg_type *)raw;
+    enum comch_msg_type msg_type = (enum comch_msg_type)raw[0];
 
     switch (msg_type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED: {
@@ -129,9 +131,6 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             }
             break;
         }
-        case COMCH_MSG_TYPE_DMA_CHUNK:
-            /* Intermediate DMA chunk landed — no action needed, just resubmit recv */
-            break;
         case COMCH_MSG_TYPE_REV_DMA_COMPLETED: {
             /* Reverse DMA completed (DPU→CPU): DPA has DMA'd data from DPU TX
              * buffer to Host RX buffer. Enqueue for DPU worker to forward
@@ -1097,7 +1096,6 @@ destroy_buf_arr:
 }
 
 #include "buffer.h"
-#include "dma.h"
 #include "comch_common.h"
 
 /*

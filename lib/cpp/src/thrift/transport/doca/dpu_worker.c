@@ -8,19 +8,16 @@
 #include "comch_msgq.h"
 #include "buffer.h"
 #include "ring.h"
-#include "dma.h"
 #include "../dpumesh.h"
 
 #include <doca_log.h>
 #include <doca_dev.h>
 #include <doca_pe.h>
-#include <doca_dpa.h>
 
 #include <time.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <stddef.h>
 
 DOCA_LOG_REGISTER(DPU_WORKER);
 
@@ -527,32 +524,6 @@ run_dpu_worker(struct objects *objs)
                 DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s, pods: %d, cq_depth: %u, deferred: %d",
                               elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt, objs->num_pods,
                               cq_depth, objs->num_deferred_recv);
-            }
-
-            /* === Diagnostic: read DPA polling counters via d2h_memcpy ===
-             * Computes polls/dma_copy ratio to validate whether dpumesh's
-             * 4-ring pattern actually amortizes polling (~1 read/dma_copy)
-             * or pays full 4 reads per dma_copy. */
-            if (objs->dpa_thread_running && objs->dpa_thread &&
-                objs->dpa_thread->arg && objs->sent_msg_cnt + objs->recv_msg_cnt > 1000) {
-                static uint64_t prev_iters = 0, prev_polls = 0, prev_copies = 0;
-                struct { uint64_t iters; uint64_t polls; uint64_t copies; } s;
-                doca_dpa_dev_uintptr_t addr = objs->dpa_thread->arg +
-                    offsetof(struct dpa_thread_arg, stat_inner_iters);
-                doca_error_t rc = doca_dpa_d2h_memcpy(objs->dpa_thread->dpa,
-                                                     &s, addr, sizeof(s));
-                if (rc == DOCA_SUCCESS) {
-                    uint64_t d_iters = s.iters - prev_iters;
-                    uint64_t d_polls = s.polls - prev_polls;
-                    uint64_t d_copies = s.copies - prev_copies;
-                    double ratio = d_copies > 0
-                        ? (double)d_polls / (double)d_copies : 0.0;
-                    DOCA_LOG_INFO("DPA stat: iters=%lu polls=%lu copies=%lu poll/copy=%.3f",
-                                  d_iters, d_polls, d_copies, ratio);
-                    prev_iters  = s.iters;
-                    prev_polls  = s.polls;
-                    prev_copies = s.copies;
-                }
             }
 
             objs->sent_msg_cnt = 0;
