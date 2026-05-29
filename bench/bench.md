@@ -1,1403 +1,850 @@
-# DPUmesh vs TCP-sidecar Transport Benchmark
+# DPUmesh Transport Benchmark — 결론 & 데이터
 
-DPUmesh DMA transport와 TCP service-mesh (Envoy sidecar) 의 raw 성능 비교.
-gateway / Thrift / application 로직을 모두 제거하고 transport 비용만 분리해
-측정. 본 문서는 실험 설계, 결과, cap의 정체 attribution, 그리고 두 차례의
-정리(in-place forwarding → strips → dead code 제거 + lazy drain)에 따른
-누적 개선을 기록.
+DPUmesh DMA transport vs TCP service-mesh(Envoy sidecar)의 raw transport 성능 비교,
+그리고 dpumesh transport의 ceiling attribution + 단계별 최적화 기록. gateway/Thrift/
+application 로직을 모두 제거하고 transport 비용만 분리 측정.
 
 ---
 
-## 1. 실험 대상
+## 0. 결론 요약 (TL;DR)
+
+1. **dpumesh transport는 단계적 최적화로 micro-bench Method 2 ceiling의 99.8%에 도달.**
+   8 KB 기준 sustainable 52K→74K RPS, overload dma_copy/s 215K→**309,736**(= M2 310,472의 99.8%).
+2. **cap은 single DPA EU의 per-dma_copy work**다. ARM/epoll/PCIe-BW/polling-ratio는 모두 cap이
+   아님이 직접 측정으로 입증·반증됨. EU active%는 0.51%지만 single-EU의 yield/wake + per-op
+   work가 throughput을 결정.
+3. **그러나 micro-bench baseline(Method 0=320K, Method 2=310K) 자체가 host descriptor feed에
+   묶인 값이었다.** host 게이트를 제거한 pure-DMA 측정에서 single EU가 **~556K dma_copy/s**
+   (size-independent, op-rate bound) 달성 → baseline은 engine 한계가 아니었음. dpumesh
+   309,736은 진짜 single-EU engine ceiling의 **55.7%**.
+4. **op-rate는 EU 수에 비례**한다: 1→2 EU near-linear(1.93×), 4 EU peak **1.8M/s**(3.25×).
+   8 EU에서 **감소(2.64×, 1.47M)** — 이 regression의 원인은 EU spin-contention이 **아님**(backoff
+   무효로 확증). DPU-side drain 또는 EU oversubscription/DMA-HW contention으로 좁혀짐(진단 중).
+5. dpumesh는 1 RTT = 4 dma_copy. 측정된 1.8M op-rate만으로도 ≈**450K RPS** 이론 상한(현재 77K의
+   ~5.8배). **병목은 engine이 아니라 work를 먹이고 구조화하는 것**(host posting + 4-dma_copy chain
+   + single-EU). 추가 이득은 §7의 architectural lever(host→host direct, multi-EU)에서만 나옴.
+6. **yield는 architectural necessity**다. 제거하면 single-run latency는 좋아져도 multi-ring
+   busy-spin이 slot leak(lossless ring stuck)을 유발 → back-to-back 붕괴.
+
+---
+
+## 1. 실험 설계
+
+### 1.1 대상
 
 | | A안 (DPUmesh) | B안 (TCP via Envoy) |
 |---|---|---|
-| client → server hop | 1 (DPU) | 2 (sidecar1, sidecar2) |
+| client→server hop | 1 (DPU) | 2 (sidecar1, sidecar2) |
 | transport 위치 | DPU ARM + DPA EU (host CPU 외부) | host CPU 내 (app과 core 공유) |
 | L7 처리 | 없음 (transport-only) | 없음 (`tcp_proxy` filter만) |
-| 목적 | DMA-기반 mesh bypass | Istio/Envoy 모델 1:1 비교 |
 
-핵심 가설: dpumesh의 architectural advantage는 transport가 host CPU 외부
-(DPU/DPA)에서 일어난다는 점. 동일한 host CPU 예산(각 1 core × 2 pod)을
-주면, TCP는 app과 sidecar가 core를 나눠 쓰고 dpumesh는 app이 1 core를
-통째로 쓸 수 있음.
+가설: dpumesh의 architectural advantage는 transport가 host CPU 외부(DPU/DPA)에서 일어난다는
+점. 동일 host CPU 예산(각 1 core × 2 pod)에서 TCP는 app+sidecar가 core를 나눠 쓰고 dpumesh는
+app이 1 core를 통째로 씀.
 
----
-
-## 2. Topology
+### 1.2 Topology & Resource Layout
 
 ```
-═══════════════════════════════════════════════════════════════════════════════════
-                    HOST NODE — Namespace: test-bench
-                    governor=performance @ 2.5GHz fixed (cores 0-7)
-═══════════════════════════════════════════════════════════════════════════════════
-
-  ╔═════════════ A안 (dpumesh) ═════════════╗
-  ║ core 0 ─ bench-dpumesh (workers≈rps/100) ║
-  ║ core 1 ─ echo-dpumesh (ECHO_THREADS=64)  ║
-  ║         comch + DMA (mlx5/PCI)           ║
-  ╚═══════════════════════════════════════════╝
-  ╔═════════════ B안 (tcp via Envoy) ═══════════════╗
-  ║ core 2 ─ bench-tcp (bench + sidecar1, share)   ║
-  ║ core 3 ─ echo-tcp  (sidecar2 + echo,  share)   ║
-  ╚══════════════════════════════════════════════════╝
-
-═══════════════════════════════════════════════════════════════════════════════════
-              DPU (BlueField-3) — host CPU 외부      │ /dev/infiniband (PCI)
-═══════════════════════════════════════════════════════════════════════════════════
-
-  ARM (8 cores, pinning X)            DPA (FlexIO EU × 1)
-  ┌──────────────────────────────┐    ┌────────────────────────────────┐
-  │ dpumesh_dpu process          │    │ run_dma_manager (single EU)    │
-  │  ▸ control PE (comch_server) │    │  ▸ drain_all_rings:            │
-  │  ▸ consumer PE (DPA → ARM)   │◀──▶│      forward DMA (host→DPU)    │
-  │  ▸ dpu_worker (routing/ACK)  │    │      reverse DMA (DPU→host)    │
-  └──────────────────────────────┘    └────────────────────────────────┘
+HOST NODE (test-bench ns, governor=performance @ 2.5GHz, cores 0-7)
+  A안: core0 bench-dpumesh / core1 echo-dpumesh(ECHO_THREADS=64) + comch+DMA(mlx5/PCI)
+  B안: core2 bench-tcp(bench+sidecar1) / core3 echo-tcp(sidecar2+echo)
+DPU (BlueField-3, host CPU 외부, /dev/infiniband PCI)
+  ARM(8core, pinning X): dpumesh_dpu — control PE(comch_server) / consumer PE(DPA→ARM) / dpu_worker(routing/ACK)
+  DPA(FlexIO EU×1): run_dma_manager — drain_all_rings: forward DMA(host→DPU) + reverse DMA(DPU→host)
 ```
 
----
+CPU pinning은 `taskset -apc`로 hard-pin (CFS quota 미사용). DVFS lock
+`cpupower -c 0-7 frequency-set -g performance -d 2.5GHz -u 2.5GHz` (latency tail noise 제거).
 
-## 3. Resource Layout
+| profile | layout |
+|---|---|
+| **fair** (default, TCP 비교) | core0 bench-dpumesh / core1 echo-dpumesh / core2 bench-tcp+sidecar1 / core3 echo-tcp+sidecar2 / DPU ARM 8core 자유 / DPA EU×1 |
+| **hw** (HW 한계 측정) | core0,4 bench-dpumesh(2core) / core1,5 echo-dpumesh(2core) / core2,3 tcp(untouched) |
 
-CPU pinning은 `taskset -apc <core> <pid>`로 hard-pin. CFS quota 미사용
-(core 정착이 핵심). `pin_pods()`가 deploy 끝 / `pin` subcommand에서 수행.
+K8s 객체(test-bench ns): bench-dpumesh(1c)/echo-dpumesh(1c)/bench-tcp(2c)/echo-tcp(2c),
+services bench-dpumesh:9092/bench-tcp:9092/echo-tcp:9091, sidecar1-config(upstream=echo-tcp:9091)/
+sidecar2-config(upstream=127.0.0.1:9092). hostPath: /dev/infiniband, $BUILD_DOCA/lib(libthrift)
+→ bench/echo-dpumesh.
 
-### Profile = fair (TCP vs DPUmesh 비교용, default)
-| core | pod | container(s) |
-|------|-----|--------------|
-| 0 | bench-dpumesh | bench_dpumesh (1 proc, 다중 worker thread) |
-| 1 | echo-dpumesh | echo_dpumesh (ECHO_THREADS=64) |
-| 2 | bench-tcp | bench_tcp + sidecar1 |
-| 3 | echo-tcp | echo_tcp + sidecar2 |
-| DPU | dpumesh_dpu | ARM 8 cores 자유 (pinning X) |
-| DPA | run_dma_manager | EU × 1 |
-
-### Profile = hw (HW 한계 측정용)
-| core | pod | container(s) |
-|------|-----|--------------|
-| 0, 4 | bench-dpumesh | 2 cores (host lock 경합 완화) |
-| 1, 5 | echo-dpumesh | 2 cores (ECHO_THREADS=64 분산) |
-| 2, 3 | bench-tcp, echo-tcp | untouched (자원 비대칭 → 비교 의의 없음) |
-
-DVFS: `cpupower -c 0-7 frequency-set -g performance -d 2.5GHz -u 2.5GHz`
-(latency tail noise 제거).
-
----
-
-## 4. K8s 객체 (test-bench namespace)
-
-```
-Deployments              Services             ConfigMaps
-bench-dpumesh (1c)       bench-dpumesh:9092   sidecar1-config (upstream=echo-tcp:9091)
-echo-dpumesh  (1c)       bench-tcp:9092       sidecar2-config (upstream=127.0.0.1:9092)
-bench-tcp     (2c)       echo-tcp:9091
-echo-tcp      (2c)
-
-hostPath volumes (privileged):
-  /dev/infiniband              ← bench-dpumesh, echo-dpumesh
-  $BUILD_DOCA/lib (libthrift)  ← bench-dpumesh, echo-dpumesh
-```
-
----
-
-## 5. 실행 인터페이스
+### 1.3 실행 인터페이스
 
 ```bash
-./test-bench.sh deploy                                 # build + image + DPU restart + pods Ready + fair pin
-./test-bench.sh dpumesh    <RPS> <DUR> <SIZE> [<CONNS>]  # fair, dpumesh
-./test-bench.sh tcp        <RPS> <DUR> <SIZE> [<CONNS>]  # fair, tcp
-./test-bench.sh dpumesh-hw <RPS> <DUR> <SIZE> [<CONNS>]  # hw, dpumesh-only
-./test-bench.sh pin / pin-hw
-./test-bench.sh cleanup
+./test-bench.sh deploy                            # build + image + DPU restart + pods Ready + fair pin
+./test-bench.sh dpumesh    <RPS> <DUR> <SIZE> [<CONNS>]
+./test-bench.sh tcp        <RPS> <DUR> <SIZE> [<CONNS>]
+./test-bench.sh dpumesh-hw <RPS> <DUR> <SIZE> [<CONNS>]   # hw profile 자동 전환
+./test-bench.sh pin / pin-hw / cleanup
 ```
+Ctrl protocol(line): `RUN <rps> <dur_sec> <msg_size> [<conns>]` → `OK <rps_ach> <p50_us> <p99_us> <p999_us> <ok> <fail> <mb_per_sec>`. (daemon raw 단위 µs, 표는 ms 통일.)
 
-dpumesh / tcp / dpumesh-hw 명령은 실행 직전 자동으로 해당 profile로 재핀.
+### 1.4 측정 방법론
 
-Ctrl protocol (line 기반):
-```
-RUN <rps> <dur_sec> <msg_size> [<conns>]
-→ OK <rps_ach> <p50_us> <p99_us> <p999_us> <ok> <fail> <mb_per_sec>
-```
+- **wrk2식 scheduled-time latency (CO 보정)**: closed-loop worker는 cap region에서 coordinated
+  omission 발생(가짜 p50≈p99 plateau). `t0=scheduled_time`(예약 tick), `latency=now()-t0`로
+  큐잉 wait를 latency에 포착 → elbow 선명. `bench_dpumesh.c`/`bench_tcp.go` 양쪽 적용.
+- **MAX_WORKERS=4096, 128 KB stack** (512 MB): concurrency cap이 낮으면(이전 512) Little's law로
+  in-flight 묶여 가짜 plateau.
+- **wall-time 측정**: watchdog thread + 즉시 join (고정 sleep은 wall 부풀려 RPS underreport).
+- **도구**: `test-bench.sh dpumesh`(sweep) / `run_bench.sh --method 0`(M2 baseline, test_dma/bench) /
+  `perf record -F 999 -g --call-graph dwarf`(flame) / `perf trace -s`(syscall) /
+  `dpa-statistics collect`(EU stat) / `top -H -p $(pgrep dpumesh_dpu)`(ARM thread CPU).
 
-> bench daemon raw 출력 단위는 microseconds. 본 문서 표는 ms 통일.
+### 1.5 측정 환경
 
----
-
-## 6. 측정 방법론
-
-### 6.1 wrk2식 scheduled-time latency (CO 보정)
-
-bench worker가 closed-loop (send → wait_response → next)라 그대로 두면 cap
-region에서 **coordinated omission** 발생 — 시스템이 느려지면 worker도 같이
-느려져서 큐잉이 latency 분포에 안 잡힘. cap 너머에서도 p50 ≈ p99 같은 가짜
-plateau가 보여 진짜 saturation이 가려짐.
-
-Fix: `t0 = scheduled_time` (보내기로 예약된 tick), `latency = now() - t0`.
-worker가 sleep_until에서 늦게 깨면 그만큼 큐잉 wait가 latency에 그대로
-잡혀서 elbow가 깨끗이 보임. `bench_dpumesh.c` / `bench_tcp.go` 양쪽 적용.
-
-### 6.2 MAX_WORKERS = 4096, 128 KB stack
-
-closed-loop concurrency cap이 낮으면(이전 512) Little's law로 in-flight가
-묶여 가짜 plateau. 4096 × 128 KB = 512 MB. CO 보정과 결합 시 latency tail /
-throughput 한계 모두 시스템 속성 직접 반영.
-
-### 6.3 wall-time 측정
-
-`bench_dpumesh.c`는 watchdog thread + 즉시 join 패턴. main이 고정 시간
-sleep하면 wall이 부풀려져 RPS underreport.
-
-### 6.4 측정 도구
-
-| 도구 | 용도 |
+| | |
 |---|---|
-| `test-bench.sh dpumesh <rps> <dur> <size> [<conns>]` | dpumesh RPS sweep |
-| `run_bench.sh --method 0 ...` (test_dma/bench) | M2 baseline 측정 |
-| `perf record -F 999 -g --call-graph dwarf` | flame graph |
-| `perf trace -s -p <pid>` | syscall summary |
-| `/opt/mellanox/doca/tools/dpa-statistics collect` | DPA EU 통계 |
-| `top -H -p $(pgrep dpumesh_dpu)` | ARM thread CPU |
-| DPA stat counters (제거됨, §10.4 결정적 측정용으로 일회성 사용 후 폐기) | polls/dma_copy ratio 실측 |
+| Host CPU | DVFS lock @ 2.5 GHz, governor=performance, cores 0-7 |
+| DPU | NVIDIA BlueField-3, ARM 8core(pinning X), DPA FlexIO EU×1(dpumesh), partition EUs 0-63 |
+| PCIe | Gen4 |
+| DOCA SDK | 3.1.0105 · FlexIO 25.07.2812 · Kernel 5.15.0-176-generic |
+| DPU 시작 | `dpumesh_dpu $DPU_PCI -l 40` (WARN+ filter) |
 
 ---
 
-## 7. Transport Ceiling Baselines
+## 2. Transport Ceiling Baselines (micro-bench)
 
-`experiment/bench.md`의 micro-bench (`/home/jukebox/test_dma/bench/`) — k8s ·
-Thrift · TCP · gateway 모두 제거. host가 dma_ring에 desc 직접 post, comch
-client + DPA RPC만 사용. `host_worker.c`의 단순 루프(`while(true) {
-get_next_dma_desc; desc->valid=1; }`)로 baseline으로 valid.
+`test_dma/bench/` micro-bench — k8s·Thrift·TCP·gateway 모두 제거. host가 dma_ring에 desc 직접
+post, comch client + DPA RPC만. `host_worker.c`의 단순 루프(`while(true){ get_next_dma_desc;
+desc->valid=1; }`).
 
-### 7.1 Method 0 / Method 2 측정 (8 KB / 60 s, 2026-05 재측정)
+### 2.1 Method 0 / Method 2 (8 KB / 60 s, 2026-05 재측정)
 
-이전 측정 (M0=302K, M2=264K)은 DOCA `comch_server.c`의 per-msg `DOCA_LOG_INFO`가
-stdio I/O로 stale overhead 주입. `run_bench.sh`에 `-l 40` 추가 + stat 로그를
-WARN으로 promote해서 silence한 결과:
+이전 측정(M0=302K, M2=264K)은 `comch_server.c`의 per-msg `DOCA_LOG_INFO`가 stdio overhead
+주입. `-l 40` + stat 로그 WARN promote로 silence한 결과:
 
-| Mode | 구성 | dma_copy ops/sec | Throughput (1 dir) | vs M0 |
+| Mode | 구성 | dma_copy ops/sec | Throughput(1 dir) | vs M0 |
 |---|---|---:|---:|---:|
-| Method 0 (Only DMA) | `dma_copy` atomic (HW max) | **320,014** | **20.97 Gbps** | 100% |
-| Method 2 (DMA + completion) | `dma_copy` + DPU CPU가 host로 `server_send_msg` | **310,472** | **20.34 Gbps** | **97%** |
+| Method 0 (Only DMA) | `dma_copy` atomic | **320,014** | 20.97 Gbps | 100% |
+| Method 2 (DMA + completion) | `dma_copy` + DPU CPU가 host로 `server_send_msg` | **310,472** | 20.34 Gbps | 97% |
 
-Method 0 → Method 2 손실 3%만. "DPU CPU → host comch forward" 진짜 비용은
-매우 작음. dpumesh가 이 chain을 그대로 사용하므로 **Method 2 = dpumesh의
-transport ceiling의 direct baseline**.
+M0→M2 손실 3%만 → "DPU CPU→host comch forward" 비용 매우 작음. dpumesh가 이 chain을 그대로
+쓰므로 **Method 2 = dpumesh transport ceiling의 direct baseline**. (단 §6에서 이 baseline 자체가
+host-bound임이 드러남.)
 
-### 7.2 micro-bench vs dpumesh chain 차이 (caveat)
+### 2.2 micro-bench vs dpumesh chain 차이 (caveat)
 
-| | micro-bench (Method 2) | dpumesh |
+| | micro-bench (M2) | dpumesh |
 |---|---|---|
-| 데이터 흐름 | host → DPU → host (단방향, 1 endpoint) | host A → DPU → host B → DPU → host A (RTT, 2 endpoints) |
-| DPU ARM | comch 수신 + `server_send_msg` 한 번 | comp_queue enq + **pod_idx 라우팅 + TX_ACK + reverse desc 작성 + tx_ring enq** |
-| descriptor 라우팅 | 없음 | `dst_pod_id` 별 분기 |
-| reverse direction | 없음 | 매 hop reverse DMA enq |
+| 흐름 | host→DPU→host (단방향, 1 endpoint) | host A→DPU→host B→DPU→host A (RTT, 2 endpoints) |
+| DPU ARM | comch 수신 + `server_send_msg` 1회 | comp_queue enq + pod_idx 라우팅 + TX_ACK + reverse desc 작성 + tx_ring enq |
+| reverse | 없음 | 매 hop reverse DMA enq |
 
-→ 같은 "1 dma_copy"라도 dpumesh는 DPU ARM 부수 작업 多. 1 RTT = forward DMA × 2 +
-reverse DMA × 2 = **4 dma_copy ops**.
+→ **1 RTT = forward DMA×2 + reverse DMA×2 = 4 dma_copy ops.** dpumesh RPS ≈ dma_copy/s ÷ 4.
 
 ---
 
-## 8. TCP/Envoy vs DPUmesh — Direct Comparison
-
-### 8.1 단일 부하점 측정 (rps=40000, dur=10s, size=8192B)
+## 3. TCP/Envoy vs DPUmesh (rps=40000, dur=10s, size=8192B)
 
 | | dpumesh | tcp/Envoy |
 |---|---|---|
-| Target RPS | 40,000 | 40,000 |
-| **Achieved RPS** | **39,732.7** (99.3%) | **33,097.0** (82.7%) |
+| Achieved RPS | **39,732.7** (99.3%) | **33,097.0** (82.7%) |
 | OK / Fail | 400,000 / 0 | 400,000 / 0 |
-| p50 latency | **4.53 ms** | **661.50 ms** |
-| p99 latency | **8.35 ms** | **3,885.30 ms** |
-| p999 latency | 8.62 ms | 4,588.43 ms |
-| Throughput (RTT) | 620.82 MB/s | 517.14 MB/s |
+| p50 | **4.53 ms** | 661.50 ms |
+| p99 | **8.35 ms** | 3,885.30 ms |
+| p999 | 8.62 ms | 4,588.43 ms |
+| Throughput(RTT) | 620.82 MB/s | 517.14 MB/s |
 
-40 K target에서 dpumesh는 healthy region (52 K sustainable의 76%), TCP/Envoy는
-deep overload (achieved 33.1 K, p99 3,885 ms). TCP/Envoy saturation은 40 K 한참 아래.
+40K target에서 dpumesh는 healthy(52K sustainable의 76%), TCP/Envoy는 deep overload(achieved
+33.1K, p99 3,885 ms). TCP saturation은 40K 한참 아래.
 
 ---
 
-## 9. DPUmesh Saturation Sweep — Baseline (in-place forwarding 전)
+## 4. dpumesh 최적화 — 누적 ceiling
 
-### 9.1 Sweep (8 KB, 10 s, conns=auto)
+8 KB·10 s·conns=auto. 각 단계 = 데이터 + 핵심. 누적 요약(§4.9)이 spine.
 
-| Target RPS | Achieved | p50 (ms) | p99 (ms) | p999 (ms) | Throughput | OK / Fail |
+### 4.1 Baseline sweep (in-place forwarding 전)
+
+| Target | Achieved | p50(ms) | p99(ms) | p999(ms) | Throughput | OK/Fail |
 |---:|---:|---:|---:|---:|---:|---|
-| 5,000 | 4,968.6 | 1.10 | 1.93 | 2.01 | 77.63 MB/s | 50,000 / 0 |
-| 10,000 | 9,939.2 | 1.60 | 2.82 | 2.94 | 155.30 MB/s | 100,000 / 0 |
-| 15,000 | 14,906.5 | 2.08 | 3.72 | 3.88 | 232.91 MB/s | 150,000 / 0 |
-| 20,000 | 19,875.0 | 2.57 | 4.64 | 6.48 | 310.55 MB/s | 200,000 / 0 |
-| 25,000 | 24,838.1 | 3.06 | 5.55 | 5.80 | 388.10 MB/s | 250,000 / 0 |
-| 30,000 | 29,807.8 | 3.54 | 6.51 | 6.74 | 465.75 MB/s | 300,000 / 0 |
-| 35,000 | 34,767.7 | 4.05 | 7.45 | 7.73 | 543.24 MB/s | 350,000 / 0 |
-| 40,000 | 39,732.7 | 4.53 | 8.35 | 8.62 | 620.82 MB/s | 400,000 / 0 |
-| 45,000 | 44,691.3 | 5.02 | 9.29 | 9.63 | 698.30 MB/s | 450,000 / 0 |
-| 50,000 | 49,664.7 | 5.41 | 11.89 | 12.17 | 776.01 MB/s | 500,000 / 0 |
-| **52,000** | **51,644.8** | **5.53** | **12.16** | **12.33** | **806.95 MB/s** | 520,000 / 0 |
-| 55,000 | 53,553.4 | 74.14 | 189.59 | 194.61 | 836.77 MB/s | 550,000 / 0 |
-| 57,000 | 53,404.0 | 319.63 | 604.52 | 611.89 | 834.44 MB/s | 570,000 / 0 |
-| 60,000 | 53,698.8 | 587.51 | 1,154.25 | 1,166.28 | 839.04 MB/s | 600,000 / 0 |
-| 65,000 | 53,841.1 | 1,043.73 | 1,961.63 | 1,983.88 | 841.27 MB/s | 650,000 / 0 |
+| 5,000 | 4,968.6 | 1.10 | 1.93 | 2.01 | 77.63 MB/s | 50,000/0 |
+| 10,000 | 9,939.2 | 1.60 | 2.82 | 2.94 | 155.30 | 100,000/0 |
+| 15,000 | 14,906.5 | 2.08 | 3.72 | 3.88 | 232.91 | 150,000/0 |
+| 20,000 | 19,875.0 | 2.57 | 4.64 | 6.48 | 310.55 | 200,000/0 |
+| 25,000 | 24,838.1 | 3.06 | 5.55 | 5.80 | 388.10 | 250,000/0 |
+| 30,000 | 29,807.8 | 3.54 | 6.51 | 6.74 | 465.75 | 300,000/0 |
+| 35,000 | 34,767.7 | 4.05 | 7.45 | 7.73 | 543.24 | 350,000/0 |
+| 40,000 | 39,732.7 | 4.53 | 8.35 | 8.62 | 620.82 | 400,000/0 |
+| 45,000 | 44,691.3 | 5.02 | 9.29 | 9.63 | 698.30 | 450,000/0 |
+| 50,000 | 49,664.7 | 5.41 | 11.89 | 12.17 | 776.01 | 500,000/0 |
+| **52,000** | **51,644.8** | **5.53** | **12.16** | 12.33 | 806.95 | 520,000/0 |
+| 55,000 | 53,553.4 | 74.14 | 189.59 | 194.61 | 836.77 | 550,000/0 |
+| 57,000 | 53,404.0 | 319.63 | 604.52 | 611.89 | 834.44 | 570,000/0 |
+| 60,000 | 53,698.8 | 587.51 | 1,154.25 | 1,166.28 | 839.04 | 600,000/0 |
+| 65,000 | 53,841.1 | 1,043.73 | 1,961.63 | 1,983.88 | 841.27 | 650,000/0 |
 
-### 9.2 핵심 관찰 (baseline)
+- sustainable ≈ **52K**(p50 5.5/p99 12 ms), 50K까지 거의 linear. elbow 52K→55K(p99 12→190ms,16×).
+- overload throughput ceiling ≈ **53.5K** (60/65K 밀어도 53.7K 고정, latency만 발산).
+- **0 failure** 전 구간(`WAIT_TIMEOUT_MS=5000` 미발동, 4-layer backpressure 흡수). plateau 836-841 MB/s.
 
-- **Sustainable saturation ≈ 52 K RPS** (p50 5.5 ms, p99 12 ms). 50 K까지 거의
-  perfectly linear (50 K → 49.7 K, 99.3%).
-- **Elbow = 52 K → 55 K 사이**. 55 K target에서 p99가 12 → 190 ms **16배** 점프
-  (전형적 M/M/1 saturation).
-- **Overload throughput ceiling ≈ 53.5 K RPS** — 60/65 K target으로 더 밀어도
-  achieved 53.7 K에 고정. latency만 발산.
-- **0 failure** — `WAIT_TIMEOUT_MS = 5,000 ms` 보다 worst-case latency가 작아
-  미발동. 4-layer flow control (tx_alloc 무한 대기, enqueue 백오프, reverse-path
-  admission gate)이 backpressure만으로 흡수.
-- **Throughput plateau 836–841 MB/s** — DMA chain 53.5 K × 4 dma_copy = 214 K
-  ops/s에서 hard cap.
+ceiling 위치:
 
-### 9.3 Baseline ceiling 위치
-
-```
-   100% ┃ ┌── HW max (Method 0, dma_copy atomic) ── 320,014 ops/s = 20.97 Gbps
-    97% ┃ ├── DMA + completion (Method 2)        ── 310,472 ops/s = 20.34 Gbps
-    67% ┃ └── dpumesh @ overload ceiling          ── 214,212 ops/s = 13.71 Gbps
-        ┃     (53,553 RPS × 4 dma_copy)
-```
-
-| | dma_copy ops/sec | vs M0 | vs M2 |
+| | dma_copy ops/s | vs M0 | vs M2 |
 |---|---:|---:|---:|
 | Only DMA (HW max) | 320,014 | 100% | — |
-| DMA + completion | 310,472 | 97% | 100% |
-| **dpumesh @ overload (53.55 K RPS)** | **214,212** | **67%** | **69%** |
-| dpumesh @ sustainable (51.64 K RPS) | 206,580 | 65% | 67% |
+| DMA + completion (M2) | 310,472 | 97% | 100% |
+| dpumesh @ overload (53.55K) | 214,212 | 67% | 69% |
+| dpumesh @ sustainable (51.64K) | 206,580 | 65% | 67% |
 
-**의미 있는 비교 = 69% vs Method 2** (동일 chain 구조).
+### 4.2 In-place forwarding (2026-05-08)
 
----
+`process_forward_entry`의 8 KB staging memcpy 제거. desc가 source mmap handle+VA 운반 → DPA
+reverse handler가 원 sender 버퍼에서 직접 읽음. **slot 점유 forward-only → full RTT** (host TX slot도
+reverse 완료 TX_ACK 후 release; 52K@5.5ms = ~290 in-flight ⊂ DMA_RING_SIZE=2048). trade-off:
+same-source multi-dst HOL blocking (echo src==dst 무영향).
 
-## 10. Cap의 정체 — DPA EU per-dma_copy work
+| Target | Base ach | New ach | Base p99 | New p99 | Δp99 |
+|---:|---:|---:|---:|---:|---:|
+| 5,000 | 4,968.6 | 4,968.8 | 1.93 | 1.92 | -0.5% |
+| 10,000 | 9,939.2 | 9,935.9 | 2.82 | 2.78 | -1.4% |
+| 30,000 | 29,807.8 | 29,800.9 | 6.51 | 6.38 | -2.0% |
+| 50,000 | 49,664.7 | 49,655.3 | 11.89 | 9.94 | -16.4% |
+| 52,000 | 51,644.8 | 51,625.3 | 12.16 | 12.12 | -0.3% |
+| **53,000** | — | **52,641.9** | — | **12.23** | new sustainable |
+| **54,000** | — | **53,636.3** | — | **12.38** | new sustainable |
+| 55,000 | 53,553.4 | 54,085.4 | 189.59 | 101.39 | -46.5% |
+| 60,000 | 53,698.8 | 54,198.6 | 1,154.25 | 998.98 | -13.5% |
+| 65,000 | 53,841.1 | 54,748.5 | 1,961.63 | 1,767.98 | -9.9% |
+| 70,000 | — | 54,369.7 | — | 2,817.77 | overload |
 
-§7 baseline 대비 dpumesh의 31% gap 원인 규명. 여러 후보를 직접 측정으로
-검증 또는 반증.
+sustainable 52K→**54K**, overload 53,553→**54,748**, overload p99 ~절반. 0 fail, 11회 sequential
+slot leak 없음. → @overload 54,748 = 218,992 ops/s (68% M0 / 71% M2); @sustainable 53,636 = 214,544.
 
-### 10.1 DPA EU stat — ARM 99.9% 인데 EU 99.5% idle
+### 4.3 Feature strip (compile-time toggle → 영구 흡수)
 
-```
-sudo /opt/mellanox/doca/tools/dpa-statistics collect -d mlx5_0 -t 10000
-```
+3 toggle: `STRIP_VALIDATION`(mmap=0/size=0/range/padded>buf 제거), `STRIP_DESC_CLEAR`(3×wb→1×wb
+valid=0만), `STRIP_CHUNK_LOOP`(size≤8KB single dma_copy fast path).
 
-50 K RPS 부하, 10 s 윈도우:
-
-| 항목 | 값 | 해석 |
-|---|---:|---|
-| Wall time | 10,000 ms | 측정창 |
-| **EU active time** | **51.5 ms** (ticks @ 1 ns) | EU가 실제 실행한 시간 |
-| **EU active %** | **0.51%** | 99.49% idle |
-| Cycles | 92.7 G | 51.5 ms × ~1.8 GHz 일치 |
-| Instructions | 7.22 G | IPC = 0.078 (memory/DMA stall — 정상) |
-| Executions | 7,314 (= 731/s) | DPA thread 깬 횟수 |
-| Cycles/execution | 12.7 M | wake 당 평균 7 µs 실행 |
-| dma_copy/execution | ~273 | wake 당 batch size |
-
-DPA는 burst 처리 — wake → 273 dma_copy 일괄 → re-schedule.
-
-### 10.2 ARM perf 분석 (50 K RPS 부하)
-
-`perf report --no-children` self-time:
-
-| 카테고리 | dpumesh | Method 0 | Method 2 |
-|---|---:|---:|---:|
-| **epoll_pwait syscall 군집** (kernel + libc + vdso) | **64%** | 65% | 62% |
-| DOCA infra (CQ poll, comch internals) | 7% | 13% | 19% |
-| Atomics (CAS, swap, mutex) | 4% | 2% | 3% |
-| **App 코드** (run_dpu_worker, process_*, drain_*) | **5.5%** | 3.4% | 2.8% |
-
-per-op time 환산:
-
-| | per-op time | Δ vs M2 |
-|---|---:|---:|
-| Method 0 | 3.13 µs | — |
-| Method 2 | 3.22 µs | baseline |
-| **dpumesh** | **4.67 µs** | **+1.45 µs (+45%)** |
-
-세 측정 모두 syscall 1순위. 하지만 dpumesh만 throughput 낮음 — ARM 폴링
-자체로는 설명 불가.
-
-### 10.3 ARM CPU 분포 — useful work 분해
-
-`bench/dpumesh_dpu_flame_per_batch.svg` 기준:
-
-| ARM 함수 | self-time % | per-event 환산 |
-|---|---:|---:|
-| `doca_pe_progress` (epoll_pwait 포함) | 76.5% | 3.48 µs (polling syscall) |
-| `process_completion_queue` | 7.95% | 0.36 µs |
-| `process_rev_notify_entry` | 5.18% | 0.24 µs |
-| `find_pod_by_id` | 2.80% | 0.13 µs |
-| `server_send_msg_to_conn` | 2.20% | 0.10 µs |
-| comp_queue ops (peek/empty/full/dq/eq) | ~3.5% | 0.16 µs |
-| `process_forward_entry` | 0.91% | 0.04 µs |
-| `drain_deferred_tx_acks` | 0.54% | 0.02 µs |
-| **ARM useful work 합계** | **~23%** | **~1.05 µs/event** |
-
-ARM과 DPA EU는 **다른 processor가 병렬 작동**. cap = max(DPA per-op, ARM per-event):
-- DPA per-dma_copy: **4.55 µs**
-- ARM per-event: **1.05 µs**
-- → **DPA가 cap, ARM은 ~3.5 µs 헤드룸**
-
-ARM 측 최적화는 throughput에 영향 없음.
-
-### 10.4 DPA polling counter — 결정적 측정 (Experiment X)
-
-가설 갈음:
-- 가설 A: dpumesh poll/copy ratio = 2~4 → polling이 갭의 ~75%
-- 가설 B: dpumesh ratio ≈ 1.0 → polling 무관, 갭은 DPA code work
-
-DPA kernel + `dpa_thread_arg`에 counter 3개 추가:
-```c
-volatile uint64_t stat_inner_iters;   /* drain_all_rings inner do-while */
-volatile uint64_t stat_polls;         /* PCIe desc->valid reads */
-volatile uint64_t stat_dma_copies;    /* dma_copy chunks issued */
-```
-
-DPU ARM이 1초마다 `doca_dpa_d2h_memcpy`로 읽어 ratio 계산.
-
-**측정 결과 (50K RPS, 15s)**:
-```
-DPA stat: iters=50858 polls=203428 copies=200052  poll/copy=1.017
-DPA stat: iters=50799 polls=203196 copies=200033  poll/copy=1.016
-DPA stat: iters=50816 polls=203268 copies=200000  poll/copy=1.016
-DPA stat: iters=50910 polls=203636 copies=200012  poll/copy=1.018
-DPA stat: iters=50876 polls=203504 copies=199999  poll/copy=1.018
-```
-
-분해:
-- `drain_all_rings` inner iter ~50,800/s
-- iter 당 4 polls (forward × 2 pods + reverse × 2 pods) → 203 K polls/s
-- iter 당 평균 ~4 dma_copies → 200 K dma_copies/s
-- **poll/copy ratio = 1.017** ≈ M2 baseline의 1.000
-
-→ **가설 B 확정**. 4 rings 폴링이 4 dma_copies 발사로 perfectly amortize.
-polling은 dpumesh-vs-M2 갭의 원인 아님.
-
-> 카운터는 결정적 측정 임무 종료 후 제거 (코드 영구화 X). 필요 시 git
-> history에서 복원.
-
-### 10.5 cap 정체 (정정된 모델)
-
-| | M2 baseline | dpumesh | Δ |
-|---|---:|---:|---:|
-| dma_copy/s | **325K** (또는 321K, §11.2 참조) | **220K** | -105K |
-| Per-dma_copy 시간 | **3.08 µs** | **4.55 µs** | **+1.47 µs** |
-| PCIe polls / dma_copy | ~1.0 | **1.017 (측정)** | 0 |
-
-+1.47 µs/dma_copy 갭은 **DPA EU의 추가 코드 작업**. M2의 `poll_desc_ring_dma_copy`에
-없는 dpumesh `process_one_desc`의 작업:
-
-| 항목 | M2 | dpumesh | 추정 EU 비용 |
-|---|---|---|---:|
-| validation (mmap=0, size=0, range) | 없음 | 3 checks + range arithmetic | ~0.1-0.2 µs |
-| chunking loop (`while offset < total`) | 없음 (단일 dma_copy) | loop + ALIGN_UP_128 + chunk type 선택 | ~0.2-0.3 µs |
-| desc 필드 clear 후 writeback × 3 | 1× writeback | 3× writeback | ~0.3-0.5 µs |
-| `comch_dma_comp_msg` 필드 수 | 3 (type/pos/length) | 6 (+ req_id/src_pod_id/dst_pod_id/flags) | ~0.1 µs |
-| `ensure_producer_slot` 호출 | 매 500 ops lazy drain | 매 chunk + counter check | ~0.2 µs |
-| reverse rings 분기 / `dpa_sent_count` 증가 | 없음 | 매 reverse desc | ~0.1 µs |
-| **합계 추정** | — | — | **~1.0-1.4 µs** |
-
-추정 합계 ≈ 실측 갭 1.47 µs.
-
----
-
-## 11. Feature 단계별 측정 — 정량 attribution
-
-DPA kernel work 가설을 두 방향에서 검증: (A) dpumesh에서 feature 제거,
-(B) M2에 feature 추가. 마지막으로 (C) §11.5에서 dead code 제거 + lazy drain +
-throttle을 추가 적용한 후속 sweep.
-
-### 11.1 DPUmesh feature strip (8 KB, 10 s, conns=auto)
-
-3개 compile-time toggle (당시 macro, 이후 §19.3에서 영구 코드로 흡수):
-```c
-#define STRIP_VALIDATION   /* mmap=0, size=0, range, padded>buf 모두 #ifdef out */
-#define STRIP_DESC_CLEAR   /* 3× writeback → 1× writeback (valid=0 만) */
-#define STRIP_CHUNK_LOOP   /* size ≤ 8KB single dma_copy fast path */
-```
-
-| Stage | 50K ach / p99 | 55K ach / p99 | **65K ach / p99** | DMA tput @ 65K |
+| Stage | 50K ach/p99 | 55K ach/p99 | **65K ach/p99** | DMA tput@65K |
 |---|---:|---:|---:|---:|
-| Baseline (per-batch only) | 49,629 / 9.89 ms | 54,080 / 91.06 ms | **54,291 / 1,894 ms** | 847 MB/s |
-| Exp A (+VALIDATION) | 49,721 / 10.04 ms | — | 55,207 / 1,704 ms | 862 MB/s |
-| Exp A+B (+DESC_CLEAR) | — | — | 56,134 / 1,545 ms | 877 MB/s |
-| **Exp A+B+C (+CHUNK_LOOP)** | **49,659 / 9.36 ms** | **54,617 / 12.27 ms** | **59,195 / 952 ms** | **925 MB/s** |
-
-단계별 기여:
-```
-Baseline overload ceiling:                 54,291 RPS
-   ↓ (+1.7%)
-Exp A — STRIP_VALIDATION:                  55,207 RPS   (+916 RPS)
-   ↓ (+1.7%)
-Exp A+B — +STRIP_DESC_CLEAR:               56,134 RPS   (+927 RPS)
-   ↓ (+5.5%)
-Exp A+B+C — +STRIP_CHUNK_LOOP:             59,195 RPS   (+3,061 RPS)
-─────────────────────────────────────────
-Total +9.0% (54,291 → 59,195 RPS)
-```
-
-**Chunking bypass가 단일 항목 최대 기여**. 이유: chunking loop 안에
-`ensure_producer_slot` + `is_consumer_empty` wait + `producer_slots_inflight++`가
-들어있어 1 chunk dma_copy도 모든 체크 발동. fast path는 1번씩만.
-
-**Elbow 이동**: baseline 55 K → A+B+C 적용 후 55 K가 여전히 sustainable
-(p99 12.27 ms, baseline의 52 K와 동일 profile). p99가 1/8 (91 → 12 ms).
-
-안정성 (3회 back-to-back 50K, slot leak 검증):
-```
-=== run 1 === Achieved RPS: 49342.6  p99: 9381.5 us  OK/Fail: 250000/0
-=== run 2 === Achieved RPS: 49353.8  p99: 9347.9 us  OK/Fail: 250000/0
-=== run 3 === Achieved RPS: 49344.8  p99: 9329.5 us  OK/Fail: 250000/0
-```
-
-per-dma_copy 시간:
-- Baseline: 4.57 µs / dma_copy
-- Exp A+B+C: 4.22 µs / dma_copy (-0.35 µs)
-- M2: 3.08 µs / dma_copy
-
-### 11.2 M2에 feature 추가 (Inverse, 8 KB, Method 0, H2D, 10 s)
-
-4개 toggle:
-```c
-/* #define ADD_VALIDATION */    /* 4 checks: mmap=0, size=0, range, padded>buf */
-/* #define ADD_CHUNK_LOOP */    /* while(offset < total) wrapper */
-/* #define ADD_PRODUCER_SLOT */ /* lazy 500-drain → per-call slot check + counter */
-/* #define ADD_DESC_CLEAR */    /* 4-field clear + 3× writeback after dma_copy */
-```
-
-| Stage | recv/s | Bandwidth | Δ vs prev |
-|---|---:|---:|---:|
-| **E0 baseline** | **321,803** | 21.08 Gbps | — |
-| E1 +ADD_VALIDATION | 324,707 | 21.27 Gbps | +0.9% (noise) |
-| E2 +ADD_CHUNK_LOOP | 319,495 | 20.93 Gbps | **-1.6%** |
-| E3 +ADD_PRODUCER_SLOT | 303,173 | 19.86 Gbps | **-5.1%** |
-| E4 +ADD_DESC_CLEAR | **17,639** | 1.15 Gbps | **-94.2%** ❗ |
-
-E4 collapse isolation 측정:
-
-| Variant | recv/s | 비고 |
-|---|---:|---|
-| E4-alone (DESC_CLEAR only) | 17,510 | 다른 toggle 무관 |
-| E4-min (`valid=0` 1줄 + writeback 1번만) | 17,225 | writeback 자체가 catastrophic |
-
-**Architectural finding — desc clear의 100× 비대칭**:
-
-M2의 ring은 **lossy** — host가 valid 안 체크하고 blind write:
-```c
-struct dma_desc *get_next_dma_desc(struct dma_ring *ring) {
-    struct dma_desc *desc = ring->descs + ring->head;
-    ring->head = (ring->head + 1) % ring->size;
-    return desc;   /* no valid check */
-}
-```
-
-dpumesh는 **lossless** — host가 `valid==1`이면 NULL 반환, DPA가 valid=0
-clear할 때까지 대기.
-
-DPA의 `__dpa_thread_window_writeback()` → host memory의 같은 cache line에
-PCIe 쓰기. M2 host는 동시에 같은 cache line write (`desc->addr/size/valid=1`).
-→ **양쪽 동시 쓰기 = PCIe cache coherency cost 폭증**.
-
-dpumesh는 host가 valid=0 기다림 → cache line 충돌 없음 → 같은 writeback cheap.
-
-### 11.3 추가 feature (E5-E10, polling amortization sanity check 포함)
-
-| Variant | recv/s | Δ vs E0 | per-iter time | 비고 |
-|---|---:|---:|---:|---|
-| **E0 baseline** | **321,803** | **0** | 3.11 µs | 1 poll : 1 op |
-| E5 +ADD_LARGER_COMP_MSG | 294,207 | -8.6% | 3.40 µs (+0.29 µs) | 3 → 7 fields (12B → 24B immediate) |
-| E6 +ADD_HANDLE_MSGS | 315,513 | -2.0% | 3.17 µs (+0.06 µs) | `consumer_get_completion` 1× per iter |
-| E7 +ADD_EXTRA_CONSUMER_WAIT | 322,857 | +0.3% (noise) | 3.10 µs | 사실상 free |
-| E8 +ADD_REVERSE_DMA | 381,826 | +18.6% | 5.24 µs / 2 op | **1 poll : 2 op** ← amortize |
-| E9 +ADD_4_DMA_COPIES | 417,119 | +29.6% | 9.62 µs / 4 op | **1 poll : 4 op** ← 더 amortize |
-| E10 +ADD_4_DMA_COPIES +EXTRA_RING_POLLS=3 | 338,322 | +5.1% | 11.83 µs / 4 op | **4 poll : 4 op** ← dpumesh ratio |
-
-E8/E9의 throughput 상승은 dpumesh ceiling이 아니라 polling amortization:
-```
-per_iter_time = α + N × β  (N = dma_copies/iter, 1 poll/iter 고정)
-3.11 = α + 1 × β  (E0)
-5.24 = α + 2 × β  (E8)
-9.62 = α + 4 × β  (E9)
-⇒ β ≈ 2.13 µs/dma_copy (marginal cost)
-  α ≈ 0.98 µs (per-iter fixed overhead)
-```
-
-- M2 per-iter overhead = **0.98 µs**
-- dma_copy 1개 marginal cost = **2.13 µs**
-
-E10 (4 poll : 4 op = dpumesh 패턴) **338,322 recv/s** — E0와 +5% 차이.
-→ dpumesh의 1:1 poll:op 패턴에서는 amortization 이득 거의 없음. **비교 baseline으로
-E0 사용이 정직**.
-
-### 11.4 추가 sanity checks
-
-#### E11 — PCIe direction balance (2H+2D vs 3H+1D)
-
-| Variant | recv/s | per-op time |
-|---|---:|---:|
-| E10 (3H+1D + 4 polls) | 338,322 | 2.96 µs |
-| **E11 (2H+2D + 4 polls)** | **337,262** | **2.97 µs** |
-
-Δ = -0.3% (noise). **PCIe direction balance 영향 없음** — PCIe full-duplex라
-forward + reverse가 같은 BW lane 공유 안 함. "PCIe BW contention" 가설 부정.
-
-#### Inner pe_progress 제거 (per-entry → per-batch)
-
-`process_completion_queue`의 entry-당 `pe_progress` × 2 호출 → batch 끝 1회.
-
-| Target | Baseline ach / p99 | Per-batch ach / p99 | Δ ach | Δ p99 |
-|---:|---:|---:|---:|---:|
-| 50K | 49,655 / 9.94 ms | 49,629 / 9.89 ms | -0.05% | -0.5% |
-| 55K | 54,085 / 101.39 ms | 54,080 / 91.06 ms | -0.01% | **-10.2%** |
-| 65K | 54,749 / 1,768 ms | 54,291 / 1,894 ms | -0.8% | +7.1% |
-
-Sustainable RPS **변화 없음**. Flame 비교:
-
-| 항목 | inplace | per_batch |
-|---|---:|---:|
-| `doca_pe_progress` subtree | 67.5% | **76.5%** ↑ |
-| `__GI_epoll_pwait` | 46.0% | **54.5%** ↑ |
-| `process_completion_queue` | 19.8% | **7.95%** ↓ |
-
-`process_completion_queue` self-time 12pp 감소분 = `epoll_pwait`로 이동.
-**ARM polling 횟수를 줄여도 polling 시간 비중은 안 줄어듦** → ARM이 cap 아님.
-
-#### epoll_pwait per-call 측정 (perf trace, 50K RPS, 15s)
-
-```
-syscall          calls      total(ms)   avg(ms)    min       max
-epoll_pwait     3,122,730   6,703.520   0.002      0.001     0.109
-```
-
-- 호출 횟수: 208 K calls/s
-- 호출당 평균: **2 µs** (syscall enter/exit 고정 비용)
-- 총 `epoll_pwait` 시간 / wall = 44.7% (flame의 ~45-55% subtree와 일치)
-
-avg 2 µs는 block 깊게 자는 게 아니라 syscall 고정 비용. M2 baseline도 같은
-41% epoll 비용 무는데 310K events/s 도달 → **epoll overhead 자체는 dpumesh-vs-M2
-갭의 원인 아님**.
-
-#### Load generator 검증 (system vs load-gen)
-
-| Target × workers | achieved | p99 |
-|---|---:|---:|
-| 65K × 650 (default) | 54,291 | 1,894 ms |
-| **65K × 1000** | **54,199** | **1,892 ms** |
-| **100K × 1500** | **54,227** | **6,814 ms** |
-| 65K × 4096 | **hang** — TX slot pool (2048) 충돌 | n/a |
-
-650 → 1500 워커 변화에도 ach가 54.2 K에 fix. **system ceiling 확정**.
-4096 워커는 `DMA_RING_SIZE = 2048` 동시성 한계로 hang.
-
-#### M2 synthetic multi-ring polling (EXTRA_RING_POLLS)
-
-매 dma_copy 마다 N개 추가 `desc->valid` PCIe read 삽입 (별도 cache line):
-
-| EXTRA_RING_POLLS | 총 rings 폴링 | recv/s | Bandwidth | Δ vs N=0 |
-|---:|---:|---:|---:|---:|
-| 0 (baseline) | 1 | **325,361** | 21.32 Gbps | — |
-| 1 | 2 | 236,660 | 15.50 Gbps | **-27%** |
-| 3 | 4 | 175,421 | 11.49 Gbps | **-46%** |
-| 7 | 8 | 114,543 | 7.50 Gbps | **-65%** |
-
-monotonic. per-extra-poll cost ≈ 0.8-1.1 µs / dma_copy. dpumesh 220K가 M2-N=3
-(synthetic 4 rings)의 175K보다 **높은** 이유 — synthetic은 매 dma_copy마다
-N reads 무조건 발사, dpumesh `drain_all_rings`은 한 inner iter에서 4 rings 폴링
-+ 0~4 dma_copy → saturation 시 amortize (§10.4의 ratio 1.017과 일치).
-
-### 11.5 Post-cleanup sweep — dead code 제거 + lazy drain + throttle
-
-§11.1의 strip 매크로를 영구 코드로 흡수한 직후 추가로 적용한 정리.
-
-**적용 사항**:
-- **DMA_REQ dead code chain 제거** (총 ~150줄): `dma.c` (init_dma_resources +
-  send_dma_request_to_dpa), `dma.h`, `dpa_kernel.c`의 `handle_dpu_msg` DMA_REQ
-  case (80줄), `dpa_common.h`의 `struct comch_dma_req_msg` + enum + union field,
-  `dpa.c`의 `COMCH_MSG_TYPE_DMA_CHUNK` consumer-side case. **caller 0**이라
-  실행 경로 변경 없는 순수 제거.
-- **Chunking fallback 제거**: host측 `check_slot_size()`가 `DPUMESH_SLOT_SIZE_DEFAULT
-  = 8192`로 강제하므로 `desc->size > 8KB`는 실제로 도달 불가. `process_one_desc` /
-  `process_one_rev_desc`의 chunking else 분기 (~120줄) 제거, size > 8KB 시
-  명시적 drop guard 추가. forward path는 fast-path만 남아 함수 절반 길이로 단축.
-- **`handle_msgs` 호출 주기 감소**: drain_all_rings의 매 inner iter (~50K/s)에서
-  매 32 iter (~1.5K/s)로. TRIGGER ~1 kHz / ADD_RING (deploy 1회)만 처리하면
-  되므로 대부분 empty poll. outer wake당 1회는 그대로 유지.
-- **`ensure_producer_slot` lazy drain**: 내부 drain spin 제거하고 inflight ≥ CAP
-  시 -1 return (caller abort). `drain_producer_completions`은 drain_all_rings 안
-  매 8 iter (~6K/s)에서 일괄. PRODUCER_SLOT_CAPACITY=1024 ≫ 일반 wake당 ~280
-  inflight 이라 abort 사실상 불발.
-
-**Sweep 결과 (8 KB, 10 s)**:
-
-| Target | Achieved | p50 (ms) | p99 (ms) | p999 (ms) | Throughput | OK / Fail | 비고 |
-|---:|---:|---:|---:|---:|---:|---|---|
-| 30K run 1 | 29,812.7 | 3.19 | **5.78** | 5.93 | 465.82 MB/s | 300,000 / 0 | sustainable |
-| 30K run 2 | 29,800.9 | 3.21 | 5.82 | 8.26 | 465.64 MB/s | 300,000 / 0 | back-to-back clean |
-| 50K | 49,653.5 | 4.96 | **9.06** | 9.33 | 775.84 MB/s | 500,000 / 0 | sustainable |
-| 55K | 54,629.5 | 5.33 | **9.80** | 12.23 | 853.59 MB/s | 550,000 / 0 | sustainable — 이전 elbow 통과 |
-| 60K | 59,564.2 | 5.60 | **12.58** | 14.45 | 930.69 MB/s | 600,000 / 0 | sustainable, elbow edge |
-| 62K run 1 | 61,536.4 | 5.92 | 12.89 | 13.12 | 961.51 MB/s | 620,000 / 0 | borderline sustainable |
-| 62K run 2 | 61,548.9 | 6.24 | 15.15 | 18.08 | 961.70 MB/s | 620,000 / 0 | back-to-back, slot leak 없음 |
-| 65K | 62,068.3 | **203.35** | **404.21** | 410.28 | 969.82 MB/s | 650,000 / 0 | overload (p99 폭증) |
-
-**핵심 관찰**:
-- **Sustainable elbow 55K → 60K** (§11.1 strips만 적용 시 55K @ p99 12 ms ≈
-  이번 60K @ p99 12.6 ms와 동일 profile).
-- **Overload throughput ceiling 59,195 → 62,068 RPS** (+4.9%, 65K target에서
-  achieved 비교).
-- Throughput 970 MB/s @ 65K target — §11.1 925 MB/s 대비 +4.9%.
-- 65K → 62K가 hard cap. DMA chain 62K × 4 = **248K dma_copy/s ≈ M2 ceiling 310K의 80%**.
-- 8 sweep 전 구간 **0 failure**, 62K back-to-back 둘 다 clean → slot leak 없음.
-
-**누적 ceiling 변화**:
-
-```
-   100% ┃ ┌── HW max (Method 0)              ── 320,014 ops/s = 20.97 Gbps
-    97% ┃ ├── DMA + completion (Method 2)    ── 310,472 ops/s = 20.34 Gbps
-    78% ┃ ├── dpumesh @ §11.5 cleanup        ── 248,272 ops/s = 16.28 Gbps
-        ┃ │     (62,068 RPS × 4 dma_copy)
-    74% ┃ ├── dpumesh @ §11.1 strips         ── 236,780 ops/s = 15.13 Gbps
-    68% ┃ └── dpumesh @ in-place baseline    ── 218,992 ops/s = 14.02 Gbps
-```
-
-### 11.6 `comch_dma_comp_msg` packing — 28B → 16B (WQE BB 1개)
-
-§11.3 E5 (M2 add LARGER_COMP_MSG, 12B → 24B = -8.6%)의 역방향. dpumesh의
-DPA→DPU 완료 메시지는 모든 7 필드가 라우팅/Thrift semantic에 실제로 쓰이므로
-필드 자체는 줄일 수 없음. 대신 **wire format을 더 좁게 packing**.
-
-**Quantization 가설 검증**:
-
-| Quantum 후보 | 12B → 24B 예상 cost | §11.3 E5 측정 | 정합 |
-|---|---:|---:|---|
-| 64B | 0% | -8.6% | ❌ 모순 |
-| 32B | 0% | -8.6% | ❌ 모순 |
-| 16B | -50% bytes (1→2 quanta) | -8.6% | ✅ |
-| Linear | 비례 | -8.6% | △ |
-
-→ §11.3 E5는 quantum ≥ 32B 가설을 **정량적으로 배제**. 28B → 16B 압축은
-32B HW quantum → 16B HW quantum 1단계 강하 = 비슷한 -8% 기대.
-
-**변경 사항** (`dpa_common.h`):
-
-| 필드 | Before | After | 정당화 |
-|---|---:|---:|---|
-| `type` | `enum` 4B | `uint8_t` 1B | DMA_COMPLETED=2, REV_DMA_COMPLETED=7 — 2값만 사용 |
-| `pos` | 4B | 4B | 변경 없음 (offset 4, 자연 정렬) |
-| `length` | 4B | 4B | 변경 없음 |
-| `req_id` | 4B | 4B | 변경 없음 |
-| `src_pod_id` | `int32_t` 4B | `int8_t` 1B | MAX_PODS=32 + -1 sentinel, int8 충분 |
-| `dst_pod_id` | `int32_t` 4B | `int8_t` 1B | 동일 |
-| `flags` | 1B | 1B | 이미 최소 |
-| 트레일 padding | 3B | 0B | 필드 재배치로 16B 정렬 |
-| **sizeof** | **28B** | **16B** | -43% bytes |
-
-`__attribute__((packed))` 불필요 — 4B 필드들이 모두 4B-aligned offset에
-랜딩하도록 재배치 (`type/flags/src/dst @ 0..3, pos @ 4, length @ 8, req_id @ 12`).
-DPA 측 unaligned access penalty 없음. `_Static_assert(sizeof == 16)`로 회귀
-방어.
-
-**Read site 수정** (`dpa.c:71-76`): 기존 `*(enum comch_msg_type *)raw`는 4B
-read였는데 이제 type가 1B → `raw[0]`로 단축. 다른 caller는 모두
-`sizeof(struct comch_dma_comp_msg)` 또는 struct pointer cast 사용이라 자동 적응.
-
-**Sweep 결과 (8 KB, 10 s, packing 적용 후)**:
-
-| Target | Achieved | p50 (ms) | p99 (ms) | p999 (ms) | Throughput | OK / Fail | 비고 |
-|---:|---:|---:|---:|---:|---:|---|---|
-| 30K | 29,801.4 | 3.04 | **5.53** | 6.21 | 465.65 MB/s | 300,000 / 0 | sustainable |
-| 50K | 49,653.8 | 4.70 | **8.59** | 9.23 | 775.84 MB/s | 500,000 / 0 | sustainable |
-| 60K | 59,585.6 | 5.44 | **10.04** | 12.64 | 931.03 MB/s | 600,000 / 0 | sustainable |
-| 62K | 61,545.3 | 5.51 | **12.59** | 12.79 | 961.65 MB/s | 620,000 / 0 | sustainable |
-| **65K run 1** | **64,549.4** | **5.65** | **12.89** | 13.08 | **1008.58 MB/s** | 650,000 / 0 | **sustainable — 1 GB/s 돌파** |
-| 65K run 2 | 64,524.0 | 5.70 | 12.90 | 13.22 | 1008.19 MB/s | 650,000 / 0 | back-to-back, slot leak 없음 |
-| 66K | 65,529.0 | 12.08 | **24.51** | 26.37 | 1023.89 MB/s | 660,000 / 0 | elbow 초과 |
-| 67K | 65,859.6 | 55.45 | **105.72** | 109.01 | 1029.06 MB/s | 670,000 / 0 | overload |
-
-**핵심 관찰**:
-- **Sustainable elbow 60K → 65K** (+8.3%). 이전엔 65K가 deep overload
-  (p99 404 ms), 이제 65K가 깨끗한 sustainable region.
-- **Overload throughput ceiling 62K → 65.5K** (+5.6%).
-- **Throughput 1 GB/s 돌파** @ 65K (이전 §11.5의 970 MB/s).
-- 50K-60K p99 일괄 5-20% 개선 (60K p99 -20.2%가 가장 큼).
-- 8 sweep 전 구간 **0 failure**, 65K back-to-back 둘 다 clean.
-
-**§11.3 E5 가설 정량 검증**:
-- E5 인버스 예측: ~+8% throughput
-- 실측: overload throughput +5.6%, p99 -20% @ 60K, elbow +8.3% RPS
-- → **§11.3 E5의 quantum hypothesis 정합** (16B HW quantum 확정).
-
-**누적 ceiling 갱신**:
-
-```
-   100% ┃ ┌── HW max (Method 0)              ── 320,014 ops/s = 20.97 Gbps
-    97% ┃ ├── DMA + completion (Method 2)    ── 310,472 ops/s = 20.34 Gbps
-    82% ┃ ├── dpumesh @ §11.6 packing        ── 263,436 ops/s = 17.27 Gbps
-        ┃ │     (65,859 RPS × 4 dma_copy @ 67K target)
-    78% ┃ ├── dpumesh @ §11.5 cleanup        ── 248,272 ops/s = 16.28 Gbps
-    74% ┃ ├── dpumesh @ §11.1 strips         ── 236,780 ops/s = 15.13 Gbps
-    68% ┃ └── dpumesh @ in-place baseline    ── 218,992 ops/s = 14.02 Gbps
-```
-
-vs Method 2: 78% → **85%**. vs Method 0: 78% → **82%**.
-
-### 11.7 Producer slot SDK 위임 + `OPTIMIZE_REPORTS`
-
-§11.5의 lazy-drain은 `producer_slots_inflight` 카운터 + `PRODUCER_SLOT_CAPACITY=1024`
-hard cap + abort 패턴으로 구현됐는데, 이 패턴이 SDK의 `DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS`
-(완료 batch 통보)와 충돌. OPTIMIZE_REPORTS를 켜면 completion이 deferred되어
-`drain_producer_completions`가 0 ack → 카운터 미감소 → CAP 도달 → abort 연쇄
-→ host TX stuck (실측 30K target에서 OK 243 / Fail 900). M2 baseline (§7.1)은
-inflight 카운터 자체를 안 두고 SDK 내부 backpressure에 위임하며 모든 dma_copy에
-OPTIMIZE_REPORTS 켜고 잘 동작.
-
-**변경 사항**:
-- `producer_slots_inflight` 카운터 제거 (dpa_thread_arg에서 `_pad1`으로 교체, alignment 보존)
-- `ensure_producer_slot` 함수 + 호출 4건 제거 (CAP/abort 패턴 폐기)
-- `drain_producer_completions`은 ack만 유지 (count 추적/슬롯 감소 제거)
-- 두 `dma_copy` 호출처에 `DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH |
-  DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS`
-
-producer 큐 backpressure 안전: per-wake burst ~280 dma_copy (§10.1) ≪ SDK 큐
-용량 1024, drain `DRAIN_COMPLETIONS_EVERY=8` inner iter 주기로 ack 유지.
-
-**Sweep (8 KB, 10 s)**:
-
-| Target | Achieved | p50 (ms) | p99 (ms) | p999 (ms) | Throughput | OK / Fail | 비고 |
-|---:|---:|---:|---:|---:|---:|---|---|
-| 30K | 29,783.2 | 2.94 | **5.38** | 6.70 | 465.36 MB/s | 300,000 / 0 | sustainable |
-| 50K | 49,662.8 | 4.58 | **8.35** | 8.61 | 775.98 MB/s | 500,000 / 0 | sustainable |
-| 60K | 59,554.3 | 5.35 | **9.84** | 12.49 | 930.54 MB/s | 600,000 / 0 | sustainable |
-| 65K | 64,523.0 | 5.59 | **12.84** | 13.08 | 1008.17 MB/s | 650,000 / 0 | sustainable |
-| **67K** | **66,533.4** | **5.67** | **13.00** | 13.20 | **1039.58 MB/s** | 670,000 / 0 | **새 sustainable** |
-| **68K** | **67,497.0** | **6.45** | **13.72** | 15.21 | **1054.64 MB/s** | 680,000 / 0 | sustainable, elbow edge |
-| 70K | 68,126.8 | 119.49 | **248.78** | 253.66 | 1064.48 MB/s | 700,000 / 0 | overload |
-
-**Back-to-back 안정성** (state drift / slot leak 검증, 5,420,000 RTT × 9 run):
-
-| Target | Run 1 / p99 | Run 2 / p99 | Run 3 / p99 |
+| Baseline(per-batch) | 49,629/9.89 | 54,080/91.06 | **54,291/1,894** | 847 MB/s |
+| +VALIDATION | 49,721/10.04 | — | 55,207/1,704 | 862 |
+| +DESC_CLEAR | — | — | 56,134/1,545 | 877 |
+| **+CHUNK_LOOP** | **49,659/9.36** | **54,617/12.27** | **59,195/952** | **925** |
+
+단계 기여: 54,291 → 55,207(+916,+1.7%) → 56,134(+927,+1.7%) → 59,195(+3,061,+5.5%) = **+9.0%**.
+chunking bypass가 최대 기여(loop 안 `ensure_producer_slot`+`is_consumer_empty` wait+inflight++가
+1 chunk도 발동; fast path는 1회). elbow 55K가 sustainable로(p99 91→12 ms). per-dma_copy:
+Baseline 4.57µs → A+B+C 4.22µs(-0.35) → (M2 3.08µs). 안정성 3× 50K: 49342.6/9381.5µs,
+49353.8/9347.9, 49344.8/9329.5 (모두 250000/0).
+
+### 4.4 Post-cleanup (dead code 제거 + lazy drain + throttle)
+
+DMA_REQ dead chain ~150줄 제거(caller 0), chunking fallback else 제거(host `check_slot_size`로
+>8KB 도달 불가 → drop guard), `handle_msgs` 매 iter→매 32 iter, `ensure_producer_slot` lazy
+drain(inflight≥CAP시 -1 abort, drain 매 8 iter, CAP=1024 ≫ wake당 ~280 inflight).
+
+| Target | Achieved | p50 | p99 | p999 | Throughput | OK/Fail |
+|---:|---:|---:|---:|---:|---:|---|
+| 30K run1 | 29,812.7 | 3.19 | **5.78** | 5.93 | 465.82 | 300,000/0 |
+| 30K run2 | 29,800.9 | 3.21 | 5.82 | 8.26 | 465.64 | 300,000/0 |
+| 50K | 49,653.5 | 4.96 | **9.06** | 9.33 | 775.84 | 500,000/0 |
+| 55K | 54,629.5 | 5.33 | **9.80** | 12.23 | 853.59 | 550,000/0 |
+| 60K | 59,564.2 | 5.60 | **12.58** | 14.45 | 930.69 | 600,000/0 |
+| 62K run1 | 61,536.4 | 5.92 | 12.89 | 13.12 | 961.51 | 620,000/0 |
+| 62K run2 | 61,548.9 | 6.24 | 15.15 | 18.08 | 961.70 | 620,000/0 |
+| 65K | 62,068.3 | **203.35** | **404.21** | 410.28 | 969.82 | 650,000/0 |
+
+sustainable 55K→**60K**, overload 59,195→**62,068**(+4.9%). 62K×4=**248,272 ops/s ≈ M2 80%**.
+0 fail 전 구간, 62K back-to-back clean.
+
+### 4.5 `comch_dma_comp_msg` packing 28B → 16B (WQE BB 1개)
+
+DPA→DPU 완료 메시지 7필드는 라우팅/Thrift semantic에 다 쓰여 줄일 수 없어 wire format을 packing.
+
+| 필드 | Before→After | | 필드 | Before→After |
+|---|---|---|---|---|
+| type | enum 4B → uint8 1B | | src_pod_id | int32 4B → int8 1B |
+| pos | 4B (유지) | | dst_pod_id | int32 4B → int8 1B |
+| length | 4B (유지) | | flags | 1B (유지) |
+| req_id | 4B (유지) | | 트레일 pad | 3B → 0B |
+
+sizeof 28B→16B(-43%). 필드 재배치로 4B-aligned offset 유지(`type/flags/src/dst@0..3, pos@4,
+length@8, req_id@12`) → packed 불필요, DPA unaligned penalty 없음, `_Static_assert(sizeof==16)`.
+read site(`dpa.c:71-76`) `*(enum*)raw`(4B) → `raw[0]`(1B).
+
+Quantization 가설(§5.6 E5 인버스): 64B/32B quantum이면 12→24B cost 0%여야 하나 E5 측정 -8.6%
+→ 32B 이상 quantum **배제**, 16B HW quantum 확정. 28B→16B = 32B→16B quantum 1단강하 ≈ -8% 기대.
+
+| Target | Achieved | p50 | p99 | p999 | Throughput | OK/Fail |
+|---:|---:|---:|---:|---:|---:|---|
+| 30K | 29,801.4 | 3.04 | **5.53** | 6.21 | 465.65 | 300,000/0 |
+| 50K | 49,653.8 | 4.70 | **8.59** | 9.23 | 775.84 | 500,000/0 |
+| 60K | 59,585.6 | 5.44 | **10.04** | 12.64 | 931.03 | 600,000/0 |
+| 62K | 61,545.3 | 5.51 | **12.59** | 12.79 | 961.65 | 620,000/0 |
+| **65K run1** | **64,549.4** | **5.65** | **12.89** | 13.08 | **1008.58** | 650,000/0 |
+| 65K run2 | 64,524.0 | 5.70 | 12.90 | 13.22 | 1008.19 | 650,000/0 |
+| 66K | 65,529.0 | 12.08 | **24.51** | 26.37 | 1023.89 | 660,000/0 |
+| 67K | 65,859.6 | 55.45 | **105.72** | 109.01 | 1029.06 | 670,000/0 |
+
+sustainable 60K→**65K**(+8.3%), overload 62K→**65.5K**(+5.6%), **1 GB/s 돌파**@65K, 50-60K p99
+5-20% 개선(60K -20.2%). 65,859×4=**263,436 ops/s(85% M2)**. E5 인버스 검증 정합(예측+8%, 실측 +5.6%
+tput/-20% p99/elbow +8.3%).
+
+### 4.6 Producer slot SDK 위임 + `OPTIMIZE_REPORTS`
+
+§4.4 lazy-drain의 `producer_slots_inflight` 카운터+CAP=1024+abort 패턴이 SDK의
+`DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS`(완료 batch 통보)와 충돌(완료 deferred → ack 0 →
+카운터 미감소 → CAP → abort 연쇄 → host TX stuck, 실측 30K OK 243/Fail 900). 카운터 제거(_pad1로
+교체), `ensure_producer_slot`+호출 4건 제거, drain은 ack만 유지, 두 dma_copy에 `FLUSH|OPTIMIZE_REPORTS`.
+M2 baseline은 카운터 없이 SDK backpressure에 위임. 안전: wake당 burst ~280 ≪ SDK 큐 1024,
+`DRAIN_COMPLETIONS_EVERY=8`.
+
+| Target | Achieved | p50 | p99 | p999 | Throughput | OK/Fail |
+|---:|---:|---:|---:|---:|---:|---|
+| 30K | 29,783.2 | 2.94 | **5.38** | 6.70 | 465.36 | 300,000/0 |
+| 50K | 49,662.8 | 4.58 | **8.35** | 8.61 | 775.98 | 500,000/0 |
+| 60K | 59,554.3 | 5.35 | **9.84** | 12.49 | 930.54 | 600,000/0 |
+| 65K | 64,523.0 | 5.59 | **12.84** | 13.08 | 1008.17 | 650,000/0 |
+| **67K** | **66,533.4** | **5.67** | **13.00** | 13.20 | **1039.58** | 670,000/0 |
+| **68K** | **67,497.0** | **6.45** | **13.72** | 15.21 | **1054.64** | 680,000/0 |
+| 70K | 68,126.8 | 119.49 | **248.78** | 253.66 | 1064.48 | 700,000/0 |
+
+Back-to-back(5,420,000 RTT × 9 run, 편차 ach<0.05%/p99<1%, 0 fail×9):
+
+| Target | Run1/p99 | Run2/p99 | Run3/p99 |
 |---:|---:|---:|---:|
-| 60K | 59,553.5 / 9.61 ms | 59,553.9 / 9.82 ms | — |
-| 65K | 64,523.0 / 12.85 ms | 64,513.8 / 12.83 ms | — |
-| 67K | 66,533.4 / 13.00 ms | 66,508.9 / 13.01 ms | 66,505.5 / 13.04 ms |
-| 68K | 67,497.0 / 13.72 ms | 67,488.3 / 13.63 ms | — |
+| 60K | 59,553.5/9.61 | 59,553.9/9.82 | — |
+| 65K | 64,523.0/12.85 | 64,513.8/12.83 | — |
+| 67K | 66,533.4/13.00 | 66,508.9/13.01 | 66,505.5/13.04 |
+| 68K | 67,497.0/13.72 | 67,488.3/13.63 | — |
 
-run-to-run achieved 편차 < 0.05%, p99 편차 < 1%, **0 failure × 9 회**. M2-style
-패턴이 §14의 lossless ring 가정과 함께 long-run drift 없이 동작.
+sustainable 65K→**68K**, overload 65,859→**68,127**(+3.4%), tput 1,029→1,065 MB/s. 67K p99 §4.5
+105ms(overload)→13.0ms(sustainable). 68,127×4=**272,508 ops/s(88% M2)**. 단독(카운터 제거만)
++1.5%, +OPTIMIZE_REPORTS 시너지로 +3.4% (단독 OPTIMIZE_REPORTS는 CAP 패턴과 incompatible).
 
-**핵심 관찰**:
-- **Sustainable elbow 65K → 68K** (+4.6% vs §11.6, +13.3% vs §11.5 60K).
-- **Overload throughput ceiling 65,859 → 68,127 RPS** (+3.4% vs §11.6).
-- Throughput 1,029 → 1,065 MB/s (+3.5%).
-- 67K p99 §11.6 105 ms (overload) → 13.0 ms (sustainable, back-to-back stable).
-- M2-style 단독 (counter 제거만): +1.5%. +OPTIMIZE_REPORTS 시너지로 +3.4%
-  ⇒ 두 변경의 결합 효과. 단독 OPTIMIZE_REPORTS는 §11.5 CAP 패턴과 incompatible.
+### 4.7 DPA poll/writeback fence 일괄화 + ring batch drain (→ M2 99.8%)
 
-**누적 ceiling 갱신**:
+DPA EU가 cap이므로 EU의 per-desc 비용을 3단계로 절감(host/DPA 자료구조 변경 없음):
+**(a) read_inv hoist** — window-wide read fence를 inner iter당 4회→1회. **(b) ring batch drain** —
+`process_one_desc`/`process_one_rev_desc`→`process_fwd_ring`/`process_rev_ring`, ring당
+`RING_BATCH_CAP=32` 연속 desc를 1호출에 처리(메타데이터 1회 로드, 중복 consumer-wait 통합).
+**(c) writeback batch** — per-desc writeback 제거, inner iter당 1회(found>0). 각 desc가 64B
+독점이라 일괄 flush 안전.
 
-```
-   100% ┃ ┌── HW max (Method 0)              ── 320,014 ops/s = 20.97 Gbps
-    97% ┃ ├── DMA + completion (Method 2)    ── 310,472 ops/s = 20.34 Gbps
-    85% ┃ ├── dpumesh @ §11.7 SDK delegation ── 272,508 ops/s = 17.85 Gbps
-        ┃ │     (68,127 RPS × 4 dma_copy @ 70K target)
-    82% ┃ ├── dpumesh @ §11.6 packing        ── 263,436 ops/s = 17.27 Gbps
-    78% ┃ ├── dpumesh @ §11.5 cleanup        ── 248,272 ops/s = 16.28 Gbps
-    74% ┃ ├── dpumesh @ §11.1 strips         ── 236,780 ops/s = 15.13 Gbps
-    68% ┃ └── dpumesh @ in-place baseline    ── 218,992 ops/s = 14.02 Gbps
-```
-
-vs Method 2: 82% → **88%**. vs Method 0: 82% → **85%**.
-
-### 11.8 DPA poll/writeback fence 일괄화 + ring batch drain
-
-§10 측정상 DPA EU가 cap. 그 EU가 desc 하나를 처리할 때마다 무는 비용을 세 단계로
-줄임. 세 변경 모두 host/DPA 자료구조 변경 없이 `dpa_kernel.c` 안에 국한.
-
-**(a) read_inv hoist.** `__dpa_thread_window_read_inv()`는 특정 주소가 아니라
-window 전체를 invalidate하는 read fence(`__DPA_MMIO, R, R`)다. 기존엔 forward/reverse
-desc를 읽기 전 매번 호출(inner iter당 4회, 매번 window 전체 re-nuke)했는데, inner
-iter 시작에 1회로 모음. 한 번의 read_inv로 그 iter의 모든 ring desc + credit slot의
-첫 read가 fresh.
-
-**(b) Ring batch drain.** `process_one_desc`/`process_one_rev_desc`(→ `process_fwd_ring`/
-`process_rev_ring`로 개명)가 호출당 desc 1개만 처리하던 것을 ring당 최대
-`RING_BATCH_CAP=32`개 연속 valid desc를 한 호출에서 처리하도록 변경. ring 메타데이터
-(producer/mmap/buf_size)를 호출당 1회만 로드하고, do-while 재방문 횟수·함수 호출·
-per-iter overhead(found 체크, throttle 카운터)를 burst당 ~수백→~10회로 압축.
-fairness 위해 batch 상한. 중복이던 consumer-empty wait 2개도 1개로 통합.
-
-**(c) Writeback batch.** `__dpa_thread_window_writeback()`도 window-wide write fence라
-desc N개의 `valid=0`을 써놓고 마지막에 1회 flush하면 모두 visible. 기존 per-desc
-writeback을 제거하고 drain_all_rings inner iter당 1회(found>0일 때)로 모음. 각 desc가
-64B = cache line 1개를 독점하므로 일괄 flush가 이웃 slot을 clobber하지 않음
-(§11.6 desc-pack 시도가 깨진 이유와 동일한 제약의 안전한 쪽).
-
-**Sweep (8 KB, 10 s) — 단계 누적**:
-
-| Target | §11.7 | (a) read_inv | (b) batch drain | (c) writeback batch |
+| Target | §4.6 | (a)read_inv | (b)batch drain | (c)wb batch |
 |---:|---:|---:|---:|---:|
 | 30K p99 | 5.38 | 5.33 | 5.28 | **5.19** |
 | 50K p99 | 8.35 | 8.31 | 8.04 | **7.97** |
 | 65K p99 | 12.84 | 12.78 | **9.98** | 9.83 |
 | 73K p99 | overload | overload | 13.50 | **13.50** |
-| **74K p99** | overload | overload | 23.22 (borderline) | **13.57** |
-| 75K p99 | overload | overload | overload | 15.83 (borderline) |
+| **74K p99** | overload | overload | 23.22 | **13.57** |
+| 75K p99 | overload | overload | overload | 15.83 |
 | Sustainable elbow | 68K | 69K | 73K | **74K** |
-| Overload ceiling (RPS) | 68,127 | 68,819 | 74,702 | **77,434** |
+| Overload ceiling(RPS) | 68,127 | 68,819 | 74,702 | **77,434** |
 
-각 단계 overload achieved: §11.7 68,127 → (a) 68,819 (+1.0%) → (b) 74,702 (**+8.5%**)
-→ (c) 77,434 (**+3.7%**). (b) ring batch drain이 최대 기여 — read fence·함수 호출·
-do-while 재방문을 한꺼번에 줄임. 65K p99는 (b)에서 12.78 → 9.98 ms (-22%).
+단계 overload: 68,127→(a)68,819(+1.0%)→(b)74,702(**+8.5%**)→(c)77,434(**+3.7%**). (b)가 최대(65K
+p99 12.78→9.98,-22%). Back-to-back(74K×4 + 73K×2 + 30K recovery): 74K 73,422-73,453/p99
+13.56·13.60·13.59·13.585; 73K 72,447·72,455/13.50·13.49; 30K 29,803/5.19. 편차 ach<0.05%/p99<1%,
+0 fail.
 
-**Back-to-back 안정성** (74K ×4 + 30K recovery + 73K ×2):
+**Milestone**: 77,434×4 = **309,736 ops/s = M2 310,472의 99.8%** (1,186 MB/s overload). single-EU
+chain이 micro-bench M2와 구분 불가 — single-EU single-ring-chain의 자연 종착점.
 
-| Run | Achieved | p99 (ms) |
-|---|---:|---:|
-| 74K ×4 | 73,422–73,453 | 13.56 / 13.60 / 13.59 / 13.585 |
-| 73K ×2 | 72,447 / 72,455 | 13.50 / 13.49 |
-| 30K recovery | 29,803 | 5.19 |
+### 4.8 desc 32B pack 시도 — 실패
 
-run-to-run achieved 편차 < 0.05%, p99 편차 < 1%, **0 failure** 전 구간. writeback batch가
-correctness 유지 (각 desc가 자기 cache line 독점 → 일괄 flush 안전).
+§4.7(b)의 read 절감을 더 밀어 `dma_desc` 64B→32B(2 desc가 한 cache line 공유) 시도 → **30K에서
+1992 OK / 900 Fail / 132 achieved 붕괴**. 원인: `__dpa_thread_window_writeback()`는 cache-line
+단위 RMW. 32B 2개가 한 line 공유 시 DPA가 desc[0].valid=0 flush할 때 stale desc[1](valid=1)을
+host로 되써서 clobber → slot stuck → timeout (§5.6 E4 storm과 동근). **64B-per-desc는 padding이
+아니라 writeback 격리를 위한 load-bearing 제약**.
 
-**결정적 milestone — Method 2 ceiling 사실상 도달**:
+### 4.9 누적 ceiling 변화
 
-```
-overload dma_copy/s = 77,434 × 4 = 309,736 ops/s
-Method 2 ceiling     =            310,472 ops/s  → 99.8%
-```
+| Phase | Sustainable elbow(8KB,p99≤~14ms) | Overload throughput | DMA ops/s | vs M2 | vs M0 |
+|---|---:|---:|---:|---:|---:|
+| §4.1 baseline | 52K(12ms) | 53,841@65K | 215,364 | 69% | 67% |
+| §4.2 in-place | 54K(12.4) | 54,748@65K | 218,992 | 71% | 68% |
+| §4.3 strips | 55K(12.3) | 59,195@65K | 236,780 | 76% | 74% |
+| §4.4 cleanup | 60K(12.6) | 62,068@65K | 248,272 | 80% | 78% |
+| §4.5 packing | 65K(12.9) | 65,859@67K | 263,436 | 85% | 82% |
+| §4.6 SDK 위임 | 68K(13.7) | 68,127@70K | 272,508 | 88% | 85% |
+| **§4.7 fence/batch** | **74K(13.6)** | **77,434@78K** | **309,736** | **99.8%** | **96.8%** |
 
-throughput 1,186 MB/s (overload). dpumesh transport가 micro-bench M2 chain과
-구분 불가능한 수준. single-EU chain의 자연 종착점 — 이 이상은 chain 자체를 바꿔야
-함(direct host→host로 dma_copy 4→2, 또는 multi-EU).
-
-**누적 ceiling 갱신**:
-
-```
-   100% ┃ ┌── HW max (Method 0)              ── 320,014 ops/s = 20.97 Gbps
-    97% ┃ ├── DMA + completion (Method 2)    ── 310,472 ops/s = 20.34 Gbps
-  99.8% ┃ ├── dpumesh @ §11.8 fence/batch    ── 309,736 ops/s = 20.29 Gbps  (of M2)
-        ┃ │     (77,434 RPS × 4 dma_copy @ 78K target)
-    88% ┃ ├── dpumesh @ §11.7 SDK delegation ── 272,508 ops/s = 17.85 Gbps
-    85% ┃ ├── dpumesh @ §11.6 packing        ── 263,436 ops/s = 17.27 Gbps
-    80% ┃ ├── dpumesh @ §11.5 cleanup        ── 248,272 ops/s = 16.28 Gbps
-    76% ┃ ├── dpumesh @ §11.1 strips         ── 236,780 ops/s = 15.13 Gbps
-    68% ┃ └── dpumesh @ in-place baseline    ── 218,992 ops/s = 14.02 Gbps
-```
-
-vs Method 2: 88% → **99.8%**. vs Method 0: 85% → **96.8%**.
-
-### 11.9 desc 32B pack 시도 — 실패 (writeback granularity 제약)
-
-§11.8 (b)의 read 절감을 더 밀어 PCIe data read까지 반으로 줄이려 `dma_desc`를
-64B → 32B로 줄여 2 desc가 한 64B cache line을 공유하게 시도. **30K에서 1992 OK /
-900 Fail, 132 achieved로 붕괴**.
-
-근본 원인: DPA의 `__dpa_thread_window_writeback()`가 cache-line 단위 RMW다. 32B desc
-2개가 한 line을 공유하면, DPA가 desc[0].valid=0을 flush할 때 DPA 캐시의 stale desc[1]을
-host로 되써서 host가 막 채운 desc[1](valid=1)을 clobber → slot stuck → timeout.
-lossless single-owner-per-slot 모델은 "slot 독립 소유"를 가정하는데, line-granular
-writeback이 이웃 slot을 침범하며 그 가정을 깬다(§11.2 E4 storm과 같은 뿌리).
-
-**64B-per-desc (cache line당 1 desc)는 padding이 아니라 writeback 격리를 위한
-load-bearing 제약**임이 실측으로 확정. `dma_desc`에 가드 주석 추가, 64B 유지. host+DPA가
-line 단위로 ownership을 lockstep 이동시키면(2 desc atomic publish/release + straggler
-skip-bit + 타임아웃 flush) 안전하게 pack 가능하나, 이득은 PCIe read 절감뿐이고 그건
-§11.8 (b)가 fence 차원에서 이미 흡수 — chain이 M2의 99.8%라 추가 여지 없어 미진행.
+throughput milestone: §4.5에서 1 GB/s 돌파(65K@1,008 MB/s), §4.7에서 1,186 MB/s(overload).
 
 ---
 
-## 12. In-place Forwarding 변경 (2026-05-08)
+## 5. Cap Attribution — 왜 dpumesh < M2였나
 
-§10.5의 우선순위 4항목 중 가장 큰 ratio (10-15% 예측)의 **`process_forward_entry`
-8 KB staging memcpy 제거**.
+§4 baseline 대비 dpumesh 31% gap의 원인을 직접 측정으로 검증/반증. **결론: cap = single DPA EU의
+per-dma_copy work** (ARM/epoll/PCIe-BW/polling은 cap 아님).
 
-### 12.1 변경 사항
+### 5.1 DPA EU stat — ARM 99.9%인데 EU 99.5% idle (50K, 10s)
+
+`dpa-statistics collect -d mlx5_0 -t 10000`:
+
+| 항목 | 값 | 해석 |
+|---|---:|---|
+| Wall time | 10,000 ms | 측정창 |
+| EU active time | **51.5 ms** | 실제 실행 |
+| EU active % | **0.51%** | 99.49% idle |
+| Cycles | 92.7 G | 51.5ms × ~1.8GHz 일치 |
+| Instructions | 7.22 G | IPC 0.078 (memory/DMA stall, 정상) |
+| Executions | 7,314 (731/s) | DPA thread wake 횟수 |
+| Cycles/execution | 12.7 M | wake당 ~7µs |
+| dma_copy/execution | ~273 | wake당 batch |
+
+DPA는 burst 처리 — wake → 273 dma_copy 일괄 → re-schedule.
+
+### 5.2 ARM perf self-time (`perf report --no-children`, 50K)
+
+| 카테고리 | dpumesh | M0 | M2 |
+|---|---:|---:|---:|
+| epoll_pwait 군집(kernel+libc+vdso) | **64%** | 65% | 62% |
+| DOCA infra(CQ poll, comch) | 7% | 13% | 19% |
+| Atomics(CAS/swap/mutex) | 4% | 2% | 3% |
+| App 코드(run_dpu_worker/process_*/drain_*) | **5.5%** | 3.4% | 2.8% |
+
+per-op time: M0 3.13µs, M2 3.22µs(baseline), **dpumesh 4.67µs (+1.45µs, +45%)**. 세 측정 모두
+syscall 1순위지만 dpumesh만 throughput 낮음 → ARM 폴링 자체로는 설명 불가.
+
+### 5.3 ARM CPU 분포 (flame `dpumesh_dpu_flame_per_batch.svg`)
+
+| ARM 함수 | self% | per-event |
+|---|---:|---:|
+| `doca_pe_progress`(epoll 포함) | 76.5% | 3.48µs |
+| `process_completion_queue` | 7.95% | 0.36µs |
+| `process_rev_notify_entry` | 5.18% | 0.24µs |
+| `find_pod_by_id` | 2.80% | 0.13µs |
+| `server_send_msg_to_conn` | 2.20% | 0.10µs |
+| comp_queue ops(peek/empty/full/dq/eq) | ~3.5% | 0.16µs |
+| `process_forward_entry` | 0.91% | 0.04µs |
+| `drain_deferred_tx_acks` | 0.54% | 0.02µs |
+| **ARM useful work 합** | **~23%** | **~1.05µs/event** |
+
+ARM·DPA EU는 병렬 processor. cap = max(DPA per-op 4.55µs, ARM per-event 1.05µs) → **DPA가 cap,
+ARM ~3.5µs 헤드룸**. ARM 최적화는 throughput 무영향.
+
+### 5.4 DPA polling counter — 결정적 측정 (50K, 15s)
+
+DPA kernel에 `stat_inner_iters/stat_polls/stat_dma_copies` 카운터 추가, ARM이 `doca_dpa_d2h_memcpy`로
+1초마다 읽음:
+```
+iters=50858 polls=203428 copies=200052  poll/copy=1.017
+iters=50799 polls=203196 copies=200033  poll/copy=1.016
+iters=50816 polls=203268 copies=200000  poll/copy=1.016
+iters=50910 polls=203636 copies=200012  poll/copy=1.018
+iters=50876 polls=203504 copies=199999  poll/copy=1.018
+```
+inner iter ~50,800/s, iter당 4 polls(forward×2 + reverse×2 pods)→203K polls/s, iter당 ~4
+dma_copies→200K/s. **poll/copy=1.017 ≈ M2 1.000** → 4 rings 폴링이 4 dma_copies로 perfectly
+amortize. **polling은 갭 원인 아님(가설 B 확정).** (카운터는 측정 후 제거.)
+
+### 5.5 정정된 cap 모델
+
+| | M2 baseline | dpumesh | Δ |
+|---|---:|---:|---:|
+| dma_copy/s | 325K (또는 321K) | 220K | -105K |
+| Per-dma_copy 시간 | 3.08µs | 4.55µs | +1.47µs |
+| PCIe polls/dma_copy | ~1.0 | 1.017(측정) | 0 |
+
++1.47µs/dma_copy = DPA EU 추가 코드 작업. M2 `poll_desc_ring_dma_copy`에 없는 dpumesh
+`process_one_desc` 작업 추정:
+
+| 항목 | 추정 EU 비용 |
+|---|---:|
+| validation(mmap=0/size=0/range) | ~0.1-0.2µs |
+| chunking loop(while offset<total, ALIGN_UP_128, chunk type) | ~0.2-0.3µs |
+| desc 필드 clear + writeback ×3 | ~0.3-0.5µs |
+| comp_msg 필드 3→6 | ~0.1µs |
+| `ensure_producer_slot` per chunk + counter | ~0.2µs |
+| reverse rings 분기 / `dpa_sent_count`++ | ~0.1µs |
+| **합** | **~1.0-1.4µs** (실측 갭 1.47µs와 정합) |
+
+### 5.6 M2에 feature 추가 (Inverse, 8 KB, Method 0, H2D, 10s)
+
+| Stage | recv/s | Bandwidth | Δ vs prev |
+|---|---:|---:|---:|
+| **E0 baseline** | **321,803** | 21.08 Gbps | — |
+| E1 +ADD_VALIDATION | 324,707 | 21.27 | +0.9%(noise) |
+| E2 +ADD_CHUNK_LOOP | 319,495 | 20.93 | **-1.6%** |
+| E3 +ADD_PRODUCER_SLOT | 303,173 | 19.86 | **-5.1%** |
+| E4 +ADD_DESC_CLEAR | **17,639** | 1.15 | **-94.2%** ❗ |
+
+E4 collapse 격리: E4-alone(DESC_CLEAR only) 17,510, E4-min(valid=0 1줄+wb 1번) 17,225 →
+**writeback 자체가 catastrophic.** 구조적 발견 — **desc clear의 100× 비대칭**: M2 ring은
+**lossy**(host가 valid 안 보고 blind write), dpumesh는 **lossless**(host가 valid==1이면 NULL,
+DPA가 valid=0 clear까지 대기). DPA writeback이 host의 같은 cache line에 PCIe write하는데, M2
+host는 동시에 같은 line write(addr/size/valid=1) → **양쪽 동시 쓰기 = PCIe cache coherency 폭증.**
+dpumesh는 host가 valid=0 대기 → 충돌 없음 → 같은 writeback cheap.
+
+추가 feature (E5-E10, polling amortization sanity):
+
+| Variant | recv/s | Δ vs E0 | per-iter | 비고 |
+|---|---:|---:|---:|---|
+| **E0** | **321,803** | 0 | 3.11µs | 1 poll:1 op |
+| E5 +LARGER_COMP_MSG | 294,207 | -8.6% | 3.40µs(+0.29) | 3→7 필드(12B→24B imm) |
+| E6 +HANDLE_MSGS | 315,513 | -2.0% | 3.17µs(+0.06) | `consumer_get_completion` 1×/iter |
+| E7 +EXTRA_CONSUMER_WAIT | 322,857 | +0.3%(noise) | 3.10µs | 사실상 free |
+| E8 +REVERSE_DMA | 381,826 | +18.6% | 5.24µs/2op | 1 poll:2 op ← amortize |
+| E9 +4_DMA_COPIES | 417,119 | +29.6% | 9.62µs/4op | 1 poll:4 op ← 더 amortize |
+| E10 +4_DMA_COPIES+EXTRA_RING_POLLS=3 | 338,322 | +5.1% | 11.83µs/4op | 4 poll:4 op ← dpumesh 패턴 |
+
+E8/E9 상승은 ceiling 아니라 polling amortization. `per_iter = α + N×β`: 3.11=α+β(E0),
+5.24=α+2β(E8), 9.62=α+4β(E9) ⇒ **β≈2.13µs/dma_copy(marginal), α≈0.98µs(per-iter fixed)**. E10(4
+poll:4 op = dpumesh) 338,322 = E0와 +5% → dpumesh 1:1 패턴에선 amortization 이득 거의 없음,
+**E0를 정직한 baseline으로 사용.**
+
+### 5.7 추가 sanity checks
+
+**E11 — PCIe direction balance**: E10(3H+1D+4polls) 338,322/2.96µs vs E11(2H+2D+4polls)
+337,262/2.97µs, Δ-0.3%(noise) → PCIe full-duplex라 forward+reverse BW lane 공유 안 함, **"PCIe BW
+contention" 부정.**
+
+**Inner pe_progress per-entry→per-batch**:
+
+| Target | Baseline ach/p99 | Per-batch ach/p99 | Δach | Δp99 |
+|---:|---:|---:|---:|---:|
+| 50K | 49,655/9.94 | 49,629/9.89 | -0.05% | -0.5% |
+| 55K | 54,085/101.39 | 54,080/91.06 | -0.01% | **-10.2%** |
+| 65K | 54,749/1,768 | 54,291/1,894 | -0.8% | +7.1% |
+
+sustainable RPS 무변화. flame: `doca_pe_progress` 67.5%→76.5%, `__GI_epoll_pwait` 46.0%→54.5%,
+`process_completion_queue` 19.8%→7.95%. **ARM polling 횟수 줄여도 polling 시간 비중 안 줄어듦 →
+ARM cap 아님.**
+
+**epoll_pwait per-call (perf trace, 50K, 15s)**: `epoll_pwait 3,122,730 calls / 6,703.520 ms total
+/ 0.002 avg / 0.001 min / 0.109 max`. 208K calls/s, **호출당 2µs(syscall 고정비용)**, 총/wall
+44.7%. M2도 같은 41% epoll 비용에 310K 도달 → **epoll overhead 자체는 갭 원인 아님.**
+
+**Load generator 검증**: 65K×650 54,291/1,894, 65K×1000 54,199/1,892, 100K×1500 54,227/6,814,
+65K×4096 **hang**(TX slot pool 2048 충돌). 650→1500 워커에도 ach 54.2K fix → **system ceiling 확정.**
+
+**M2 synthetic multi-ring polling (EXTRA_RING_POLLS, 매 dma_copy마다 N개 추가 desc->valid read)**:
+
+| EXTRA_RING_POLLS | 총 rings | recv/s | Bandwidth | Δ vs N=0 |
+|---:|---:|---:|---:|---:|
+| 0 | 1 | **325,361** | 21.32 Gbps | — |
+| 1 | 2 | 236,660 | 15.50 | -27% |
+| 3 | 4 | 175,421 | 11.49 | -46% |
+| 7 | 8 | 114,543 | 7.50 | -65% |
+
+monotonic, per-extra-poll ~0.8-1.1µs/dma_copy. dpumesh 220K가 M2-N=3(175K)보다 높은 이유 —
+synthetic은 매 dma_copy마다 N reads 무조건, dpumesh `drain_all_rings`은 한 iter에서 4 rings 폴링 +
+0~4 dma_copy → saturation 시 amortize (§5.4 ratio 1.017 일치).
+
+### 5.8 E0(321,803) 기준 attribution
+
+cleanup 이전 dpumesh-vs-E0 갭 = **1.44µs/op = 32%**.
+
+| 항목 | 비용(µs/op) | dma_copy/s loss | 출처 | 회복 |
+|---|---:|---:|---|---|
+| Larger comp_msg(7필드,28B) | 0.29 | ~27K | E5 | §4.5 packing 16B 부분회복 |
+| Per-call `ensure_producer_slot` | 0.17 | ~17K | E3 | §4.4 lazy + §4.6 SDK 위임 |
+| `handle_msgs` per iter | 0.06 | ~6K | E6 | §4.4 throttle |
+| Chunking loop wrapper | 0.05 | ~5K | E2 | §4.3 CHUNK_LOOP |
+| Desc clear(lossless context) | 0.05 | ~5K | §4.3 STRIP_DESC_CLEAR | 회복 |
+| Validation | ~0 | 0 | E1(noise) | §4.3 STRIP_VALIDATION |
+| Extra consumer empty wait | ~0 | 0 | E7(noise) | — |
+| **측정 합(E1-E7+§4.3)** | **0.62** | **~60K(59%)** | direct | |
+| **Yield/wake architecture** | **0.55** | — | §5.9 | architectural(보존) |
+| Cache footprint + amortization 불완전 | ~0.27 | — | 잔여 | — |
+| **합 = 실측 갭** | **1.44** | **~102K** | 82% attributed | |
+
+실측 회복: §4.4 +11.5K(248 vs 236), §4.5 +15.2K(263 vs 248), §4.6 +9.1K(272 vs 263), §4.7
++37.2K(309.7 vs 272.5). 누적 **+72.9K/106K = 69%**.
+
+### 5.9 Yield/Wake architecture cost
+
+M2 DPA kernel에 wake 메커니즘 이식해 직접 측정.
+
+- **1단계 — naive yield(wake source 없음)**: `thread_reschedule()` 추가(273 dma_copy마다) → **273
+  recv/s**(1 burst 후 영원히 hang). `doca_dpa_dev_thread_reschedule()`는 진짜 yield(block형 suspend),
+  외부 wake 없으면 못 깸.
+- **2단계 — yield + 1 kHz wake**(DPU keepalive 이식):
+
+| Variant | recv/s | per-op | Δ vs E0 |
+|---|---:|---:|---:|
+| E0(busy-spin) | 321,803 | 3.11µs | — |
+| **+yield+1kHz wake(burst 273)** | **272,928** | **3.66µs** | **+0.55µs=-15.2%** |
+| +yield+1kHz wake(burst 1000) | 249,916 | 4.00µs | +0.89µs=-22.3% |
+
+비용 정체: burst 273(=849µs) vs wake interval 1ms(=1000µs) mismatch. burst 1000(=3110µs)은 더
+악화. dpumesh는 host trigger도 함께 사용(`dpumesh_enqueue`가 DPU trigger), 1 kHz는 idle fallback.
+**발견**: function-local `static yield_counter`는 thread re-entry 시 reset(처음 999 recv/s) → file-scope
+global + entry reset 필요.
+
+### 5.10 Busy-spin은 architectural necessity (yield 제거 불가)
+
+**strips 전**:
+
+| Target | per-batch ach/p99 | busy-spin ach/p99 |
+|---:|---:|---:|
+| 50K | 49,629/9.89 | 49,605/9.54 |
+| 55K | 54,080/91.06 | **53,562/224.4** |
+| 65K | 54,291/1,894 | 53,398/2,064 |
+
+55K p99 91→224ms(2.5× 악화). 4 rings busy-spin = PCIe poll BW가 DMA traffic과 경쟁, yield가 PCIe
+polling rate throttle 역할.
+
+**strips 후** (단일 run은 개선):
+
+| Target | yield 유지 | busy-spin |
+|---|---:|---:|
+| 50K | 49,659/9.36 | 49,614/8.67 |
+| 55K | 54,617/12.27 | 54,628/9.61 |
+| 65K | 59,195/952 | 59,784/819 |
+
+표면상 모든 p99 개선(50K -7%, 55K -22%, 65K -14%). **그러나 back-to-back 붕괴**:
+```
+run1(55K) Achieved 0.0 RPS, OK/Fail 0/1650
+run2/3 (empty — daemon 무응답)
+[WRN][ring.c:96][get_next_dma_desc] DMA ring busy at head=160 (size=2048) ... 무한 반복
+```
+**Slot leak — host ring head=160 slot이 valid==1 stuck.** recovery 로직 0(timeout/force-clear/
+head++ skip/reset/backoff escalate 전무, "DPA reliable" 가정). leak 메커니즘(logical): DPA
+`process_one_desc`는 모든 종료 path에서 valid=0+wb라 logic만으론 leak 불가 → busy-spin의 PCIe+
+coherency 부담으로 **DPA window cache가 host의 valid=1 write를 stale 읽음 → desc_idx 안 advance →
+slot 영원히 skip**(유일 plausible path).
+
+**결론**: dpumesh가 multi-pod/multi-ring/lossless인 한 yield 불가피(multi-ring busy-spin = PCIe+
+coherency stress = valid bit stuck; lossless ring이 stuck을 hang으로 표면화, M2 lossy면 덮어씀).
+yield의 ~0.55µs/op는 이 보호의 가격. **(yield + 모든 §4 최적화)이 production 최적점.**
+
+### 5.11 Flow control audit
+
+7 layer + 3 retry queue:
+
+| # | Layer | 위치 | 크기 | 필수성 |
+|---|---|---|---:|---|
+| 1 | DPA producer slot | DPA EU(SDK 관리, §4.6 위임) | 1024 | 필수 |
+| 2 | DPA consumer recv | DPA EU `is_consumer_empty` spin | 8192 | 필수 |
+| 3 | DPU comp_queue | DPU ARM(BP_HIGH 3072/BP_LOW 2048 hysteresis) | 4096 | 필수 |
+| 4 | DPU send pool mirror | `send_tasks_in_flight` atomic | 8192 | DOCA AGAIN 회피 |
+| 5 | DPU recv pool mirror | `recv_tasks_in_flight` atomic | 8192 | DOCA AGAIN 회피 |
+| 6 | Host TX slot | `get_next_dma_desc` NULL on valid==1 | 2048 | 필수 |
+| 7 | DPA reverse admission | `dpa_sent_count - dpa_cached_freed < rq_depth` | 2048 | reverse 필수 |
+
+Retry queue: `deferred_tx_acks`(16384), `deferred_recv`(1024), `consumer_retry`(256). 3큐 통합
+**비추천**: entry shape 비대칭(tx_acks 20B struct vs 8B 포인터 → union 24KB 낭비), lock 비대칭
+(consumer_retry만 mutex → 통합 시 무락 큐가 락 코스트 + hot path mutex regression), drain timing
+상이(tx_acks=send-pool 자유화 직후, recv=comp_queue depth, consumer_retry=다음 메인루프). 추가
+단순화 후보(영향 미미): (a) `send_tasks_in_flight` mirror 제거 ~0.1µs/op, (b) `is_consumer_empty`
+backoff. **flow control은 correctness 잘 설계됨, throughput cap 주원인 아님(§5의 DPA work가 큼).**
+
+### 5.12 Single-pod / idle ring 효과 (분석적 추정)
+
+4 rings 다 active = ratio 1.017(perfect amortize). single-pod self-loop(2 active+2 idle) = ratio
+2.0 → 추가 1 poll/op = +0.19µs/op → 4.55→4.74µs/op → ~211K dma_copy/s(현재 248K의 -15%). ring
+개수 자체는 작은 영향, idle ring이 폴링 낭비 만들 때만 중요. 현재 echo bench는 4 rings 모두 active.
+
+### 5.13 부정된 가설
+
+- ❌ PCIe BW contention (§5.7 E11 -0.3% noise)
+- ❌ ARM polling이 cap (§5.7 per-batch RPS flat; §5.4 ratio 1.017)
+- ❌ DPA busy-spin이 도움 (§5.10 latency 2.5× 악화 / slot leak)
+- ❌ comp_msg quantum ≥ 32B (§4.5 16B HW WQE BB 확정)
+- ❌ desc 32B pack로 PCIe read 절감 (§4.8 line-granular writeback이 이웃 clobber)
+- ❌ (§6) Method 0/2 = HW max — **host descriptor feed에 묶인 값이었음**
+
+---
+
+## 6. Pure DMA-engine ceiling — baseline가 host-bound였음 (2026-05-29)
+
+### 6.1 동기 & 측정 코드
+
+§2의 Method 0(320K)/Method 2(310K)가 DMA engine 한계인지, host descriptor feed에 묶인 값인지
+미검증. Method 0/2 커널은 매 dma_copy를 host descriptor에 게이트한다
+(`poll_desc_ring_dma_copy`의 `while(!desc->valid) read_inv;`) → host single-thread posting rate가
+측정값에 섞임. host를 루프에서 제거해 "single EU가 dma_copy를 초당 몇 번 발사하나"를 직접 측정.
+
+코드: `test_dma/pure_dma/` + `run_pure_dma.sh` (기존 `test_dma/bench/`·`run_bench.sh` 미수정, 동일
+`$SRC_DIR`에 install 후 복원). baseline(`bench/`) 대비 **변경 5파일 / 동일 4파일**:
 
 | 파일 | 변경 |
 |---|---|
-| `object.h` | `pod_state.local_mmap_dpa_handle` 필드 추가 (uint32_t — SDK 일치) |
-| `dpa.c` | `setup_pod_dma`에서 DPA mmap handle 캐싱 |
-| `dpu_worker.c` | `dpu_enqueue_reverse_dma` signature (memcpy / write_pos 제거); `process_forward_entry` 성공 path TX_ACK 제거 (에러 path만); `process_rev_notify_entry`에 reverse 완료 후 TX_ACK 추가; `send_or_defer_tx_ack` 헬퍼 |
-| `device/dpa_kernel.c` | reverse handler가 `desc->mmap` / `desc->addr`를 source로 사용. `desc->mmap == 0`이면 legacy `dpu_mmap` fallback |
+| `device/dpa_kernel.c` | **재작성**. descriptor ring 안 봄 — 고정 주소창(`dpu_pos`/`host_pos`가 1MB 버퍼 회전)에 `producer_dma_copy` back-to-back. size=`PURE_MSG_SIZE`, 게이트 `is_consumer_empty`만, producer 완료 256 op마다 drain+ack. multi-EU용 `is_consumer_empty` spin backoff(`PURE_BACKOFF_SPINS`). |
+| `dpa_common.h` | `dpa_thread_arg`에 `uint64_t host_addr` 추가(descriptor 없어 host base 직접 전달). |
+| `dpa.c` | `.host_addr=remote_addr`; `g_pure_thread_idx/n`로 1MB 버퍼를 EU별 128B-aligned slice 분할. |
+| `host_worker.c` | posting loop → idle(comch PE만 유지, post 안 함). ring/buffer/mmap export 셋업 동일. |
+| `dpu_worker.c` | 공유 DPA 1개 위에 N개 thread + N개 독립 comch 채널(`PURE_NUM_THREADS`). 모든 DPU consumer를 같은 `consumer_pe`에 연결 → 한 pe_progress가 전부 drain, `recv_msg_cnt`가 EU 합산. thread launch 후 **kick(`send_dma_request_to_dpa`) per channel** 필수. |
+| `comch_consumer.c` | teardown recv-error 로그 mute. |
+| `object.h`/`dpa.h`/`comch_client.c` | byte-identical. |
 
-**Slot lifecycle 변화**: src `dma_buffer` slot 점유 시간이 forward-only → **full
-RTT**. host TX slot도 reverse 완료 후 TX_ACK 받아야 release. sustainable
-52 K @ 5.5 ms RTT = ~290 in-flight slots, `DMA_RING_SIZE = 2048` 안에 fit.
+**구조 차이(한 줄)**: 데이터 경로(host→DPU buffer, dma_copy + 완료 imm)는 동일. baseline은 매 copy를
+`desc->valid` PCIe 악수로 host에 동기화(= host posting rate에 묶임), pure_dma는 그 악수 제거하고
+EU가 back-to-back 발사. 이 한 가지가 320K→556K의 전부.
 
-**Trade-off**: dst pod별 staging buffer가 사라지면서 한 src가 여러 dst로
-보낼 때 **HOL blocking across destinations from same source**. echo bench
-(src==dst) 영향 없음 — multi-dst 워크로드에서만 manifest (사용자 합의).
+**NO_DATA 버그(fix됨)**: `doca_dpa_thread_run`은 thread를 arm만 하고, handler는 consumer에 메시지
+도착 시 첫 실행(§5.9 "DPA는 external wake 필요"). pure 커널은 무한 no-yield loop라 kick 1회면 영원히
+돎. kick(`send_dma_request_to_dpa`) 누락이 원인 → 채널별 kick 복원.
 
-### 12.2 RPS sweep 비교 (8 KB, 10 s, conns=auto)
+### 6.2 Single-EU 측정 (8 KB / 128 B, H2D, dma_copy, 10s)
 
-| Target | Baseline ach | New ach | Baseline p99 | New p99 | Δ p99 |
-|---:|---:|---:|---:|---:|---:|
-| 5,000 | 4,968.6 | 4,968.8 | 1.93 ms | 1.92 ms | -0.5% |
-| 10,000 | 9,939.2 | 9,935.9 | 2.82 ms | 2.78 ms | -1.4% |
-| 30,000 | 29,807.8 | 29,800.9 | 6.51 ms | 6.38 ms | -2.0% |
-| 50,000 | 49,664.7 | 49,655.3 | 11.89 ms | 9.94 ms | -16.4% |
-| 52,000 | 51,644.8 | 51,625.3 | 12.16 ms | 12.12 ms | -0.3% |
-| **53,000** | — | **52,641.9** | — | **12.23 ms** | 새 sustainable |
-| **54,000** | — | **53,636.3** | — | **12.38 ms** | 새 sustainable |
-| 55,000 | 53,553.4 | 54,085.4 | 189.59 ms | 101.39 ms | **-46.5%** |
-| 60,000 | 53,698.8 | 54,198.6 | 1,154.25 ms | 998.98 ms | -13.5% |
-| 65,000 | 53,841.1 | 54,748.5 | 1,961.63 ms | 1,767.98 ms | -9.9% |
-| 70,000 | — | 54,369.7 | — | 2,817.77 ms | overload |
+recv/s = dma_copy/s:
 
-**결과**:
-- Sustainable 52 K → **54 K** (+~4%, p99 < 13 ms)
-- Overload ceiling 53,553 → **54,748** (+~2%)
-- Overload p99 약 절반 (55 K: 190 → 101 ms)
-- 0 failure, 11회 sequential test slot leak 없음
+| size | dma_copy/s | payload BW | status |
+|---:|---:|---:|---|
+| 8 KB(8192 B) | **555,383** | 36.39 Gbps | OK |
+| 128 B | **556,149** | 0.56 Gbps | OK |
 
-| | dma_copy ops/sec | vs Method 0 | vs Method 2 |
-|---|---:|---:|---:|
-| dpumesh baseline @ overload (53,553 RPS) | 214,212 | 67% | 69% |
-| **dpumesh new @ overload (54,748 RPS)** | **218,992** | **68%** | **71%** |
-| dpumesh new @ sustainable (53,636 RPS) | 214,544 | 67% | 69% |
+8 KB run DPU `recv:` raw 샘플(15s steady): `556045, 556164, 556161, 556160, 556156, 556154,
+556149, 556151, 556150, 556147, 556146, 556146, 556149, 556150, 556150`; teardown 1회성 drop
+`20693`(host가 DPA보다 먼저 종료 → 사라진 host 버퍼 read 실패; `comch_consumer.c:273` IO_FAILED 256건
+= in-flight recv pool 1회 drain, 측정 무영향. fix: teardown 순서 `stop_dpu; stop_host` + 로그 mute).
 
----
+**해석**:
+- **op-rate bound (size-independent)**: 128B와 8KB가 동일 ~556K/s. 8KB의 36.4 Gbps=4.55 GB/s로
+  PCIe Gen4(~32 GB/s) 한참 미달 → 대역폭 아니라 **copy 1번당 고정비용(WQE 발행 + 완료 통보)**이 천장.
+- **baseline은 host-feed bound였음**: pure 556K = **M0(320K)의 1.74×, M2(310K)의 1.79×**. host
+  descriptor 게이트 제거하자마자 천장 1.7배+ → §2 "HW max"는 engine 한계가 아니라 host posting +
+  per-op `desc->valid` 악수에 묶인 값.
+- **§4.7/§5의 "99.8%" 재해석**: dpumesh 309,736은 host-bound M2 기준 99.8%일 뿐. 진짜 single-EU
+  engine op-rate(556K) 기준 **309,736/556,150 = 55.7%**. single-EU에도 ~44% 헤드룸이 남음.
+- single-EU 이론 상한: dpumesh 1 RTT=4 dma_copy → op-rate÷4 ≈ **139K RPS**. 현재 77K는 그 56%.
+- caveat: 556K는 dma_copy에 필수 per-op 완료 imm 포함(= dpumesh primitive, 직접 비교 가능). 단
+  comch 완료통보·DPU recv drain 경로도 per-op 포함.
 
-## 13. Yield/Wake Architecture Cost — M2에 wake 메커니즘 이식
+### 6.3 Multi-EU 스케일링 — op-rate는 EU 수에 비례 (peak ≈ 4 EU)
 
-§10.5의 "DPA scheduling overhead" 후보 (~0.4-0.6 µs/op 추정)를 직접 측정.
+N개 DPA thread(EU)가 각자 독립 dma_copy 발사. 모든 EU 합산 = DPU recv/s.
 
-### 13.1 1단계 — M2 + naive yield (wake source 없음)
+| EU 수 | dma_copy/s | scaling | efficiency | payload BW |
+|---:|---:|---:|---:|---:|
+| 1 | 554,789 | 1.00× | 100% | 36.35 Gbps |
+| 2 | 1,070,930 | 1.93× | 96% | 70.18 Gbps |
+| 4 | **1,804,363** | **3.25×** | 81% | 118.25 Gbps |
+| 8 | 1,466,216 | 2.64× | (regression) | 96.08 Gbps |
 
-M2 DPA kernel에 `thread_reschedule()` 추가 (273 dma_copy 마다).
+N=4 DPU `recv:` raw: `1802837, 1803922, 1802533 /s`. (N=1 = 554,789 → §6.2 555,383 재현, 리팩터 검증.)
 
-**측정: 273 recv/s** — 정확히 1 burst 처리 후 영원히 hang.
+**해석**: op-rate가 EU 수에 비례(2 EU near-linear, 4 EU peak 1.8M) → §6.2의 556K는 **per-EU 발사
+한계**이지 device 한계 아님(공유 comch/recv가 556K 천장이었다면 EU 늘려도 안 올랐을 것). **N=8이
+N=4보다 낮음(regression)** — 포화면 plateau여야 하므로 단순 포화 아님(= 능동적 contention).
 
-→ `doca_dpa_dev_thread_reschedule()`는 **진짜 yield**. 외부 wake source 없으면
-DPA가 깨어나지 못함. cooperative 아니라 **block형 suspend**.
+### 6.4 N=8 regression 원인 — spin-contention 가설 **기각** (8 KB, 10s)
 
-### 13.2 2단계 — M2 + yield + wake (DPU 1 kHz keepalive 이식)
+`is_consumer_empty` busy-spin에 backoff(`PURE_BACKOFF_SPINS`) 추가해 폴링 contention 가설 검증
+(DPU 코어 1개 유지, dma_copy 유지):
 
-dpumesh의 wake 메커니즘 모방:
-- M2 DPU worker에 `dmesh_doca_dpa_msgq_send`로 매 1 ms trigger msg 발사
-- M2 DPA kernel의 yield 직전 consumer comp queue 드레인 + ack
-- yield counter를 file-scope global로 (function-local static은 thread re-entry
-  시 reset됨 — 아래 발견 참조)
+| threads | backoff | dma_copy/s | payload BW |
+|---:|---:|---:|---:|
+| 4 | 0 | 1,741,769 | 114.14 Gbps |
+| 4 | 256 | 1,739,988 | 114.03 |
+| 8 | 0 | 1,557,332 | 102.06 |
+| 8 | 256 | 1,526,402 | 100.03 |
 
-| Variant | recv/s | per-op time | Δ vs E0 |
-|---|---:|---:|---:|
-| E0 (M2 busy-spin) | 321,803 | 3.11 µs | — |
-| **M2 + yield + 1 kHz wake (burst=273)** | **272,928** | **3.66 µs** | **+0.55 µs = -15.2%** |
-| M2 + yield + 1 kHz wake (burst=1000) | 249,916 | 4.00 µs | +0.89 µs = -22.3% |
+- N=4: backoff 무영향(1.742M≈1.740M, 거의 안 막힘 — 예상대로).
+- N=8: backoff 효과 없음 — 오히려 약간 나쁨(1.557M→1.526M). regression 그대로.
 
-### 13.3 발견 — DPA thread re-entry 시 function-local static reset
+→ **N=8 감소는 EU spin-contention이 아니다(가설 기각).** backoff는 EU-side 폴링만 건드리는데 효과
+없음 → 한계는 EU가 손댈 수 없는 곳(DPU-side 또는 EU/DMA-HW).
 
-처음 시도: `static int yield_counter`. 결과 999 recv/s. 분석: DPA thread가
-`thread_reschedule()` 후 **함수 entry부터 restart**. function-local static 재초기화
-→ 매 wake마다 1 dma_copy 후 다시 yield. 해결: file-scope global + function
-entry에서 reset.
+### 6.5 미해결 & 다음 단계
 
-### 13.4 Yield 비용의 정체
-
-burst 273 (=849 µs 처리)와 wake interval 1 ms (=1000 µs) mismatch가 비용
-주된 원인. burst 1000 (=3110 µs)으로 늘리면 wake interval보다 길어져 다른
-mismatch → -22% 더 악화.
-
-dpumesh의 731 exec/s × 273 ops/exec = 200K도 같은 패턴. 비용 줄이려면:
-- Wake rate를 burst 처리 시간에 매칭 (250 Hz wake + 1000 op burst)
-- 또는 wake-on-event (host trigger desc post 마다)
-
-dpumesh는 실제로 host trigger도 함께 사용 (`dpumesh_enqueue`가 DPU trigger).
-1 kHz keepalive는 idle fallback. multi-source wake가 dpumesh ~200K 도달의 이유.
-
----
-
-## 14. DPUmesh Busy-Spin — Architectural Necessity 검증
-
-### 14.1 §11.1 strips **전** busy-spin (yield 제거)
-
-| Target | per-batch ach / p99 | **DPA busy-spin** ach / p99 |
-|---:|---:|---:|
-| 50K | 49,629 / 9.89 ms | 49,605 / 9.54 ms |
-| 55K | 54,080 / 91.06 ms | **53,562 / 224.4 ms** |
-| 65K | 54,291 / 1,894 ms | 53,398 / 2,064 ms |
-
-55K p99 91 → 224 ms (**2.5배 악화**). dpumesh 4 rings × busy-spin = PCIe poll
-bandwidth가 실제 DMA traffic과 경쟁. yield가 **PCIe polling rate throttle** 역할.
-
-### 14.2 §11.1 strips **후** busy-spin 재시도
-
-가설: strips가 DPA EU per-dma_copy work 줄였으니 PCIe BW 헤드룸 생겨 결과 다를 수 있음.
-
-| Target | yield 유지 (§11.1 baseline) | **busy-spin (재시도)** |
-|---|---:|---:|
-| 50K | 49,659 / 9.36 ms | **49,614 / 8.67 ms** |
-| 55K | 54,617 / 12.27 ms | **54,628 / 9.61 ms** |
-| 65K | 59,195 / 952 ms | **59,784 / 819 ms** |
-
-표면적으로는 모든 target p99 개선 (50K -7%, 55K **-22%**, 65K -14%).
-
-### 14.3 Back-to-back stability check — catastrophic failure
-
-```
-=== run 1 (55K) ===  Achieved 0.0 RPS, OK/Fail 0/1650
-=== run 2 (55K) ===  (empty — daemon 응답 없음)
-=== run 3 (55K) ===  (empty)
-```
-
-bench-dpumesh pod log:
-```
-[WRN][ring.c:96][get_next_dma_desc] DMA ring busy at head=160 (size=2048)
-... 무한 반복
-```
-
-**Slot leak — host ring `head=160` slot이 `valid==1` 채로 stuck**.
-
-### 14.4 Code trace — recovery 로직 0
-
-```c
-struct dma_desc *get_next_dma_desc(struct dma_ring *ring) {
-    struct dma_desc *desc = ring->descs + ring->head;
-    if (desc->valid) {
-        DOCA_LOG_WARN("DMA ring busy at head=%u (size=%u)", ring->head, ring->size);
-        return NULL;           /* ← head 진행 안 함 */
-    }
-    uint32_t next_head = (ring->head + 1) % ring->size;
-    ring->head = next_head;
-    return desc;
-}
-```
-
-```c
-/* bench_dpumesh.c worker */
-if (dpumesh_enqueue(g_ctx, &desc) < 0) {
-    atomic_fetch_add(w->fail, 1);
-    continue;             /* 같은 stuck slot 무한 재시도 */
-}
-```
-
-Recovery 로직 0:
-- ❌ Stuck slot timeout / Force-clear / head++ skip / Ring reset / Backoff escalate
-
-설계가 "DPA reliable" 가정.
-
-### 14.5 Leak mechanism (logical trace)
-
-DPA의 `process_one_desc`는 모든 종료 path (success / abort / consumer_empty
-timeout)에서 `desc->valid = 0` + writeback. logic만으론 leak 불가.
-
-가능한 race:
-1. **DPA window cache stale read** — host의 `valid=1` write가 coherency 통해
-   DPA window cache line invalidate해야 하는데, busy-spin의 PCIe + coherency
-   부담으로 invalidation 누락/지연. DPA가 stale `valid=0` 봄 → desc_idx
-   advance 안 함 → 그 slot 영원히 skip.
-2. **DPA → host writeback propagation 누락** — 5+ 초 갭이면 propagation 시간
-   충분 → less likely.
-
-→ (1)이 plausible한 유일 path. 정상 coherency라면 발생 안 해야 하지만
-busy-spin stress에서 corner case 발생.
-
-### 14.6 종합 — yield는 architectural necessity
-
-| | §14.1 (strips 전) | §14.2-14.3 (strips 후) |
-|---|---|---|
-| Single-run | 55K p99 91 → **224 ms 악화** | 55K p99 12 → **9.6 ms 개선** |
-| Back-to-back 안정성 | 미측정 | **fail (slot leak)** |
-| 결론 | busy-spin 안 좋음 (PCIe poll storm) | busy-spin 안 좋음 (slot leak) |
-
-dpumesh가 **multi-pod / multi-ring / lossless**인 한 yield 불가피:
-- multi-ring busy-spin = PCIe + coherency stress
-- coherency race = `valid` bit stuck 가능성
-- lossless ring 모델 = stuck slot이 hang으로 표면화 (M2 lossy면 그냥 덮어씀)
-- **yield의 ~0.55 µs/op 비용 (§13)은 이 architectural 보호의 가격**
-
-§11.1 strips로 +9% 회복했지만 busy-spin으로 더 짜내면 stability 잃음.
-**(yield + strips + §11.5 cleanup + §11.6 packing + §11.7 SDK delegation + §11.8 fence/batch)이 production 최적점**.
+- **regression 재해석(진단 중)**: 가장 유력 — 단일 DPU drain 스레드가 N개 consumer 컨텍스트를 하나의
+  `doca_pe_progress`로 처리, N↑ 시 per-cycle 폴링 오버헤드↑로 실효 drain rate↓ → producer throttle↓
+  (DPU-side, EU backoff로 못 고침). 2차 후보: EU oversubscription(8 thread가 8 distinct EU에 안
+  올라감), 공유 DMA-engine/PCIe contention.
+- **다음 진단(값쌈, 함수·DPU 1코어 유지)**: N=8 sustained 중 `top -H`(drain thread ~100%? → DPU-bound)
+  + `dpa-statistics`(EU active% / 활성 EU 수: 낮음→DPU 기다리며 stall, 높은데 throughput 낮음→DMA
+  contention, <8→oversubscription).
+- **engine 진짜 multi-EU 천장**: per-op DPU completion을 없애고 DPA-side 카운터 + d2h readout으로
+  세야 정확(§5.4 instrumentation 패턴). 현재 1.8M은 측정 하한.
 
 ---
 
-## 15. Flow Control Audit
+## 7. 종합 결론 & 남은 lever
 
-dpumesh flow control은 7 layer + 3 retry queue:
-
-| # | Layer | 위치 | 메커니즘 | 크기 | 필수성 |
-|---|---|---|---|---:|---|
-| 1 | DPA producer slot | DPA EU | SDK 내부 관리 (§11.7 위임, drain ack로 큐 순환) | 1024 | 필수 |
-| 2 | DPA consumer recv | DPA EU | `is_consumer_empty` spin (~0x200K loops) | 8192 | 필수 |
-| 3 | DPU comp_queue | DPU ARM | ring + BP_HIGH (3072) / BP_LOW (2048) hysteresis | 4096 | 필수 |
-| 4 | DPU send pool mirror | DPU ARM | `send_tasks_in_flight` atomic | 8192 | DOCA AGAIN 회피용 |
-| 5 | DPU recv pool mirror | DPU ARM | `recv_tasks_in_flight` atomic | 8192 | DOCA AGAIN 회피용 |
-| 6 | Host TX slot | Host | `get_next_dma_desc` NULL on `desc->valid==1` | 2048 | 필수 |
-| 7 | DPA reverse admission | DPA EU | `dpa_sent_count - dpa_cached_freed < rq_depth` | 2048 | reverse 필수 |
-
-Retry queues:
-- `deferred_tx_acks` (16384) — comch send pool full 시 TX_ACK 저장
-- `deferred_recv` (1024) — comp_queue ≥ BP_HIGH 시 recv 보관
-- `consumer_retry` (256) — gated submit 실패 시 stash
-
-### 15.1 3 retry queue 단순화 가능성 — **통합 비추천**
-
-| Queue | Entry | Trigger | Drain | Lock |
-|---|---|---|---|---|
-| `deferred_tx_acks` | `{conn*, req_id, dst_pod_id}` 20B struct | `server_send_tx_ack_to()` → `DOCA_ERROR_AGAIN` (send pool exhausted) | main loop, **`pe_progress` 직후** (released slots 활용) | lock-free (single PE-callback producer) |
-| `deferred_recv` | `struct doca_task *` 포인터 | comp_queue ≥ BP_HIGH 또는 `doca_task_submit` 실패 | main loop, `comp_queue < BP_LOW` 시 | lock-free |
-| `consumer_retry` | `struct doca_task *` 포인터 | gated `pool_try_acquire` 성공 후 `task_submit` 실패 (rare) | `objects_drain_consumer_retry()` | **mutex** (PE callback ↔ main loop 경합) |
-
-통합 비추천 이유:
-1. **Entry shape 비대칭**: tx_acks 20B struct vs 나머지 8B 포인터 → union으로
-   묶으면 12B × 2000 entries ≈ 24KB 메모리 낭비.
-2. **Lock 비대칭**: consumer_retry만 mutex 필요. 통합 시 무락 큐들이 락
-   코스트 떠안게 됨 — `pe_progress` 직후 hot path에 mutex 진입 → 즉시 regression.
-3. **Drain timing 다름**: tx_acks는 send-pool 자유화 직후. recv는 comp_queue
-   depth 기준. consumer_retry는 다음 메인 루프. 단일 drain 호출에 분기 필요.
-
-분리가 정당. 그대로 둠.
-
-### 15.2 추가 단순화 후보 (성능 영향 미미)
-
-- (a) `send_tasks_in_flight` mirror 제거 (DOCA capability check 지원 확인 후):
-  ~0.1 µs/dma_copy 절감
-- (b) `is_consumer_empty` spin에 backoff: 미세 latency 개선
-
-### 15.3 결론
-
-Flow control 자체는 **correctness 측면에서 잘 설계됨**. throughput cap의 주된
-원인 아님 (§10-11의 DPA kernel work가 더 큼).
-
----
-
-## 16. HW 한계 측정 해석 가이드
-
-목적: dpumesh가 §7의 Method 2 ceiling (77.6 K RPS = 310,472 dma_copy ops/s
-÷ 4)에 host-side 자원을 충분히 줬을 때 얼마나 근접하는지.
-
-`./test-bench.sh dpumesh-hw <RPS> <DUR> <SIZE>` — 자동으로 `pin_pods hw` 전환.
-
-### 16.1 결과 해석 매트릭스
-
-| `dpumesh-hw` 결과 | 해석 | 다음 실험 |
-|---|---|---|
-| RPS ≈ 60-62 K (§11.5와 동일) | chain 자체가 cap | DPU `top -H -p $(pgrep dpumesh_dpu)`로 ARM core 100% 확인 |
-| 65-75 K | chain 가까이 도달. host-side lock/scheduling이 fair-mode cap | bench/echo 코어 더 늘려서 한계 측정 |
-| > 77 K | Method 2 baseline 잘못됐거나 측정 노이즈 | sweep 재실행 |
-| RPS 떨어짐 (< 60 K) | multi-core thread thrashing. cache locality 손실 | core 개수 줄이거나 NUMA 구분 |
-
-### 16.2 보조 측정
-
-- **CPU 사용률**: `mpstat -P 0-7 1`
-- **DPU ARM CPU**: DPU에 ssh + `top -H -p $(pgrep dpumesh_dpu)`
-- **DPA EU stat**: `dpa-statistics show`의 Cycles, producer drain stall,
-  consumer_empty wait
-
-### 16.3 추가 변수
-
-- **msg_size 작게 (1 KB)** — per-msg overhead 격리. 8 KB는 DMA 비중 큼, 1 KB는
-  ops 자체 cap. ops/sec 비교에 더 깨끗.
-- **bench 측 thread 수 (workers)** — 기본값 (rps/100)이 cap region에서
-  thrashing 유발 가능.
-
----
-
-## 17. Single-pod / Idle Ring 효과 (분석적 추정)
-
-dpumesh 4 rings 중 일부가 idle (예: bench self-loop으로 echo pod ring 2개 idle):
-- §10.4 측정: 4 rings 다 active = ratio 1.017 (perfect amortize)
-- Single-pod self-loop: 2 active + 2 idle = **ratio 2.0** (idle ring 폴링 낭비)
-
-§11.4의 single-op per-extra-poll cost ~0.8 µs. multi-op amortized cost ~0.19 µs
-(E9→E10의 per-extra). 추정:
-- 정상 ratio 1.017 → idle 시 ratio 2.0 = 추가 1 poll/op = **+0.19 µs/op**
-- dpumesh 4.55 → 4.74 µs/op → **~211K dma_copy/s** (현재 248K의 -15%)
-
-ring 개수 자체는 작은 영향 (다 active 시), idle ring이 폴링 낭비 만들 때만
-중요. 현재 echo bench는 4 rings 모두 active.
-
----
-
-## 18. 최종 Attribution
-
-### 18.1 누적 ceiling 변화
-
-| Phase | Sustainable elbow (8KB, p99 ≤ ~14 ms) | Overload throughput | DMA ops/s |
-|---|---:|---:|---:|
-| §9.2 baseline (pre in-place) | 52K (p99 12 ms) | 53,841 @ 65K | 215,364 |
-| §12 in-place forwarding | 54K (p99 12.4 ms) | 54,748 @ 65K | 218,992 |
-| §11.1 STRIP_VALIDATION/DESC_CLEAR/CHUNK_LOOP | 55K (p99 12.3 ms) | 59,195 @ 65K | 236,780 |
-| §11.5 cleanup (dead code + lazy drain + throttle) | 60K (p99 12.6 ms) | 62,068 @ 65K | 248,272 |
-| §11.6 comp_msg packing (28B → 16B) | 65K (p99 12.9 ms) | 65,859 @ 67K | 263,436 |
-| §11.7 SDK delegation + OPTIMIZE_REPORTS | 68K (p99 13.7 ms) | 68,127 @ 70K | 272,508 |
-| **§11.8 fence 일괄화 + ring batch drain** | **74K (p99 13.6 ms)** | **77,434 @ 78K** | **309,736** |
-
-vs M2 ceiling (310,472 ops/s = 100%):
-- baseline 69% → in-place 71% → strips 76% → §11.5 cleanup 80% → §11.6 packing 85% → §11.7 SDK 88% → **§11.8 99.8%** (vs M2)
-- vs M0 (320,014 ops/s): 67% → 68% → 74% → 78% → 82% → 85% → **96.8%**
-
-Throughput milestone: §11.6에서 1 GB/s 돌파 (65K @ 1,008 MB/s), §11.8에서 1,186 MB/s (overload).
-§11.8에서 dpumesh chain이 micro-bench Method 2 ceiling의 99.8%에 도달 — transport
-overhead가 사실상 소멸.
-
-### 18.2 E0 (321,803 dma_copy/s) baseline 기준 attribution
-
-§11.5/§11.6/§11.7 cleanup 이전 dpumesh-vs-E0 갭 = **1.44 µs/op = 32%**.
-
-| 항목 | 비용 (µs/op) | dma_copy/s loss | 출처 | 회복 상태 |
-|---|---:|---:|---|---|
-| Larger comp_msg (7 fields, 28B) | 0.29 | ~27K | §11.3 E5 | **§11.6 packing 16B로 부분 회복** |
-| Per-call `ensure_producer_slot` | 0.17 | ~17K | §11.2 E3 (M2 add, -5.1%) | **§11.5 lazy drain + §11.7 SDK 위임으로 회복** |
-| `handle_msgs` per iter | 0.06 | ~6K | §11.3 E6 (M2 add, -2.0%) | **§11.5 throttle로 회복** |
-| Chunking loop wrapper | 0.05 | ~5K | §11.2 E2 (M2 add, -1.6%) | §11.1 CHUNK_LOOP fast path로 회복 |
-| Desc clear (in lossless context) | 0.05 | ~5K | §11.1 STRIP_DESC_CLEAR (dpumesh remove) | 회복 |
-| Validation | ~0 | 0 | §11.2 E1 (noise) | §11.1 STRIP_VALIDATION로 회복 |
-| Extra consumer empty wait | ~0 | 0 | §11.3 E7 (noise) | — |
-| **측정 합계 (E1-E7 + §11.1)** | **0.62** | **~60K (59%)** | direct | |
-| **Yield/wake architecture** | **0.55** | — | **§13.2 (M2 + yield+wake, -15.2%)** | architectural (보존) |
-| Cache footprint + amortization 불완전성 | ~0.27 | — | 잔여 | — |
-| **합계 = 실측 갭** | **1.44** | **~102K** | **E0 → dpumesh, 82% attributed** | |
-
-§11.5 cleanup 적용 → **+11.5K dma_copy/s 실측 회복** (248K vs 236K, E3+E6 23K
-잠재의 50%).
-§11.6 packing 적용 → **추가 +15.2K dma_copy/s 실측 회복** (263K vs 248K,
-E5 27K 잠재의 56%).
-§11.7 SDK 위임 + OPTIMIZE_REPORTS 적용 → **추가 +9.1K dma_copy/s 실측 회복**
-(272K vs 263K, completion 통보 batch + per-call check 제거).
-§11.8 fence 일괄화 + ring batch drain → **추가 +37.2K dma_copy/s 실측 회복**
-(309.7K vs 272.5K, read/write fence + 함수 호출 + do-while 재방문 압축).
-누적 회복 **+72.9K/106K** = E1-E7 측정 가능 갭의 **69%**. dpumesh chain이 Method 2의
-99.8%에 도달 — single-core transport overhead 사실상 소멸.
-
-### 18.3 부정된 가설
-
-- ❌ **PCIe BW contention** (E11: 2H+2D vs 3H+1D = -0.3% noise)
-- ❌ **ARM polling이 cap** (per-batch pe_progress 변경에도 RPS flat;
-  poll/copy ratio = 1.017 측정)
-- ❌ **DPA busy-spin이 도움** (§14.1 latency 2.5× 악화, §14.2-14.3 slot leak)
-- ❌ **comp_msg quantum ≥ 32B** (§11.6 quantization 표 — 16B HW WQE BB 확정)
-- ❌ **desc 32B pack로 PCIe read 절감** (§11.9 — line-granular writeback이 이웃 slot
-  clobber → 붕괴; 64B-per-desc는 load-bearing 제약)
-
-### 18.4 남은 최적화 후보
-
-dpumesh chain이 Method 2 ceiling(310K dma_copy/s)의 99.8%에 도달했으므로, **single-EU
-single-ring-chain 최적화 여지는 사실상 소진**. 더 밀려면 chain 구조 자체를 바꿔야 함:
+dpumesh chain은 single-EU single-ring-chain의 최적화를 사실상 소진(M2 99.8%, §4.7). 그러나 §6에서
+그 baseline 자체가 host-bound임이 드러났고, engine은 single-EU 556K·multi-EU ≥1.8M의 헤드룸 보유.
+추가 이득은 **chain 구조 변경**에서만 나옴:
 
 | 변경 | 잠재 이득 | 비고 |
 |---|---:|---|
-| **Direct host→host DMA** (chain 4 → 2 dma_copy/RTT) | ~+100% (M2 자체 우회) | host A → DPU buf → host B → … 의 staging hop 제거, host A → host B 직접 DMA. DPA에 양쪽 host mmap 노출 (보안/격리 모델 변경). dma_copy 절반이면 M2 ceiling 무관 |
-| **Multi-EU DPA thread** | ~+50-100% (이론) | §10.1 EU 0.51% active = idle 큼. 단일 EU yield/wake cycle이 cap. 2 EU 분할 시 throughput 합산. producer/consumer/comp_queue 공유 contention + HW EU 가용성 확인 필요 |
-| Wake mechanism 재조정 (host-trigger wake) | 측정 후 결정 | §13.4 + 현 1 kHz keepalive가 wake clock. event-driven host wake로 idle 비효율 제거 가능하나 burst amortization 잃을 위험 |
-| §15.2 (a) `send_tasks_in_flight` mirror 제거 | +0.1 µs/dma_copy | DOCA capability check 필요. chain이 이미 99.8%라 가시 효과 작음 |
+| **Direct host→host DMA** (chain 4→2 dma_copy/RTT) | ~+100% | staging hop 제거, host A→host B 직접. DPA에 양쪽 host mmap 노출(이미 forward는 host read, reverse는 host write 하므로 신규 노출 작음). dma_copy 절반 → M2 무관 |
+| **Multi-EU DPA thread** | ~+50-100%(실측 3.25× peak) | §5.1 EU 0.51% idle. single-EU yield/wake가 cap. §6.3에서 op-rate가 EU에 비례 확인. producer/consumer/comp_queue 분할 + N=8 regression(§6.4-6.5) 해결 필요 |
+| Wake mechanism 재조정(host-trigger wake) | 측정 후 결정 | §5.9 + 1 kHz keepalive가 wake clock. event-driven으로 idle 비효율 제거 가능하나 burst amortization 잃을 위험 |
+| §5.11(a) `send_tasks_in_flight` mirror 제거 | +0.1µs/op | DOCA capability check 필요, 효과 작음 |
 
-§11.8 기준 잔여 갭은 Method 2 대비 0.2% (측정 노이즈 수준). 이는 single-core
-transport가 micro-bench와 구분 불가능함을 의미하므로, 추가 이득은 위 architectural
-변경에서만 나옴.
+dpumesh 1 RTT=4 dma_copy이므로 measured 1.8M op-rate만으로도 ≈450K RPS 이론 상한(현재 77K의 ~5.8×).
+**병목은 engine이 아니라 work를 먹이고 구조화하는 것.**
+
+### HW 한계 측정 해석 가이드 (`dpumesh-hw`)
+
+| 결과 | 해석 | 다음 |
+|---|---|---|
+| RPS ≈ 60-62K (§4.4와 동일) | chain 자체가 cap | DPU `top -H`로 ARM 100% 확인 |
+| 65-75K | chain 가까이, host-side lock/scheduling이 fair-mode cap | bench/echo core 더 늘려 측정 |
+| > 77K | M2 baseline 오류 또는 노이즈 | sweep 재실행 |
+| < 60K | multi-core thrashing, cache locality 손실 | core 줄이거나 NUMA 구분 |
+
+보조: `mpstat -P 0-7 1`(CPU), DPU `top -H -p $(pgrep dpumesh_dpu)`(ARM), `dpa-statistics show`(EU).
+추가 변수: msg_size 1KB(per-msg overhead 격리, ops cap 깨끗), bench thread 수(기본 rps/100, cap region
+thrashing 가능).
 
 ---
 
-## 19. 측정 환경 종합
+## 8. 부록
 
-### 19.1 Hardware
-
-| 항목 | 사양 |
-|---|---|
-| Host CPU | DVFS lock @ 2.5 GHz, governor=performance, cores 0-7 |
-| DPU | NVIDIA BlueField-3 |
-| DPU ARM | 8 cores (no pinning — dpumesh offload 강점 유지) |
-| DPU DPA | FlexIO EU × 1 (single thread for dpumesh) |
-| PCIe | Gen4 |
-| Network | 테스트 환경 내부 통신 (NIC 외부 트래픽 없음) |
-
-### 19.2 Software
-
-| 항목 | 버전 / 설정 |
-|---|---|
-| DOCA SDK | 3.1.0105 |
-| FlexIO library | 25.07.2812 |
-| Kernel | Linux 5.15.0-176-generic |
-| Kubernetes | test-bench namespace, single node |
-| DPU 시작 옵션 | `dpumesh_dpu $DPU_PCI -l 40` (WARN+ filter) |
-| Test harness | `test-bench.sh` (deploy / dpumesh / tcp / pin / cleanup / logs / status) |
-
-### 19.3 dpumesh 정리 후 적용된 변경 (merge 대상)
-
-§10.4 / §11.1 / §11.4 / §11.5 / §11.6 / §11.7 / §11.8의 측정으로 채택된 항목만
-영구 코드로 남기고 실험용 toggle / instrumentation은 모두 제거.
+### 8.1 dpumesh에 적용된 변경 (merge 대상, §4·§5 채택분만 영구화)
 
 | 파일 | 변경 | 근거 |
 |---|---|---|
-| `comch_server.c` + `object.h` | `pods_*` mutex → `__atomic_*` publication (lock-free hot read path) + 동기화 모델 코멘트 | hot read path 락 제거 |
-| `object.h` | `comp_queue_*` helpers `always_inline` 강제 | -O2 self frame 남는 문제 |
-| `dpu_worker.c` | `process_completion_queue` per-entry `pe_progress` × 2 → per-batch 1회 | §11.4 (RPS flat, 55K p99 -10.2%) |
-| `device/dpa_kernel.c` | descriptor 검증 (mmap=0 / size=0 / range / buf-overflow) 제거 | §11.1 Exp A (+1.7%) |
-| `device/dpa_kernel.c` | desc 종료 시 4-field clear + 3× writeback → `valid=0` + 1× writeback | §11.1 Exp B (+1.7%) |
-| `device/dpa_kernel.c` | size ≤ 8KB 단일 dma_copy fast path + >8KB 명시적 drop guard | §11.1 Exp C (+5.5%) |
-| `device/dpa_kernel.c` | chunking fallback else 분기 ~120줄 제거 (host `check_slot_size`로 도달 불가) | §11.5 dead code |
-| `device/dpa_kernel.c` | `run_dma_manager` yield 유지 (코멘트로 측정 근거 보존) | §13/§14 |
-| `device/dpa_kernel.c` | `handle_msgs` throttle (매 32 inner iter) + `drain_producer_completions` throttle (매 8 inner iter) | §11.5 throttle (§11.3 E6 inverse) |
-| `device/dpa_kernel.c` + `dpa_common.h` | `producer_slots_inflight` 카운터 + `ensure_producer_slot` CAP/abort 패턴 제거 → SDK가 producer-side backpressure 관리, drain은 ack만 유지 (`producer_slots_inflight` 필드는 `_pad1` 으로 교체해 struct 정렬 보존) | §11.7 SDK 위임 (M2 baseline 패턴 일치, OPTIMIZE_REPORTS 호환 위한 선행 조건) |
-| `device/dpa_kernel.c` | 두 `dma_copy` 호출에 `DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS` 추가 (FLUSH와 OR) | §11.7 SDK delegation (+3.4% throughput) |
-| `dpa_common.h` | `comch_dma_comp_msg` 28B → 16B packing (type → uint8_t, src/dst_pod_id → int8_t, 필드 재배치로 자연 정렬 유지) + `_Static_assert(sizeof == 16)` | §11.6 packing (§11.3 E5 inverse, +5.6% throughput) |
-| `dpa.c` | DPA→DPU recv handler의 type read `*(enum *)raw` (4B) → `raw[0]` (1B) — packed struct 정합 | §11.6 packing 동반 |
-| `device/dpa_kernel.c` | `__dpa_thread_window_read_inv()` per-desc(inner iter당 4회) → inner iter당 1회 hoist | §11.8 (a) — window-wide read fence |
-| `device/dpa_kernel.c` | `process_one_desc`/`process_one_rev_desc` → `process_fwd_ring`/`process_rev_ring`로 개명 + ring당 `RING_BATCH_CAP=32` 연속 desc batch drain (메타데이터 1회 로드, 중복 consumer-wait 통합) | §11.8 (b) — overload +8.5% |
-| `device/dpa_kernel.c` | per-desc `__dpa_thread_window_writeback()` 제거 → drain_all_rings inner iter당 1회 (found>0) | §11.8 (c) — window-wide write fence, 64B desc 독점이라 clobber 없음 |
-| `device/dpa_kernel.c` + `dpa.c` | dead chain `hello_world` 커널 + `launch_dpa_kernel` 제거 (호출처 0) | §11.8 동반 정리 |
-| `dpa_common.h` | `dma_desc` 64B 유지 + cache-line 독점 사유 가드 주석 (32B pack은 writeback granularity로 unsafe) | §11.9 desc-pack 실패 기록 |
-| `dma.c` / `dma.h` 완전 삭제, `dpa_kernel.c` 의 DMA_REQ case (80줄), `dpa_common.h`의 `comch_dma_req_msg` + enum + union field, `dpa.c`의 DMA_CHUNK case | dead chain (caller 0) ~150줄 | §11.5 dead code |
-| `comch_*`, `dpa.c`, `dpu_worker.c`, `ring.c` | hot path `DOCA_LOG_DBG` 제거 | `-l 40` 정책 일관성 |
+| `comch_server.c`+`object.h` | `pods_*` mutex → `__atomic_*` publication(lock-free hot read) | hot read path 락 제거 |
+| `object.h` | `comp_queue_*` helpers `always_inline` | -O2 self frame 제거 |
+| `dpu_worker.c` | `process_completion_queue` per-entry `pe_progress`×2 → per-batch 1회 | §5.7 (RPS flat, 55K p99 -10.2%) |
+| `device/dpa_kernel.c` | descriptor 검증(mmap=0/size=0/range/overflow) 제거 | §4.3 +VALIDATION |
+| `device/dpa_kernel.c` | 4-field clear + 3×wb → valid=0 + 1×wb | §4.3 +DESC_CLEAR |
+| `device/dpa_kernel.c` | size≤8KB single dma_copy fast path + >8KB drop guard | §4.3 +CHUNK_LOOP |
+| `device/dpa_kernel.c` | chunking fallback else ~120줄 제거 | §4.4 dead code |
+| `device/dpa_kernel.c` | `run_dma_manager` yield 유지(측정 근거 코멘트) | §5.9/§5.10 |
+| `device/dpa_kernel.c` | `handle_msgs` 매 32 iter + `drain_producer_completions` 매 8 iter throttle | §4.4 |
+| `device/dpa_kernel.c`+`dpa_common.h` | `producer_slots_inflight`+`ensure_producer_slot` CAP/abort 제거(→ SDK 위임, _pad1 교체) | §4.6 |
+| `device/dpa_kernel.c` | 두 dma_copy에 `OPTIMIZE_REPORTS`(FLUSH OR) | §4.6 (+3.4%) |
+| `dpa_common.h` | `comch_dma_comp_msg` 28B→16B(type→u8, src/dst→i8, 재배치 자연정렬) + `_Static_assert(==16)` | §4.5 (+5.6%) |
+| `dpa.c` | recv handler type read `*(enum*)raw`(4B)→`raw[0]`(1B) | §4.5 동반 |
+| `device/dpa_kernel.c` | `__dpa_thread_window_read_inv()` 매 desc(iter당 4회)→iter당 1회 hoist | §4.7(a) |
+| `device/dpa_kernel.c` | `process_one_desc`/`process_one_rev_desc`→`process_fwd_ring`/`process_rev_ring` + `RING_BATCH_CAP=32` batch drain | §4.7(b) +8.5% |
+| `device/dpa_kernel.c` | per-desc writeback 제거 → iter당 1회(found>0) | §4.7(c) |
+| `device/dpa_kernel.c`+`dpa.c` | dead `hello_world` 커널 + `launch_dpa_kernel` 제거(호출 0) | §4.7 동반 |
+| `dpa_common.h` | `dma_desc` 64B 유지 + cache-line 독점 가드 주석 | §4.8 실패 기록 |
+| `dma.c`/`dma.h` 삭제, `dpa_kernel.c` DMA_REQ case(80줄), `dpa_common.h` `comch_dma_req_msg`+enum+union, `dpa.c` DMA_CHUNK case | dead chain(caller 0) ~150줄 | §4.4 |
+| `comch_*`/`dpa.c`/`dpu_worker.c`/`ring.c` | hot path `DOCA_LOG_DBG` 제거 | `-l 40` 일관성 |
 
-§10.4의 결정적 측정 (poll/copy=1.017)에 쓰였던 `stat_inner_iters /
-stat_polls / stat_dma_copies` 카운터 및 `dpu_worker.c`의 `doca_dpa_d2h_memcpy`
-로깅 블록은 임무 완료로 제거.
+§5.4 결정적 측정용 카운터(`stat_inner_iters/stat_polls/stat_dma_copies`)와 `doca_dpa_d2h_memcpy`
+로깅은 임무 완료로 제거.
 
-### 19.4 M2 baseline (test_dma/bench) 현재 상태
+### 8.2 M2 baseline (test_dma/bench) 현재 상태
 
 | 파일 | 변경 |
 |---|---|
-| `device/dpa_kernel.c` | `DOCA_DPA_DEV_LOG_*` 모두 no-op |
-| `device/dpa_kernel.c` | `EXTRA_RING_POLLS=0` (E0 baseline 복원) |
-| `device/dpa_kernel.c` | `ADD_VALIDATION`/`CHUNK_LOOP`/`PRODUCER_SLOT`/`DESC_CLEAR_*`/`LARGER_COMP_MSG`/`HANDLE_MSGS`/`EXTRA_CONSUMER_WAIT`/`REVERSE_DMA`/`4_DMA_COPIES`/`YIELD`/`YIELD_WITH_WAKE` 매크로 모두 OFF |
-| `dpa.c` | `DOCA_LOG_*` 모두 no-op |
-| `dpu_worker.c` | `DOCA_LOG_INFO/ERR/DBG` no-op (WARN만 유지 — `recv:` stat 출력용) |
+| `device/dpa_kernel.c` | `DOCA_DPA_DEV_LOG_*` no-op; `EXTRA_RING_POLLS=0`(E0 복원); `ADD_*` 매크로 전부 OFF |
+| `dpa.c` | `DOCA_LOG_*` no-op |
+| `dpu_worker.c` | `DOCA_LOG_INFO/ERR/DBG` no-op (WARN만 — `recv:` 출력용) |
 
-### 19.5 Flame graph 파일
+### 8.3 Flame graph
 
-| 파일 | 캡처 시점 |
+| 파일 | 시점 |
 |---|---|
-| `bench/m2_dpu_flame.svg` | M2 baseline (Method 2 chain) |
-| `bench/dpumesh_dpu_flame.svg` | dpumesh 초기 (in-place forwarding 전) |
-| `bench/dpumesh_dpu_flame_inplace.svg` | §12 in-place forwarding 적용 후 |
-| `bench/dpumesh_dpu_flame_optimized.svg` | comch_server lock-free 적용 후 |
-| `bench/dpumesh_dpu_flame_per_batch.svg` | §11.4 per-batch pe_progress 적용 후 |
+| `bench/m2_dpu_flame.svg` | M2 baseline |
+| `bench/dpumesh_dpu_flame.svg` | dpumesh 초기(in-place 전) |
+| `bench/dpumesh_dpu_flame_inplace.svg` | §4.2 in-place 후 |
+| `bench/dpumesh_dpu_flame_optimized.svg` | comch_server lock-free 후 |
+| `bench/dpumesh_dpu_flame_per_batch.svg` | §5.7 per-batch pe_progress 후 |
 
-### 19.6 소스 파일 인덱스
+### 8.4 소스 인덱스
 
 | 경로 | 내용 |
 |---|---|
-| `bench/bench_dpumesh.c` | A안 client daemon (dpumesh init 1회, ctrl TCP 9092) |
+| `bench/bench_dpumesh.c` | A안 client daemon (init 1회, ctrl TCP 9092) |
 | `bench/echo_dpumesh.c` | A안 server daemon (32 worker thread) |
-| `bench/bench_tcp.go` | B안 client daemon (TCP, ctrl TCP 9092) |
+| `bench/bench_tcp.go` | B안 client daemon |
 | `bench/echo_tcp.go` | B안 server (Go, listen 9092) |
 | `bench/Dockerfile.*` | 4 image (dpumesh: libthrift+DOCA, tcp: slim) |
-| `test-bench.sh` | 배포 + 실행 스크립트 (deploy / dpumesh / tcp / pin / cleanup / logs / status) |
+| `test-bench.sh` | A/B 배포+실행 (deploy/dpumesh/tcp/pin/cleanup/logs/status) |
+| `test_dma/bench/` + `run_bench.sh` | M2 micro-bench (Method 0/2) |
+| `test_dma/pure_dma/` + `run_pure_dma.sh` | §6 pure DMA-engine 측정(single/multi-EU, `--threads`/`--backoff`) |
 
----
+### 8.5 설계 결정 (rationale)
 
-## 20. 설계 결정 (rationale)
-
-- **bench/echo daemon 구조**: 매 실험마다 init 안 함. dpumesh 등록은 deploy 시
-  한 번. 매 실험은 ctrl TCP 명령만으로 트리거. ring 등록/해제 경로를 실험 hot
-  path에서 제거.
-- **echo 32 thread**: 단일 thread는 ~25K RPS에서 막힘 (서버 측 큐잉 3 ms+ p50).
-  32 thread로 dequeue 병목 해소.
-- **wall-time 측정**: bench_dpumesh.c는 watchdog thread + 즉시 join 패턴. main이
-  고정 시간 sleep하면 wall이 부풀려져 RPS underreport.
-- **wrk2식 scheduled-time latency (CO 보정)**: §6.1 참조. cap 너머 가짜 plateau 제거.
-- **MAX_WORKERS = 4096, 128 KB stack**: closed-loop concurrency cap 낮으면
-  (이전 512) Little's law로 in-flight 묶임. 4096 × 128 KB = 512 MB.
-- **Envoy 최소 설정**: tcp_proxy filter 1개, cluster 1개. admin/HTTP/tracing/
-  stats sink/access log/runtime 모두 제거. DPUmesh가 transport-only인 것에 대응.
-- **2 sidecar (1개 아님)**: Istio/Envoy 모델은 client-side + server-side 두 hop.
-  socat 단일 splice는 너무 가벼움 (kernel fast-path) → 비교 부정확.
-- **pinning은 taskset (CFS quota 아님)**: CFS quota는 시간만 제한, core 안 정함.
-  같은 core 공유시키려면 pinning 필수. CFS는 redundant + 잘못된 throttling 가능성.
-- **DPU/DPA는 pinning 안 함**: "DPU/DPA가 host CPU와 독립"이 dpumesh 핵심 advantage.
-  임의로 묶는 건 비교 의의 깎음.
+- **bench/echo daemon**: 매 실험 init 안 함(dpumesh 등록은 deploy 1회), 매 실험은 ctrl TCP만으로
+  트리거 → ring 등록/해제를 hot path에서 제거.
+- **echo 32 thread**: 단일 thread는 ~25K RPS에서 막힘(서버 큐잉 3ms+ p50), 32 thread로 dequeue 병목 해소.
+- **wall-time 측정 / wrk2 CO 보정 / MAX_WORKERS 4096**: §1.4.
+- **Envoy 최소 설정**: tcp_proxy filter 1 + cluster 1, admin/HTTP/tracing/stats/access log/runtime 제거.
+- **2 sidecar(1개 아님)**: Istio 모델 = client-side + server-side 두 hop. socat 단일 splice는 너무
+  가벼움(kernel fast-path) → 비교 부정확.
+- **pinning은 taskset(CFS quota 아님)**: CFS는 시간만 제한·core 안 정함, 같은 core 공유엔 pinning 필수.
+- **DPU/DPA pinning 안 함**: "DPU/DPA가 host CPU와 독립"이 dpumesh 핵심 advantage, 임의 묶기는 비교 의의 깎음.
