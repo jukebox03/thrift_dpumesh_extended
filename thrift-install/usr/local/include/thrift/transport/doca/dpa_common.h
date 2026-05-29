@@ -132,6 +132,14 @@ struct comch_msg {
 
 /* ====== DMA ring descriptor ====== */
 
+/* Exactly 64 bytes = one cache line per descriptor. This isolation is
+ * load-bearing, not just padding: the DPA clears valid=0 and flushes via
+ * __dpa_thread_window_writeback(), which operates at cache-line granularity.
+ * If two descriptors shared a line, that writeback would read-modify-write the
+ * whole line and clobber a neighbouring slot the host had concurrently filled
+ * (valid=1) — breaking the lossless single-owner-per-slot handshake. A 32B
+ * pack was tried and produced exactly this corruption (stuck slots → timeouts),
+ * so keep one descriptor per cache line. */
 struct dma_desc {
 	doca_dpa_dev_mmap_t mmap;      /* 4B */
 	uint64_t addr;                 /* 8B */

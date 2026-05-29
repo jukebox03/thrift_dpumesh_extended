@@ -27,7 +27,6 @@ DOCA_LOG_REGISTER(DPA);
 
 #ifdef DOCA_ARCH_DPU
 /* Kernel function declaration (resolved from dpa_program.a stubs, DPU only) */
-extern doca_dpa_func_t hello_world;
 extern doca_dpa_func_t run_dma_manager;
 extern doca_dpa_func_t thread_init_rpc;
 
@@ -354,24 +353,6 @@ destroy_dpa:
     doca_dpa_destroy(objs->dpa_thread->dpa);
     objs->dpa_thread->dpa = NULL;
     return result;
-}
-
-doca_error_t
-launch_dpa_kernel(struct dmesh_doca_dpa_thread *dpa_thread)
-{
-    doca_error_t result;
-
-    result = doca_dpa_kernel_launch_update_set(dpa_thread->dpa, 
-                    NULL, 0,
-                    NULL, 0,
-                    1,
-                    &hello_world);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to launch DPA kernel with error = %s", doca_error_get_name(result));
-        return result;
-    }
-
-    return DOCA_SUCCESS;
 }
 
 doca_error_t
