@@ -21,13 +21,14 @@
 #define DMA_COPY_SIZE_ALIGN  128
 #define ALIGN_UP_128(x)  (((x) + (DMA_COPY_SIZE_ALIGN - 1)) & ~(uint32_t)(DMA_COPY_SIZE_ALIGN - 1))
 
-/* Producer send slot capacity — must match PRODUCER_SLOT_CAPACITY in dpa.h.
- * Duplicated here because DPA kernel cannot include DPU-side headers. */
-#define PRODUCER_SLOT_CAPACITY  1024
+/* Producer completion queue depth is configured to CC_DPA_MAX_MSG_NUM=1024
+ * (see dpa.h + doca_comch_producer_set_dev_max_num_send). We rely on periodic
+ * drain (every DRAIN_COMPLETIONS_EVERY inner iters in drain_all_rings) to ack
+ * completions and keep the queue cycling. SDK handles producer-side backpressure
+ * internally; we no longer track per-op inflight in DPA-local state. */
 
 /* Forward declarations */
 static void drain_producer_completions(struct dpa_thread_arg *thread_arg);
-static int ensure_producer_slot(struct dpa_thread_arg *thread_arg);
 
 /* DPA-local cache of host's freed_cumulative, refreshed lazily.
  * process_one_rev_desc reads from this cache (no PCIe access in reverse
@@ -134,12 +135,17 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
 }
 
 /*
- * Drain all pending producer completions (send_imm acks).
- * Each dma_copy consumes one send slot.
- * This function acknowledges completed sends to free those slots
- * and decrements the inflight counter accordingly.
- * Without this, the producer runs out of send slots after PRODUCER_SLOT_CAPACITY
- * sends and subsequent calls silently fail.
+ * M2-style lazy drain: we do not track per-op inflight here. SDK + producer
+ * completion queue (CC_DPA_MAX_MSG_NUM=1024) absorbs the in-flight ops; we
+ * just have to keep acking so the queue does not fill. Per wake burst is
+ * ~280 dma_copies (§10.1), drain runs every DRAIN_COMPLETIONS_EVERY inner
+ * iters in drain_all_rings, and we never let more than that build up.
+ *
+ * Counter-and-CAP-with-abort pattern (the previous design) was incompatible
+ * with the SDK's OPTIMIZE_REPORTS flag: deferred completions caused our
+ * inflight counter to look saturated and trigger spurious abort. M2 baseline
+ * proves the SDK handles producer-side backpressure internally as long as
+ * completions are drained and acked periodically.
  */
 static void drain_producer_completions(struct dpa_thread_arg *thread_arg)
 {
@@ -151,31 +157,8 @@ static void drain_producer_completions(struct dpa_thread_arg *thread_arg)
         count++;
     }
 
-    if (count > 0) {
+    if (count > 0)
         doca_dpa_dev_completion_ack(producer_comp, count);
-        if (thread_arg->producer_slots_inflight >= count)
-            thread_arg->producer_slots_inflight -= count;
-        else
-            thread_arg->producer_slots_inflight = 0;
-    }
-}
-
-/*
- * Lazy-drain model: the heavy drain happens in drain_all_rings (periodic) and
- * in run_dma_manager outer (per wake). This is a pure fast-check — return
- * immediately if slots are available, abort the caller if the cap is hit.
- *
- * The cap (PRODUCER_SLOT_CAPACITY = 1024) is far above the typical per-wake
- * burst (~280 dma_copies measured, §10.1). With periodic drain it should not
- * trip in practice; an abort here means dropping the desc, surfacing as a host
- * timeout — the cooperative drain path is what carries the load.
- */
-static __attribute__((always_inline)) int
-ensure_producer_slot(struct dpa_thread_arg *thread_arg)
-{
-    if (thread_arg->producer_slots_inflight < PRODUCER_SLOT_CAPACITY)
-        return 0;
-    return -1;
 }
 
 /*
@@ -257,9 +240,7 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
 
     int num_chunks = 0;
     int aborted = 0;
-    if (ensure_producer_slot(thread_arg) != 0) {
-        aborted = 1;
-    } else {
+    {
         uint32_t wait = 0;
         while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
             if (++wait >= DPA_CONSUMER_WAIT_LOOPS) { aborted = 1; break; }
@@ -274,8 +255,8 @@ static int process_one_desc(struct dpa_thread_arg *thread_arg,
                                         chunk,
                                         (uint8_t *)&comp,
                                         sizeof(struct comch_dma_comp_msg),
-                                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-            thread_arg->producer_slots_inflight++;
+                                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH |
+                                        DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS);
             num_chunks = 1;
         }
     }
@@ -401,9 +382,7 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
 
     int num_chunks = 0;
     int aborted = 0;
-    if (ensure_producer_slot(thread_arg) != 0) {
-        aborted = 1;
-    } else {
+    {
         uint32_t wait = 0;
         while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
             if (++wait >= DPA_CONSUMER_WAIT_LOOPS) { aborted = 1; break; }
@@ -418,8 +397,8 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
                                         chunk,
                                         (uint8_t *)&comp,
                                         sizeof(struct comch_dma_comp_msg),
-                                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-            thread_arg->producer_slots_inflight++;
+                                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH |
+                                        DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS);
             num_chunks = 1;
         }
     }
@@ -441,25 +420,19 @@ static int process_one_rev_desc(struct dpa_thread_arg *thread_arg, uint32_t r)
 
 /*
  * Drain all valid descriptors across all rings (both directions).
- * Returns total number of dma_copy calls issued.
- * Each process_one_desc/process_one_rev_desc call ensures producer slot
- * and consumer availability before every dma_copy via ensure_producer_slot().
- */
-/* Throttle two periodic actions that don't need to fire on every inner iter:
+ * Returns total number of dma_copy calls issued. Producer-side backpressure
+ * is handled by the SDK; we only need to ack producer completions periodically
+ * (drain_producer_completions throttle below) so the completion queue cycles.
  *
- *  - handle_msgs: PCIe-touching poll on the consumer completion ring. The only
- *    messages it dispatches under steady state are TRIGGER (~1 kHz) and the
- *    rare deploy-time ADD_RING / ADD_REV_RING. Every-iter polling at ~50K
- *    iters/s wastes ~6K dma_copy/s of EU time on empty completions.
+ * Throttled actions inside the inner iter:
+ *  - handle_msgs: PCIe-touching consumer-completion poll. Steady-state messages
+ *    are only TRIGGER (~1 kHz) and deploy-time ADD_RING / ADD_REV_RING. Every-iter
+ *    polling at ~50K iters/s wastes EU cycles on empty completions.
+ *  - drain_producer_completions: acks producer send completions to free queue slots.
  *
- *  - drain_producer_completions: harvests producer send slot completions and
- *    decrements producer_slots_inflight. ensure_producer_slot is now a pure
- *    fast-check; the cooperative drain has to happen here so the inflight
- *    counter stays well below PRODUCER_SLOT_CAPACITY across a wake's burst.
- *
- * The outer run_dma_manager loop still calls handle_msgs and drain_producer_*
- * once per wake, so newly-arrived setup messages and remaining inflight slots
- * are not delayed beyond a single yield cycle. */
+ * The outer run_dma_manager loop calls handle_msgs and drain_producer_completions
+ * once per wake, so any setup message / pending completion is not delayed beyond
+ * a single yield cycle. */
 #define HANDLE_MSGS_EVERY 32
 #define DRAIN_COMPLETIONS_EVERY 8
 

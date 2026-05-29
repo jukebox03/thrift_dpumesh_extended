@@ -40,7 +40,7 @@ struct dpa_thread_arg {
 	uint64_t dpa_producer;
 	uint64_t dpa_consumer;
 	uint32_t dpu_consumer_id; /* DPU-side comch consumer ID for DPA->DPU sends */
-	uint32_t producer_slots_inflight; /* number of producer send slots currently in use */
+	uint32_t _pad1; /* was producer_slots_inflight (M2-style lazy drain — SDK manages backpressure) */
 
 	/* Forward rings (CPU→DPU, per-pod) */
 	volatile uint32_t num_rings;

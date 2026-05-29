@@ -744,6 +744,73 @@ read였는데 이제 type가 1B → `raw[0]`로 단축. 다른 caller는 모두
 
 vs Method 2: 78% → **85%**. vs Method 0: 78% → **82%**.
 
+### 11.7 Producer slot SDK 위임 + `OPTIMIZE_REPORTS`
+
+§11.5의 lazy-drain은 `producer_slots_inflight` 카운터 + `PRODUCER_SLOT_CAPACITY=1024`
+hard cap + abort 패턴으로 구현됐는데, 이 패턴이 SDK의 `DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS`
+(완료 batch 통보)와 충돌. OPTIMIZE_REPORTS를 켜면 completion이 deferred되어
+`drain_producer_completions`가 0 ack → 카운터 미감소 → CAP 도달 → abort 연쇄
+→ host TX stuck (실측 30K target에서 OK 243 / Fail 900). M2 baseline (§7.1)은
+inflight 카운터 자체를 안 두고 SDK 내부 backpressure에 위임하며 모든 dma_copy에
+OPTIMIZE_REPORTS 켜고 잘 동작.
+
+**변경 사항**:
+- `producer_slots_inflight` 카운터 제거 (dpa_thread_arg에서 `_pad1`으로 교체, alignment 보존)
+- `ensure_producer_slot` 함수 + 호출 4건 제거 (CAP/abort 패턴 폐기)
+- `drain_producer_completions`은 ack만 유지 (count 추적/슬롯 감소 제거)
+- 두 `dma_copy` 호출처에 `DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH |
+  DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS`
+
+producer 큐 backpressure 안전: per-wake burst ~280 dma_copy (§10.1) ≪ SDK 큐
+용량 1024, drain `DRAIN_COMPLETIONS_EVERY=8` inner iter 주기로 ack 유지.
+
+**Sweep (8 KB, 10 s)**:
+
+| Target | Achieved | p50 (ms) | p99 (ms) | p999 (ms) | Throughput | OK / Fail | 비고 |
+|---:|---:|---:|---:|---:|---:|---|---|
+| 30K | 29,783.2 | 2.94 | **5.38** | 6.70 | 465.36 MB/s | 300,000 / 0 | sustainable |
+| 50K | 49,662.8 | 4.58 | **8.35** | 8.61 | 775.98 MB/s | 500,000 / 0 | sustainable |
+| 60K | 59,554.3 | 5.35 | **9.84** | 12.49 | 930.54 MB/s | 600,000 / 0 | sustainable |
+| 65K | 64,523.0 | 5.59 | **12.84** | 13.08 | 1008.17 MB/s | 650,000 / 0 | sustainable |
+| **67K** | **66,533.4** | **5.67** | **13.00** | 13.20 | **1039.58 MB/s** | 670,000 / 0 | **새 sustainable** |
+| **68K** | **67,497.0** | **6.45** | **13.72** | 15.21 | **1054.64 MB/s** | 680,000 / 0 | sustainable, elbow edge |
+| 70K | 68,126.8 | 119.49 | **248.78** | 253.66 | 1064.48 MB/s | 700,000 / 0 | overload |
+
+**Back-to-back 안정성** (state drift / slot leak 검증, 5,420,000 RTT × 9 run):
+
+| Target | Run 1 / p99 | Run 2 / p99 | Run 3 / p99 |
+|---:|---:|---:|---:|
+| 60K | 59,553.5 / 9.61 ms | 59,553.9 / 9.82 ms | — |
+| 65K | 64,523.0 / 12.85 ms | 64,513.8 / 12.83 ms | — |
+| 67K | 66,533.4 / 13.00 ms | 66,508.9 / 13.01 ms | 66,505.5 / 13.04 ms |
+| 68K | 67,497.0 / 13.72 ms | 67,488.3 / 13.63 ms | — |
+
+run-to-run achieved 편차 < 0.05%, p99 편차 < 1%, **0 failure × 9 회**. M2-style
+패턴이 §14의 lossless ring 가정과 함께 long-run drift 없이 동작.
+
+**핵심 관찰**:
+- **Sustainable elbow 65K → 68K** (+4.6% vs §11.6, +13.3% vs §11.5 60K).
+- **Overload throughput ceiling 65,859 → 68,127 RPS** (+3.4% vs §11.6).
+- Throughput 1,029 → 1,065 MB/s (+3.5%).
+- 67K p99 §11.6 105 ms (overload) → 13.0 ms (sustainable, back-to-back stable).
+- M2-style 단독 (counter 제거만): +1.5%. +OPTIMIZE_REPORTS 시너지로 +3.4%
+  ⇒ 두 변경의 결합 효과. 단독 OPTIMIZE_REPORTS는 §11.5 CAP 패턴과 incompatible.
+
+**누적 ceiling 갱신**:
+
+```
+   100% ┃ ┌── HW max (Method 0)              ── 320,014 ops/s = 20.97 Gbps
+    97% ┃ ├── DMA + completion (Method 2)    ── 310,472 ops/s = 20.34 Gbps
+    85% ┃ ├── dpumesh @ §11.7 SDK delegation ── 272,508 ops/s = 17.85 Gbps
+        ┃ │     (68,127 RPS × 4 dma_copy @ 70K target)
+    82% ┃ ├── dpumesh @ §11.6 packing        ── 263,436 ops/s = 17.27 Gbps
+    78% ┃ ├── dpumesh @ §11.5 cleanup        ── 248,272 ops/s = 16.28 Gbps
+    74% ┃ ├── dpumesh @ §11.1 strips         ── 236,780 ops/s = 15.13 Gbps
+    68% ┃ └── dpumesh @ in-place baseline    ── 218,992 ops/s = 14.02 Gbps
+```
+
+vs Method 2: 82% → **88%**. vs Method 0: 82% → **85%**.
+
 ---
 
 ## 12. In-place Forwarding 변경 (2026-05-08)
@@ -947,7 +1014,7 @@ dpumesh가 **multi-pod / multi-ring / lossless**인 한 yield 불가피:
 - **yield의 ~0.55 µs/op 비용 (§13)은 이 architectural 보호의 가격**
 
 §11.1 strips로 +9% 회복했지만 busy-spin으로 더 짜내면 stability 잃음.
-**(yield + strips + §11.5 cleanup + §11.6 packing)이 production 최적점**.
+**(yield + strips + §11.5 cleanup + §11.6 packing + §11.7 SDK delegation)이 production 최적점**.
 
 ---
 
@@ -957,7 +1024,7 @@ dpumesh flow control은 7 layer + 3 retry queue:
 
 | # | Layer | 위치 | 메커니즘 | 크기 | 필수성 |
 |---|---|---|---|---:|---|
-| 1 | DPA producer slot | DPA EU | `ensure_producer_slot` fast-check (§11.5 inline) | 1024 | 필수 |
+| 1 | DPA producer slot | DPA EU | SDK 내부 관리 (§11.7 위임, drain ack로 큐 순환) | 1024 | 필수 |
 | 2 | DPA consumer recv | DPA EU | `is_consumer_empty` spin (~0x200K loops) | 8192 | 필수 |
 | 3 | DPU comp_queue | DPU ARM | ring + BP_HIGH (3072) / BP_LOW (2048) hysteresis | 4096 | 필수 |
 | 4 | DPU send pool mirror | DPU ARM | `send_tasks_in_flight` atomic | 8192 | DOCA AGAIN 회피용 |
@@ -1053,28 +1120,29 @@ ring 개수 자체는 작은 영향 (다 active 시), idle ring이 폴링 낭비
 
 ### 18.1 누적 ceiling 변화
 
-| Phase | Sustainable elbow (8KB, p99 ≤ ~13 ms) | Overload throughput | DMA ops/s |
+| Phase | Sustainable elbow (8KB, p99 ≤ ~14 ms) | Overload throughput | DMA ops/s |
 |---|---:|---:|---:|
 | §9.2 baseline (pre in-place) | 52K (p99 12 ms) | 53,841 @ 65K | 215,364 |
 | §12 in-place forwarding | 54K (p99 12.4 ms) | 54,748 @ 65K | 218,992 |
 | §11.1 STRIP_VALIDATION/DESC_CLEAR/CHUNK_LOOP | 55K (p99 12.3 ms) | 59,195 @ 65K | 236,780 |
 | §11.5 cleanup (dead code + lazy drain + throttle) | 60K (p99 12.6 ms) | 62,068 @ 65K | 248,272 |
-| **§11.6 comp_msg packing (28B → 16B)** | **65K (p99 12.9 ms)** | **65,859 @ 67K** | **263,436** |
+| §11.6 comp_msg packing (28B → 16B) | 65K (p99 12.9 ms) | 65,859 @ 67K | 263,436 |
+| **§11.7 SDK delegation + OPTIMIZE_REPORTS** | **68K (p99 13.7 ms)** | **68,127 @ 70K** | **272,508** |
 
 vs M2 ceiling (310,472 ops/s = 100%):
-- baseline 69% → in-place 71% → strips 76% → §11.5 cleanup 80% → **§11.6 packing 85%** (vs M2)
-- vs M0 (320,014 ops/s): 67% → 68% → 74% → 78% → **82%**
+- baseline 69% → in-place 71% → strips 76% → §11.5 cleanup 80% → §11.6 packing 85% → **§11.7 SDK 88%** (vs M2)
+- vs M0 (320,014 ops/s): 67% → 68% → 74% → 78% → 82% → **85%**
 
-Throughput milestone: §11.6에서 **1 GB/s 돌파** (65K @ 1,008.58 MB/s).
+Throughput milestone: §11.6에서 1 GB/s 돌파 (65K @ 1,008 MB/s), §11.7에서 1,065 MB/s @ 70K target.
 
 ### 18.2 E0 (321,803 dma_copy/s) baseline 기준 attribution
 
-§11.5/§11.6 cleanup 이전 dpumesh-vs-E0 갭 = **1.44 µs/op = 32%**.
+§11.5/§11.6/§11.7 cleanup 이전 dpumesh-vs-E0 갭 = **1.44 µs/op = 32%**.
 
 | 항목 | 비용 (µs/op) | dma_copy/s loss | 출처 | 회복 상태 |
 |---|---:|---:|---|---|
 | Larger comp_msg (7 fields, 28B) | 0.29 | ~27K | §11.3 E5 | **§11.6 packing 16B로 부분 회복** |
-| Per-call `ensure_producer_slot` | 0.17 | ~17K | §11.2 E3 (M2 add, -5.1%) | **§11.5 lazy drain로 회복** |
+| Per-call `ensure_producer_slot` | 0.17 | ~17K | §11.2 E3 (M2 add, -5.1%) | **§11.5 lazy drain + §11.7 SDK 위임으로 회복** |
 | `handle_msgs` per iter | 0.06 | ~6K | §11.3 E6 (M2 add, -2.0%) | **§11.5 throttle로 회복** |
 | Chunking loop wrapper | 0.05 | ~5K | §11.2 E2 (M2 add, -1.6%) | §11.1 CHUNK_LOOP fast path로 회복 |
 | Desc clear (in lossless context) | 0.05 | ~5K | §11.1 STRIP_DESC_CLEAR (dpumesh remove) | 회복 |
@@ -1089,7 +1157,9 @@ Throughput milestone: §11.6에서 **1 GB/s 돌파** (65K @ 1,008.58 MB/s).
 잠재의 50%).
 §11.6 packing 적용 → **추가 +15.2K dma_copy/s 실측 회복** (263K vs 248K,
 E5 27K 잠재의 56%).
-누적 회복 **+26.7K/106K** = E1-E7 측정 가능 갭의 **45%**.
+§11.7 SDK 위임 + OPTIMIZE_REPORTS 적용 → **추가 +9.1K dma_copy/s 실측 회복**
+(272K vs 263K, completion 통보 batch + per-call check 제거).
+누적 회복 **+35.7K/106K** = E1-E7 측정 가능 갭의 **60%**.
 
 ### 18.3 부정된 가설
 
@@ -1103,7 +1173,11 @@ E5 27K 잠재의 56%).
 
 | 변경 | 잠재 이득 | 비고 |
 |---|---:|---|
-| comp_msg 추가 packing (16B → 12B) | 측정 필요 | §11.3 E5에서 12B가 M2 baseline. `pos`/`length`를 uint16_t로 줄이면 가능 (≤8KB 한도 내). 단 16B HW quantum 아래로 내려가도 추가 quantum 절약 없을 수 있음 |
+| Doorbell coalescing (drain_all_rings inner iter당 1× FLUSH) | 측정 후 결정 | OPTIMIZE_REPORTS만 켜는 1줄 변경은 §11.5 CAP 패턴과 충돌 — §11.7로 해소됨. 다음 단계는 N-1 op에만 OPTIMIZE_REPORTS 켜고 마지막에 FLUSH 발사하는 batch boundary 추적 필요 |
+| Multi-EU DPA thread | ~+50-100% (이론) | §10.1 EU 0.51% active = idle 큼. 단일 EU yield/wake cycle이 cap. 2 EU 분할 (forward/reverse 또는 pod별) 시 throughput 합산. 구조 변경 큼 |
+| `dma_desc` cache line split (host-write vs DPA-write 영역 격리) | ~+5-10% (가설) | §11.2 E4의 100× 비대칭은 lossy ring 한정이지만 dpumesh도 같은 cache line 공유. valid 비트만 별도 cache line으로 격리 시 PCIe coherency cost 절감 |
+| Wake mechanism 재조정 (1 kHz keepalive 빈도/제거) | 측정 후 결정 | §13.4에서 거론만. 현재 host trigger + 1 kHz keepalive 병용. keepalive 낮추거나 제거하면 wake mismatch 변화 |
+| comp_msg 추가 packing (16B → 12B) | 측정 필요 | §11.3 E5에서 12B가 M2 baseline. `pos`/`length`를 uint16_t로 줄이면 가능 (≤8KB 한도 내). 단 16B HW WQE BB quantum 아래로 내려가도 추가 quantum 절약 없을 수 있음 |
 | §15.2 (a) `send_tasks_in_flight` mirror 제거 | +0.1 µs/dma_copy | DOCA capability check 필요 |
 
 남은 0.27 µs unknown은 DPA scheduling 패턴, cache footprint, amortization
@@ -1138,8 +1212,8 @@ architectural 변경 필요.
 
 ### 19.3 dpumesh 정리 후 적용된 변경 (merge 대상)
 
-§10.4 / §11.1 / §11.4 / §11.5 / §11.6의 측정으로 채택된 항목만 영구 코드로
-남기고 실험용 toggle / instrumentation은 모두 제거.
+§10.4 / §11.1 / §11.4 / §11.5 / §11.6 / §11.7의 측정으로 채택된 항목만 영구
+코드로 남기고 실험용 toggle / instrumentation은 모두 제거.
 
 | 파일 | 변경 | 근거 |
 |---|---|---|
@@ -1152,7 +1226,8 @@ architectural 변경 필요.
 | `device/dpa_kernel.c` | chunking fallback else 분기 ~120줄 제거 (host `check_slot_size`로 도달 불가) | §11.5 dead code |
 | `device/dpa_kernel.c` | `run_dma_manager` yield 유지 (코멘트로 측정 근거 보존) | §13/§14 |
 | `device/dpa_kernel.c` | `handle_msgs` throttle (매 32 inner iter) + `drain_producer_completions` throttle (매 8 inner iter) | §11.5 throttle (§11.3 E6 inverse) |
-| `device/dpa_kernel.c` | `ensure_producer_slot` lazy drain — fast-check만 (CAP 시 abort, drain은 drain_all_rings에서) | §11.5 lazy drain (§11.2 E3 inverse) |
+| `device/dpa_kernel.c` + `dpa_common.h` | `producer_slots_inflight` 카운터 + `ensure_producer_slot` CAP/abort 패턴 제거 → SDK가 producer-side backpressure 관리, drain은 ack만 유지 (`producer_slots_inflight` 필드는 `_pad1` 으로 교체해 struct 정렬 보존) | §11.7 SDK 위임 (M2 baseline 패턴 일치, OPTIMIZE_REPORTS 호환 위한 선행 조건) |
+| `device/dpa_kernel.c` | 두 `dma_copy` 호출에 `DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS` 추가 (FLUSH와 OR) | §11.7 SDK delegation (+3.4% throughput) |
 | `dpa_common.h` | `comch_dma_comp_msg` 28B → 16B packing (type → uint8_t, src/dst_pod_id → int8_t, 필드 재배치로 자연 정렬 유지) + `_Static_assert(sizeof == 16)` | §11.6 packing (§11.3 E5 inverse, +5.6% throughput) |
 | `dpa.c` | DPA→DPU recv handler의 type read `*(enum *)raw` (4B) → `raw[0]` (1B) — packed struct 정합 | §11.6 packing 동반 |
 | `dma.c` / `dma.h` 완전 삭제, `dpa_kernel.c` 의 DMA_REQ case (80줄), `dpa_common.h`의 `comch_dma_req_msg` + enum + union field, `dpa.c`의 DMA_CHUNK case | dead chain (caller 0) ~150줄 | §11.5 dead code |
