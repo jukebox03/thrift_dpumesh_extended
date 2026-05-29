@@ -190,8 +190,7 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         if (desc->size > DPA_DMA_COPY_MAX) {
             DOCA_DPA_DEV_LOG_INFO("FWD: desc size %u > %u (slot cap); dropping ring=%u slot=%u\n",
                                   desc->size, DPA_DMA_COPY_MAX, r, thread_arg->desc_idx[r]);
-            desc->valid = 0;
-            __dpa_thread_window_writeback();
+            desc->valid = 0;   /* flushed by the batched writeback in drain_all_rings */
             thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
             total_chunks += 1;
             continue;
@@ -210,7 +209,6 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
             DOCA_DPA_DEV_LOG_INFO("FWD: consumer timeout (ring=%u slot=%u). Dropping.\n",
                                   r, thread_arg->desc_idx[r]);
             desc->valid = 0;
-            __dpa_thread_window_writeback();
             thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
             total_chunks += 1;
             break;
@@ -245,10 +243,10 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         if (thread_arg->pos[r] >= ring->dpu_buf_size)
             thread_arg->pos[r] = 0;
 
-        /* Only flip valid=0. Host overwrites mmap/addr/size/idx/dst_pod_id/flags
-         * on next post, so pre-clearing them is cosmetic. */
+        /* Flip valid=0; the actual host-visible writeback is batched once per
+         * drain_all_rings inner iter. Each desc owns its own 64B cache line, so
+         * deferring the flush cannot clobber a neighbour. */
         desc->valid = 0;
-        __dpa_thread_window_writeback();
 
         thread_arg->desc_idx[r] = (thread_arg->desc_idx[r] + 1) % ring->buf_arr_size;
         total_chunks += 1;
@@ -289,8 +287,7 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         if (desc->size > DPA_DMA_COPY_MAX) {
             DOCA_DPA_DEV_LOG_INFO("REV: desc size %u > %u (slot cap); dropping ring=%u slot=%u\n",
                                   desc->size, DPA_DMA_COPY_MAX, r, thread_arg->rev_desc_idx[r]);
-            desc->valid = 0;
-            __dpa_thread_window_writeback();
+            desc->valid = 0;   /* flushed by the batched writeback in drain_all_rings */
             thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
             total_chunks += 1;
             continue;
@@ -320,7 +317,6 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         }
         if (aborted) {
             desc->valid = 0;
-            __dpa_thread_window_writeback();
             thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
             total_chunks += 1;
             break;
@@ -359,8 +355,8 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         /* Successfully consumed one host RX slot (admission accounting) */
         dpa_sent_count[r]++;
 
+        /* valid=0 flushed by the batched writeback in drain_all_rings. */
         desc->valid = 0;
-        __dpa_thread_window_writeback();
 
         thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
         total_chunks += 1;
@@ -449,6 +445,14 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
                 total_dma_calls += chunks;
             }
         }
+
+        /* Batched writeback: process_fwd_ring/process_rev_ring only store
+         * desc->valid=0 in DPA cache; this single window-wide fence flushes all
+         * of this iteration's frees to host memory at once. Each desc owns its
+         * own 64B cache line, so the batched flush never touches a neighbouring
+         * slot the host is concurrently filling. */
+        if (found)
+            __dpa_thread_window_writeback();
     } while (found > 0);
 
     return total_dma_calls;
