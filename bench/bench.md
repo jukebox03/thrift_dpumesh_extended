@@ -8,12 +8,12 @@ application 로직을 모두 제거하고 transport 비용만 분리 측정.
 
 ## 0. 결론 요약 (TL;DR)
 
-1. **dpumesh transport는 단계적 최적화로 micro-bench Method 2 ceiling의 99.8%에 도달.**
-   8 KB 기준 sustainable 52K→74K RPS, overload dma_copy/s 215K→**309,736**(= M2 310,472의 99.8%).
+1. **dpumesh transport는 단계적 최적화로 transport baseline(M2, §2.0) ceiling의 96.8%에 도달.**
+   8 KB 기준 sustainable 52K→74K RPS, overload dma_copy/s 215K→**309,736**(= M2 320,105의 96.8%).
 2. **cap은 single DPA EU의 per-dma_copy work**다. ARM/epoll/PCIe-BW/polling-ratio는 모두 cap이
    아님이 직접 측정으로 입증·반증됨. EU active%는 0.51%지만 single-EU의 yield/wake + per-op
    work가 throughput을 결정.
-3. **그러나 micro-bench baseline(Method 0=320K, Method 2=310K) 자체가 host descriptor feed에
+3. **그러나 micro-bench baseline(M0=325K, M2=320K) 자체가 host descriptor feed에
    묶인 값이었다.** host 게이트를 제거한 pure-DMA 측정에서 single EU가 **~556K dma_copy/s**
    (size-independent, op-rate bound) 달성 → baseline은 engine 한계가 아니었음. dpumesh
    309,736은 진짜 single-EU engine ceiling의 **55.7%**.
@@ -101,25 +101,47 @@ Ctrl protocol(line): `RUN <rps> <dur_sec> <msg_size> [<conns>]` → `OK <rps_ach
 
 ---
 
-## 2. Transport Ceiling Baselines (micro-bench)
+## 2. Transport Baseline — dpumesh와 동일 구조 micro-bench (≠ engine 한계, → §6)
 
 `test_dma/bench/` micro-bench — k8s·Thrift·TCP·gateway 모두 제거. host가 dma_ring에 desc 직접
 post, comch client + DPA RPC만. `host_worker.c`의 단순 루프(`while(true){ get_next_dma_desc;
 desc->valid=1; }`).
 
-### 2.1 Method 0 / Method 2 (8 KB / 60 s, 2026-05 재측정)
+### 2.0 용어 — baseline 2종 / Method 번호 (먼저 고정)
 
-이전 측정(M0=302K, M2=264K)은 `comch_server.c`의 per-msg `DOCA_LOG_INFO`가 stdio overhead
-주입. `-l 40` + stat 로그 WARN promote로 silence한 결과:
+Method 번호 = `run_bench.sh --method N` = `g_bench_method`. (코드 일부 주석이 dma_copy를 "Method 2"로
+부르지만 무시하고 아래로 통일.)
 
-| Mode | 구성 | dma_copy ops/sec | Throughput(1 dir) | vs M0 |
+| Method | g_bench_method | DPA 커널 | DPU ARM | 측정 지점 | 의미 |
+|---|---|---|---|---|---|
+| **M0** "Only DMA" | 0 | dma_copy + per-op imm | recv 카운트만 (forward 없음) | DPU recv/s | DPA→DPU dma_copy+completion rate |
+| **M1** | 1 | post_memcpy (stop-and-wait) | recv 카운트만 | DPU recv/s | 헤드라인 비교 미사용 |
+| **M2** "DMA + completion" | 2 | dma_copy + per-op imm (커널은 M0와 동일) | 매 recv를 host로 `server_send_msg` forward | DPU recv/s¹ | **dpumesh와 동일 구조의 transport baseline** |
+
+¹ M0·M2 모두 DPU recv/s(= dma_copy/s)로 측정 — 동일 관측점. M0→M2 delta = DPU ARM forward 비용(§2.1).
+
+**baseline 2종 — 서로 다른 질문에 답한다 (둘 다 정당):**
+- **Transport baseline (M2)** = dpumesh의 per-op 구조(single-EU · host descriptor-gated · dma_copy +
+  per-op completion imm · `is_consumer_empty` polling)를 그대로 가진 micro-bench. 질문: *"dpumesh가
+  자기 구조에서 낼 수 있는 최대 dma_copy/s는?"* → §0/§2/§4의 ceiling·vs M2·vs M0는 전부 이 기준.
+  **engine 한계가 아니다.** (M2 lossy vs dpumesh lossless 차이는 §5.6 E4가 보이듯 dpumesh 문맥에선
+  writeback이 싸서 dma_copy/s ceiling으로는 공정. RTT 4× 차이는 dma_copy/s = RPS×4로 정규화.)
+- **Engine op-rate ceiling (§6, pure_dma)** = host descriptor 핸드셰이크를 제거하고 single EU가
+  dma_copy를 back-to-back 발사한 raw op-rate(**556K**). 질문: *"이 HW single-EU의 절대 한계는?"*
+  → dpumesh 309,736은 이 기준 **55.7%**.
+
+### 2.1 Method 0 / Method 2 (8 KB, H2D, 60 s, 2026-05-30)
+
+`-l 40` + per-msg 로그 제거, **둘 다 DPU-side recv/s(= dma_copy/s)** 측정:
+
+| Method | 구성 | dma_copy/s | Throughput(1 dir) | vs M0 |
 |---|---|---:|---:|---:|
-| Method 0 (Only DMA) | `dma_copy` atomic | **320,014** | 20.97 Gbps | 100% |
-| Method 2 (DMA + completion) | `dma_copy` + DPU CPU가 host로 `server_send_msg` | **310,472** | 20.34 Gbps | 97% |
+| Method 0 (Only DMA) | `dma_copy` + per-op imm | **325,407** | 21.32 Gbps | 100% |
+| Method 2 (DMA + completion) | M0 + DPU ARM이 매 completion을 host로 `server_send_msg` forward | **320,105** | 20.97 Gbps | 98.4% |
 
-M0→M2 손실 3%만 → "DPU CPU→host comch forward" 비용 매우 작음. dpumesh가 이 chain을 그대로
-쓰므로 **Method 2 = dpumesh transport ceiling의 direct baseline**. (단 §6에서 이 baseline 자체가
-host-bound임이 드러남.)
+M0→M2 = **−1.6%** = DPU ARM per-completion forward가 sustainable dma_copy/s에 주는 비용. M2 =
+dpumesh와 동일 per-op 구조(single-EU · host descriptor-gated · dma_copy + per-op completion +
+polling)의 transport baseline(§2.0); engine op-rate은 §6(pure_dma 556K).
 
 ### 2.2 micro-bench vs dpumesh chain 차이 (caveat)
 
@@ -179,12 +201,14 @@ host-bound임이 드러남.)
 
 ceiling 위치:
 
-| | dma_copy ops/s | vs M0 | vs M2 |
+| | dma_copy/s | vs M0 | vs M2 |
 |---|---:|---:|---:|
-| Only DMA (HW max) | 320,014 | 100% | — |
-| DMA + completion (M2) | 310,472 | 97% | 100% |
-| dpumesh @ overload (53.55K) | 214,212 | 67% | 69% |
-| dpumesh @ sustainable (51.64K) | 206,580 | 65% | 67% |
+| Only DMA (M0) | 325,407 | 100% | — |
+| DMA + completion (M2) | 320,105 | 98.4% | 100% |
+| dpumesh @ overload (53.55K) | 214,212 | 66% | 67% |
+| dpumesh @ sustainable (51.64K) | 206,580 | 63% | 65% |
+
+M0·M2는 host descriptor-gated dma_copy/s ceiling(§2.0); single-EU engine op-rate은 556K(§6).
 
 ### 4.2 In-place forwarding (2026-05-08)
 
@@ -208,7 +232,7 @@ same-source multi-dst HOL blocking (echo src==dst 무영향).
 | 70,000 | — | 54,369.7 | — | 2,817.77 | overload |
 
 sustainable 52K→**54K**, overload 53,553→**54,748**, overload p99 ~절반. 0 fail, 11회 sequential
-slot leak 없음. → @overload 54,748 = 218,992 ops/s (68% M0 / 71% M2); @sustainable 53,636 = 214,544.
+slot leak 없음. → @overload 54,748 = 218,992 ops/s (67% M0 / 68% M2); @sustainable 53,636 = 214,544.
 
 ### 4.3 Feature strip (compile-time toggle → 영구 흡수)
 
@@ -245,7 +269,7 @@ drain(inflight≥CAP시 -1 abort, drain 매 8 iter, CAP=1024 ≫ wake당 ~280 in
 | 62K run2 | 61,548.9 | 6.24 | 15.15 | 18.08 | 961.70 | 620,000/0 |
 | 65K | 62,068.3 | **203.35** | **404.21** | 410.28 | 969.82 | 650,000/0 |
 
-sustainable 55K→**60K**, overload 59,195→**62,068**(+4.9%). 62K×4=**248,272 ops/s ≈ M2 80%**.
+sustainable 55K→**60K**, overload 59,195→**62,068**(+4.9%). 62K×4=**248,272 ops/s ≈ M2 78%**.
 0 fail 전 구간, 62K back-to-back clean.
 
 ### 4.5 `comch_dma_comp_msg` packing 28B → 16B (WQE BB 1개)
@@ -278,7 +302,7 @@ Quantization 가설(§5.6 E5 인버스): 64B/32B quantum이면 12→24B cost 0%�
 | 67K | 65,859.6 | 55.45 | **105.72** | 109.01 | 1029.06 | 670,000/0 |
 
 sustainable 60K→**65K**(+8.3%), overload 62K→**65.5K**(+5.6%), **1 GB/s 돌파**@65K, 50-60K p99
-5-20% 개선(60K -20.2%). 65,859×4=**263,436 ops/s(85% M2)**. E5 인버스 검증 정합(예측+8%, 실측 +5.6%
+5-20% 개선(60K -20.2%). 65,859×4=**263,436 ops/s(82% M2)**. E5 인버스 검증 정합(예측+8%, 실측 +5.6%
 tput/-20% p99/elbow +8.3%).
 
 ### 4.6 Producer slot SDK 위임 + `OPTIMIZE_REPORTS`
@@ -310,10 +334,10 @@ Back-to-back(5,420,000 RTT × 9 run, 편차 ach<0.05%/p99<1%, 0 fail×9):
 | 68K | 67,497.0/13.72 | 67,488.3/13.63 | — |
 
 sustainable 65K→**68K**, overload 65,859→**68,127**(+3.4%), tput 1,029→1,065 MB/s. 67K p99 §4.5
-105ms(overload)→13.0ms(sustainable). 68,127×4=**272,508 ops/s(88% M2)**. 단독(카운터 제거만)
+105ms(overload)→13.0ms(sustainable). 68,127×4=**272,508 ops/s(85% M2)**. 단독(카운터 제거만)
 +1.5%, +OPTIMIZE_REPORTS 시너지로 +3.4% (단독 OPTIMIZE_REPORTS는 CAP 패턴과 incompatible).
 
-### 4.7 DPA poll/writeback fence 일괄화 + ring batch drain (→ M2 99.8%)
+### 4.7 DPA poll/writeback fence 일괄화 + ring batch drain (→ M2 96.8%)
 
 DPA EU가 cap이므로 EU의 per-desc 비용을 3단계로 절감(host/DPA 자료구조 변경 없음):
 **(a) read_inv hoist** — window-wide read fence를 inner iter당 4회→1회. **(b) ring batch drain** —
@@ -338,8 +362,9 @@ p99 12.78→9.98,-22%). Back-to-back(74K×4 + 73K×2 + 30K recovery): 74K 73,422
 13.56·13.60·13.59·13.585; 73K 72,447·72,455/13.50·13.49; 30K 29,803/5.19. 편차 ach<0.05%/p99<1%,
 0 fail.
 
-**Milestone**: 77,434×4 = **309,736 ops/s = M2 310,472의 99.8%** (1,186 MB/s overload). single-EU
-chain이 micro-bench M2와 구분 불가 — single-EU single-ring-chain의 자연 종착점.
+**Milestone**: 77,434×4 = **309,736 dma_copy/s = M2 320,105의 96.8%** (1,186 MB/s overload).
+transport baseline M2(§2.0)에 근접 — single-EU single-ring-chain의 자연 종착점(engine op-rate 556K
+대비 55.7%, §6).
 
 ### 4.8 desc 32B pack 시도 — 실패
 
@@ -353,15 +378,16 @@ host로 되써서 clobber → slot stuck → timeout (§5.6 E4 storm과 동근).
 
 | Phase | Sustainable elbow(8KB,p99≤~14ms) | Overload throughput | DMA ops/s | vs M2 | vs M0 |
 |---|---:|---:|---:|---:|---:|
-| §4.1 baseline | 52K(12ms) | 53,841@65K | 215,364 | 69% | 67% |
-| §4.2 in-place | 54K(12.4) | 54,748@65K | 218,992 | 71% | 68% |
-| §4.3 strips | 55K(12.3) | 59,195@65K | 236,780 | 76% | 74% |
-| §4.4 cleanup | 60K(12.6) | 62,068@65K | 248,272 | 80% | 78% |
-| §4.5 packing | 65K(12.9) | 65,859@67K | 263,436 | 85% | 82% |
-| §4.6 SDK 위임 | 68K(13.7) | 68,127@70K | 272,508 | 88% | 85% |
-| **§4.7 fence/batch** | **74K(13.6)** | **77,434@78K** | **309,736** | **99.8%** | **96.8%** |
+| §4.1 baseline | 52K(12ms) | 53,841@65K | 215,364 | 67% | 66% |
+| §4.2 in-place | 54K(12.4) | 54,748@65K | 218,992 | 68% | 67% |
+| §4.3 strips | 55K(12.3) | 59,195@65K | 236,780 | 74% | 73% |
+| §4.4 cleanup | 60K(12.6) | 62,068@65K | 248,272 | 78% | 76% |
+| §4.5 packing | 65K(12.9) | 65,859@67K | 263,436 | 82% | 81% |
+| §4.6 SDK 위임 | 68K(13.7) | 68,127@70K | 272,508 | 85% | 84% |
+| **§4.7 fence/batch** | **74K(13.6)** | **77,434@78K** | **309,736** | **96.8%** | **95.2%** |
 
-throughput milestone: §4.5에서 1 GB/s 돌파(65K@1,008 MB/s), §4.7에서 1,186 MB/s(overload).
+throughput milestone: §4.5에서 1 GB/s 돌파(65K@1,008 MB/s), §4.7에서 1,186 MB/s(overload). (위
+"vs M2/vs M0"는 transport baseline(§2.0) 기준; engine op-rate 556K 대비는 55.7% — §6.)
 
 ---
 
@@ -687,11 +713,11 @@ recv/s = dma_copy/s:
 **해석**:
 - **op-rate bound (size-independent)**: 128B와 8KB가 동일 ~556K/s. 8KB의 36.4 Gbps=4.55 GB/s로
   PCIe Gen4(~32 GB/s) 한참 미달 → 대역폭 아니라 **copy 1번당 고정비용(WQE 발행 + 완료 통보)**이 천장.
-- **baseline은 host-feed bound였음**: pure 556K = **M0(320K)의 1.74×, M2(310K)의 1.79×**. host
-  descriptor 게이트 제거하자마자 천장 1.7배+ → §2 "HW max"는 engine 한계가 아니라 host posting +
-  per-op `desc->valid` 악수에 묶인 값.
-- **§4.7/§5의 "99.8%" 재해석**: dpumesh 309,736은 host-bound M2 기준 99.8%일 뿐. 진짜 single-EU
-  engine op-rate(556K) 기준 **309,736/556,150 = 55.7%**. single-EU에도 ~44% 헤드룸이 남음.
+- **baseline은 host-feed bound**: pure 556K = **M0(325K)의 1.71×, M2(320K)의 1.74×**. host
+  descriptor 게이트(per-op `desc->valid` PCIe 악수) 제거 시 천장 1.7×+ → §2 baseline(M0/M2)은 engine
+  한계가 아니라 host descriptor 핸드셰이크에 묶인 값.
+- **transport baseline vs engine**: dpumesh 309,736은 transport baseline M2(320,105) 기준 **96.8%**,
+  진짜 single-EU engine op-rate(556K) 기준 **309,736/556,150 = 55.7%** — single-EU에도 ~44% 헤드룸.
 - single-EU 이론 상한: dpumesh 1 RTT=4 dma_copy → op-rate÷4 ≈ **139K RPS**. 현재 77K는 그 56%.
 - caveat: 556K는 dma_copy에 필수 per-op 완료 imm 포함(= dpumesh primitive, 직접 비교 가능). 단
   comch 완료통보·DPU recv drain 경로도 per-op 포함.
@@ -747,7 +773,7 @@ N=4보다 낮음(regression)** — 포화면 plateau여야 하므로 단순 포�
 
 ## 7. 종합 결론 & 남은 lever
 
-dpumesh chain은 single-EU single-ring-chain의 최적화를 사실상 소진(M2 99.8%, §4.7). 그러나 §6에서
+dpumesh chain은 single-EU single-ring-chain의 최적화를 사실상 소진(M2 96.8%, §4.7). 그러나 §6에서
 그 baseline 자체가 host-bound임이 드러났고, engine은 single-EU 556K·multi-EU ≥1.8M의 헤드룸 보유.
 추가 이득은 **chain 구조 변경**에서만 나옴:
 
