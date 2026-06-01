@@ -16,7 +16,6 @@ struct dmesh_doca_dpa_thread {
     struct doca_dpa *dpa;           /* DOCA DPA */
     struct doca_dpa_thread *thread; /* DPA thread */
     doca_dpa_dev_uintptr_t arg;     /* argument to be used by DPA thread */
-	doca_dpa_dev_buf_arr_t dpa_buf_arr; /* DPA buffer array */
 };
 
 struct dmesh_doca_dpa_msgq {
@@ -65,11 +64,11 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                             struct dmesh_doca_dpa_msgq *msgq);
 
 doca_error_t
-dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread);
+dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread, int eu_id);
 
 struct objects;
 doca_error_t
-dmesh_doca_dpa_comch_create(struct objects *objs);
+dmesh_doca_dpa_comch_create(struct objects *objs, int idx);
 
 doca_error_t
 dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t msg_size);

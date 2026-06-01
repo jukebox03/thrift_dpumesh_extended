@@ -20442,7 +20442,6 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/buffer.c.o: ../li
   /usr/include/x86_64-linux-gnu/asm/posix_types.h \
   /usr/include/x86_64-linux-gnu/asm/posix_types_64.h \
   /usr/include/asm-generic/posix_types.h \
-  /opt/mellanox/doca/include/doca_buf_inventory.h \
   /opt/mellanox/doca/include/doca_mmap.h \
   /opt/mellanox/doca/include/doca_dev.h \
   /opt/mellanox/doca/include/doca_log.h \
@@ -20784,7 +20783,6 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.
   ../lib/cpp/src/thrift/transport/doca/buffer.h \
   /opt/mellanox/doca/include/doca_buf.h \
   /opt/mellanox/doca/include/doca_buf_pool.h \
-  /opt/mellanox/doca/include/doca_buf_inventory.h \
   /opt/mellanox/doca/include/doca_mmap.h \
   /opt/mellanox/doca/include/doca_log.h \
   /usr/include/stdio.h \
@@ -21438,7 +21436,6 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o: ../lib/
   ../lib/cpp/src/thrift/transport/doca/buffer.h \
   /opt/mellanox/doca/include/doca_buf.h \
   /opt/mellanox/doca/include/doca_buf_pool.h \
-  /opt/mellanox/doca/include/doca_buf_inventory.h \
   ../lib/cpp/src/thrift/transport/doca/comch_common.h
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: ../lib/cpp/src/thrift/transport/dpumesh_doca.c \

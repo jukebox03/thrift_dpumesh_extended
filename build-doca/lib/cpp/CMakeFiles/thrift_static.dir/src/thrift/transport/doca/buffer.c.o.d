@@ -64,7 +64,6 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/buffer.c.o: \
  /usr/include/x86_64-linux-gnu/asm/posix_types.h \
  /usr/include/x86_64-linux-gnu/asm/posix_types_64.h \
  /usr/include/asm-generic/posix_types.h \
- /opt/mellanox/doca/include/doca_buf_inventory.h \
  /opt/mellanox/doca/include/doca_mmap.h \
  /opt/mellanox/doca/include/doca_dev.h \
  /opt/mellanox/doca/include/doca_log.h /usr/include/stdio.h \

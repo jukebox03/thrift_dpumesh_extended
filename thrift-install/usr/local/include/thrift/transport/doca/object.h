@@ -13,6 +13,7 @@
 
 struct dmesh_doca_dpa_thread;
 struct dmesh_doca_dpa_comch;
+struct doca_dpa;
 struct dma_ring;
 typedef uint64_t doca_dpa_dev_comch_producer_t;
 typedef uint64_t doca_dpa_dev_completion_t;
@@ -175,13 +176,6 @@ struct pod_state {
     /* Host's RX RQ depth (= num_slots), derived from host_rx_buf_size.
      * Used by DPA admission gate as the cap on in-flight reverse DMAs. */
     uint32_t rq_depth;
-
-    /* === DPU-internal write cursor for reverse DMA ===
-     * DPU is a pure forwarder. End-nodes do flow control end-to-end via
-     * slot-based admission (slot_count × slot_size ≤ DPU_BUFFER_SIZE), so
-     * DPU does not throttle. tx_producer_head only chooses the next physical
-     * write offset (with wrap) inside this pod's reverse-DMA staging buffer. */
-    uint32_t tx_producer_head;
 };
 
 struct objects {
@@ -205,19 +199,35 @@ struct objects {
 
     struct doca_buf_arr *buf_arr;
 
-    /* DPA (shared, 1 thread for all pods) */
-    struct dmesh_doca_dpa_thread *dpa_thread;
-	struct dmesh_doca_dpa_comch *dpa_comch;
-    int dpa_thread_running;  /* 1 = DPA thread started */
+    /* DPA (shared device, N EU threads for multi-EU data plane).
+     *
+     * num_dpa_threads (= N, from DPUMESH_DPA_THREADS, default 1, clamp
+     * [1, MAX_DPA_RINGS]) EU threads share ONE doca_dpa device (`dpa`).
+     * Each EU k owns its own dpa_threads[k] (doca_dpa_thread + arg) and its
+     * own 1c/1p comch channel dpa_comches[k]. A pod's rings are assigned to
+     * EU (pod_id % num_dpa_threads). The DPU side stays single-threaded:
+     * all N recv-msgq consumers connect to the one consumer_pe, so one
+     * pe_progress drains every channel into the single comp_queue — no lock,
+     * tx_ring stays single-producer. Forward-compatible with future DPU
+     * multicore: consumer k just moves to ARM thread k.
+     *
+     * Kept as pointer arrays (not inline) so object.h needs only the
+     * forward declarations above — host-side translation units that include
+     * object.h never pull in doca_dpa.h. */
+    struct doca_dpa *dpa;                                   /* shared DPA device */
+    struct dmesh_doca_dpa_thread *dpa_threads[MAX_DPA_RINGS];
+    struct dmesh_doca_dpa_comch  *dpa_comches[MAX_DPA_RINGS];
+    int num_dpa_threads;                                    /* N */
+    int dpa_affinity;                       /* 1 = pin thread k to EU k; 0 = relaxed (DPUMESH_DPA_AFFINITY) */
+    int dpa_thread_running[MAX_DPA_RINGS];  /* per-EU: 1 = thread k started */
+    int dpa_thread_running_any;             /* 1 = at least one EU started (keepalive guard) */
 
     /* comch data path related */
     struct local_mem_bufs *consumer_mem;
     struct doca_comch_consumer *consumer;
     struct doca_pe *consumer_pe;
 
-    uint32_t remote_consumer_id;
 	doca_error_t consumer_result;		  /* Holds result will be updated in consumer callbacks */
-	bool consumer_finish;			  /* Controls whether consumer progress loop should be run */
 
     int recv_msg_cnt;                  /* Counts number of messages received by consumer */
     int sent_msg_cnt;

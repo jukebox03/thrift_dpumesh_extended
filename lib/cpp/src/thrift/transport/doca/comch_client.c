@@ -103,7 +103,6 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 			DOCA_LOG_ERR("Received invalid MMAP message from server");
 			return;
 		}
-		// result = process_mmap_msg(objs, (struct dmesh_mmap_msg *)recv_buffer);
 		break;
 	case DMESH_MSG_TX_ACK:
 		/* Forward DMA consumed by DPU — sender can free TX buffer slot */
@@ -124,7 +123,6 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 			DOCA_LOG_ERR("Received invalid CONSUMER_ID message");
 			return;
 		}
-		objs->remote_consumer_id = cid_msg->consumer_id;
 		DOCA_LOG_INFO("Received remote consumer ID = %u from DPU", cid_msg->consumer_id);
 		break;
 	}
@@ -234,12 +232,6 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
         DOCA_LOG_ERR("Failed adding pe context to client with error = %s", doca_error_get_name(result));
         goto destroy_client;
     }
-
-    // result = doca_ctx_set_state_changed_cb(ctx, client_state_changed_callback);
-    // if (result != DOCA_SUCCESS) {   
-    //     DOCA_LOG_ERR("Failed setting state change callback with error = %s", doca_error_get_name(result));
-    //     goto destroy_client;
-    // }
 
     result = doca_comch_client_task_send_set_conf(objs->cc_client,
                                                   client_send_task_completion_callback,

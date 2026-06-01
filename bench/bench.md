@@ -874,3 +874,189 @@ thrashing 가능).
   가벼움(kernel fast-path) → 비교 부정확.
 - **pinning은 taskset(CFS quota 아님)**: CFS는 시간만 제한·core 안 정함, 같은 core 공유엔 pinning 필수.
 - **DPU/DPA pinning 안 함**: "DPU/DPA가 host CPU와 독립"이 dpumesh 핵심 advantage, 임의 묶기는 비교 의의 깎음.
+
+---
+
+## 9. Multi-EU DPA threads — 구현 & 측정 (2026-06-01)
+
+§7 lever 중 **multi-EU DPA thread**를 실제 구현하고 `test-bench.sh dpumesh`(fair)로 측정. §6.3
+pure_dma의 "2 EU=1.93×, 4 EU=3.25×"가 실체인에 얼마나 전이되는지 검증.
+
+### 9.1 구조 변경 — N EU(데이터 평면) + 단일 ARM(제어 평면)
+
+데이터 평면만 N개 DPA EU로 복제하고 **DPU ARM 제어 평면은 단일 유지** → lock 0(tx_ring 단일 producer).
+
+| 자원 | 변경 | 위치 |
+|---|---|---|
+| `doca_dpa` device | 1개 공유 | `objs->dpa`, `dpa.c` init_dpa_objects |
+| `doca_dpa_thread` + `dpa_thread_arg` | **per-EU ×N** | `objs->dpa_threads[N]`, share-nothing |
+| comch 채널(send+recv msgq, producer/consumer_comp) | **per-EU ×N** (각 1c/1p) | `objs->dpa_comches[N]`, `comch_msgq.c` loop |
+| ring→EU 매핑 | **`pod_id % N`** | `setup_pod_dma`/`update_rev_ring_host_rx` |
+| EU affinity | thread k → 물리 EU k(`doca_dpa_eu_affinity_*`, abs_EUs 0-63) | `dmesh_doca_dpa_thread_create` |
+| **DPU consumer_pe / comp_queue / cc_server / objs->pe** | **단일 유지** — N개 recv consumer를 한 `consumer_pe`에 attach → 1회 `pe_progress`가 전부 drain → 단일 comp_queue → 단일 ARM worker(라우팅+reverse enqueue+send) | `dpu_worker.c` |
+| reverse admission 카운터 | **per-EU 2D 전역** `dpa_sent_count[eu][ring]`/`dpa_cached_freed[eu][ring]` (thread_arg.eu_index로 행 선택) | `dpa_kernel.c:46-47` |
+
+- 노브: `DPUMESH_DPA_THREADS`(기본 1, clamp [1,MAX_DPA_RINGS=8]), `DPUMESH_DPA_AFFINITY`(기본 1).
+  `test-bench.sh start_dpu`가 DPU launcher에 전달.
+- forward-compat: EU↔채널 1:1이라, 추후 DPU multicore에서 consumer k를 ARM_k가 progress하면 그대로 확장.
+
+### 9.2 측정 방법
+
+- harness: **`test-bench.sh dpumesh`(fair, 1-core host/pod)**, 8 KB, 10 s, 2-pod echo(bench pod 10 ↔ echo pod 11). §4와 동일 harness.
+- **천장은 RPS 타깃을 overload까지 밀어야 보임**(achieved가 plateau, p99 발산). sustainable elbow(저타깃 achieved)와 혼동 금지 — 본 측정 초기에 52K(elbow)를 천장으로 오판했던 교훈.
+- 노브: `DPUMESH_DPA_THREADS=N [DPUMESH_DPA_AFFINITY=0|1] ./test-bench.sh deploy` 후 `dpumesh <RPS> 10 8192`.
+- **원본 대조**: `git stash`로 수정 전 코드를 **같은 날·같은 환경**에 배포해 측정(일변동 분리).
+- 합격 기준: **0 fail + 백투백 무재배포 성공(slot-leak 0)**. 모든 표는 OK/Fail 0 확인.
+- (참고) `dpumesh-hw`(2-core host)도 측정 — host 코어 수가 천장에 영향 있는지 분리용.
+
+### 9.3 회귀 발견 & 수정 — admission 카운터의 메모리 위치
+
+multi-EU 정합성을 위해 file-scope 전역이던 `dpa_sent_count/cached_freed`를 per-EU로 옮겨야 했는데,
+**heap-allocated `dpa_thread_arg`에 넣었더니 reverse-desc마다 느린 메모리 접근으로 single-EU 천장 7% 회귀.**
+→ **per-EU 2D 전역**(`[eu_index][ring]`, 빠른 메모리 + per-EU 격리)으로 되돌려 회복.
+
+| N=1 변형 | @78K target | @85K target(천장) |
+|---|---:|---:|
+| 원본(stash, 카운터=file-scope 전역) | 75,182 | **76,749** |
+| 카운터 in `dpa_thread_arg`(heap) | 71,725 | 71,561 (**−7% 회귀**) |
+| **카운터 in per-EU 2D 전역(수정본)** | 75,922 | **74,704** (회귀 0, 원본 수준) |
+
+교훈: **DPA hot path의 per-op 카운터는 heap struct가 아니라 file-scope 전역에 둘 것.**
+
+### 9.4 N-value 스케일링 데이터 (수정본, fair, 2-pod echo, 8KB)
+
+**2-pod 벤치는 ring→EU=`pod%N`이라 N≥2에서 활성 EU가 항상 2개**(pod10, pod11). N>2는 추가 EU를
+못 켬 → 같은 천장.
+
+| N | 활성 EU(pod10/11) | overload 천장 | vs N=1 |
+|---:|---|---:|---:|
+| 1 | 1 (EU0) | **~76K** | 1.00× |
+| 2 | 2 (EU0, EU1) | **~104K** | **1.37×** |
+| 4 | 2 (EU2, EU3; EU0/1 idle-created) | **~104–105K** | 1.37× |
+
+전체 스윕(achieved RPS, OK/Fail 전부 0):
+
+| target | N=1 | N=2 | N=4 | N=4 (dpumesh-hw, 2-core) |
+|---:|---:|---:|---:|---:|
+| 70,000 | 69,310 | — | — | — |
+| 78,000 | 75,922 | — | — | 77,468 |
+| 85,000 | **74,704** | — | 84,352 | 84,367 |
+| 95,000 | — | 94,117 | 94,249 | 94,194 |
+| 105,000 | — | **104,100** | **104,185** | 104,220 |
+| 115,000(과부하) | — | 102,806 | 105,695 | 120K→104,526 |
+
+- **N=2 ≈ N=4 ≈ 104K** → N>2는 2-pod에서 무의미(활성 EU 2개 cap) 확증.
+- **fair(1-core) ≈ hw(2-core) ≈ 104K** → **host 코어 수는 104K 천장과 무관** → 병목은 host posting 아님.
+- 백투백 정합성: N=4 @40K 연속 2회 39,730/39,732 OK/Fail 0; 95K→115K 연속 스윕 slot-leak 0.
+
+### 9.5 핵심 발견 & 미해결 (조사 중)
+
+1. **single-EU 회복**: 수정본 N=1 ~76K = 원본 = §4.7(77,434) 재현. 리팩터 회귀 0.
+2. **multi-EU 실이득 확인**: 2 활성 EU가 76K→104K(**+37%**, 1.37×). §6.3 pure_dma의 2-EU 1.93×보다
+   낮음 — 실체인엔 단일 ARM 라우팅·cc_server·reverse admission이 추가되기 때문(pure_dma엔 없음).
+3. **2-EU가 1.37×에 묶이는 이유 = 미해결**. 각 EU는 solo 76K의 ~68%(52K)만 사용 → EU 여유 있음.
+   2×=152K가 아니라 104K인 건 **EU 수와 무관한 공유 자원**(단일 comp_queue/consumer_pe/cc_server/
+   objs->pe, send pool) **또는 buffer size**(DMA_RING_SIZE 2048, CC_DPA_MAX_MSG_NUM 1024/EU,
+   DPU_COMP_QUEUE_SIZE 4096, DPU_BUFFER_SIZE 16MB)가 cap. host 아님(§9.4 fair=hw). → §9.6에서 buffer
+   기각·**단일 ARM 제어평면(특히 host-bound comch send 경로)**으로 확정(§9.6e).
+4. **full N-scaling(>2×)은 pod ≥ N 필요**: 2-pod는 구조적으로 2-EU cap. `bench_dpumesh.c`가 다중
+   `BENCH_DST_POD_ID`로 보내도록 + echo-dpumesh pod 추가 시 4-EU 측정 가능(harness 변경 필요).
+
+### 9.6 병목 조사 — buffer 반증 & 천장 재해석 (조사 중)
+
+§9.5의 "2-EU가 1.37×에 묶이는 이유"를 (a) 코드 병렬 분석(4-agent 워크플로우) + (b) buffer-size 반증
+실험으로 좁힘. **결론: cap은 buffer가 아니라 EU 수와 무관한 단일 DPU ARM 제어 평면.**
+
+**(a) buffer-size 반증 실험 (depth 계열 키워도 천장 무변화):**
+
+| 실험 | 변경 | 결과 | 판정 |
+|---|---|---|---|
+| comp_queue depth | `DPU_COMP_QUEUE_SIZE` 4096→16384 + `RING_BATCH_CAP` 32→128 | N=2 @105K → **100,064** (~101K, 변화 0) | cap 아님 |
+| DPA recv/producer pool | `CC_DPA_MAX_MSG_NUM` 1024→4096 | **배포 실패 — DPA HW recv-task 한계 초과, DPU init fail** (`bench-dpumesh` crash-loop) | HW상 4× 불가 + cap 아님 |
+
+→ depth 계열 버퍼(comp_queue/CC_DPA_MAX_MSG_NUM/RING_BATCH_CAP) 전부 천장 무영향. (실험 후 전부 원복.)
+
+**(b) "M2=320K가 천장" 가설 반증 — 측정이 이미 초과함:**
+
+- 2-EU = 104K RPS = **416,000 dma_copy/s**, M2 transport baseline = 320,105 dma_copy/s(§2.1).
+- **416K > 320K (M2 30% 초과)**: DPU(단일 ARM)를 **그대로 둔 채 DPA EU만 늘려 이미 M2를 넘었다.**
+  → M2는 ARM 단독 천장이 아니라 *single-EU가 ARM을 먹이는 합산 rate*(single-EU/chain에 묶인 값).
+  bench §5.3 "ARM ~3.5µs 헤드룸"과 정합 — 2nd EU가 그 헤드룸을 먹어 416K로 올림.
+- 즉 **single-EU 309K는 ARM 병목이 아니었고(EU-bound)**, multi-EU가 ARM 헤드룸을 활용해 초과한 것.
+  진짜 공유-stage 천장 = **≥416K, 위치 미상**.
+
+**(c) 워크플로우 코드 분석 — 공유 자원 순위 (104K cap 후보):**
+
+| # | 후보 | EU 수와 함께 scale? | 비고 |
+|---|---|---|---|
+| 1 | 단일 ARM worker(`run_dpu_worker`): comp_queue drain + 라우팅 + RTT당 ~2 cc_server send | ❌ 단일 | 유력 |
+| 2 | 단일 `cc_server` / pod당 단일 host connection (serial comch send) | ❌ 단일 | 유력 |
+| 3 | 단일 `consumer_pe` (1 `pe_progress`가 N EU 채널 전부 drain) | ❌ 단일 | §6.5 N=8 regression 메커니즘 |
+| 4 | 단일 comp_queue (직렬화 funnel, depth 아님) | ❌ 단일 | (a)에서 depth 반증 |
+| — | thread_arg / comch 채널 / producer·consumer_comp / `dpa_sent_count[eu][r]` | ✅ per-EU | cap 아님 |
+| — | DMA_RING_SIZE / host TX slots / DPU_BUFFER_SIZE / rq_depth | (pod수에 scale, EU 무관) | 점유 3–58%, cap 아님 |
+
+- **host 아님 확증**: fair(1-core) = hw(2-core) = 104K(§9.4) → host 코어 늘려도 무변화.
+
+**(d) 미해결 & 다음 실험**: 2-EU=416K가 *공유 ARM 포화*인지 *2-EU의 몫일 뿐 4 EU면 더 오르는지*는
+**활성 EU 4개로만 판별**(2-pod는 2-EU cap). 후보 실험:
+- **A. fwd/rev ring 분리**(2-pod 유지, forward ring→EU_x / reverse ring→EU_y로 같은 부하를 4 EU 분산;
+  매핑 코드만): 104K 그대로면 **ARM이 cap** 확정.
+- **B. 독립 2쌍**(bench10↔echo11 + bench12↔echo13 = 4-pod, 4 EU, 부하 2×; harness 변경): 합계
+  ~208K면 multi-EU 스케일, <150K면 단일 ARM이 aggregate cap.
+- 이후 **DPU multicore**(multithread_verified_plan.md §3 Phase 3)가 단일 ARM을 풀 대상.
+
+**(e) 적대적 다관점 확정 (5-agent 워크플로우, 2026-06-02)** — 코드만 정독한 5개 독립 관점(ARM per-RTT
+직렬비용 / consumer-drain 퍼널 / comch-send 직렬화 / EU throttle 루프 / "ARM 아님" skeptic)이 **단일 ARM
+제어평면 = 104K cap**으로 수렴(skeptic 포함, refuted=false):
+
+- **결정적 반증(pure_dma clincher)**: pure_dma N=2 = **1,070,930 dma_copy/s**가 *같은 2 EU·같은 DMA-HW·
+  같은 doca_dpa device·같은 단일 consumer_pe drain*에서 측정됨(§6.3). 체인 N=2는 **416,000**(=38.8%)뿐.
+  HW·device·drain이 1.07M을 내므로 cap은 그것들이 **아니고**, pure_dma에 없는 **dpumesh 제어평면**이 유일
+  차이 → DMA-HW/PCIe/producer_comp/DMA_RING_SIZE/rq_depth 후보 전부 기각.
+- **consumer_pe drain은 cap 아님**: pure_dma가 *같은* 단일 drain을 1.07M로 돌림 → 체인 416K엔 ~2.6× 헤드룸.
+  병목은 drain *이후*의 직렬 작업(`process_completion_queue`→라우팅→host-bound send).
+- **per-RTT 단일 ARM 직렬 작업(1 RTT=4 dma_copy 기준)**: comp_queue 4 entry drain(2 FORWARD + 2
+  REV_NOTIFY, `dpu_worker.c:342`) + reverse tx-ring post ×2(`dpu_enqueue_reverse_dma`) + **host-bound
+  comch send ×4**(hop당 `process_rev_notify_entry`의 DMA_COMPLETION + TX_ACK, `dpu_worker.c:290,313`).
+  104K RPS → **~416K comch send/s ≈ 2.4µs/send** 예산을 단일 `cc_server`/단일 `objs->pe`/단일 core가
+  직렬 소화(`server_send_msg_to_conn`: pool acquire + alloc_init + task_submit + DPU→host doorbell).
+  **지배적 직렬비용 = host-bound comch send 경로.**
+- **1.37×의 산수**: single-EU는 EU-bound(309K)·ARM 헤드룸 보유(§5.3 ARM useful ~1.05µs/op vs DPA
+  4.55µs/op). 2nd EU가 그 헤드룸을 먹어 416K(=1.37×, M2 320K의 +30%)까지 올리지만, ARM 직렬 천장이
+  ~416K라 2×(618K) 불가 → 각 EU가 backpressure 루프로 ~52K(solo의 68%)로 throttle(§9.5-2 확증).
+- **여전히 열린 질문(§9.6d)**: 104K가 ARM *하드* 천장인지(4 EU여도 동일) vs 2-EU의 몫인지는 **활성 EU 4개**
+  (실험 A/B)로만 확정. cheap 진단: 104K run 중 `top -H -p $(pgrep dpumesh_dpu)`로 `run_dpu_worker` ARM
+  스레드 ~100% 확인 + `dpa-statistics`로 EU active% 낮음(throttle 확증).
+- **near-term lever**: host→host direct(4→2 dma_copy/RTT, §7; **단 USER L7 결정 선행**, verified_plan §4)
+  또는 control-plane 완화(DMA_COMPLETION+TX_ACK **배치**·per-shard send 채널, verified_plan §3 Phase 4)가
+  ARM 직렬비용을 직접 깎는다. multi-ARM(Phase 3)은 최고 리스크.
+
+**Post-cleanup 재검증 (dead-code 정리 17건 적용 후 N=2 재배포, 2026-06-02)** — 코드 정리(write-only 필드 4 +
+미호출 헬퍼 `clean_comch_consumer` + INVENTORY 버퍼 경로 + dead 매크로 + `[PAIRCHK]`/주석 디버그 로그 +
+stale 주석/`(void)` 제거; `app_name`은 진단용 보존)가 behavior-neutral임을 확인: 40K→39,707 / 105K→**104,106**
+/ 95K back-to-back→94,250·94,263, **전부 OK/Fail 0**, §9.4 수치 정확 재현, slot-leak 0.
+
+### 9.7 실행/배포 방법 (N 노브)
+
+EU thread 수 `N`은 DPU 바이너리가 **시작 시 env로 읽음** → 바꾸려면 매번 `deploy` 필요(`dpumesh`
+명령만으론 안 바뀜). `test-bench.sh start_dpu`가 launcher에 전달.
+
+```bash
+# N=4로 배포 (DPA EU thread 4개)
+DPUMESH_DPA_THREADS=4 ./test-bench.sh deploy
+# 천장 측정 (overload까지 타깃 올림)
+./test-bench.sh dpumesh 105000 10 8192
+
+# affinity 끄기(relaxed 배치, 원본 동일)도 함께
+DPUMESH_DPA_THREADS=4 DPUMESH_DPA_AFFINITY=0 ./test-bench.sh deploy
+```
+
+| 노브 | 기본 | 범위 | 의미 |
+|---|---|---|---|
+| `DPUMESH_DPA_THREADS` | 1 | 1–8 (`MAX_DPA_RINGS`, 초과 시 clamp) | DPA EU thread 수 N |
+| `DPUMESH_DPA_AFFINITY` | 1 | 0/1 | 1=thread k→물리 EU k 핀, 0=relaxed |
+
+- 확인: 배포 로그 `Starting dpumesh_dpu on DPU (DPA EU threads=4, affinity=1)`.
+- **주의**: 2-pod 벤치는 N≥2가 전부 활성 EU 2개(§9.4) → N=2/3/4 동일 ~104K. N 효과를 더 보려면
+  pod ≥ N 필요(§9.6 실험 A/B).

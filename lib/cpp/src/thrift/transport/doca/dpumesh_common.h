@@ -12,12 +12,9 @@
 #define OP_REQUEST     0x00
 #define OP_RESPONSE    0x10
 
-/* PoolType — buffer-pool identifiers (only POOL_NONE and POOL_HOST_TX_BODY currently used) */
+/* PoolType — buffer-pool identifiers */
 #define POOL_NONE           0
 #define POOL_HOST_TX_BODY   2
-#define POOL_HOST_RX_BODY   4
-#define POOL_DPU_TX_BODY    6
-#define POOL_DPU_RX_BODY    7
 
 /* ====== DOCA / DPA limits ====== */
 #define MAX_DPA_RINGS       8

@@ -233,11 +233,13 @@ stop_dpu() {
 }
 
 start_dpu() {
-    step "=== Starting dpumesh_dpu on DPU ==="
+    local dpa_threads="${DPUMESH_DPA_THREADS:-1}"
+    local dpa_affinity="${DPUMESH_DPA_AFFINITY:-1}"
+    step "=== Starting dpumesh_dpu on DPU (DPA EU threads=$dpa_threads, affinity=$dpa_affinity) ==="
     stop_dpu
     ssh "$DPU_HOST" "cat > /tmp/start_dpu_bench.sh << 'LAUNCHER'
 #!/bin/bash
-screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && ./dpumesh_dpu $DPU_PCI -l 40 > $DPU_LOG 2>&1\"
+screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_DPA_THREADS=$dpa_threads DPUMESH_DPA_AFFINITY=$dpa_affinity ./dpumesh_dpu $DPU_PCI -l 40 > $DPU_LOG 2>&1\"
 sleep 2
 pgrep -f 'dpumesh_dpu.*03:00' || echo NO_PID
 LAUNCHER

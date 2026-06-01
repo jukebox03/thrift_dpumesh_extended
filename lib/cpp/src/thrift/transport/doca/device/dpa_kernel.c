@@ -25,21 +25,21 @@
  * drain_all_rings inner iter. */
 #define RING_BATCH_CAP  32
 
-/* Producer completion queue depth (CC_DPA_MAX_MSG_NUM=1024 in dpa.h, set via
- * doca_comch_producer_set_dev_max_num_send). drain_producer_completions acks
- * periodically to keep the queue cycling; the SDK manages producer-side
- * backpressure. */
-
 /* Forward declarations */
 static void drain_producer_completions(struct dpa_thread_arg *thread_arg);
 
-/* DPA-local cache of host's freed_cumulative, refreshed lazily in
- * drain_all_rings. process_rev_ring reads this cache instead of doing a
- * PCIe read per reverse desc. */
-uint64_t dpa_cached_freed[MAX_DPA_RINGS] = {0};
-
-/* Per-ring count of reverse DMAs DPA has issued (reverse admission accounting). */
-uint64_t dpa_sent_count[MAX_DPA_RINGS] = {0};
+/* Reverse admission accounting — per-EU file-scope globals (fast DPA memory),
+ * indexed by [eu_index][ring]. In the multi-EU data plane N EU threads each run
+ * run_dma_manager over their own thread_arg; a 1-D global indexed by the EU-local
+ * ring index r would alias across EUs (EU_a ring 0 vs EU_b ring 0). The 2-D form
+ * gives each EU its OWN row (thread_arg->eu_index) → single-writer per row, no
+ * atomics, while staying in fast global memory. (Storing these inside the
+ * heap-allocated thread_arg instead cost ~7% of the single-EU ceiling via a
+ * per-reverse-desc slow-memory access; globals restore the original fast path.)
+ *   dpa_cached_freed[e][r] = host's freed_cumulative cached for EU e, ring r
+ *   dpa_sent_count[e][r]   = reverse DMAs EU e has issued for ring r */
+uint64_t dpa_cached_freed[MAX_DPA_RINGS][MAX_DPA_RINGS] = {{0}};
+uint64_t dpa_sent_count[MAX_DPA_RINGS][MAX_DPA_RINGS] = {{0}};
 
 /* Lazy-refresh margin: refresh credit when computed inflight is within
  * this many slots of the cap. Smaller = fewer PCIe reads but tighter
@@ -51,7 +51,8 @@ uint64_t dpa_sent_count[MAX_DPA_RINGS] = {0};
  * RPC for initializing DPA IO thread called before running the thread
  *
  * @consumer [in]: The DPA Comch consumer
- * @return: returns RPC_RETURN_STATUS_SUCCESS on success and RPC_RETURN_STATUS_ERROR otherwise
+ * @num_msg [in]: Number of consumer recv credits to acknowledge
+ * @return: always returns 0
  */
 
 __dpa_rpc__ uint64_t thread_init_rpc(doca_dpa_dev_comch_consumer_t consumer, uint32_t num_msg)
@@ -270,6 +271,7 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
      * completions and forwards to Host via the comch control path. */
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
     uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
+    uint32_t e = thread_arg->eu_index;   /* this EU's row in the per-EU admission globals */
     struct comch_dma_comp_msg comp;
     int total_chunks = 0;
 
@@ -303,7 +305,7 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
          * If inflight reverse DMAs >= rq_depth, host's RX RQ is at capacity —
          * stop the batch (desc stays valid, retried next iter after cache refresh). */
         if (ring->host_credit_buf_arr != 0 && ring->rq_depth != 0) {
-            if (dpa_sent_count[r] - dpa_cached_freed[r] >= ring->rq_depth)
+            if (dpa_sent_count[e][r] - dpa_cached_freed[e][r] >= ring->rq_depth)
                 break;
         }
 
@@ -353,7 +355,7 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         if (thread_arg->rev_pos[r] >= ring->host_buf_size)
             thread_arg->rev_pos[r] = 0;
         /* Successfully consumed one host RX slot (admission accounting) */
-        dpa_sent_count[r]++;
+        dpa_sent_count[e][r]++;
 
         /* valid=0 flushed by the batched writeback in drain_all_rings. */
         desc->valid = 0;
@@ -388,6 +390,7 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
     int total_dma_calls = 0;
     int found;
     uint32_t iter_counter = 0;
+    uint32_t e = thread_arg->eu_index;   /* this EU's row in the per-EU admission globals */
 
     do {
         found = 0;
@@ -424,7 +427,7 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
             struct dpa_ring_info *rev = &thread_arg->rev_rings[r];
             if (rev->host_credit_buf_arr == 0 || rev->rq_depth == 0)
                 continue;
-            uint64_t inflight = dpa_sent_count[r] - dpa_cached_freed[r];
+            uint64_t inflight = dpa_sent_count[e][r] - dpa_cached_freed[e][r];
             if (inflight + CREDIT_REFRESH_MARGIN < (uint64_t)rev->rq_depth)
                 continue;  /* still plenty of headroom — skip PCIe read */
             /* Credit slot sits one past the DMA_RING_SIZE descriptors in the
@@ -434,7 +437,7 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
                                                DMA_RING_SIZE);
             doca_dpa_dev_uintptr_t cptr = doca_dpa_dev_buf_get_external_ptr(cbuf);
             volatile uint64_t *fp = (volatile uint64_t *)cptr;
-            dpa_cached_freed[r] = *fp;
+            dpa_cached_freed[e][r] = *fp;
         }
 
         /* Reverse rings (DPU→Host) */

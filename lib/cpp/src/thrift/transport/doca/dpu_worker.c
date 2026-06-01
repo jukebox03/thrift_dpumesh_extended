@@ -411,13 +411,19 @@ run_dpu_worker(struct objects *objs)
         return;
     }
 
-    /* 4. DPA thread create (shared, not run yet — started on first pod) */
-    result = dmesh_doca_dpa_thread_create(objs->dpa_thread);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create DPA thread: %s",
-                     doca_error_get_descr(result));
-        cleanup_objects(objs);
-        return;
+    /* 4. DPA threads create (one per EU on the shared device; not run yet —
+     *    each EU is started on its first assigned pod in setup_pod_dma). */
+    for (int k = 0; k < objs->num_dpa_threads; k++) {
+        /* Pin EU thread k to absolute EU k (partition exposes abs_EUs 0-63)
+         * when affinity is enabled; eu_id<0 leaves placement relaxed. */
+        int eu_id = objs->dpa_affinity ? k : -1;
+        result = dmesh_doca_dpa_thread_create(objs->dpa_threads[k], eu_id);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to create DPA thread EU %d: %s",
+                         k, doca_error_get_descr(result));
+            cleanup_objects(objs);
+            return;
+        }
     }
 
     /* 5. comch DPA message queue (shared) */
@@ -502,12 +508,18 @@ run_dpu_worker(struct objects *objs)
         kick_elapsed = (now.tv_sec - last_kick.tv_sec) +
                        (now.tv_nsec - last_kick.tv_nsec) / 1e9;
         if (kick_elapsed >= 0.001) {
-            if (objs->dpa_thread_running && objs->dpa_comch) {
+            if (objs->dpa_thread_running_any) {
                 struct comch_msg trigger;
                 memset(&trigger, 0, sizeof(trigger));
                 trigger.type = COMCH_MSG_TYPE_TRIGGER;
-                (void)dmesh_doca_dpa_msgq_send_try(&objs->dpa_comch->send,
-                                                    &trigger, sizeof(trigger));
+                /* Each running EU has its own channel and reschedules
+                 * independently when idle, so every started EU needs its own
+                 * keepalive to be woken within ~1 ms. */
+                for (int k = 0; k < objs->num_dpa_threads; k++) {
+                    if (objs->dpa_thread_running[k])
+                        (void)dmesh_doca_dpa_msgq_send_try(&objs->dpa_comches[k]->send,
+                                                            &trigger, sizeof(trigger));
+                }
             }
             last_kick = now;
         }

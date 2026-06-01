@@ -3,7 +3,6 @@
 
 #include <doca_buf.h>
 #include <doca_buf_pool.h>
-#include <doca_buf_inventory.h>
 #include <doca_mmap.h>
 #include <doca_dev.h>
 #include <doca_log.h>
@@ -13,19 +12,14 @@
 #define CACHE_ALIGN 128 /* dma_copy requires 128B-aligned addresses */
 
 enum buf_inv_type {
-	BUF_INV_TYPE_INVENTORY = 0,
 	BUF_INV_TYPE_POOL = 1
 };
 
 struct local_mem_bufs {
 	void *mem;								/* Memory address for DOCA buf mmap */
 	struct doca_mmap *mmap;					/* DOCA mmap object */
-	union
-	{
-		struct doca_buf_inventory *buf_inv;	/* DOCA buf inventory object */
-		struct doca_buf_pool *bpool;		/* DOCA buf pool object */
-	};
-	uint8_t buf_inv_type;					/* DOCA buf inventory type */
+	struct doca_buf_pool *bpool;			/* DOCA buf pool object */
+	uint8_t buf_inv_type;					/* DOCA buf pool type */
 	bool need_alloc_mem;		    		/* Whether need to allocate memory */
 };
 

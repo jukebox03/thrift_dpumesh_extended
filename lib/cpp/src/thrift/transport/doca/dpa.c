@@ -296,29 +296,54 @@ init_dpa_objects(struct objects *objs)
 {
     doca_error_t result;
 
-    if (!objs->dpa_thread) {
-		objs->dpa_thread = malloc(sizeof(struct dmesh_doca_dpa_thread));
-		if (!objs->dpa_thread) {
-			DOCA_LOG_ERR("Failed to allocate memory for dpa_thread");
-			return DOCA_ERROR_NO_MEMORY;
-		}
-	}
+    /* Resolve N = number of DPA EU threads (multi-EU data plane).
+     * Default 1 (= legacy single-EU behaviour), overridable via
+     * DPUMESH_DPA_THREADS, clamped to [1, MAX_DPA_RINGS]. */
+    if (objs->num_dpa_threads <= 0) {
+        int n = 1;
+        const char *env = getenv("DPUMESH_DPA_THREADS");
+        if (env && *env) {
+            n = atoi(env);
+            if (n < 1) n = 1;
+            if (n > MAX_DPA_RINGS) n = MAX_DPA_RINGS;
+        }
+        objs->num_dpa_threads = n;
+    }
+    /* EU affinity: default ON (pin thread k → EU k). DPUMESH_DPA_AFFINITY=0
+     * leaves placement 'relaxed' (the SDK picks the EU), matching the
+     * pre-multi-EU behaviour. */
+    {
+        const char *aenv = getenv("DPUMESH_DPA_AFFINITY");
+        objs->dpa_affinity = (aenv && aenv[0] == '0') ? 0 : 1;
+    }
+    DOCA_LOG_INFO("DPA multi-EU: num_dpa_threads=%d affinity=%d (MAX_DPA_RINGS=%d)",
+                  objs->num_dpa_threads, objs->dpa_affinity, MAX_DPA_RINGS);
 
-	if (!objs->dpa_comch) {
-		objs->dpa_comch = malloc(sizeof(struct dmesh_doca_dpa_comch));
-		if (!objs->dpa_comch) {
-			DOCA_LOG_ERR("Failed to allocate memory for dpa_comch");
-			return DOCA_ERROR_NO_MEMORY;
-		}
-	}
+    for (int k = 0; k < objs->num_dpa_threads; k++) {
+        if (!objs->dpa_threads[k]) {
+            objs->dpa_threads[k] = calloc(1, sizeof(struct dmesh_doca_dpa_thread));
+            if (!objs->dpa_threads[k]) {
+                DOCA_LOG_ERR("Failed to allocate memory for dpa_threads[%d]", k);
+                return DOCA_ERROR_NO_MEMORY;
+            }
+        }
+        if (!objs->dpa_comches[k]) {
+            objs->dpa_comches[k] = calloc(1, sizeof(struct dmesh_doca_dpa_comch));
+            if (!objs->dpa_comches[k]) {
+                DOCA_LOG_ERR("Failed to allocate memory for dpa_comches[%d]", k);
+                return DOCA_ERROR_NO_MEMORY;
+            }
+        }
+    }
 
-    result = doca_dpa_create(objs->dev, &objs->dpa_thread->dpa);
+    /* One DPA device shared by all EU threads (handles are device-level). */
+    result = doca_dpa_create(objs->dev, &objs->dpa);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create DOCA DPA with error = %s", doca_error_get_name(result));
         return result;
     }
 
-    result = doca_dpa_set_app(objs->dpa_thread->dpa, DPU_mesh_dpa_app);
+    result = doca_dpa_set_app(objs->dpa, DPU_mesh_dpa_app);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set DPA application with error = %s", doca_error_get_name(result));
         goto destroy_dpa;
@@ -328,28 +353,32 @@ init_dpa_objects(struct objects *objs)
      * that pile up at chain throughput rates (54K RPS × 4 dma_copy + 1 kHz
      * keepalive → GB/min). Forwarded to /tmp/dpumesh_dpu_bench.log on DPU,
      * filling /tmp and stalling sshd writes (banner-exchange hang seen). */
-    result = doca_dpa_set_log_level(objs->dpa_thread->dpa, DOCA_DPA_DEV_LOG_LEVEL_ERROR);
+    result = doca_dpa_set_log_level(objs->dpa, DOCA_DPA_DEV_LOG_LEVEL_ERROR);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_WARN("Failed to set DPA log level: %s", doca_error_get_name(result));
     }
 
-    result = doca_dpa_start(objs->dpa_thread->dpa);
+    result = doca_dpa_start(objs->dpa);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start DOCA DPA with error = %s", doca_error_get_name(result));
         goto destroy_dpa;
     }
 
+    /* Point every EU thread struct at the shared device. */
+    for (int k = 0; k < objs->num_dpa_threads; k++)
+        objs->dpa_threads[k]->dpa = objs->dpa;
+
     DOCA_LOG_INFO("Init DOCA DPA done.");
     return DOCA_SUCCESS;
 
 destroy_dpa:
-    doca_dpa_destroy(objs->dpa_thread->dpa);
-    objs->dpa_thread->dpa = NULL;
+    doca_dpa_destroy(objs->dpa);
+    objs->dpa = NULL;
     return result;
 }
 
 doca_error_t
-dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
+dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread, int eu_id)
 {
     doca_error_t result;
 
@@ -366,14 +395,36 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
             doca_error_get_descr(result));
         return result;
     }
-    
+
     result = doca_dpa_thread_set_func_arg(dpa_thread->thread, run_dma_manager, dpa_thread->arg);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set DPA thread func: %s",
             doca_error_get_descr(result));
         return result;
     }
-    
+
+    /* Pin this thread to a distinct EU so N threads land on N distinct EUs
+     * (avoids the 'relaxed' placement collapsing several threads onto one EU,
+     * the suspected cause of the N=8 multi-EU regression). eu_id < 0 = leave
+     * placement relaxed. Affinity must be set between create and start.
+     * The affinity object is intentionally NOT destroyed (leaked, ≤ MAX_DPA_RINGS
+     * for the process lifetime) so there is no chance of a use-after-free if the
+     * SDK references it past thread_start. */
+    if (eu_id >= 0) {
+        struct doca_dpa_eu_affinity *affinity = NULL;
+        doca_error_t ar = doca_dpa_eu_affinity_create(dpa_thread->dpa, &affinity);
+        if (ar == DOCA_SUCCESS) {
+            ar = doca_dpa_eu_affinity_set(affinity, (unsigned int)eu_id);
+            if (ar == DOCA_SUCCESS)
+                ar = doca_dpa_thread_set_affinity(dpa_thread->thread, affinity);
+        }
+        if (ar != DOCA_SUCCESS)
+            DOCA_LOG_WARN("EU affinity for eu_id=%d failed: %s (continuing relaxed)",
+                          eu_id, doca_error_get_descr(ar));
+        else
+            DOCA_LOG_INFO("DPA thread pinned to EU %d", eu_id);
+    }
+
     result = doca_dpa_thread_start(dpa_thread->thread);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start DPA thread: %s",
@@ -466,9 +517,7 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
         return result;
     }
     msgq->target_consumer_id = consumer_id;
-    DOCA_LOG_INFO("[PAIRCHK] msgq_create begin: is_send=%d target_consumer_id=%u max_num_msg=%u",
-                  (int)attr->is_send, msgq->target_consumer_id, attr->max_num_msg);
-    
+
     consumer_ctx = doca_comch_consumer_as_ctx(msgq->consumer);
     /* DPU→DPA direction: must fit the largest message (ADD_RING, NEW_DESC, etc.) */
     result = doca_comch_consumer_set_imm_data_len(msgq->consumer, sizeof(struct comch_msg));
@@ -492,8 +541,6 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                     doca_error_get_name(result));
             return result;
         }
-        DOCA_LOG_INFO("[PAIRCHK] msgq_create(is_send=1): consumer completion attached: consumer=%p consumer_comp=%p",
-                  (void *)msgq->consumer, (void *)attr->consumer_comp);
         result = doca_comch_consumer_set_dev_max_num_recv(msgq->consumer, attr->max_num_msg);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to set consumer max # of recv messages - %s",
@@ -598,8 +645,6 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                     doca_error_get_name(result));
             return result;
         }
-        DOCA_LOG_INFO("[PAIRCHK] msgq_create(is_send=0): producer completion attached: producer=%p producer_comp=%p",
-                      (void *)msgq->producer, (void *)attr->producer_comp);
     }
     result = doca_ctx_start(producer_ctx);
     if (result != DOCA_SUCCESS) {
@@ -607,10 +652,6 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                 doca_error_get_name(result));
         return result;
     }
-
-    DOCA_LOG_INFO("[PAIRCHK] msgq_create done: is_send=%d consumer=%p producer=%p target_consumer_id=%u",
-                  (int)attr->is_send, (void *)msgq->consumer, (void *)msgq->producer,
-                  msgq->target_consumer_id);
 
     if (attr->is_send == false) {
         for (uint32_t idx = 0; idx < attr->max_num_msg; idx++) {
@@ -633,13 +674,12 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
 }
 
 doca_error_t
-dmesh_doca_dpa_comch_create(struct objects *objs)
+dmesh_doca_dpa_comch_create(struct objects *objs, int idx)
 {
-    struct dmesh_doca_dpa_comch *comch = objs->dpa_comch;
-    struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_thread;
+    struct dmesh_doca_dpa_comch *comch = objs->dpa_comches[idx];
+    struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_threads[idx];
     doca_error_t result;
-    
-    (void)dpa_thread;
+
     memset(comch, 0, sizeof(*comch));
 
     result = doca_comch_consumer_completion_create(&(comch->consumer_comp));
@@ -714,10 +754,10 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
  * @return: DOCA_SUCCESS on success, a DOCA error otherwise
  */
 static doca_error_t
-dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
+dmesh_fill_dpa_thread_arg(struct objects *objs, int idx, struct dpa_thread_arg *arg)
 {
     doca_error_t result;
-    struct dmesh_doca_dpa_comch *comch = objs->dpa_comch;
+    struct dmesh_doca_dpa_comch *comch = objs->dpa_comches[idx];
     doca_dpa_dev_comch_consumer_completion_t dpa_consumer_comp;
     doca_dpa_dev_completion_t dpa_producer_comp;
     doca_dpa_dev_comch_producer_t dpa_producer;
@@ -764,11 +804,8 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         return result;
     }
 
-    DOCA_LOG_INFO("[PAIRCHK] fill_arg handles: send.consumer=%p recv.consumer=%p recv.producer=%p producer_comp=%p",
-                  (void *)comch->send.consumer, (void *)comch->recv.consumer,
-                  (void *)comch->recv.producer, (void *)comch->producer_comp);
-
     memset(arg, 0, sizeof(*arg));
+    arg->eu_index = (uint32_t)idx;   /* selects this EU's row in the per-EU admission globals */
     arg->dpa_consumer_comp = dpa_consumer_comp;
     arg->dpa_producer_comp = dpa_producer_comp;
     arg->dpa_consumer = dpa_consumer;
@@ -780,9 +817,6 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         arg->dpa_consumer_comp, arg->dpa_producer_comp,
         arg->dpa_consumer, arg->dpa_producer, arg->dpu_consumer_id,
         send_consumer_id, recv_consumer_id);
-
-    DOCA_LOG_INFO("[PAIRCHK] fill_arg ids: send_consumer_id=%u recv_consumer_id=%u dpu_consumer_id=%u",
-                  send_consumer_id, recv_consumer_id, dpu_consumer_id);
 
     return DOCA_SUCCESS;
 }
@@ -906,7 +940,7 @@ setup_dpa_buf_array_pod(struct objects *objs, size_t num_elem,
         return result;
     }
 
-    result = doca_buf_arr_set_target_dpa(*out_buf_arr, objs->dpa_thread->dpa);
+    result = doca_buf_arr_set_target_dpa(*out_buf_arr, objs->dpa);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set buffer array target DPA: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;
@@ -933,7 +967,6 @@ destroy_buf_arr:
 }
 
 #include "buffer.h"
-#include "comch_common.h"
 
 /*
  * Fill ring info for a specific pod.
@@ -1037,26 +1070,35 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         return result;
     }
 
-    /* 5. Update DPA thread arg: write ring info first, then increment num_rings */
-    struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_thread;
+    /* 5. Update DPA thread arg: write ring info first, then increment num_rings.
+     *
+     * Multi-EU: this pod's rings are owned by EU k = pod_id % num_dpa_threads.
+     * dpa_thread_running[k] tracks whether EU k has been bootstrapped yet, so
+     * the FIRST pod landing on each EU does the h2d_memcpy + thread_run, and
+     * every subsequent pod on that EU sends ADD_RING to the SAME channel k.
+     * Each EU is share-nothing (own thread_arg + own 1c/1p comch channel), so
+     * there is no cross-EU lock here. */
+    int k = pod->pod_id % objs->num_dpa_threads;
+    struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_threads[k];
     struct dpa_thread_arg arg;
 
-    if (!objs->dpa_thread_running) {
-        /* First pod: fill shared handles + first ring, write via h2d_memcpy */
-        result = dmesh_fill_dpa_thread_arg(objs, &arg);
+    if (!objs->dpa_thread_running[k]) {
+        /* First pod on EU k: fill EU k's handles + first ring, write via h2d_memcpy */
+        result = dmesh_fill_dpa_thread_arg(objs, k, &arg);
         if (result != DOCA_SUCCESS)
             return result;
         arg.rings[0] = ring_info;
         arg.num_rings = 1;
 
-        result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg,
+        result = doca_dpa_h2d_memcpy(objs->dpa, dpa_thread->arg,
                                       &arg, sizeof(struct dpa_thread_arg));
         if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("setup_pod_dma: h2d_memcpy failed: %s", doca_error_get_descr(result));
+            DOCA_LOG_ERR("setup_pod_dma: h2d_memcpy failed (EU %d): %s",
+                         k, doca_error_get_descr(result));
             return result;
         }
     } else {
-        /* Subsequent pods: send ADD_RING message via comch msgq to DPA thread.
+        /* Subsequent pods on EU k: send ADD_RING message via EU k's comch msgq.
          * This avoids DPA local memory cache coherency issues with h2d_memcpy
          * — the DPA thread updates its own data structures directly. */
         struct comch_add_ring_msg add_msg;
@@ -1064,34 +1106,38 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         add_msg.type = COMCH_MSG_TYPE_ADD_RING;
         add_msg.ring = ring_info;
 
-        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k]->send,
                                            &add_msg, sizeof(add_msg));
         if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("setup_pod_dma: send ADD_RING to DPA failed: %s",
-                         doca_error_get_descr(result));
+            DOCA_LOG_ERR("setup_pod_dma: send ADD_RING to EU %d failed: %s",
+                         k, doca_error_get_descr(result));
             return result;
         }
-        DOCA_LOG_INFO("Sent ADD_RING to DPA for pod_id=%d", pod->pod_id);
+        DOCA_LOG_INFO("Sent ADD_RING to EU %d for pod_id=%d", k, pod->pod_id);
     }
 
-    /* 6. If first pod, run DPA thread */
-    if (!objs->dpa_thread_running) {
+    /* 6. If first pod on EU k, run that EU's DPA thread */
+    if (!objs->dpa_thread_running[k]) {
         uint64_t rpc_ret;
         uint32_t num_msg = CC_DPA_MAX_MSG_NUM;
-        result = doca_dpa_rpc(dpa_thread->dpa, thread_init_rpc, &rpc_ret,
+        result = doca_dpa_rpc(objs->dpa, thread_init_rpc, &rpc_ret,
                               arg.dpa_consumer, num_msg);
         if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("setup_pod_dma: thread_init_rpc failed: %s", doca_error_get_descr(result));
+            DOCA_LOG_ERR("setup_pod_dma: thread_init_rpc failed (EU %d): %s",
+                         k, doca_error_get_descr(result));
             return result;
         }
 
         result = doca_dpa_thread_run(dpa_thread->thread);
         if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("setup_pod_dma: dpa_thread_run failed: %s", doca_error_get_descr(result));
+            DOCA_LOG_ERR("setup_pod_dma: dpa_thread_run failed (EU %d): %s",
+                         k, doca_error_get_descr(result));
             return result;
         }
-        objs->dpa_thread_running = 1;
-        DOCA_LOG_INFO("DPA thread set to runnable (pod_id=%d), sending trigger msg", pod->pod_id);
+        objs->dpa_thread_running[k] = 1;
+        objs->dpa_thread_running_any = 1;
+        DOCA_LOG_INFO("DPA thread EU %d set to runnable (pod_id=%d), sending trigger msg",
+                      k, pod->pod_id);
 
         /* Send trigger message to DPA consumer to activate the thread.
          * DPA thread only runs when its attached completion ctx fires.
@@ -1101,17 +1147,17 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
             struct comch_msg trigger;
             memset(&trigger, 0, sizeof(trigger));
             trigger.type = COMCH_MSG_TYPE_TRIGGER;
-            result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+            result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k]->send,
                                                &trigger, sizeof(trigger));
             if (result != DOCA_SUCCESS) {
-                DOCA_LOG_WARN("Trigger msg to DPA failed: %s (thread may not start)",
-                              doca_error_get_descr(result));
+                DOCA_LOG_WARN("Trigger msg to EU %d failed: %s (thread may not start)",
+                              k, doca_error_get_descr(result));
             } else {
-                DOCA_LOG_INFO("Trigger msg sent to DPA, thread should activate");
+                DOCA_LOG_INFO("Trigger msg sent to EU %d, thread should activate", k);
             }
         }
     } else {
-        DOCA_LOG_INFO("Sent ADD_RING msg to DPA for pod_id=%d", pod->pod_id);
+        DOCA_LOG_INFO("Sent ADD_RING msg to EU %d for pod_id=%d", k, pod->pod_id);
     }
 
     /* === Reverse direction (DPU→CPU) setup === */
@@ -1201,20 +1247,16 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         rev_msg.type = COMCH_MSG_TYPE_ADD_REV_RING;
         rev_msg.ring = rev_ring_info;
 
-        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k]->send,
                                            &rev_msg, sizeof(rev_msg));
         if (result != DOCA_SUCCESS) {
-            DOCA_LOG_WARN("setup_pod_dma: send ADD_REV_RING failed: %s",
-                          doca_error_get_descr(result));
+            DOCA_LOG_WARN("setup_pod_dma: send ADD_REV_RING to EU %d failed: %s",
+                          k, doca_error_get_descr(result));
         } else {
-            DOCA_LOG_INFO("Sent ADD_REV_RING to DPA for pod_id=%d (rq_depth=%u, credit_at_slot=%d)",
-                          pod->pod_id, pod->rq_depth, DMA_RING_SIZE);
+            DOCA_LOG_INFO("Sent ADD_REV_RING to EU %d for pod_id=%d (rq_depth=%u, credit_at_slot=%d)",
+                          k, pod->pod_id, pod->rq_depth, DMA_RING_SIZE);
         }
     }
-
-    /* Initialize DPU-internal write cursor for reverse DMA. DPU is a pure
-     * forwarder; this only chooses the next physical write offset. */
-    pod->tx_producer_head = 0;
 
     pod->dma_ready = 1;
     return DOCA_SUCCESS;
@@ -1229,6 +1271,7 @@ doca_error_t
 update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod)
 {
     doca_error_t result;
+    int k = pod->pod_id % objs->num_dpa_threads;   /* same EU that owns this pod */
 
     if (!pod->host_rx_mmap || !pod->tx_buf_arr) {
         DOCA_LOG_WARN("update_rev_ring_host_rx: missing mmap or buf_arr for pod %d", pod->pod_id);
@@ -1281,15 +1324,15 @@ update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod)
     rev_msg.type = COMCH_MSG_TYPE_ADD_REV_RING;
     rev_msg.ring = rev_ring_info;
 
-    result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+    result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k]->send,
                                        &rev_msg, sizeof(rev_msg));
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("update_rev_ring_host_rx: send ADD_REV_RING failed: %s",
-                      doca_error_get_descr(result));
+        DOCA_LOG_ERR("update_rev_ring_host_rx: send ADD_REV_RING to EU %d failed: %s",
+                      k, doca_error_get_descr(result));
         return result;
     }
 
-    DOCA_LOG_INFO("Updated DPA reverse ring with Host RX mmap for pod %d", pod->pod_id);
+    DOCA_LOG_INFO("Updated DPA reverse ring with Host RX mmap for pod %d (EU %d)", pod->pod_id, k);
     return DOCA_SUCCESS;
 }
 

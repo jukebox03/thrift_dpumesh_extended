@@ -40,7 +40,10 @@ struct dpa_thread_arg {
 	uint64_t dpa_producer;
 	uint64_t dpa_consumer;
 	uint32_t dpu_consumer_id; /* DPU-side comch consumer ID for DPA->DPU sends */
-	uint32_t _pad1; /* was producer_slots_inflight (M2-style lazy drain — SDK manages backpressure) */
+	uint32_t eu_index; /* which EU this thread is (0..N-1); indexes the per-EU
+	                    * reverse-admission globals in dpa_kernel.c. Occupies a
+	                    * fixed 4-byte slot so the struct keeps its original
+	                    * size/offsets (host/DPA ABI unchanged). */
 
 	/* Forward rings (CPU→DPU, per-pod) */
 	volatile uint32_t num_rings;
@@ -55,6 +58,11 @@ struct dpa_thread_arg {
 	struct dpa_ring_info rev_rings[MAX_DPA_RINGS];
 	uint32_t rev_desc_idx[MAX_DPA_RINGS];
 	uint32_t rev_pos[MAX_DPA_RINGS];
+	/* Reverse admission accounting (dpa_sent_count/dpa_cached_freed) is NOT
+	 * stored here — it lives in fast file-scope globals in dpa_kernel.c indexed
+	 * by [eu_index][ring]. Keeping them out of this (heap-allocated) struct
+	 * avoids a per-reverse-desc slow-memory access that measurably lowered the
+	 * single-EU ceiling; the globals stay per-EU-isolated via eu_index. */
 } __attribute__((__packed__, aligned(8)));
 
 /* ====== Per-message payload layout ======

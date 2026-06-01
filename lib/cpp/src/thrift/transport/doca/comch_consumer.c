@@ -41,7 +41,6 @@ void server_new_consumer_callback(struct doca_comch_event_consumer *event,
 	}
 
 	objs = (struct objects *)(user_data.ptr);
-	objs->remote_consumer_id = id;
 
 	DOCA_LOG_INFO("Got a new remote consumer with ID = [%d]", id);
 }
@@ -70,7 +69,6 @@ void client_new_consumer_callback(struct doca_comch_event_consumer *event,
 	}
 
 	objs = (struct objects *)(user_data.ptr);
-	objs->remote_consumer_id = id;
 
 	DOCA_LOG_INFO("Got a new remote consumer with ID = [%d]", id);
 }
@@ -90,24 +88,6 @@ void expired_consumer_callback(struct doca_comch_event_consumer *event,
 	(void)event;
 	(void)comch_connection;
 	(void)id;
-}
-
-void clean_comch_consumer(struct doca_comch_consumer *consumer, struct doca_pe *pe)
-{
-	doca_error_t result;
-
-	if (consumer != NULL) {
-		result = doca_comch_consumer_destroy(consumer);
-		if (result != DOCA_SUCCESS)
-			DOCA_LOG_ERR("Failed to destroy consumer properly with error = %s",
-				     doca_error_get_name(result));
-	}
-
-	if (pe != NULL) {
-		result = doca_pe_destroy(pe);
-		if (result != DOCA_SUCCESS)
-			DOCA_LOG_ERR("Failed to destroy pe properly with error = %s", doca_error_get_name(result));
-	}
 }
 
 doca_error_t init_comch_consumer(struct doca_comch_connection *connection,
@@ -361,7 +341,6 @@ static void consumer_state_changed_cb(const union doca_data user_data,
 					    enum doca_ctx_states next_state)
 {
 	(void)ctx;
-	(void)prev_state;
 
 	struct objects *objs = (struct objects *)user_data.ptr;
 	
@@ -373,8 +352,6 @@ static void consumer_state_changed_cb(const union doca_data user_data,
 		if ((prev_state != DOCA_CTX_STATE_RUNNING) && (prev_state != DOCA_CTX_STATE_STOPPING))
 			objs->consumer_result = DOCA_ERROR_UNEXPECTED;
 
-		/* We can stop progressing the PE */
-		objs->consumer_finish = true;
 		break;
 	case DOCA_CTX_STATE_STARTING:
 		/**

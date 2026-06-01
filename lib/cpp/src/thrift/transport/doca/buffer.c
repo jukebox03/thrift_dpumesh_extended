@@ -32,14 +32,7 @@ void clean_local_mem_bufs(struct local_mem_bufs *local)
 	}
 	local->mmap = NULL;
 
-	if (local->buf_inv_type == BUF_INV_TYPE_INVENTORY) {
-		result = doca_buf_inventory_destroy(local->buf_inv);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to destroy inventory: %s", doca_error_get_descr(result));
-			return;
-		}
-		local->buf_inv = NULL;
-	} else if (local->buf_inv_type == BUF_INV_TYPE_POOL) {
+	if (local->buf_inv_type == BUF_INV_TYPE_POOL) {
 		result = doca_buf_pool_destroy(local->bpool);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to destroy bpool: %s", doca_error_get_descr(result));
@@ -99,20 +92,7 @@ doca_error_t init_local_mem_bufs(struct local_mem_bufs *local, struct doca_dev *
 		goto destroy_mmap;
 	}
 
-	if (buf_inv_type == BUF_INV_TYPE_INVENTORY) {
-		result = doca_buf_inventory_create(max_bufs, &(local->buf_inv));
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Unable to create inventory: %s", doca_error_get_descr(result));
-			goto destroy_mmap;
-		}
-
-		result = doca_buf_inventory_start(local->buf_inv);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Unable to start inventory: %s", doca_error_get_descr(result));
-			goto destroy_inv;
-		}
-
-	} else if (buf_inv_type == BUF_INV_TYPE_POOL) {
+	if (buf_inv_type == BUF_INV_TYPE_POOL) {
 		result = doca_buf_pool_create(max_bufs, buf_len, local->mmap, &(local->bpool));
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Unable to create buf pool: %s", doca_error_get_descr(result));
@@ -134,13 +114,8 @@ doca_error_t init_local_mem_bufs(struct local_mem_bufs *local, struct doca_dev *
 	return DOCA_SUCCESS;
 
 destroy_inv:
-	if (buf_inv_type == BUF_INV_TYPE_INVENTORY) {
-		doca_buf_inventory_destroy(local->buf_inv);
-		local->buf_inv = NULL;
-	} else if (buf_inv_type == BUF_INV_TYPE_POOL) {
-		doca_buf_pool_destroy(local->bpool);
-		local->bpool = NULL;
-	}
+	doca_buf_pool_destroy(local->bpool);
+	local->bpool = NULL;
 destroy_mmap:
 	doca_mmap_destroy(local->mmap);
 	local->mmap = NULL;

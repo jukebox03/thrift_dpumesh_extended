@@ -119,7 +119,6 @@ doca_error_t open_doca_device_rep_with_pci(struct doca_dev *local,
 			"Failed to create devinfo representors list. Representor devices are available only on DPU, do not run on Host");
 		return DOCA_ERROR_INVALID_VALUE;
 	}
-	// DOCA_LOG_INFO("Number of representors found: %u, pci_addr: %s", nb_rdevs, pci_addr);
 	for (i = 0; i < nb_rdevs; i++) {
 
 		result = doca_devinfo_rep_get_pci_addr_str(rep_dev_list[i], rep_pci_addr);
@@ -133,8 +132,7 @@ doca_error_t open_doca_device_rep_with_pci(struct doca_dev *local,
 			DOCA_LOG_ERR("Failed to get representor iface name: %s", doca_error_get_descr(result));
 			continue;
 		}
-		// DOCA_LOG_INFO("Checking representor rep[%zu]: %s, name: %s", i, rep_pci_addr, if_name);
-		
+
 		result = doca_devinfo_rep_is_equal_pci_addr(rep_dev_list[i], pci_addr, &is_addr_equal);
 		if (result == DOCA_SUCCESS && is_addr_equal &&
 		    doca_dev_rep_open(rep_dev_list[i], retval) == DOCA_SUCCESS) {
