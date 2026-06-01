@@ -26,7 +26,10 @@ public:
     /**
      * @param app_name  Service name (e.g. "unique-id-service")
      * @param worker_id Worker number for pod registration
-     * @param config    Optional configuration (0 values = use defaults)
+     * @param config    (second overload only) DPUmesh configuration; zero-valued
+     *                  fields fall back to DPUMESH_*_DEFAULT (8192-byte slots,
+     *                  2048 slots, 2048 descriptors). The first overload uses
+     *                  DPUMESH_CONFIG_DEFAULT.
      */
     TDpumeshServerTransport(const std::string &app_name, int worker_id);
     TDpumeshServerTransport(const std::string &app_name, int worker_id,

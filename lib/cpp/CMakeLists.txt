@@ -53,9 +53,6 @@ set( thriftcpp_SOURCES
    src/thrift/transport/TServerSocket.cpp
    src/thrift/transport/TTransportUtils.cpp
    src/thrift/transport/TBufferTransports.cpp
-   src/thrift/transport/TDpumeshTransport.cpp
-   src/thrift/transport/TDpumeshServerTransport.cpp
-   src/thrift/transport/TDpumeshClientTransport.cpp
    src/thrift/server/TConnectedClient.cpp
    src/thrift/server/TServerFramework.cpp
    src/thrift/server/TSimpleServer.cpp
@@ -63,9 +60,12 @@ set( thriftcpp_SOURCES
    src/thrift/server/TThreadedServer.cpp
 )
 
-# DPUmesh backend selection: DOCA (real hardware) or SHM (simulation)
+# DPUmesh transport (host side) — built only with the NVIDIA DOCA backend.
 if(WITH_DOCA)
     list(APPEND thriftcpp_SOURCES
+        src/thrift/transport/TDpumeshTransport.cpp
+        src/thrift/transport/TDpumeshServerTransport.cpp
+        src/thrift/transport/TDpumeshClientTransport.cpp
         src/thrift/transport/dpumesh_doca.c
         src/thrift/transport/doca/common.c
         src/thrift/transport/doca/object.c
@@ -75,13 +75,8 @@ if(WITH_DOCA)
         src/thrift/transport/doca/comch_client.c
         src/thrift/transport/doca/comch_server.c
         src/thrift/transport/doca/comch_consumer.c
-        src/thrift/transport/doca/comch_producer.c
         src/thrift/transport/doca/comch_msgq.c
         src/thrift/transport/doca/dpa.c
-    )
-else()
-    list(APPEND thriftcpp_SOURCES
-        src/thrift/transport/dpumesh_shm.c
     )
 endif()
 

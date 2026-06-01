@@ -50,22 +50,6 @@ typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_comch_producer_t;
 typedef uint64_t doca_dpa_dev_comch_consumer_t;
 
-struct dmesh_dpa_comp_msg {
-    enum dmesh_msg_type type;
-    doca_dpa_dev_comch_consumer_completion_t dpa_consumer_comp;
-	doca_dpa_dev_completion_t dpa_producer_comp;
-	doca_dpa_dev_comch_producer_t dpa_producer;
-	doca_dpa_dev_comch_consumer_t dpa_consumer;
-};
-
-struct dmesh_rx_data_msg {
-    enum dmesh_msg_type type;   /* = DMESH_MSG_RX_DATA (4B) */
-    uint8_t desc[64];           /* sw_descriptor_t, opaque */
-    uint32_t body_len;          /* payload length (4B) */
-    uint8_t body[];             /* body data (flexible array) */
-};
-/* Header overhead: 72 bytes, max body = max_msg_size - 72 */
-
 /* Host→DPU: register this connection's pod_id */
 struct dmesh_register_msg {
     enum dmesh_msg_type type;   /* = DMESH_MSG_REGISTER */
@@ -107,7 +91,6 @@ struct dmesh_comch_msg {
     union 
     {
         struct dmesh_mmap_msg mmap_msg;
-        struct dmesh_dpa_comp_msg dpa_comp_msg;
     };
 };
 doca_error_t
@@ -116,6 +99,4 @@ struct doca_comch_connection;
 doca_error_t
 process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
                  struct dmesh_mmap_msg *mmap_msg);
-doca_error_t
-process_dpa_comp_msg(struct objects *objs, struct dmesh_dpa_comp_msg *dpa_comp_msg);
 #endif // COMCH_COMMON_H

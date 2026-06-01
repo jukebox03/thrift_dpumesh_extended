@@ -530,13 +530,9 @@ run_dpu_worker(struct objects *objs)
             objs->recv_msg_cnt = 0;
             last = now;
 
-            /* No keepalive: DPA wake-up is driven entirely by per-request
-             * triggers (host WAKE_DPA on dpumesh_enqueue, DPU TRIGGER on
-             * dpu_enqueue_reverse_dma). The 1Hz tick had two roles —
-             * timer reset against the 12 s max kernel runtime, and idle
-             * fallback wake — neither needed once DPA reschedules every
-             * iteration and every desc post is paired with an explicit
-             * trigger. */
+            /* The 1 kHz keepalive above bounds idle DPA wake-up latency;
+             * this 1 Hz tick only resets the per-second stat counters and
+             * emits the stat line above. */
         }
     }
 

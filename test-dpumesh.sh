@@ -71,7 +71,6 @@ sync_sources() {
     rsync -avz \
         "$TRANSPORT_SRC/dpumesh_doca.c" \
         "$TRANSPORT_SRC/dpumesh.h" \
-        "$TRANSPORT_SRC/dpumesh_shm.c" \
         "$TRANSPORT_SRC/TDpumeshTransport.cpp" \
         "$TRANSPORT_SRC/TDpumeshTransport.h" \
         "$TRANSPORT_SRC/TDpumeshServerTransport.cpp" \

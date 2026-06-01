@@ -584,16 +584,37 @@ wrk2 -> nginx(8080) -> ComposePostService -> [병렬 호출, std::async]
 
 ### 변경 파일 요약
 
-#### Thrift 라이브러리 (신규 파일)
+> **백엔드 = NVIDIA DOCA (실 BlueField-3 하드웨어).** 과거 RFC의 Python+SHM
+> 시뮬레이션(`dpumesh/*.py`, `dpumesh_shm.c`, TCP bridge 5050)은 제거되었다.
+> 현재 dpumesh transport는 `-DWITH_DOCA=ON`으로 libthrift에 빌드되며 DOCA
+> Comch(컨트롤) + DPA `dma_copy`(데이터)로 동작한다. 최신 설계 상세는
+> `architecture/dpumesh_architecture.md` 참조.
+
+세 개의 별도 빌드로 나뉜다: ① host `libthrift.so`, ② DPU(BF3 ARM)
+`dpumesh_dpu`, ③ DPA(FlexIO EU) 프로그램 `dpa_program.a`.
+
+#### ① Thrift 라이브러리 (host, libthrift.so)
 
 | 파일 | 역할 |
 |------|------|
-| `lib/cpp/src/thrift/transport/dpumesh_shm.h` | C API 헤더: BufferPool, DescriptorRing, PodRegistry, 64B sw_descriptor_t |
-| `lib/cpp/src/thrift/transport/dpumesh_shm.c` | C 구현: SHM mmap, flock 동기화, poller thread (RX SQ → notify pipe) |
-| `lib/cpp/src/thrift/transport/TDpumeshTransport.h/.cpp` | Per-request transport: RX slot에서 read, TX slot에 write+flush → TX SQ enqueue |
-| `lib/cpp/src/thrift/transport/TDpumeshServerTransport.h/.cpp` | Server transport: dpumesh_init()으로 SHM 초기화, acceptImpl()이 RX SQ에서 dequeue → TDpumeshTransport 반환 |
+| `transport/dpumesh.h` | 공개 C API: 64B `sw_descriptor_t`, TX/RX 슬롯 풀, SQ enqueue/dequeue, 클라이언트 req/resp 매칭 |
+| `transport/dpumesh_doca.c` | 호스트 DOCA 백엔드: 슬롯 풀·DMA 디스크립터 링·RX 큐·pending 테이블·PE progress 스레드·`rx_data_hook`(TX_ACK / DMA_COMPLETION 처리) |
+| `transport/doca/common.c, object.c, buffer.c, ring.c` | DOCA 디바이스/리소스/버퍼/링 헬퍼 |
+| `transport/doca/comch_common.c, comch_client.c, comch_server.c, comch_consumer.c, comch_msgq.c` | DOCA Comch 컨트롤·데이터 경로 (host = comch client) |
+| `transport/doca/dpa.c` | 호스트측 DPA 셋업 (DPA thread, msgq, per-pod buffer array) |
+| `transport/TDpumeshTransport.h/.cpp` | 요청당 transport: RX 슬롯 read, TX 슬롯 direct-write + flush |
+| `transport/TDpumeshServerTransport.h/.cpp` | 서버 transport: `dpumesh_init()`, `acceptImpl()`이 RX 큐에서 dequeue → `TDpumeshTransport` 반환 |
+| `transport/TDpumeshClientTransport.h/.cpp` | 클라이언트 transport: `register_pending` + `enqueue` + `wait_response` |
 
-TSocket.h/cpp, TServerSocket.h/cpp는 **수정하지 않았다.**
+`TSocket.h/cpp`, `TServerSocket.h/cpp`는 **수정하지 않았다.** dpumesh transport는
+`-DWITH_DOCA=ON`일 때만 libthrift에 포함된다.
+
+#### ② DPU / ③ DPA (별도 빌드, `transport/doca/`)
+
+| 파일 | 역할 |
+|------|------|
+| `doca/dpu_main.c, dpu_worker.c, config.c` | DPU(BF3 ARM) 바이너리 `dpumesh_dpu`: comch 컨트롤 PE + consumer PE + 라우팅/ACK 워커 루프 |
+| `doca/device/dpa_kernel.c` | DPA(FlexIO EU) 프로그램: `drain_all_rings`로 forward/reverse `dma_copy` 수행 |
 
 #### 앱 코드 (UniqueIdService만 변경)
 
@@ -609,42 +630,29 @@ TSocket.h/cpp, TServerSocket.h/cpp는 **수정하지 않았다.**
 
 UniqueIdHandler.h, ComposePostHandler.h, ThriftClient.h, ClientPool.h 등은 **변경 없음.**
 
-#### 빌드 (CMakeLists.txt)
-
-`src/UniqueIdService/CMakeLists.txt`에 dpumesh 소스 3개를 직접 컴파일 대상으로 추가:
-```cmake
-${THRIFT_SRC_DIR}/thrift/transport/dpumesh_shm.c
-${THRIFT_SRC_DIR}/thrift/transport/TDpumeshTransport.cpp
-${THRIFT_SRC_DIR}/thrift/transport/TDpumeshServerTransport.cpp
-```
-
-#### DPUmesh 데몬 (Python, 신규)
-
-| 파일 | 역할 |
-|------|------|
-| `dpumesh/common.py` | SHM 구조체 (C와 binary-compatible): BufferPool, DescriptorRing, PodRegistry |
-| `dpumesh/dpa_daemon.py` | DPA (RISC-V 시뮬레이션): Host TX SQ ↔ Sidecar SQ 간 DMA 복사 |
-| `dpumesh/dpu_daemon.py` | DPU (ARM 시뮬레이션): TCP Bridge (port 5050) + SHM 라우팅. persistent connection 지원 |
-| `Dockerfile.dpumesh` | python:3.10-slim, `dpumesh/` 복사 |
-
-### 데이터 경로
+### 데이터 경로 (1 RTT = 4 dma_copy)
 
 ```
-ComposePostService (client)
-  → TCP:9090 (k8s Service "unique-id-service" → DPU bridge port 5050)
-  → DPU daemon: TCP frame 수신 → DPU RX body pool에 write → sidecar_rx_sq enqueue
-  → DPA daemon: sidecar_rx_sq dequeue → DMA copy → Host RX body pool → host_rx_sq enqueue
-  → UniqueIdService (TDpumeshServerTransport): host_rx_sq dequeue → TDpumeshTransport로 처리
-  → 응답: host_tx_sq → DPA → sidecar_tx_sq → DPU → TCP로 응답
+ComposePostService (client, libthrift + DOCA)
+  → host TX 슬롯 direct-write → DMA 디스크립터 링 enqueue (host→DPU)
+  → DPA: host TX → DPU buf 로 dma_copy (forward)
+  → DPU worker: pod 라우팅 + TX_ACK 송신 + reverse 디스크립터 작성
+  → DPA: DPU buf → 목적지 host RX 로 dma_copy (reverse)
+  → DMA_COMPLETION(16B comch_dma_comp_msg) → host rx_data_hook → RX 큐
+  → UniqueIdService (TDpumeshServerTransport): RX 큐 dequeue → TDpumeshTransport 처리
 ```
+
+페이로드는 body-only(인밴드 헤더 없음). 메타데이터(req_id, src/dst pod, flags,
+length)는 DMA 페이로드가 아니라 `comch_dma_comp_msg`로 전달된다.
 
 ### TCP vs DPUmesh 비교
 
-| 항목 | TCP (원본) | DPUmesh (현재) |
+| 항목 | TCP (원본) | DPUmesh (DOCA) |
 |------|-----------|---------------|
-| listen | `socket()` → `bind()` → `listen()` | `dpumesh_init()` — SHM 풀/링 생성 |
-| accept | 커널 `accept()` → 새 fd | `dpumesh_dequeue()` → 디스크립터 |
-| read | `recv(fd)` — 커널 버퍼 → 유저 복사 | `dpumesh_rx_buf()` — SHM 직접 포인터 (zero-copy) |
-| write | `send(fd)` — 유저 → 커널 버퍼 → NIC | `memcpy` → SHM TX 슬롯, `dpumesh_enqueue()` |
+| listen | `socket()` → `bind()` → `listen()` | `dpumesh_init()` — DOCA 풀/링/comch 초기화 |
+| accept | 커널 `accept()` → 새 fd | `dpumesh_dequeue()` → RX 디스크립터 |
+| read | `recv(fd)` — 커널 버퍼 → 유저 복사 | `dpumesh_rx_buf()` — RX 슬롯 직접 포인터 (zero-copy) |
+| write | `send(fd)` — 유저 → 커널 → NIC | TX 슬롯 direct-write, `dpumesh_enqueue()` → DPA `dma_copy` |
+| 전송 위치 | host CPU (커널 TCP) | DPU ARM + DPA EU (host CPU 외부) |
 | 연결 단위 | 클라이언트당 소켓 fd (persistent) | 요청당 디스크립터 (one-shot) |
-| 라우팅 | IP:port | pod_id + stream_id |
+| 라우팅 | IP:port | pod_id + req_id(stream_id) |

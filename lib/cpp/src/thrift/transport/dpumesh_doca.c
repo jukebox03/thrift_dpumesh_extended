@@ -2,9 +2,9 @@
  * dpumesh_doca.c - DPUmesh DOCA transport layer implementation
  *
  * NVIDIA DOCA (Comch + DMA) backend for DPUmesh Thrift transport.
- * Replaces the SHM-based dpumesh_shm.c when built with -DWITH_DOCA=ON.
- *
- * Phase 1: TX path only. RX functions are stubs.
+ * Provides the host-side raw buffer API declared in dpumesh.h: TX/RX
+ * slot pools, descriptor SQ enqueue/dequeue, and client-side
+ * request/response matching over the DPU control + DMA data path.
  */
 
 #include "dpumesh.h"
@@ -26,7 +26,6 @@
 #include "doca/buffer.h"
 #include "doca/ring.h"
 #include "doca/comch_client.h"
-#include "doca/comch_producer.h"
 #include "doca/comch_consumer.h"
 #include "doca/comch_common.h"
 #include "doca/comch_msgq.h"
@@ -62,7 +61,7 @@ typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     sw_descriptor_t desc;
-    volatile int state;   /* -1=unused, -2=cancelled(tx deferred), 0=waiting, 1=arrived */
+    volatile int state;   /* -1=unused, -2=abandoned/timed-out (TX freed here, or deferred to TX_ACK), 0=waiting, 1=arrived */
     int tx_slot;          /* TX buffer slot owned by this request, -1 if none */
 } dpumesh_pending_t;
 
@@ -108,9 +107,6 @@ struct dpumesh_ctx {
     pthread_cond_t rx_cond;
     pthread_cond_t rx_not_full;  /* Signaled when rx_count drops, for backpressure */
 
-    /* comch max message size (for RX data validation) */
-    uint32_t comch_max_msg_size;
-
     /* PE progress thread */
     pthread_t pe_tid;
     volatile int pe_running;
@@ -126,16 +122,13 @@ struct dpumesh_ctx {
 
 static void *pe_progress_fn(void *arg) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)arg;
-    struct timespec ts = {0, 1000}; /* 1 µs */
 
     while (ctx->pe_running) {
-        int progressed = 0;
-
         if (ctx->doca_objs.pe)
-            progressed += doca_pe_progress(ctx->doca_objs.pe);
+            doca_pe_progress(ctx->doca_objs.pe);
 
         if (ctx->doca_objs.consumer_pe)
-            progressed += doca_pe_progress(ctx->doca_objs.consumer_pe);
+            doca_pe_progress(ctx->doca_objs.consumer_pe);
     }
     return NULL;
 }
@@ -327,37 +320,6 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         }
         return;
     }
-
-    /* === Legacy comch data path (DMESH_MSG_RX_DATA) === */
-    const struct dmesh_rx_data_msg *msg = (const struct dmesh_rx_data_msg *)data;
-
-    DOCA_LOG_DBG("rx_data_hook ENTER: len=%u body_len=%u sizeof_hdr=%zu",
-                 len, msg->body_len, sizeof(struct dmesh_rx_data_msg));
-
-    uint32_t expected = (uint32_t)sizeof(struct dmesh_rx_data_msg) + msg->body_len;
-    if (len < expected) {
-        DOCA_LOG_ERR("RX_DATA: truncated message: got %u, need %u", len, expected);
-        return;
-    }
-
-    int slot = rx_slot_alloc(ctx);
-    if (slot < 0) {
-        DOCA_LOG_ERR("RX_DATA: no free RX slots, dropping message");
-        return;
-    }
-
-    uint8_t *dst = (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
-    memcpy(dst, msg->body, msg->body_len);
-
-    sw_descriptor_t desc;
-    memcpy(&desc, msg->desc, sizeof(desc));
-    desc.body_buf_slot = slot;
-
-    DOCA_LOG_DBG("rx_data_hook DESC: req_id=%u flags=0x%x dst_pod=%d src_pod=%d slot=%d body_len=%u",
-                 desc.req_id, (unsigned)(uint8_t)desc.flags, desc.dst_pod_id, desc.src_pod_id,
-                 slot, desc.body_len);
-
-    rx_deliver_desc(ctx, &desc, slot);
 }
 
 static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, const char *app_name, int worker_num) {
@@ -519,10 +481,6 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     pthread_mutex_init(&ctx->rx_lock, NULL);
     pthread_cond_init(&ctx->rx_cond, NULL);
     pthread_cond_init(&ctx->rx_not_full, NULL);
-
-    uint32_t max_msg_sz = 0;
-    if (doca_comch_cap_get_max_msg_size(doca_dev_as_devinfo(ctx->doca_objs.dev), &max_msg_sz) == DOCA_SUCCESS)
-        ctx->comch_max_msg_size = max_msg_sz;
 
     atomic_init(&ctx->next_req_id, 1);
     for (int i = 0; i < MAX_PENDING; i++) {

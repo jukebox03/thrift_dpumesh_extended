@@ -5,8 +5,6 @@
 #include <doca_ctx.h>
 #include <doca_pe.h>
 #include <doca_buf_array.h>
-// #include <doca_dpa_dev.h>
-// #include <doca_dpa_dev_comch_msgq.h>
 
 #define CC_DPA_MAX_MSG_NUM  1024
 
@@ -18,7 +16,6 @@ struct dmesh_doca_dpa_thread {
     struct doca_dpa *dpa;           /* DOCA DPA */
     struct doca_dpa_thread *thread; /* DPA thread */
     doca_dpa_dev_uintptr_t arg;     /* argument to be used by DPA thread */
-    doca_dpa_dev_uintptr_t buf;     /* buffer to be used by DPA thread */
 	doca_dpa_dev_buf_arr_t dpa_buf_arr; /* DPA buffer array */
 };
 
@@ -30,12 +27,6 @@ struct dmesh_doca_dpa_msgq {
 	bool is_send;			      /**< Indicates if MsgQ is used for sending from DPU to DPA */
 	uint32_t target_consumer_id;          /**< Remote consumer target used by producer send tasks */
 	
-	/* variables to measure latency of msgq */	
-	long unsigned int send_start_time_ns;  /**< Timestamp when the first send message is posted */
-	long unsigned int send_end_time_ns;	/**< Timestamp when the last send message is completed */
-	int msg_cnt;
-	uint64_t total_ns;
-	bool completed;
 };
 
 struct dmesh_doca_dpa_comch {
@@ -81,22 +72,12 @@ doca_error_t
 dmesh_doca_dpa_comch_create(struct objects *objs);
 
 doca_error_t
-dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dpa_thread, struct dmesh_doca_dpa_comch *comch);
-
-doca_error_t
 dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t msg_size);
 
 /* Non-blocking variant of dmesh_doca_dpa_msgq_send: returns AGAIN on submit
  * failure, no retry, no PE progress. For hot-path TRIGGER fire-and-forget. */
 doca_error_t
 dmesh_doca_dpa_msgq_send_try(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t msg_size);
-
-doca_error_t
-dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg,
-                                void *msg, uint32_t msg_size);
-
-doca_error_t
-setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mmap);
 
 doca_error_t
 setup_dpa_buf_array_pod(struct objects *objs, size_t num_elem,

@@ -24,9 +24,7 @@
 
 #include <thrift/transport/TDpumeshTransport.h>
 #include <cstring>
-#include <algorithm>
 #include <string>
-#include <vector>
 
 namespace apache {
 namespace thrift {
@@ -61,8 +59,8 @@ void TDpumeshTransport::close() {
         rx_slot_ = -1;
     }
     /* If the handler started writing but never flushed, the TX slot is
-     * still ours — release it directly (no DPA in flight, since enqueue
-     * is what hands ownership to the pending entry). */
+     * still ours — release it directly (no DPA in flight, since ownership
+     * is handed to the pending entry by attach_tx inside flush()). */
     if (tx_slot_ >= 0) {
         dpumesh_tx_free(ctx_, tx_slot_);
         tx_slot_ = -1;

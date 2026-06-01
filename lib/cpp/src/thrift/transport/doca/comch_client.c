@@ -105,22 +105,6 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 		}
 		// result = process_mmap_msg(objs, (struct dmesh_mmap_msg *)recv_buffer);
 		break;
-	case DMESH_MSG_EXPORT_DPA_COMP:
-		DOCA_LOG_INFO("Received DPA completion handles from server");
-		struct dmesh_dpa_comp_msg *dpa_comp_msg = (struct dmesh_dpa_comp_msg *)recv_buffer;
-		result = process_dpa_comp_msg(objs, dpa_comp_msg);
-		break;
-
-	case DMESH_MSG_RX_DATA:
-		if (msg_len < sizeof(struct dmesh_rx_data_msg)) {
-			DOCA_LOG_ERR("Received invalid RX_DATA message: len=%u < header=%zu",
-				     msg_len, sizeof(struct dmesh_rx_data_msg));
-			return;
-		}
-		if (objs->rx_data_hook)
-			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
-		break;
-
 	case DMESH_MSG_TX_ACK:
 		/* Forward DMA consumed by DPU — sender can free TX buffer slot */
 		if (objs->rx_data_hook)

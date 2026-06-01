@@ -82,7 +82,6 @@
 /usr/local/include/thrift/transport/doca/dpu_worker.h
 /usr/local/include/thrift/transport/doca/comch_client.h
 /usr/local/include/thrift/transport/doca/object.h
-/usr/local/include/thrift/transport/doca/comch_producer.h
 /usr/local/include/thrift/transport/TShortReadTransport.h
 /usr/local/include/thrift/transport/TSimpleFileTransport.h
 /usr/local/include/thrift/transport/TServerSocket.h

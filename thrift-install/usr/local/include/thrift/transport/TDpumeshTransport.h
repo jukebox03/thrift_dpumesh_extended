@@ -46,9 +46,6 @@ public:
     void write(const uint8_t *buf, uint32_t len);
     void flush() override;
 
-    uint32_t getStreamId() const { return stream_id_; }
-    int32_t getSrcPodId() const { return src_pod_id_; }
-
     /* Idle timeout (ms) for the internal dequeue between requests. After
      * this many ms with no incoming work the transport returns 0 from
      * read(), which causes the Thrift processor loop to exit cleanly so

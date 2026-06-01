@@ -12,7 +12,6 @@
 #include "dpa_common.h"
 #include "comch_common.h"
 #include "dpu_worker.h"
-#include "comch_producer.h"
 #include "comch_consumer.h"
 #include "../dpumesh.h"
 #include "ring.h"
@@ -32,8 +31,6 @@ extern doca_dpa_func_t thread_init_rpc;
 
 extern struct doca_dpa_app *DPU_mesh_dpa_app;
 #endif
-
-#define TEST_DPA_MEMORY
 
 /*
  * Callback invoked once a message is received from DPA successfully
@@ -362,26 +359,6 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
             doca_error_get_descr(result));
         return result;
     }
-
-// #ifdef TEST_DPA_MEMORY
-//     result = doca_dpa_mem_alloc(dpa_thread->dpa, 1024, &dpa_thread->buf);
-//     if (result != DOCA_SUCCESS) {
-//         DOCA_LOG_ERR("Failed to alloc dpa mem for buffer: %s",
-//             doca_error_get_descr(result));
-//         return result;
-//     }
-
-//     char *temp = "Hello from Host to DPA via DPA memory!";
-//     result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->buf,
-//                                 temp, strlen(temp) + 1);
-//     if (result != DOCA_SUCCESS) {
-//         DOCA_LOG_ERR("Failed to copy data from host to DPA memory: %s",
-//             doca_error_get_descr(result));
-//         return result;
-//     }
-
-//     DOCA_LOG_INFO("Copied data to DPA memory at device pointer: 0x%lx", dpa_thread->buf);
-// #endif
 
     result = doca_dpa_thread_create(dpa_thread->dpa, &dpa_thread->thread);
     if (result != DOCA_SUCCESS) {
@@ -729,13 +706,12 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
 }
 
 /*
- * Fills the DPA thread argument with the relevant DPA handles to be later copied to the DPA thread
+ * Fill shared comch (consumer/producer) DPA handles into the DPA thread arg.
+ * No ring info is set here — rings are added dynamically per-pod via
+ * setup_pod_dma (arg->num_rings starts at 0).
  *
- * @arg [out]: The returned thread argument that was filled
- * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
- */
-/*
- * Fill shared comch handles into DPA thread arg (no ring info yet — added per-pod).
+ * @arg [out]: the thread argument that is filled in
+ * @return: DOCA_SUCCESS on success, a DOCA error otherwise
  */
 static doca_error_t
 dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
@@ -812,63 +788,7 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
 }
 
 /*
- *  Initialize and run the DOCA DPA thread
- *
- */
-doca_error_t
-dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dpa_thread, struct dmesh_doca_dpa_comch *comch)
-{
-    doca_error_t result;
-    struct dpa_thread_arg arg;
-
-    result = dmesh_fill_dpa_thread_arg(objs, &arg);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to fill dpa thread argument - %s",
-            doca_error_get_name(result));
-        return result;
-    }
-
-    uint64_t rpc_ret;
-    uint32_t num_msg = CC_DPA_MAX_MSG_NUM;
-    DOCA_LOG_INFO("[PAIRCHK] run_dpa_thread pre-rpc: arg.consumer=0x%lx arg.producer=0x%lx arg.consumer_comp=0x%lx arg.producer_comp=0x%lx consumer_id=%u",
-                  arg.dpa_consumer, arg.dpa_producer,
-                  arg.dpa_consumer_comp, arg.dpa_producer_comp, arg.dpu_consumer_id);
-    result = doca_dpa_rpc(dpa_thread->dpa, 
-                        thread_init_rpc,
-                        &rpc_ret,
-                        arg.dpa_consumer,
-                        num_msg);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to issue init thread RPC - %s",
-            doca_error_get_name(result));
-        return result;
-    }
-
-    if (rpc_ret != 0) {
-        DOCA_LOG_ERR("Failed to init thread RPC");
-        return result;
-    }
-
-    result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg, 
-                                &arg, sizeof(struct dpa_thread_arg));
-    if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to update DPA thread argument - %s",
-			     doca_error_get_name(result));
-		return result;
-	}
-
-    result = doca_dpa_thread_run(dpa_thread->thread);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to run DPA thread - %s",
-			     doca_error_get_name(result));
-		return result;
-	}             
-
-    return DOCA_SUCCESS;
-}
-
-/*
- * Send message to DPA using NVMf DOCA DPA MsgQ
+ * Send message to DPA over the DOCA Comch MsgQ
  *
  * @msgq [in]: The MsgQ to be used for the send operation
  * @msg [in]: The message to send
@@ -969,66 +889,6 @@ dmesh_doca_dpa_msgq_send_try(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32
         return result;
     }
     return DOCA_SUCCESS;
-}
-
-doca_error_t
-dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg,
-                                void *msg, uint32_t msg_size)
-{
-	struct doca_comch_producer_task_send *send_task;
-    struct doca_task *task;
-	doca_error_t result;
-    union doca_data user_data;
-    void *msg_copy;
-    int i;
-
-    for (i = 0; i < num_msg; i++) {
-        msg_copy = malloc(msg_size);
-        if (msg_copy == NULL) {
-            DOCA_LOG_ERR("DPA MsgQ bulk send failed: payload copy allocation failed at idx=%d", i);
-            return DOCA_ERROR_NO_MEMORY;
-        }
-        memcpy(msg_copy, msg, msg_size);
-        result = doca_comch_producer_task_send_alloc_init(msgq->producer,
-                                  NULL,
-                              msg_copy,
-                                  msg_size,
-							  msgq->target_consumer_id,
-                                  &send_task);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to send msg using NVMf DOCA DPA MsgQ: Failed to allocate send task - %s",
-                     doca_error_get_name(result));
-            free(msg_copy);
-            return result;
-        }
-        task = doca_comch_producer_task_send_as_task(send_task);
-        user_data.ptr = msg_copy;
-        doca_task_set_user_data(task, user_data);
-        int retry = 0;
-        const int max_retry = 10000;
-        do {
-            result = doca_task_submit(task);
-            if (result == DOCA_ERROR_AGAIN) {
-                doca_pe_progress(msgq->pe);
-                retry++;
-            }
-        } while (result == DOCA_ERROR_AGAIN && retry < max_retry);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("DPA MsgQ bulk send failed: %s (retries=%d, msg_size=%u, idx=%d)",
-                     doca_error_get_name(result), retry, msg_size, i);
-            free(msg_copy);
-            doca_task_free(task);
-            return result;
-        }
-    }
-    // DOCA_LOG_INFO("Sent mesg done.");
-	return DOCA_SUCCESS;
-}
-
-doca_error_t
-setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mmap)
-{
-    return setup_dpa_buf_array_pod(objs, num_elem, mmap, &objs->buf_arr);
 }
 
 /*

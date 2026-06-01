@@ -83,7 +83,6 @@ sync_sources() {
     rsync -avz \
         "$TRANSPORT_SRC/dpumesh_doca.c" \
         "$TRANSPORT_SRC/dpumesh.h" \
-        "$TRANSPORT_SRC/dpumesh_shm.c" \
         "$TRANSPORT_SRC/TDpumeshTransport.cpp" \
         "$TRANSPORT_SRC/TDpumeshTransport.h" \
         "$TRANSPORT_SRC/TDpumeshServerTransport.cpp" \
@@ -199,6 +198,12 @@ build_images() {
     # tcp bench — slim, build from BENCH_DIR directly
     build_image "$BENCH_DIR/Dockerfile.bench_tcp" "$IMG_BENCH_TCP" "$BENCH_DIR"
     build_image "$BENCH_DIR/Dockerfile.echo_tcp" "$IMG_ECHO_TCP" "$BENCH_DIR"
+
+    # Reclaim Docker build cache. It grows by GBs every deploy (4 builds) and
+    # `docker image prune` does NOT touch it. Left unchecked the disk fills,
+    # the kubelet hits DiskPressure and evicts the BestEffort bench/echo pods —
+    # leaving Failed-phase corpses that break the next deploy's `kubectl wait`.
+    docker builder prune -f >/dev/null 2>&1 || true
 
     info "All images built and imported to containerd"
 }
@@ -628,7 +633,7 @@ ctrl_send() {
     # $1 = bench app label, $2 = command line
     local app="$1" cmd="$2"
     local pod_ip
-    pod_ip=$(kubectl get pod -n "$NS" -l "app=$app" -o jsonpath='{.items[0].status.podIP}')
+    pod_ip=$(kubectl get pod -n "$NS" -l "app=$app" --field-selector=status.phase=Running -o jsonpath='{.items[0].status.podIP}')
     if [ -z "$pod_ip" ]; then
         err "$app pod not found"
         return 1
@@ -650,7 +655,7 @@ run_bench() {
     step "=== $mode bench: rps=$rps dur=${dur}s size=${size}B conns=${conns} ==="
     local timeout_sec=$((dur + 30))
     local pod_ip
-    pod_ip=$(kubectl get pod -n "$NS" -l "app=$app" -o jsonpath='{.items[0].status.podIP}')
+    pod_ip=$(kubectl get pod -n "$NS" -l "app=$app" --field-selector=status.phase=Running -o jsonpath='{.items[0].status.podIP}')
     if [ -z "$pod_ip" ]; then
         err "$app pod not found — run '$0 deploy' first"
         return 1
@@ -710,6 +715,20 @@ cleanup() {
     stop_dpu
 }
 
+# Remove terminal-phase (Evicted/Error) pods. Kubernetes never auto-GCs Failed
+# pods, so after a DiskPressure eviction they linger indefinitely under the same
+# `app=` label — breaking `kubectl wait` (deploy hangs → exit 1) and run_bench's
+# `.items[0]` pod-IP lookup. Clear them before (re)starting so selectors only
+# ever see live pods.
+clean_failed_pods() {
+    local n
+    n=$(kubectl get pods -n "$NS" --field-selector=status.phase=Failed --no-headers 2>/dev/null | wc -l)
+    if [ "$n" -gt 0 ]; then
+        info "Removing $n stale Failed/Evicted pod(s) in $NS"
+        kubectl delete pod -n "$NS" --field-selector=status.phase=Failed --ignore-not-found=true >/dev/null 2>&1 || true
+    fi
+}
+
 ### ---------------------------------------------------------- main ###
 
 CMD="${1:-help}"
@@ -717,6 +736,7 @@ CMD="${1:-help}"
 case "$CMD" in
     deploy)
         ensure_namespace
+        clean_failed_pods
         apply_k8s
         sync_sources
         build_dpu

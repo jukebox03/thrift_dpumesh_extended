@@ -22,8 +22,6 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
  * the 64-bit addr at offset 4). */
 typedef uint32_t doca_dpa_dev_mmap_t;
 
-#define MAX_CONSUMERS 16
-
 /* Deferred completion queue — DPU only.
  * Consumer callback enqueues; main loop drains.
  * Single-threaded (same DPU worker), so no lock needed. */
@@ -210,33 +208,19 @@ struct objects {
     /* DPA (shared, 1 thread for all pods) */
     struct dmesh_doca_dpa_thread *dpa_thread;
 	struct dmesh_doca_dpa_comch *dpa_comch;
-    doca_dpa_dev_comch_producer_t remote_dpa_producer;
-    doca_dpa_dev_completion_t remote_dpa_producer_comp;
     int dpa_thread_running;  /* 1 = DPA thread started */
-
-    /* comch control path related */
-    bool server_finish;             /* Controls whether server progress loop should be run */
 
     /* comch data path related */
     struct local_mem_bufs *consumer_mem;
     struct doca_comch_consumer *consumer;
     struct doca_pe *consumer_pe;
 
-    struct local_mem_bufs *producer_mem;
-    struct doca_comch_producer *producer;
-    struct doca_pe *producer_pe;
-
     uint32_t remote_consumer_id;
-    doca_error_t producer_result;		  /* Holds result will be updated in producer callbacks */
-	bool producer_finish;			  /* Controls whether producer progress loop should be run */
 	doca_error_t consumer_result;		  /* Holds result will be updated in consumer callbacks */
 	bool consumer_finish;			  /* Controls whether consumer progress loop should be run */
 
     int recv_msg_cnt;                  /* Counts number of messages received by consumer */
     int sent_msg_cnt;
-
-    long unsigned int start_time_ns;
-    long unsigned int end_time_ns;
 
     /* RX data hook (comch control path → dpumesh_ctx) */
     void (*rx_data_hook)(void *hook_ctx, const uint8_t *data, uint32_t len);

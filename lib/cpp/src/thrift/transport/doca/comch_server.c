@@ -75,7 +75,7 @@ server_send_msg(struct objects *objs, const char *msg, size_t len)
 
 	/* Capacity check: gate on our mirror of DOCA's send pool so we never
 	 * trigger DOCA_ERROR_AGAIN. Caller treats AGAIN the same as us (retry
-	 * later). This path is init-only (export_dpa_comp_to_host), so we
+	 * later). This path is init-only (mmap/handle export), so we
 	 * progress PE while waiting to make room. */
 	int acq_retry = 0;
 	while (!doca_pool_try_acquire(&objs->send_tasks_in_flight, objs->send_tasks_max)) {
@@ -141,8 +141,6 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 	struct dmesh_comch_msg *comch_msg;
 
 	(void)event;
-
-	// DOCA_LOG_INFO("Message received: '%.*s', size: %u", (int)msg_len, recv_buffer, msg_len);
 
 	comch_server = doca_comch_server_get_server_ctx(comch_connection);
 	result = doca_ctx_get_user_data(doca_comch_server_as_ctx(comch_server), &user_data);
@@ -462,51 +460,6 @@ destroy_pe:
     doca_pe_destroy(objs->pe);
     objs->pe = NULL;
     return result;
-}
-
-doca_error_t
-export_dpa_comp_to_host(struct objects *objs)
-{
-	doca_error_t result;
-	struct dmesh_dpa_comp_msg dpa_comp_msg;
-	dpa_comp_msg.type = DMESH_MSG_EXPORT_DPA_COMP;
-
-	result = doca_comch_consumer_completion_get_dpa_handle(objs->dpa_comch->consumer_comp,
-									&dpa_comp_msg.dpa_consumer_comp);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get DPA consumer completion handle - %s",
-				doca_error_get_name(result));
-		return result;
-	}
-	result = doca_dpa_completion_get_dpa_handle(objs->dpa_comch->producer_comp,
-									&dpa_comp_msg.dpa_producer_comp);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get DPA producer completion handle - %s",
-				doca_error_get_name(result));
-		return result;
-	}
-	result = doca_comch_producer_get_dpa_handle(objs->dpa_comch->recv.producer,
-									&dpa_comp_msg.dpa_producer);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get DPA producer handle - %s",
-				doca_error_get_name(result));
-		return result;
-	}
-	result = doca_comch_consumer_get_dpa_handle(objs->dpa_comch->send.consumer,
-									&dpa_comp_msg.dpa_consumer);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get DPA consumer handle - %s",
-				doca_error_get_name(result));
-		return result;
-	}
-
-	DOCA_LOG_INFO("dpa_consumer_comp: 0x%lx, dpa_producer_comp: 0x%lx, dpa_producer: 0x%lx, dpa_consumer: 0x%lx",
-			dpa_comp_msg.dpa_consumer_comp,
-			dpa_comp_msg.dpa_producer_comp,
-			dpa_comp_msg.dpa_producer,
-			dpa_comp_msg.dpa_consumer);
-
-	return server_send_msg(objs, (const char *)&dpa_comp_msg, sizeof(dpa_comp_msg));
 }
 
 /* ====================================================================

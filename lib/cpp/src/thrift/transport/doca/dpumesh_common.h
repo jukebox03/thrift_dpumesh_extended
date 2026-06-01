@@ -3,16 +3,16 @@
 
 /* ====== Common Flags (shared by Host, DPU ARM, and DPA) ====== */
 
-/* CaseFlag (match Python CaseFlag) */
+/* CaseFlag — case classification (wire protocol shared by Host, DPU ARM, DPA) */
 #define CASE_EXTERNAL  1
 #define CASE_INGRESS   2
 #define CASE_LOCAL     3
 
-/* OpFlag (match Python OpFlag) */
+/* OpFlag — request/response direction bit (OR'd into the descriptor flags byte) */
 #define OP_REQUEST     0x00
 #define OP_RESPONSE    0x10
 
-/* PoolType (match Python PoolType) */
+/* PoolType — buffer-pool identifiers (only POOL_NONE and POOL_HOST_TX_BODY currently used) */
 #define POOL_NONE           0
 #define POOL_HOST_TX_BODY   2
 #define POOL_HOST_RX_BODY   4

@@ -1,8 +1,8 @@
 /*
  * dpumesh.h - DPUmesh transport public API for Thrift
  *
- * Backend-agnostic header. The actual implementation (SHM or DOCA)
- * is selected at library build time via -DWITH_DOCA=ON|OFF.
+ * Public C API for the NVIDIA DOCA (Comch + DMA) DPUmesh backend,
+ * compiled into libthrift when configured with -DWITH_DOCA=ON.
  * Application code should include only this header.
  */
 
@@ -27,20 +27,18 @@ extern "C" {
  * the DPA-side admission gate's lazy-refresh tolerate larger cache lag
  * without false-positive defers, smoothing the latency curve at cap. */
 #define DPUMESH_NUM_SLOTS_DEFAULT       2048
-#define DPUMESH_DESCRIPTOR_SIZE         64
 #define DPUMESH_MAX_DESCRIPTORS_DEFAULT 2048
-#define DPUMESH_PREFIX_DEFAULT          "dpumesh"
 
 /* ====== Configuration ====== */
 typedef struct {
-    int num_slots;        /* slots per pool (0 = use default 64) */
-    int slot_size;        /* bytes per slot (0 = use default 1MB) */
-    int max_descriptors;  /* descriptor ring capacity (0 = use default 512) */
+    int num_slots;        /* slots per pool (0 = use default 2048) */
+    int slot_size;        /* bytes per slot (0 = use default 8192 = 8KB) */
+    int max_descriptors;  /* descriptor ring capacity (0 = use default 2048) */
 } dpumesh_config_t;
 
 #define DPUMESH_CONFIG_DEFAULT { 0, 0, 0 }
 
-/* ====== SwDescriptor (64 bytes, packed, matches '<iIiIIIiibbBBiiii12x') ====== */
+/* ====== SwDescriptor (64 bytes, packed; little-endian field layout) ====== */
 typedef struct __attribute__((packed)) {
     int32_t  header_buf_slot;       /* i  (always -1 for Thrift) */
     uint32_t header_len;            /* I  (always 0 for Thrift)  */

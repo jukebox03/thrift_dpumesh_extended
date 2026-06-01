@@ -133,7 +133,8 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		}
 	}
 #else
-	/* Host side: store in objs (backward compat, single client) */
+	/* Host side: store the imported mmap in objs. The host holds only its
+	 * own ring/data buffers; the per-pod table lives on the DPU. */
 	(void)conn;
 	if (mmap_msg->mmap_type == DMA_BUFFER) {
 		mmap = &objs->remote_mmap;
@@ -165,13 +166,4 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 #endif
 
 	return DOCA_SUCCESS;
-}
-
-doca_error_t
-process_dpa_comp_msg(struct objects *objs, struct dmesh_dpa_comp_msg *dpa_comp_msg)
-{
-    objs->remote_dpa_producer = dpa_comp_msg->dpa_producer;
-    objs->remote_dpa_producer_comp = dpa_comp_msg->dpa_producer_comp;
-
-    return DOCA_SUCCESS;
 }

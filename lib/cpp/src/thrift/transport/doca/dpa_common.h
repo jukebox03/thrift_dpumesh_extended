@@ -84,7 +84,7 @@ enum comch_msg_type {
  * on dma_copy. Field widths chosen to preserve semantics:
  *   type        : 1B  — only 2 values used (DMA_COMPLETED, REV_DMA_COMPLETED)
  *   flags       : 1B  — OP_REQUEST/OP_RESPONSE + CASE_* (bit-flag set)
- *   src/dst_pod : 1B  — MAX_PODS=32 + -1 sentinel fits in int8
+ *   src/dst_pod : 1B  — MAX_PODS=8 + -1 sentinel fits in int8
  *   pos         : 4B  — buffer offset (DPU buf / Host RX buf)
  *   length      : 4B  — DMA'd body length (≤ DPUMESH_SLOT_SIZE_DEFAULT)
  *   req_id      : 4B  — Thrift stream/request ID (wraparound counter)

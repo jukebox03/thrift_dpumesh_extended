@@ -97,8 +97,6 @@ file(REMOVE_RECURSE
   "CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.o.d"
   "CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o"
   "CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o.d"
-  "CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_producer.c.o"
-  "CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_producer.c.o.d"
   "CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o"
   "CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o.d"
   "CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.o"

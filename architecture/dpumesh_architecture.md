@@ -400,7 +400,7 @@ T22 w0: admission_release; epoll_wait next
 
 ## 9. 앞서 RFC와 무엇이 달라졌나 (`architecture/README.md` vs 실제 코드)
 
-`architecture/README.md`는 **Python 시뮬레이션 시기**의 설계(`dpumesh/dpa_daemon.py`, `dpumesh/dpu_daemon.py`, TCP bridge :5050)를 설명한다. 현재 코드는 그게 아니라:
+`architecture/README.md`는 이제 현재 DOCA 구현을 반영하도록 갱신되었다. 원래 RFC의 **Python 시뮬레이션 설계**(`dpumesh/dpa_daemon.py`, `dpumesh/dpu_daemon.py`, TCP bridge :5050) 대비 핵심 변경은:
 
 - **DPU/DPA 실제 BlueField 하드웨어** 위에서 DOCA SDK로 구현 (`lib/cpp/src/thrift/transport/doca/`).
 - **별도 gateway 프로세스**(`gateway.c`, port 9091)가 도입되어 외부 TCP 클라이언트를 받아 DPUmesh 라우팅으로 변환.
