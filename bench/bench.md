@@ -1021,7 +1021,9 @@ multi-EU 정합성을 위해 file-scope 전역이던 `dpa_sent_count/cached_free
   comch send ×4**(hop당 `process_rev_notify_entry`의 DMA_COMPLETION + TX_ACK, `dpu_worker.c:290,313`).
   104K RPS → **~416K comch send/s ≈ 2.4µs/send** 예산을 단일 `cc_server`/단일 `objs->pe`/단일 core가
   직렬 소화(`server_send_msg_to_conn`: pool acquire + alloc_init + task_submit + DPU→host doorbell).
-  **지배적 직렬비용 = host-bound comch send 경로.**
+  **지배적 직렬비용 = host-bound comch send 경로.** ⚠️ **§10에서 정정**: M2 실측상 단일 ARM은 send만이면
+  1.0M/s까지 침 → send 자체는 지배 병목 아님. 병목은 send를 포함한 **per-RTT 묶음 전체**(comp_queue+routing+
+  reverse 중재+admission+2 lossless send), op당 2.4µs. (§10.3)
 - **1.37×의 산수**: single-EU는 EU-bound(309K)·ARM 헤드룸 보유(§5.3 ARM useful ~1.05µs/op vs DPA
   4.55µs/op). 2nd EU가 그 헤드룸을 먹어 416K(=1.37×, M2 320K의 +30%)까지 올리지만, ARM 직렬 천장이
   ~416K라 2×(618K) 불가 → 각 EU가 backpressure 루프로 ~52K(solo의 68%)로 throttle(§9.5-2 확증).
@@ -1060,3 +1062,141 @@ DPUMESH_DPA_THREADS=4 DPUMESH_DPA_AFFINITY=0 ./test-bench.sh deploy
 - 확인: 배포 로그 `Starting dpumesh_dpu on DPU (DPA EU threads=4, affinity=1)`.
 - **주의**: 2-pod 벤치는 N≥2가 전부 활성 EU 2개(§9.4) → N=2/3/4 동일 ~104K. N 효과를 더 보려면
   pod ≥ N 필요(§9.6 실험 A/B).
+
+---
+
+## 10. M2 baseline multi-EU — 단일 ARM은 2-EU를 안 가둔다 (2026-06-02)
+
+§9의 체인 2-EU 천장(1.37×)이 *단일 ARM 제어평면 때문*인지, 아니면 체인의 *per-RTT 작업 무게* 때문인지를
+가르기 위해, **M2 transport baseline(`test_dma/bench/`)에 DPA EU thread를 N개로 확장**해 직접 측정.
+M2는 체인과 같은 단일 DPU ARM 제어평면(단일 `consumer_pe`·단일 `cc_server`·매 completion을 host로
+`server_send_msg` forward)을 갖되, 체인의 reverse-DMA·routing·lossless RTT가 없는 **one-way** 구조 —
+즉 "단일 ARM + 가벼운 per-op forward"만 분리한 control.
+
+### 10.1 구현 (M2 multi-EU)
+
+pure_dma(§6.3)의 multi-EU 플럼빙을 M2에 이식하되 **M2 커널(descriptor-gated dma_copy + per-op completion)
+과 DPU forward는 유지**. 변경 = `test_dma/bench/` 5파일 + `run_bench.sh --threads`:
+
+| 파일 | 변경 |
+|---|---|
+| `dpu_worker.c` | N개 DPA thread + N개 1c/1p comch 채널을 **shared DPA**에 생성, 모두 단일 `consumer_pe`에 attach(→ `recv_msg_cnt` EU 합산). N개 buf_arr 슬라이스 생성 + EU별 run+kick. method-2 forward 루프 유지. |
+| `dpa.c` | per-EU dst 슬라이싱(`g_bench_thread_idx/n`로 1MB DPU 버퍼를 N분할, write 경합 회피). `setup_dpa_buf_array_off`(한 ring mmap을 offset으로 EU별 disjoint 슬라이스). |
+| `host_worker.c` | ring을 **N×DMA_RING_SIZE**로(EU별 슬라이스). M2 커널은 free-running(`get_next_dma_desc`가 valid 무시·NULL 없음 → 단일 host가 모든 슬라이스를 refresh, per-EU 레이트는 host-posting 아닌 **EU-bound**). |
+| `dpa_common.h` | `#define BENCH_NUM_THREADS`(sed-patch). |
+| `run_bench.sh` | `--threads "1 2 4 8"` 노브(`set_threads`가 `BENCH_NUM_THREADS` sed). CSV에 threads 열. |
+
+핵심: 각 EU = 자기 descriptor ring 슬라이스(disjoint, 공유-read 경합 0) + 자기 DPU dst 슬라이스 + 자기
+comch 채널. 단일 ARM이 N EU의 완료를 한 `consumer_pe`로 drain + (method 2) host로 forward.
+
+### 10.2 측정 (8 KB, H2D, dma_copy, 10 s, DPU recv/s = dma_copy/s)
+
+| threads | M0 (forward 없음) dma_copy/s | scaling | M2 (+DPU forward) dma_copy/s | scaling | M2/M0 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 324,630 | 1.00× | **321,754** | 1.00× | 0.99 |
+| 2 | **628,622** | **1.94×** | **625,708** | **1.94×** | 0.99 |
+| 4 | 1,187,147 | 3.66× | 1,006,224 | 3.13× | 0.85 |
+| 8 | **1,534,325** | **4.73×** | **1,024,805** | **3.19× (plateau)** | 0.67 |
+
+payload BW: M0 N=8 = 100.5 Gbps, M2 N=8 = 67.2 Gbps (8 KB).
+
+- **N=1 재현**: M2 321,754 ≈ §2.1 M2 baseline 320,105(리팩터 회귀 0).
+- **N=2 near-linear 1.94×** — M0·M2 사실상 동일. **per-op DPU ARM forward는 N=2를 안 가둠**(M2/M0=0.99).
+- **forward는 drop이 아니라 실제 전달**: m2/N=2에서 **HOST 도착률 625,148/s ≈ DPU dma_copy 625,352/s**
+  (`host_worker.c:118` "HOST recv" 로그). 즉 단일 ARM이 N=2에서 **초당 ~625K comch 메시지를 host로 실제
+  전송하면서** 1.94× 스케일.
+- **N≥4에서 forward가 비로소 cap**: M0는 N=8까지 계속 오르는데(4.73×, 1.53M) M2는 **~1.0M dma_copy/s에
+  plateau**(N=4 1.006M → N=8 1.025M, +1.8%만). M2/M0가 0.99→0.85(N=4)→0.67(N=8)로 하락 = forward 비용이
+  N과 함께 커짐. **단일 ARM의 server_send_msg 천장 ≈ 1.0M send/s.** N=2(625K)는 그 천장 아래라 free.
+
+### 10.3 해석 — §9 진단의 정정
+
+**단일 ARM의 comch-send 처리량은 체인 2-EU 천장의 원인이 아니다. 진짜 gap은 ~3.7×이고, 두 단일-ARM
+효과의 곱이다.**
+
+**(0) 3.7× 분해 (raw DMA-HW 천장 대비, 전부 §10.2 측정값):**
+
+| 단계 | dma_copy/s | 직전 대비 | 무엇이 깎나 |
+|---|---:|---:|---|
+| raw HW + drain (M0, forward 0, N=8) | 1,534,325 | — | DMA 엔진 + 단일 consumer_pe drain 한계 |
+| + 최소 forward (M2, op당 1 send, N=8) | 1,024,805 | **÷1.5** | 단일 ARM이 매 op을 host로 forward(직렬화) |
+| chain (lossless RTT, 104K RPS×4) | 416,000 | **÷2.4** | chain 제어평면 묶음(①–⑥ 아래) |
+
+→ **1.53M → 416K = 3.7× = 1.5×(forward) × 2.4×(chain 묶음).** 체인은 DMA-HW dma_copy 능력의 **27%만** 쓴다.
+"거의 3~4배"가 맞고, 그건 한 종류 병목이 아니라 **단일 ARM이 만드는 두 직렬화의 곱**이다.
+
+**(1) "무겁다"는 비유가 아니라 측정 — M2 등가**: *같은* 단일 ARM이 가벼운 op은 1.0M/s, 무거운 op은 416K/s
+친다. **416K × 2.4µs ≈ 1.0M × 1.0µs = 같은 총 ARM 작업량** → 체인 ARM도 416K에서 ~포화(M2 1.0M plateau =
+그 코어 포화점). 즉 op당 cost 2.4× 차이는 직접 측정 등가에서 나온 값.
+
+**(2) 세부:**
+
+- 단일 ARM의 **server_send_msg 천장 ≈ 1.0M send/s**(M2 N=4/8 plateau). 체인은 같은 단일 ARM·단일
+  `consumer_pe`·단일 `cc_server`로 **416K dma_copy/s**(104K RPS, ~416K host-bound send/s = 4 send/RTT)
+  에서 멈춤(1.37×) — **단일 ARM send 천장(1.0M)의 42%**. 즉 체인은 send 천장에 **한참 못 미쳐** 멈춘다 →
+  **"host-bound comch send 경로가 지배 병목"(§9.6e)은 refuted.** send 자체는 1.0M/s까지 친다.
+- **정량**: M2의 bare forward는 1.0M op/s(op당 ARM cost ≈ 1.0µs), 체인은 416K op/s(op당 ≈ 2.4µs) →
+  **체인 per-op ARM 작업이 M2 forward의 ~2.4×.** 그 초과분 = 아래 ①–⑥(reverse 중재+comp_queue+routing+
+  admission+lossless RTT). 단일 ARM "존재"가 아니라 **per-op 작업 무게**가 체인을 가둔다.
+- 그러므로 체인 1.37× cap = 체인이 M2의 one-way forward **너머**에 하는 일: ① comp_queue 2단 indirection
+  (recv cb enqueue → main-loop drain) ② routing(`find_pod_by_id`) ③ **reverse-DMA 중재**(매 hop
+  `dpu_enqueue_reverse_dma`가 tx_ring에 desc post → EU가 reverse DMA drain → 1 RTT=4 dma_copy) ④
+  reverse admission 회계(`dpa_sent_count/cached_freed`) ⑤ **hop당 2개의 lossless host-bound send**
+  (DMA_COMPLETION+TX_ACK, drop 불가·deferred 큐 보유) ⑥ **full-RTT slot lifecycle**(src slot을
+  forward→reverse 내내 점유) + 그 backpressure(comp_queue BP_HIGH→deferred_recv→DPA `is_consumer_empty`
+  stall)가 EU를 ARM drain 레이트로 rate-match.
+- **결론(정정)**: 체인 2-EU 천장은 *단일 ARM이라서*가 아니라 **체인 제어평면의 per-RTT 작업량 + lossless·
+  reverse-DMA·full-RTT 결합** 때문. 가벼운/one-way 제어평면(M2)은 같은 단일 ARM에서 1.94×로 스케일한다.
+  (§9.6e의 "단일 ARM=cap, send 지배"는 → "단일 ARM 자체는 안 가둠; 체인의 무거운 lossless RTT 제어평면이
+  가둠"으로 정정.)
+
+**정직한 한계 (직접 측정 안 된 한 칸)**: §9.6(소거: HW·buffer·drain·send·host 전부 기각) + §10(M2 등가)으로
+"단일 ARM 제어평면 + per-RTT 무게"는 강하게 입증됐으나, **체인 ARM의 실제 CPU% @104K는 직접 측정 안 함**
+(§5.3은 single-EU 50K에서 useful 23%/epoll 76%만 잼). M2 등가(같은 코어가 1.0M 가벼운 op = 416K 무거운 op =
+동일 총작업)가 "포화"를 강하게 시사하나, *2-EU에서 ARM 코어가 정말 ~100%인지 vs epoll-cadence/직렬 파이프라인
+latency가 더 큰지*는 추론. 직접 확정하려면 재배포 후 ARM 프로파일(flame/perf) 또는 §9.6d 실험 A(fwd/rev→4 EU)
+필요 — §10 결론(3.7× = forward 1.5× × chain-RTT 2.4×, 둘 다 단일 ARM)에는 영향 없음.
+
+### 10.4 fix 우선순위에 주는 함의
+
+- **send 배치(§9.6e가 제안)는 효과 작음** — send 자체가 병목 아님(M2가 625K send/s 입증).
+- **host→host direct DMA(§7 lever 1)가 가장 직접적**: 1 RTT 4→2 dma_copy로 줄이면서 **reverse staging+
+  reverse-DMA 중재+admission 회계를 통째로 제거** → ARM per-RTT 작업을 절반 이하로. M2가 보인 "가벼운
+  제어평면=near-linear EU scaling"을 체인으로 끌어오는 길.
+- **multi-ARM(Phase 3)**: reverse 중재를 EU/shard로 병렬화하면 도움이나, host→host보다 고위험.
+- (열린 항목) 4-pod 실험(§9.6d-B)으로 체인 reverse 제어평면이 EU≥2에서도 ARM-aggregate-bound인지 직접 확인.
+
+### 10.5 실행
+
+```bash
+cd test_dma
+./run_bench.sh --method "0 2" --threads "1 2 4 8" --sizes 8192 --duration 10
+# method 0=forward 없음(데이터평면+drain 스케일), 2=+per-op DPU forward
+# CSV: bench_results_*.csv (threads,method,...,recv_per_sec,...)
+```
+### 10.6 N-스케일링 곡선 & pure_dma 대조
+
+| N | M0 효율 | M2 효율 | 메모 |
+|---:|---:|---:|---|
+| 1 | 100% | 100% | M2 = §2.1 baseline 재현 |
+| 2 | 97% | 97% | forward free |
+| 4 | 91% | 78% | forward 비용 시작 |
+| 8 | 59% | 40% | M0는 절대 증가 유지(1.53M), M2는 ~1.0M plateau |
+
+- **M0(데이터평면+단일 consumer_pe drain)는 N=8까지 절대 증가**(1→2→4→8 = 0.32→0.63→1.19→1.53M, regression
+  없음). §6.3 pure_dma는 N=8에서 **절대 감소**(1.80M@4 → 1.47M@8)했는데 M2-M0는 안 그럼 → **N=8 regression은
+  pure_dma의 fixed-address·self-driving 구조 특이성**이고, host-descriptor-gated + per-EU disjoint ring
+  슬라이스 구조에선 재현 안 됨(효율은 59%로 떨어지나 절대 throughput은 계속 상승). §6.5 "단일 DPU drain이
+  N↑에서 가둔다" 가설은 **M2 구조에선 N=8(1.53M)까지 미발동** — drain은 최소 1.5M/s까지 스케일.
+- **M2(+forward)는 ~1.0M에서 plateau** = 단일 ARM의 per-op `server_send_msg` 천장. M0와의 격차(N=8:
+  1.53M vs 1.02M)가 그 forward 병목의 크기.
+- **체인과의 정합**: 체인은 416K(1.37×)에서 멈춤 — M2 forward 천장(1.0M)보다 한참 낮음. 체인의 per-RTT
+  제어평면(reverse-DMA 중재+lossless RTT, §10.3)이 단일 ARM을 op당 ~2.4× 무겁게 만들어 더 일찍 가둠.
+  **데이터평면·drain·send는 모두 ≥1M/s로 스케일하므로, 체인 lever는 EU 추가가 아니라 per-RTT ARM 작업
+  경감(host→host) 또는 그 작업의 병렬화(multi-ARM)다.**
+
+### 10.7 측정 산출물
+
+- 코드: `test_dma/bench/`(M2 multi-EU, `BENCH_NUM_THREADS`) + `test_dma/run_bench.sh --threads`.
+- 데이터 CSV: `test_dma/bench_results_20260602_020604.csv`(N=1,2) + `..._021256.csv`(N=4,8).
+- raw: DPU `recv:`(dma_copy/s) + HOST `HOST recv`(도착률) 로그로 forward 전달 확인(§10.2).
