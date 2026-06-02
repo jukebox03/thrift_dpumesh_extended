@@ -80,7 +80,6 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 	union doca_data user_data;
 	struct doca_comch_client *comch_client;
 	doca_error_t result;
-	struct dmesh_comch_msg *comch_msg;
 	struct objects *objs;
 
 	(void)event;
@@ -95,40 +94,33 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 
 	objs = (struct objects *)user_data.ptr;
 
-	comch_msg = (struct dmesh_comch_msg *)recv_buffer;
-	switch (comch_msg->type)
+	/* Dispatch on the 1-byte type. The legacy 4-byte enum messages carry their
+	 * value in the little-endian low byte, and the 16B completion carries a
+	 * 1-byte type at offset 0 — so a single-byte read handles both. */
+	switch (recv_buffer[0])
 	{
-	case DMESH_MSG_EXPORT_DESC:
+	case DMESH_MSG_MMAP_EXPORT:
 		if (msg_len <= sizeof(struct dmesh_mmap_msg)) {
 			DOCA_LOG_ERR("Received invalid MMAP message from server");
 			return;
 		}
 		break;
-	case DMESH_MSG_TX_ACK:
+	case DMESH_MSG_FWD_ACK:
 		/* Forward DMA consumed by DPU — sender can free TX buffer slot */
 		if (objs->rx_data_hook)
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
 
-	case DMESH_MSG_DMA_COMPLETION:
-		/* Reverse DMA (DPU→CPU) completion: data is already in Host RX DMA buffer.
-		 * The notification carries comch_dma_comp_msg in desc[64] with pos/length. */
+	case DMESH_MSG_REV_DONE:
+		/* Reverse DMA (DPU→CPU) completion: data is already in Host RX DMA
+		 * buffer. The 16B notification (struct dmesh_dma_completion_msg)
+		 * carries pos/length/req_id/src/dst/flags. */
 		if (objs->rx_data_hook)
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
 
-	case DMESH_MSG_CONSUMER_ID: {
-		struct dmesh_consumer_id_msg *cid_msg = (struct dmesh_consumer_id_msg *)recv_buffer;
-		if (msg_len < sizeof(struct dmesh_consumer_id_msg)) {
-			DOCA_LOG_ERR("Received invalid CONSUMER_ID message");
-			return;
-		}
-		DOCA_LOG_INFO("Received remote consumer ID = %u from DPU", cid_msg->consumer_id);
-		break;
-	}
-
 	default:
-		DOCA_LOG_INFO("Received unknown message type from server: %u", comch_msg->type);
+		DOCA_LOG_INFO("Received unknown message type from server: %u", recv_buffer[0]);
 		break;
 	}
 }

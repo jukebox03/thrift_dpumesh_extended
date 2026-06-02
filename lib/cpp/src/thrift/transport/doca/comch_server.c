@@ -79,7 +79,14 @@ server_send_msg(struct objects *objs, const char *msg, size_t len)
 	 * progress PE while waiting to make room. */
 	int acq_retry = 0;
 	while (!doca_pool_try_acquire(&objs->send_tasks_in_flight, objs->send_tasks_max)) {
-		progress_all_pes(objs);
+		/* Under SPLIT_SEND, consumer_pe belongs to thread A; this path runs
+		 * on thread B (pod-setup export). Progress only objs->pe so we never
+		 * cross-progress A's PE (DOCA: one thread per PE). The send completes
+		 * on objs->pe anyway, so this still drains the pool. */
+		if (objs->split_send)
+			doca_pe_progress(objs->pe);
+		else
+			progress_all_pes(objs);
 		if (++acq_retry > 10000) {
 			DOCA_LOG_ERR("server_send_msg: send pool full after %d PE progresses", acq_retry);
 			return DOCA_ERROR_AGAIN;
@@ -158,7 +165,7 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 	comch_msg = (struct dmesh_comch_msg *)recv_buffer;
 
 	switch (comch_msg->type) {
-	case DMESH_MSG_EXPORT_DESC:
+	case DMESH_MSG_MMAP_EXPORT:
 
 		if (msg_len <= sizeof(struct dmesh_mmap_msg)) {
 			DOCA_LOG_ERR("Received invalid MMAP message from client");
@@ -167,7 +174,7 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 		result = process_mmap_msg(objs, comch_connection, (struct dmesh_mmap_msg *)recv_buffer);
 		break;
 
-	case DMESH_MSG_REGISTER: {
+	case DMESH_MSG_POD_REGISTER: {
 		struct dmesh_register_msg *reg = (struct dmesh_register_msg *)recv_buffer;
 		if (msg_len < sizeof(struct dmesh_register_msg)) {
 			DOCA_LOG_ERR("Received invalid REGISTER message");
@@ -175,38 +182,6 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 		}
 		pods_register(objs, comch_connection, reg->pod_id, reg->app_name);
 		DOCA_LOG_INFO("Pod registered: pod_id=%d, app=%s", reg->pod_id, reg->app_name);
-
-		/* Reply with consumer ID so the host can create its producer.
-		 * This is needed because the "new consumer" event only fires once
-		 * (when the consumer is first created), so the second+ pod never
-		 * gets the event and would block forever. */
-		if (objs->consumer != NULL) {
-			uint32_t cid;
-			doca_comch_consumer_get_id(objs->consumer, &cid);
-			struct dmesh_consumer_id_msg reply;
-			reply.type = DMESH_MSG_CONSUMER_ID;
-			reply.consumer_id = cid;
-			server_send_msg_to_conn(objs, comch_connection,
-			                   (const char *)&reply, sizeof(reply));
-			DOCA_LOG_INFO("Sent CONSUMER_ID=%u to pod_id=%d", cid, reg->pod_id);
-		}
-		break;
-	}
-
-	case DMESH_MSG_POD_CONSUMER_ID: {
-		struct dmesh_pod_consumer_id_msg *cid = (struct dmesh_pod_consumer_id_msg *)recv_buffer;
-		if (msg_len < sizeof(struct dmesh_pod_consumer_id_msg)) {
-			DOCA_LOG_ERR("Received invalid POD_CONSUMER_ID message");
-			return;
-		}
-		struct pod_state *pod = find_pod_by_connection(objs, comch_connection);
-		if (!pod) {
-			DOCA_LOG_ERR("POD_CONSUMER_ID: connection not found");
-			break;
-		}
-		pod->remote_consumer_id = cid->consumer_id;
-		DOCA_LOG_INFO("POD_CONSUMER_ID registered: conn pod_id=%d msg_pod_id=%d consumer_id=%u",
-		              pod->pod_id, cid->pod_id, cid->consumer_id);
 		break;
 	}
 
@@ -526,9 +501,10 @@ server_send_tx_ack_to(struct objects *objs,
                       int32_t dst_pod_id)
 {
 	struct dmesh_tx_ack_msg ack;
-	ack.type = DMESH_MSG_TX_ACK;
+	ack.type = DMESH_MSG_FWD_ACK;
+	ack._pad[0] = ack._pad[1] = ack._pad[2] = 0;
 	ack.req_id = req_id;
-	ack.dst_pod_id = dst_pod_id;
+	(void)dst_pod_id;   /* retained in signature for callers/debug; no longer on the wire */
 	return server_send_msg_to_conn(objs, conn, (const char *)&ack, sizeof(ack));
 }
 
@@ -552,7 +528,6 @@ pods_add_connection(struct objects *objs, struct doca_comch_connection *conn)
 	objs->pods[idx].connection = conn;
 	objs->pods[idx].pod_id = -1;  /* not yet registered */
 	objs->pods[idx].app_name[0] = '\0';
-	objs->pods[idx].remote_consumer_id = 0;
 	__atomic_store_n(&objs->pods[idx].registered, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&objs->num_pods, idx + 1, __ATOMIC_RELEASE);
 

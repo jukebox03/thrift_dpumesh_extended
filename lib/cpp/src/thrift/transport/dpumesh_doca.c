@@ -63,6 +63,9 @@ typedef struct {
     sw_descriptor_t desc;
     volatile int state;   /* -1=unused, -2=abandoned/timed-out (TX freed here, or deferred to TX_ACK), 0=waiting, 1=arrived */
     int tx_slot;          /* TX buffer slot owned by this request, -1 if none */
+    uint32_t owner_req_id; /* req_id currently occupying this idx; guards TX_ACK
+                            * (DMESH_MSG_FWD_ACK) against a late/duplicate ACK
+                            * after req_id wraps every MAX_PENDING requests */
 } dpumesh_pending_t;
 
 struct dpumesh_ctx {
@@ -84,9 +87,8 @@ struct dpumesh_ctx {
     struct doca_mmap *rx_dma_mmap;
     size_t rx_dma_buf_size;
 
-    /* Persistent buffers for initial registration to avoid stack UAF */
+    /* Persistent buffer for initial registration to avoid stack UAF */
     struct dmesh_register_msg reg_msg;
-    struct dmesh_pod_consumer_id_msg pod_cid_msg;
 
     /* TX slot management */
     uint8_t *slot_bitmap;
@@ -219,9 +221,18 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
 static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_len,
                                 uint32_t req_id, int32_t src_pod_id,
                                 int32_t dst_pod_id, int8_t flags) {
-    if (!ctx->rx_dma_buffer || pos + dma_len > ctx->rx_dma_buf_size) {
+    if (!ctx->rx_dma_buffer || (size_t)pos + dma_len > ctx->rx_dma_buf_size) {
         DOCA_LOG_ERR("process_rx_dma_entry: bounds fail pos=%u len=%u buf=%zu",
                      pos, dma_len, ctx->rx_dma_buf_size);
+        return -1;
+    }
+    /* The RX staging slot is exactly slot_size bytes; a body longer than that
+     * would overflow into the next slot on the memcpy below. The DPA caps each
+     * reverse DMA at DPA_DMA_COPY_MAX (= default slot_size), but guard here so a
+     * non-default (smaller) slot_size can never corrupt the heap. */
+    if (dma_len > (uint32_t)ctx->slot_size) {
+        DOCA_LOG_ERR("process_rx_dma_entry: len=%u exceeds slot_size=%d (req_id=%u)",
+                     dma_len, ctx->slot_size, req_id);
         return -1;
     }
     uint8_t *body = (uint8_t *)ctx->rx_dma_buffer + pos;
@@ -253,9 +264,12 @@ static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_l
 
 static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)hook_ctx;
-    const struct dmesh_comch_msg *comch_msg = (const struct dmesh_comch_msg *)data;
+    /* Dispatch on the 1-byte type (see comch_client.c: the legacy 4-byte enum
+     * carries its value in the LE low byte, and the completion uses a 1-byte
+     * type at offset 0, so a single-byte read handles both). */
+    uint8_t mtype = data[0];
 
-    if (comch_msg->type == DMESH_MSG_TX_ACK) {
+    if (mtype == DMESH_MSG_FWD_ACK) {
         /* === TX_ACK: per-request notification that DPU has consumed the
          * forward DMA tied to req_id — host's TX slot for this request can
          * now be released. Pure event signal; no flow-control piggyback. */
@@ -269,7 +283,12 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         uint32_t idx = ack.req_id % MAX_PENDING;
         dpumesh_pending_t *p = &ctx->pending[idx];
         pthread_mutex_lock(&p->lock);
-        if ((p->state == 0 || p->state == -2) && p->tx_slot >= 0) {
+        /* owner_req_id guard: every MAX_PENDING requests reuse this idx, so a
+         * late/duplicate ACK for an old req_id could otherwise free the TX slot
+         * of the live request now occupying the slot. Only free if THIS req_id
+         * still owns it. */
+        if ((p->state == 0 || p->state == -2) && p->tx_slot >= 0 &&
+            p->owner_req_id == ack.req_id) {
             /* state 0: request still waiting — free TX slot early.
              * state -2: wait_response gave up on timeout but deferred the TX
              *           free until DPA finished the forward DMA; this ACK
@@ -287,7 +306,7 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         return;
     }
 
-    if (comch_msg->type == DMESH_MSG_DMA_COMPLETION) {
+    if (mtype == DMESH_MSG_REV_DONE) {
         /* === Reverse DMA notification (DPU→CPU) ===
          * DPU ARM forwards this after DPA completes DMA from DPU TX buffer
          * to Host RX buffer. Data (body only) is already at rx_dma_buffer[pos].
@@ -303,7 +322,7 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         uint32_t pos = comp.pos;
         uint32_t dma_len = comp.length;
 
-        if (!ctx->rx_dma_buffer || pos + dma_len > ctx->rx_dma_buf_size) {
+        if (!ctx->rx_dma_buffer || (size_t)pos + dma_len > ctx->rx_dma_buf_size) {
             DOCA_LOG_ERR("DMA_COMPLETION: invalid pos=%u len=%u buf_size=%zu",
                          pos, dma_len, ctx->rx_dma_buf_size);
             return;
@@ -372,7 +391,7 @@ static doca_error_t init_control_path(dpumesh_ctx_t *ctx) {
     result = init_comch_ctrl_path_client("DPUMesh", &ctx->doca_objs, true);
     if (result != DOCA_SUCCESS) return result;
 
-    ctx->reg_msg.type = DMESH_MSG_REGISTER;
+    ctx->reg_msg.type = DMESH_MSG_POD_REGISTER;
     ctx->reg_msg.pod_id = ctx->pod_id;
     snprintf(ctx->reg_msg.app_name, sizeof(ctx->reg_msg.app_name), "%s", ctx->app_name);
 
@@ -389,19 +408,12 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
     result = init_comch_datapath_consumer(&ctx->doca_objs);
     if (result != DOCA_SUCCESS) return result;
 
-    if (ctx->doca_objs.consumer != NULL) {
-        uint32_t local_consumer_id = 0;
-        result = doca_comch_consumer_get_id(ctx->doca_objs.consumer, &local_consumer_id);
-        if (result != DOCA_SUCCESS) return result;
-
-        ctx->pod_cid_msg.type = DMESH_MSG_POD_CONSUMER_ID;
-        ctx->pod_cid_msg.pod_id = ctx->pod_id;
-        ctx->pod_cid_msg.consumer_id = local_consumer_id;
-        client_send_msg(&ctx->doca_objs, (const char *)&ctx->pod_cid_msg, sizeof(ctx->pod_cid_msg));
-    }
-
-    /* NOTE: init_comch_datapath_producer() removed — CPU→DPU uses DMA ring,
-     * DPU→CPU uses reverse DMA. comch datapath producer no longer needed. */
+    /* NOTE: the host datapath consumer object is created above (its PE is
+     * progressed in the RX path), but its consumer ID is no longer advertised
+     * to the DPU. The old POD_CONSUMER_ID / CONSUMER_ID handshake existed so the
+     * host could build a comch producer for CPU→DPU payload; that producer was
+     * removed — CPU→DPU now uses the DMA ring and DPU→CPU uses reverse DMA, so
+     * neither side consumes the other's datapath consumer ID. */
 
     result = setup_dma_ring(&ctx->doca_objs, DMA_RING_SIZE);
     if (result != DOCA_SUCCESS) return result;
@@ -830,6 +842,7 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
 
     p->state = 0;
     p->tx_slot = -1;
+    p->owner_req_id = req_id;   /* claim this idx; TX_ACK frees only for this req_id */
     memset(&p->desc, 0, sizeof(p->desc));
     pthread_mutex_unlock(&p->lock);
     return 0;

@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* pthread_setaffinity_np, cpu_set_t */
+#endif
+
 #include "dpu_worker.h"
 
 #include "comch_server.h"
@@ -18,8 +22,71 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <sched.h>
 
 DOCA_LOG_REGISTER(DPU_WORKER);
+
+/* Pin a thread to a single ARM core. core < 0 = leave placement relaxed. */
+static void
+dmesh_pin_thread(pthread_t t, int core)
+{
+    if (core < 0)
+        return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    int rc = pthread_setaffinity_np(t, sizeof(set), &set);
+    if (rc != 0)
+        DOCA_LOG_WARN("pthread_setaffinity_np(core %d) failed: %d", core, rc);
+}
+
+/* Defined below; forward-declared so the SPLIT_SEND helpers can fall back to it
+ * in the non-split path. */
+static void
+send_or_defer_tx_ack(struct objects *objs, struct pod_state *src_pod,
+                     uint32_t req_id, int32_t dst_pod_id);
+
+/* ====== A-side egress send hand-off (SPLIT_SEND) ======
+ * Thread A pushes a TX_ACK onto the A→B SPSC. Returns 1 if pushed (or nothing
+ * to send), 0 if the SPSC is full (caller must retain the comp_queue entry so
+ * backpressure flows through comp_queue, NOT a side buffer). */
+static int
+a_spsc_tx_ack(struct objects *objs, struct pod_state *src_pod,
+              uint32_t req_id, int32_t dst_pod_id)
+{
+    if (!src_pod || !src_pod->connection)
+        return 1;   /* originator gone — host's 2s reclaim is the safety net */
+    if (send_spsc_free(&objs->send_spsc) < 1)
+        return 0;
+    send_req_t a;
+    a.conn       = src_pod->connection;
+    a.kind       = SEND_REQ_TX_ACK;
+    a.flags      = 0;
+    a.src_pod_id = src_pod->pod_id;
+    a.dst_pod_id = dst_pod_id;
+    a.pos        = 0;
+    a.length     = 0;
+    a.req_id     = req_id;
+    send_spsc_push(&objs->send_spsc, &a);
+    return 1;
+}
+
+/* Forward-path error ACK on the correct thread. Returns 1 if dispatched (caller
+ * drops the entry, returns -1); 0 if it could not be dispatched now (SPSC full)
+ * and the caller must retain the entry (return 0). */
+static int
+forward_error_ack(struct objects *objs, struct pod_state *src_pod,
+                  uint32_t req_id, int32_t dst_pod_id)
+{
+    /* SPLIT_SENDS: thread A routes but must not touch the send pool → hand the
+     * ACK to B via send_spsc. SPLIT_REBAL/OFF: the caller IS the send-owning
+     * thread (B, or the single worker), so send inline. */
+    if (objs->split_send == SPLIT_SENDS)
+        return a_spsc_tx_ack(objs, src_pod, req_id, dst_pod_id);
+    send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id);
+    return 1;
+}
 
 /* ====== TX_ACK send helper ====== */
 
@@ -153,10 +220,13 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
     if (entry->pod_idx >= 0 && entry->pod_idx < objs->num_pods)
         fwd_buf_pod = &objs->pods[entry->pod_idx];
 
-    if (!fwd_buf_pod || !fwd_buf_pod->dma_buffer ||
+    /* pod_data_ready ACQUIRE-loads dma_ready so the dma_buffer/handle/tx_ring
+     * reads below see the RELEASE-published setup fields under SPLIT_SEND. */
+    if (!fwd_buf_pod || !pod_data_ready(fwd_buf_pod) || !fwd_buf_pod->dma_buffer ||
         fwd_buf_pod->local_mmap_dpa_handle == 0) {
         DOCA_LOG_ERR("comp_queue: invalid pod_idx=%d for req_id=%u", entry->pod_idx, req_id);
-        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id);
+        if (!forward_error_ack(objs, src_pod, req_id, dst_pod_id))
+            return 0;   /* SPSC full — retain entry, retry next iter */
         return -1;
     }
 
@@ -164,10 +234,11 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
     struct pod_state *target_pod = echo_mode ? src_pod
                                              : find_pod_by_id(objs, dst_pod_id);
 
-    if (!target_pod || !target_pod->tx_ring) {
+    if (!target_pod || !pod_data_ready(target_pod) || !target_pod->tx_ring) {
         DOCA_LOG_ERR("DMA completed: target_pod=%d not found or TX ring not ready",
                      echo_mode ? src_pod_id : dst_pod_id);
-        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id);
+        if (!forward_error_ack(objs, src_pod, req_id, dst_pod_id))
+            return 0;
         return -1;
     }
 
@@ -195,7 +266,8 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
                      req_id, dst_pod_id, doca_error_get_descr(fwd_result));
         /* Reverse will not fire — release src host's TX slot now so the
          * caller doesn't stall on 2s reclaim. */
-        send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id);
+        if (!forward_error_ack(objs, src_pod, req_id, dst_pod_id))
+            return 0;
         return -1;
     }
 
@@ -267,6 +339,54 @@ process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
     int32_t target_id = echo_mode ? entry->src_pod_id : entry->dst_pod_id;
     struct pod_state *target_pod = find_pod_by_id(objs, target_id);
 
+    if (objs->split_send == SPLIT_SENDS) {
+        /* Hand both egress sends to thread B. DMA_COMPLETION (→dst) and TX_ACK
+         * (→src) are pushed as an all-or-nothing PAIR so a partial enqueue
+         * can't split a request and desync src TX-slot accounting. SPSC-full →
+         * return 0 so the comp_queue entry is RETAINED and backpressure flows
+         * through comp_queue (BP_HIGH → deferred_recv → DPA stall), NOT a side
+         * buffer. Order DMA_COMPLETION-before-TX_ACK is preserved (single SPSC,
+         * FIFO drain) — load-bearing only for the echo same-conn case. */
+        struct pod_state *src_pod = echo_mode ? target_pod
+                                              : find_pod_by_id(objs, entry->src_pod_id);
+        int have_dst = (target_pod && target_pod->connection);
+        int have_src = (src_pod && src_pod->connection);
+        int need = (have_dst ? 1 : 0) + (have_src ? 1 : 0);
+        if (need == 0) {
+            DOCA_LOG_ERR("REV_NOTIFY: target pod %d not found or no connection", target_id);
+            return -1;   /* nothing deliverable — drop (host 2s reclaim) */
+        }
+        if (send_spsc_free(&objs->send_spsc) < (uint32_t)need)
+            return 0;    /* retain entry → comp_queue backpressure */
+        if (have_dst) {
+            send_req_t c;
+            c.conn       = target_pod->connection;
+            c.kind       = SEND_REQ_DMA_COMPLETION;
+            c.flags      = entry->flags;
+            c.src_pod_id = entry->src_pod_id;
+            c.dst_pod_id = entry->dst_pod_id;
+            c.pos        = entry->buf_offset;
+            c.length     = entry->length;
+            c.req_id     = entry->req_id;
+            send_spsc_push(&objs->send_spsc, &c);
+        } else {
+            DOCA_LOG_ERR("REV_NOTIFY: target pod %d not found or no connection", target_id);
+        }
+        if (have_src) {
+            send_req_t a;
+            a.conn       = src_pod->connection;
+            a.kind       = SEND_REQ_TX_ACK;
+            a.flags      = 0;
+            a.src_pod_id = entry->src_pod_id;
+            a.dst_pod_id = entry->dst_pod_id;
+            a.pos        = 0;
+            a.length     = 0;
+            a.req_id     = entry->req_id;
+            send_spsc_push(&objs->send_spsc, &a);
+        }
+        return 1;
+    }
+
     if (!target_pod || !target_pod->connection) {
         DOCA_LOG_ERR("REV_NOTIFY: target pod %d not found or no connection", target_id);
         /* Still try to release the src's TX slot — reverse DMA already
@@ -279,7 +399,7 @@ process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
 
     /* Send DMA_COMPLETION to destination Host pod via comch control path */
     struct dmesh_dma_completion_msg comp_msg;
-    comp_msg.type = DMESH_MSG_DMA_COMPLETION;
+    comp_msg.type = DMESH_MSG_REV_DONE;
     comp_msg.pos = entry->buf_offset;
     comp_msg.length = entry->length;
     comp_msg.req_id = entry->req_id;
@@ -362,6 +482,95 @@ process_completion_queue(struct objects *objs, int max_batch)
     return processed;
 }
 
+/* ====== Thread B drain — rebalanced (SPLIT_REBAL) ======
+ * B drains the raw-completion work_spsc and does the FULL per-RTT work: route
+ * (find_pod_by_id), reverse-DMA enqueue (process_forward_entry → dst tx_ring),
+ * and the inline comch sends (process_rev_notify_entry, mode != SPLIT_SENDS).
+ * Same peek/retain contract as process_completion_queue: result 0 = retain
+ * (TX-ring or send pool busy) → stop draining → work_spsc fills → A's recv-cb
+ * trips backpressure (ingest_usage ≥ BP_HIGH) → DPA stall. Single producer of
+ * every tx_ring here is thread B (A only feeds work_spsc), so the reverse
+ * desc post stays single-writer. */
+static int
+process_work_spsc(struct objects *objs, int max_batch)
+{
+    int processed = 0;
+    while (processed < max_batch) {
+        dpu_comp_entry_t *entry = work_spsc_peek(&objs->work_spsc);
+        if (!entry)
+            break;
+
+        int result;
+        if (entry->entry_type == COMP_ENTRY_REV_NOTIFY)
+            result = process_rev_notify_entry(objs, entry);
+        else
+            result = process_forward_entry(objs, entry);
+        if (result == 0)
+            break;   /* busy — retain entry, retry next iter */
+
+        work_spsc_pop(&objs->work_spsc);
+        processed++;
+    }
+    return processed;
+}
+
+/* ====== Thread B — egress sends (SPLIT_SEND) ======
+ * Owns objs->pe (comch control PE) + the comch send pool. Drains the A→B SPSC
+ * and submits the DMA_COMPLETION / TX_ACK that thread A produced. Peek-and-retry
+ * on DOCA_ERROR_AGAIN: a full send pool stops the drain, the SPSC then fills,
+ * thread A retains comp_queue entries, and the existing comp_queue→DPA
+ * backpressure engages. objs->pe is progressed every loop so send completions
+ * are reaped (freeing the pool) and control messages (connection / REGISTER /
+ * EXPORT_DESC / POD_CONSUMER_ID) are serviced — all on this thread, so cc_server
+ * has exactly one submitter+progressor (no concurrent-submit hazard). */
+static void *
+run_send_thread(void *arg)
+{
+    struct objects *objs = (struct objects *)arg;
+    dmesh_pin_thread(pthread_self(), objs->arm_core_b);
+    DOCA_LOG_INFO("DPU send thread (B) running (core=%d)", objs->arm_core_b);
+
+    while (true) {
+        doca_pe_progress(objs->pe);
+
+        if (objs->split_send == SPLIT_REBAL) {
+            /* Rebalanced: B does the whole route+reverse+send half off work_spsc. */
+            process_work_spsc(objs, 128);
+            drain_deferred_tx_acks(objs);
+            continue;
+        }
+
+        /* SPLIT_SENDS: B only submits the sends A queued. */
+        int budget = 256;   /* bound so send-completion reaping isn't starved */
+        while (budget-- > 0) {
+            send_req_t *r = send_spsc_peek(&objs->send_spsc);
+            if (!r)
+                break;
+            doca_error_t rc;
+            if (r->kind == SEND_REQ_DMA_COMPLETION) {
+                struct dmesh_dma_completion_msg m;
+                m.type       = DMESH_MSG_REV_DONE;
+                m.pos        = r->pos;
+                m.length     = r->length;
+                m.req_id     = r->req_id;
+                m.src_pod_id = r->src_pod_id;
+                m.dst_pod_id = r->dst_pod_id;
+                m.flags      = r->flags;
+                rc = server_send_msg_to_conn(objs, r->conn,
+                                             (const char *)&m, sizeof(m));
+            } else {
+                rc = server_send_tx_ack_to(objs, r->conn, r->req_id, r->dst_pod_id);
+            }
+            if (rc == DOCA_ERROR_AGAIN)
+                break;   /* pool full — retry next iter after objs->pe progress */
+            /* success or hard error: consume. Hard error falls back to the
+             * host's 2s slot reclaim, same as the single-thread path. */
+            send_spsc_pop(&objs->send_spsc);
+        }
+    }
+    return NULL;
+}
+
 /* ====== DPU Worker ====== */
 
 void
@@ -383,6 +592,30 @@ run_dpu_worker(struct objects *objs)
     objs->comp_queue.head = 0;
     objs->comp_queue.tail = 0;
     objs->num_deferred_recv = 0;
+
+    /* Functional pipeline split (DPUMESH_SPLIT_SEND): 0=off, 1=sends-only,
+     * 2=rebalanced. Non-zero runs a second ARM core (thread B). Default off →
+     * byte-identical single loop. */
+    {
+        const char *se = getenv("DPUMESH_SPLIT_SEND");
+        int mode = se ? atoi(se) : 0;
+        if (mode < SPLIT_OFF || mode > SPLIT_REBAL) mode = SPLIT_OFF;
+        objs->split_send = mode;
+        const char *ca = getenv("DPUMESH_ARM_CORE_A");
+        const char *cb = getenv("DPUMESH_ARM_CORE_B");
+        objs->arm_core_a = ca ? atoi(ca) : 2;
+        objs->arm_core_b = cb ? atoi(cb) : 3;
+        objs->send_spsc.head = 0;
+        objs->send_spsc.tail = 0;
+        objs->work_spsc.head = 0;
+        objs->work_spsc.tail = 0;
+        pthread_mutex_init(&objs->consumer_lock, NULL);
+        DOCA_LOG_INFO("DPUMESH_SPLIT_SEND=%d (%s) (A=core %d, B=core %d)",
+                      objs->split_send,
+                      objs->split_send == SPLIT_REBAL ? "rebalanced" :
+                      objs->split_send == SPLIT_SENDS ? "sends-only" : "off",
+                      objs->arm_core_a, objs->arm_core_b);
+    }
 
     /* 1. comch control path server (waits for first connection) */
     result = init_comch_ctrl_path_server("DPUMesh", objs, true);
@@ -442,29 +675,59 @@ run_dpu_worker(struct objects *objs)
 
     DOCA_LOG_INFO("DPU worker initialized (event-based), entering main loop");
 
+    /* SPLIT_SEND: pin this thread (A = consumer_pe / route) and spawn thread B
+     * (egress sends, owns objs->pe). All single-threaded init above is done, so
+     * objs->pe is now handed exclusively to B; A stops progressing it below. */
+    if (objs->split_send) {
+        dmesh_pin_thread(pthread_self(), objs->arm_core_a);
+        int rc = pthread_create(&objs->send_thread, NULL, run_send_thread, objs);
+        if (rc != 0) {
+            DOCA_LOG_ERR("SPLIT_SEND: pthread_create failed (%d) — falling back to single thread", rc);
+            objs->split_send = 0;
+        } else {
+            DOCA_LOG_INFO("SPLIT_SEND active: A(route)=core %d, B(send)=core %d",
+                          objs->arm_core_a, objs->arm_core_b);
+        }
+    }
+
     /* Main loop: poll consumer PE + ctrl path PE + per-pod producer PE */
     clock_gettime(CLOCK_MONOTONIC, &last);
     last_kick = last;
     while (true) {
-        doca_pe_progress(objs->consumer_pe);
-        doca_pe_progress(objs->pe);  /* handle new connections, REGISTER, TX_DATA */
+        if (objs->split_send) {
+            /* Thread A owns consumer_pe; thread B owns objs->pe + sends. Hold
+             * consumer_lock around consumer_pe progress so the rare pod-setup
+             * path on B (which progresses consumer_pe via DPU→DPA msgq sends)
+             * never runs concurrently. Uncontended on the steady path. */
+            pthread_mutex_lock(&objs->consumer_lock);
+            doca_pe_progress(objs->consumer_pe);
+            pthread_mutex_unlock(&objs->consumer_lock);
+            /* objs->pe progress + drain_deferred_tx_acks are B's job now. */
+        } else {
+            doca_pe_progress(objs->consumer_pe);
+            doca_pe_progress(objs->pe);  /* handle new connections, REGISTER, TX_DATA */
 
-        /* Retry any TX_ACKs that were deferred when the comch send pool was
-         * full. Done right after pe_progress so the just-released send-pool
-         * slots are available. */
-        drain_deferred_tx_acks(objs);
+            /* Retry any TX_ACKs that were deferred when the comch send pool was
+             * full. Done right after pe_progress so the just-released send-pool
+             * slots are available. */
+            drain_deferred_tx_acks(objs);
+        }
 
         /* Drain deferred completion queue (reverse DMA enqueue).
+         * SPLIT_REBAL: thread B drains work_spsc instead — A is consumer_pe
+         * drain ONLY here. SPLIT_OFF/SENDS: A routes + posts reverse DMA.
          * 128 entries per batch — safe because consumer_pe is progressed
          * inside the loop, keeping DPA recv tasks recycled. */
-        process_completion_queue(objs, 128);
+        if (objs->split_send != SPLIT_REBAL)
+            process_completion_queue(objs, 128);
 
-        /* Backpressure release: resubmit deferred recv tasks when queue
-         * drains below BP_LOW. This resumes DPA→DPU message flow.
-         * Gate each submit on recv task pool capacity; preserve un-submitted
-         * tasks by shifting them to the front instead of zeroing count. */
+        /* Backpressure release: resubmit deferred recv tasks when the ingest
+         * hand-off (comp_queue, or work_spsc under SPLIT_REBAL) drains below
+         * BP_LOW. This resumes DPA→DPU message flow. Gate each submit on recv
+         * task pool capacity; preserve un-submitted tasks by shifting them to
+         * the front instead of zeroing count. */
         if (objs->num_deferred_recv > 0 &&
-            comp_queue_usage(&objs->comp_queue) < COMP_QUEUE_BP_LOW) {
+            ingest_usage(objs) < COMP_QUEUE_BP_LOW) {
             int remaining = 0;
             int resubmitted = 0;
             int original = objs->num_deferred_recv;
@@ -511,7 +774,11 @@ run_dpu_worker(struct objects *objs)
             if (objs->dpa_thread_running_any) {
                 struct comch_msg trigger;
                 memset(&trigger, 0, sizeof(trigger));
-                trigger.type = COMCH_MSG_TYPE_TRIGGER;
+                trigger.type = DPA_MSG_WAKE;
+                /* dpa_comches[k]->send is a consumer_pe-bound producer; under
+                 * SPLIT_SEND take consumer_lock so this never races B's
+                 * setup-time ADD_RING sends on the same producer. */
+                if (objs->split_send) pthread_mutex_lock(&objs->consumer_lock);
                 /* Each running EU has its own channel and reschedules
                  * independently when idle, so every started EU needs its own
                  * keepalive to be woken within ~1 ms. */
@@ -520,6 +787,7 @@ run_dpu_worker(struct objects *objs)
                         (void)dmesh_doca_dpa_msgq_send_try(&objs->dpa_comches[k]->send,
                                                             &trigger, sizeof(trigger));
                 }
+                if (objs->split_send) pthread_mutex_unlock(&objs->consumer_lock);
             }
             last_kick = now;
         }

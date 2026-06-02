@@ -40,6 +40,8 @@
  * from ALL source pods that target it. With N concurrent sources targeting
  * one dst, worst-case dst staging occupancy is N × this size. Single-source
  * workloads fit exactly; multi-source needs a scaled DPU_BUFFER_SIZE. */
+/* 16MB = 2048×8KB. §10.7 tried 32MB/4096: throughput flat, latency ∝ depth
+ * (fixed-rate-server signature) → NOT depth-bound, reverted. */
 #define DPU_BUFFER_SIZE     (16 * 1024 * 1024)  /* 16MB = 2048 × 8KB */
 #define DPUMESH_SLOT_SIZE   8192               /* matches DPUMESH_SLOT_SIZE_DEFAULT */
 /* DMA descriptor ring depth (host→DPU forward). Mirrored from ring.h so

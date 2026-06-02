@@ -31,8 +31,18 @@ export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer
     DOCA_LOG_INFO("Successfully exported local mmap to DPU, export descriptor length: %zu bytes",
                   export_desc_len);
 
+    /* Bound the export descriptor against the fixed staging buffer before the
+     * memcpy below. The DOCA PCI export descriptor is normally small, but a
+     * future DOCA/firmware version could exceed this; without the guard that
+     * would smash the stack. */
+    if (export_desc_len > sizeof(export_msg) - sizeof(struct dmesh_mmap_msg)) {
+        DOCA_LOG_ERR("export_desc_len=%zu exceeds staging buffer capacity %zu",
+                     export_desc_len, sizeof(export_msg) - sizeof(struct dmesh_mmap_msg));
+        return DOCA_ERROR_TOO_BIG;
+    }
+
     msg = (struct dmesh_mmap_msg *)export_msg;
-    msg->type = DMESH_MSG_EXPORT_DESC;
+    msg->type = DMESH_MSG_MMAP_EXPORT;
     msg->mmap_type = mmap_type;
     msg->host_addr = (void *)htonq((uint64_t)buffer);
     msg->buf_size = htonq((uint64_t)buf_size);
@@ -114,9 +124,16 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		      pod->pod_id, mmap_msg->mmap_type,
 		      (void *)pod->ring_mmap, (void *)pod->remote_mmap, (void *)pod->host_rx_mmap);
 
-	/* Trigger per-pod DMA setup when both forward-direction mmaps have arrived */
+	/* Trigger per-pod DMA setup when both forward-direction mmaps have arrived.
+	 * setup_pod_dma / update_rev_ring_host_rx send ADD_RING/ADD_REV_RING to the
+	 * DPA, which progress consumer_pe internally. This callback runs on
+	 * objs->pe (thread B under SPLIT_SEND), so take consumer_lock to serialize
+	 * against thread A's consumer_pe progress. Rare (pod registration), so the
+	 * coarse lock costs nothing on the steady path. */
 	if (pod->ring_mmap && pod->remote_mmap && !pod->dma_ready) {
+		if (objs->split_send) pthread_mutex_lock(&objs->consumer_lock);
 		result = setup_pod_dma(objs, pod);
+		if (objs->split_send) pthread_mutex_unlock(&objs->consumer_lock);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("setup_pod_dma failed for pod %d: %s",
 				     pod->pod_id, doca_error_get_descr(result));
@@ -126,7 +143,9 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 
 	/* If Host RX buffer arrived after DMA setup, update the DPA reverse ring info */
 	if (mmap_msg->mmap_type == DMA_HOST_RX_BUFFER && pod->dma_ready) {
+		if (objs->split_send) pthread_mutex_lock(&objs->consumer_lock);
 		result = update_rev_ring_host_rx(objs, pod);
+		if (objs->split_send) pthread_mutex_unlock(&objs->consumer_lock);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_WARN("update_rev_ring_host_rx failed for pod %d: %s",
 				      pod->pod_id, doca_error_get_descr(result));

@@ -13,21 +13,19 @@ enum msg_direction {
     DPU_TO_HOST = 1,
 };
 
+/* Control-channel message types (Host ↔ DPU ARM, over the DOCA Comch control
+ * path). Explicit values, contiguous from 1; 0 is reserved INVALID so a zeroed
+ * buffer never decodes to a live type. The verb vocabulary (POD_, MMAP_, FWD_,
+ * REV_) is shared with the DPU<->DPA datapath enum (enum dpa_msg_type) for a
+ * consistent naming scheme across both channels. The type travels on the wire
+ * as the low byte of this field; the host dispatches by reading a single byte
+ * (little-endian), so values must stay < 256. */
 enum dmesh_msg_type {
-    DMESH_MSG_EXPORT_DESC,
-    DMESH_MSG_EXPORT_DPA_COMP,
-    DMESH_MSG_RX_DATA,
-    DMESH_MSG_REGISTER,          /* Host→DPU: register pod_id */
-    DMESH_MSG_CONSUMER_ID,       /* DPU→Host: consumer ID reply */
-    DMESH_MSG_TX_ACK,            /* DPU→Host: forward DMA consumed, sender can free TX slot */
-    DMESH_MSG_POD_CONSUMER_ID,   /* Host→DPU: advertise host datapath consumer ID */
-    DMESH_MSG_DMA_COMPLETION,    /* DPU→Host: reverse DMA completed, data in Host RX buffer */
-};
-
-/* DPU→Host: tell the client what consumer ID to use for producer */
-struct dmesh_consumer_id_msg {
-    enum dmesh_msg_type type;   /* = DMESH_MSG_CONSUMER_ID */
-    uint32_t consumer_id;
+    DMESH_MSG_INVALID      = 0, /* reserved: zeroed buffer is never a live type */
+    DMESH_MSG_POD_REGISTER = 1, /* Host→DPU: register this connection's pod_id */
+    DMESH_MSG_MMAP_EXPORT  = 2, /* Host→DPU: export an mmap region (ring / TX buf / RX buf) */
+    DMESH_MSG_FWD_ACK      = 3, /* DPU→Host: forward DMA (CPU→DPU) consumed — free TX slot */
+    DMESH_MSG_REV_DONE     = 4, /* DPU→Host: reverse DMA (DPU→CPU) done — data in Host RX buf */
 };
 
 enum mmap_type {
@@ -52,37 +50,44 @@ typedef uint64_t doca_dpa_dev_comch_consumer_t;
 
 /* Host→DPU: register this connection's pod_id */
 struct dmesh_register_msg {
-    enum dmesh_msg_type type;   /* = DMESH_MSG_REGISTER */
+    enum dmesh_msg_type type;   /* = DMESH_MSG_POD_REGISTER */
     int32_t pod_id;
     char app_name[64];
 };
 
-/* Host→DPU: advertise this pod's datapath consumer ID for DPU→Host payload sends */
-struct dmesh_pod_consumer_id_msg {
-    enum dmesh_msg_type type;   /* = DMESH_MSG_POD_CONSUMER_ID */
-    int32_t pod_id;
-    uint32_t consumer_id;
-};
-
 /* DPU→Host: per-request notification that forward DMA (CPU→DPU) is done —
  * sender can release the TX slot tied to req_id. Pure event signal; DPU does
- * NOT communicate any flow-control position. */
+ * NOT communicate any flow-control position. 1-byte type (host dispatches by
+ * reading a single byte). The old int32 dst_pod_id was set by the sender but
+ * never read by the host (the slot is freed by req_id alone) — dropped. */
 struct dmesh_tx_ack_msg {
-    enum dmesh_msg_type type;   /* = DMESH_MSG_TX_ACK */
+    uint8_t  type;       /* = DMESH_MSG_FWD_ACK */
+    uint8_t  _pad[3];    /* align req_id to its natural 4B boundary */
     uint32_t req_id;
-    int32_t dst_pod_id;
 };
+_Static_assert(sizeof(struct dmesh_tx_ack_msg) == 8,
+               "dmesh_tx_ack_msg must pack to 8B");
 
-/* DPU→Host: reverse DMA (DPU→CPU) completion — data landed in Host RX buffer */
+/* DPU→Host: reverse DMA (DPU→CPU) completion — data landed in Host RX buffer.
+ *
+ * Byte-identical to struct comch_dma_comp_msg (dpa_common.h): the DPA emits
+ * that 16B packed struct to the DPU (DPA_MSG_REV_DONE) and the DPU relays the
+ * SAME content up to the host. type is 1 byte (not the 4-byte enum) so the
+ * layout matches the DPA struct exactly — only the type byte is rewritten
+ * (DPA_MSG_REV_DONE → DMESH_MSG_REV_DONE) on relay. The host dispatches control
+ * messages by reading type as a single byte, so the 1-byte type here and the
+ * 4-byte enum on the other Family-A messages both dispatch correctly. */
 struct dmesh_dma_completion_msg {
-    enum dmesh_msg_type type;   /* = DMESH_MSG_DMA_COMPLETION */
-    uint32_t pos;               /* offset in Host RX DMA buffer */
-    uint32_t length;            /* DMA'd body length */
+    uint8_t  type;        /* = DMESH_MSG_REV_DONE */
+    int8_t   flags;       /* OP_REQUEST/OP_RESPONSE + CASE_* */
+    int8_t   src_pod_id;
+    int8_t   dst_pod_id;
+    uint32_t pos;         /* offset in Host RX DMA buffer */
+    uint32_t length;      /* DMA'd body length */
     uint32_t req_id;
-    int32_t src_pod_id;
-    int32_t dst_pod_id;
-    int8_t flags;
 };
+_Static_assert(sizeof(struct dmesh_dma_completion_msg) == 16,
+               "dmesh_dma_completion_msg must pack to 16B (mirrors comch_dma_comp_msg)");
 
 
 

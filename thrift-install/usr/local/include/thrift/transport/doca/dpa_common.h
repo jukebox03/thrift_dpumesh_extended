@@ -78,19 +78,25 @@ struct dpa_thread_arg {
  * Flow control is handled end-to-end at the application layer via slot-
  * based admission. DPU/DPA do not interpret any byte-position field. */
 
-/* ====== Comch message types (DPU ↔ DPA) ====== */
-
-enum comch_msg_type {
-	COMCH_MSG_TYPE_DMA_COMPLETED = 2,
-	COMCH_MSG_TYPE_ADD_RING = 3,
-	COMCH_MSG_TYPE_TRIGGER = 4,   /* DPU→DPA: wake up thread (no payload) */
-	COMCH_MSG_TYPE_ADD_REV_RING = 6, /* DPU→DPA: add reverse (DPU→CPU) ring */
-	COMCH_MSG_TYPE_REV_DMA_COMPLETED = 7, /* DPA→DPU: reverse DMA completed (DPU→CPU) */
+/* ====== Datapath message types (DPU ARM ↔ DPA) ======
+ * Exchanged over the doca_comch_msgq between the DPU ARM and the DPA EU kernel.
+ * Explicit values, contiguous from 1; 0 is reserved INVALID so a zeroed buffer
+ * hits the default-reject arm (fail-safe). The verb vocabulary (RING_, WAKE,
+ * FWD_, REV_) mirrors the control enum (enum dmesh_msg_type) for a consistent
+ * naming scheme across both channels. (Legacy gaps {0,1,5} held removed types
+ * DMA_REQ / NEW_DESC / DMA_CHUNK and are gone.) */
+enum dpa_msg_type {
+	DPA_MSG_INVALID      = 0, /* reserved: zeroed buffer hits default-reject */
+	DPA_MSG_RING_ADD     = 1, /* DPU→DPA: add forward (CPU→DPU) ring */
+	DPA_MSG_REV_RING_ADD = 2, /* DPU→DPA: add reverse (DPU→CPU) ring */
+	DPA_MSG_WAKE         = 3, /* DPU→DPA: wake up the EU thread (no payload) */
+	DPA_MSG_FWD_DONE     = 4, /* DPA→DPU: forward DMA completed (CPU→DPU) */
+	DPA_MSG_REV_DONE     = 5, /* DPA→DPU: reverse DMA completed (DPU→CPU) */
 };
 
 /* Packed to exactly 16 bytes (one WQE BB) to minimize PCIe immediate-data cost
  * on dma_copy. Field widths chosen to preserve semantics:
- *   type        : 1B  — only 2 values used (DMA_COMPLETED, REV_DMA_COMPLETED)
+ *   type        : 1B  — only 2 values used (DPA_MSG_FWD_DONE, DPA_MSG_REV_DONE)
  *   flags       : 1B  — OP_REQUEST/OP_RESPONSE + CASE_* (bit-flag set)
  *   src/dst_pod : 1B  — MAX_PODS=8 + -1 sentinel fits in int8
  *   pos         : 4B  — buffer offset (DPU buf / Host RX buf)
@@ -101,7 +107,7 @@ enum comch_msg_type {
  * int8 + 3B pad); §11.3 E5 showed 12B→24B = -8.6% throughput, so dropping the
  * struct from 32B HW quantum to 16B HW quantum is the inverse of that. */
 struct comch_dma_comp_msg {
-	uint8_t  type;        /* one of: COMCH_MSG_TYPE_DMA_COMPLETED, _REV_DMA_COMPLETED */
+	uint8_t  type;        /* one of: DPA_MSG_FWD_DONE, DPA_MSG_REV_DONE */
 	int8_t   flags;       /* OP_REQUEST / OP_RESPONSE + CASE_* */
 	int8_t   src_pod_id;  /* originating pod */
 	int8_t   dst_pod_id;  /* destination pod */
@@ -121,19 +127,19 @@ typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_comch_producer_t;
 
 struct comch_add_ring_msg {
-	enum comch_msg_type type;
+	enum dpa_msg_type type;
 	uint32_t _pad;
 	struct dpa_ring_info ring;
 } __attribute__((__packed__, aligned(8)));
 
 struct comch_add_rev_ring_msg {
-	enum comch_msg_type type;
+	enum dpa_msg_type type;
 	uint32_t _pad;
 	struct dpa_ring_info ring;
 } __attribute__((__packed__, aligned(8)));
 
 struct comch_msg {
-	enum comch_msg_type type;
+	enum dpa_msg_type type;
 	union
 	{
 		struct comch_dma_comp_msg dma_comp_msg;
@@ -141,6 +147,17 @@ struct comch_msg {
 		struct comch_add_rev_ring_msg add_rev_ring_msg;
 	};
 } __attribute__((__packed__, aligned(4)));
+
+/* These structs cross the host(x86) / DPU-ARM / DPA-EU toolchain boundary
+ * (dpa_ring_info is the RING_ADD/REV_RING_ADD payload and is also h2d_memcpy'd
+ * inside dpa_thread_arg; comch_msg is the configured msgq imm_data_len). Lock
+ * their layout so any ABI drift between toolchains fails the build instead of
+ * silently corrupting the wire. Sizes verified on gcc 11 (x86) / DPACC. */
+_Static_assert(sizeof(struct dpa_ring_info) == 72, "dpa_ring_info ABI drift");
+_Static_assert(sizeof(struct comch_add_ring_msg) == 80, "comch_add_ring_msg ABI drift");
+_Static_assert(sizeof(struct comch_add_rev_ring_msg) == 80, "comch_add_rev_ring_msg ABI drift");
+_Static_assert(offsetof(struct comch_add_ring_msg, ring) == 8, "comch_add_ring_msg.ring offset drift");
+_Static_assert(sizeof(struct comch_msg) == 84, "comch_msg ABI drift");
 
 /* ====== DMA ring descriptor ====== */
 

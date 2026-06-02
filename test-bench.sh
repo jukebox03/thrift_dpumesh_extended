@@ -235,11 +235,15 @@ stop_dpu() {
 start_dpu() {
     local dpa_threads="${DPUMESH_DPA_THREADS:-1}"
     local dpa_affinity="${DPUMESH_DPA_AFFINITY:-1}"
-    step "=== Starting dpumesh_dpu on DPU (DPA EU threads=$dpa_threads, affinity=$dpa_affinity) ==="
+    # DPU ARM functional split (sends on a 2nd ARM core). Off by default.
+    local split_send="${DPUMESH_SPLIT_SEND:-0}"
+    local arm_core_a="${DPUMESH_ARM_CORE_A:-2}"
+    local arm_core_b="${DPUMESH_ARM_CORE_B:-3}"
+    step "=== Starting dpumesh_dpu on DPU (DPA EU threads=$dpa_threads, affinity=$dpa_affinity, split_send=$split_send A=$arm_core_a B=$arm_core_b) ==="
     stop_dpu
     ssh "$DPU_HOST" "cat > /tmp/start_dpu_bench.sh << 'LAUNCHER'
 #!/bin/bash
-screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_DPA_THREADS=$dpa_threads DPUMESH_DPA_AFFINITY=$dpa_affinity ./dpumesh_dpu $DPU_PCI -l 40 > $DPU_LOG 2>&1\"
+screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_DPA_THREADS=$dpa_threads DPUMESH_DPA_AFFINITY=$dpa_affinity DPUMESH_SPLIT_SEND=$split_send DPUMESH_ARM_CORE_A=$arm_core_a DPUMESH_ARM_CORE_B=$arm_core_b ./dpumesh_dpu $DPU_PCI -l 40 > $DPU_LOG 2>&1\"
 sleep 2
 pgrep -f 'dpumesh_dpu.*03:00' || echo NO_PID
 LAUNCHER
@@ -398,6 +402,7 @@ spec:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
         - { name: BENCH_WORKER_ID, value: "10" }
         - { name: BENCH_DST_POD_ID, value: "11" }
+        - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-2048}" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리 (CFS quota 미사용).
         volumeMounts:
@@ -433,6 +438,7 @@ spec:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
         - { name: BENCH_WORKER_ID, value: "11" }
         - { name: ECHO_THREADS, value: "64" }
+        - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-2048}" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리.
         volumeMounts:

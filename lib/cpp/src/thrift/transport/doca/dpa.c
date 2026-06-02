@@ -69,10 +69,10 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
         goto resubmit_recv_task;
     }
 
-    enum comch_msg_type msg_type = (enum comch_msg_type)raw[0];
+    enum dpa_msg_type msg_type = (enum dpa_msg_type)raw[0];
 
     switch (msg_type) {
-        case COMCH_MSG_TYPE_DMA_COMPLETED: {
+        case DPA_MSG_FWD_DONE: {
             if (data_len < sizeof(struct comch_dma_comp_msg)) {
                 DOCA_LOG_ERR("DPA MsgQ recv: DMA_COMPLETED too short (len=%u, need=%zu)",
                              data_len, sizeof(struct comch_dma_comp_msg));
@@ -83,10 +83,13 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             int32_t dst_pod_id = comp_msg->dst_pod_id;
             uint32_t req_id = comp_msg->req_id;
 
-            /* Find the source pod's local DMA buffer for data */
+            /* Find the source pod's local DMA buffer for data. pod_data_ready
+             * ACQUIRE-loads dma_ready so the dma_buffer/handle reads below (and
+             * everything thread A does with this entry afterward) see the
+             * RELEASE-published setup fields under SPLIT_SEND. */
             struct pod_state *src_pod = find_pod_by_id(objs, src_pod_id);
-            if (!src_pod || !src_pod->dma_buffer) {
-                DOCA_LOG_ERR("DMA completed but src_pod %d not found or no buffer", src_pod_id);
+            if (!src_pod || !pod_data_ready(src_pod) || !src_pod->dma_buffer) {
+                DOCA_LOG_ERR("DMA completed but src_pod %d not found or not ready", src_pod_id);
                 break;
             }
 
@@ -116,14 +119,14 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
              * the per-RTT hot path). */
             entry.pod_idx = (int)(src_pod - objs->pods);
 
-            if (comp_queue_enqueue(&objs->comp_queue, &entry) != 0) {
+            if (ingest_push(objs, &entry) != 0) {
                 DOCA_LOG_ERR("Completion queue full, dropping req_id=%u (src=%d, dst=%d)",
                              req_id, src_pod_id, dst_pod_id);
                 /* zero-copy: no heap data to free */
             }
             break;
         }
-        case COMCH_MSG_TYPE_REV_DMA_COMPLETED: {
+        case DPA_MSG_REV_DONE: {
             /* Reverse DMA completed (DPU→CPU): DPA has DMA'd data from DPU TX
              * buffer to Host RX buffer. Enqueue for DPU worker to forward
              * completion notification to the destination Host pod via comch. */
@@ -144,13 +147,13 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             rev_entry.buf_offset = rev_comp->pos;  /* position in Host RX buffer */
             rev_entry.pod_idx = -1;
 
-            if (comp_queue_enqueue(&objs->comp_queue, &rev_entry) != 0) {
+            if (ingest_push(objs, &rev_entry) != 0) {
                 DOCA_LOG_ERR("Completion queue full, dropping REV_DMA req_id=%u",
                              rev_comp->req_id);
             }
             break;
         }
-        case COMCH_MSG_TYPE_TRIGGER:
+        case DPA_MSG_WAKE:
             break;
         default:
             DOCA_LOG_ERR("Received unknown message type: %u", msg_type);
@@ -165,7 +168,7 @@ resubmit_recv_task:
      * Main loop resubmits when queue drops below BP_LOW.
      * If submit fails (e.g. transient state), also stash so the main loop retries
      * rather than losing the task. */
-    if (comp_queue_usage(&objs->comp_queue) >= COMP_QUEUE_BP_HIGH &&
+    if (ingest_usage(objs) >= COMP_QUEUE_BP_HIGH &&
         objs->num_deferred_recv < MAX_DEFERRED_RECV) {
         objs->deferred_recv[objs->num_deferred_recv++] = task;
     } else {
@@ -1103,7 +1106,7 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
          * — the DPA thread updates its own data structures directly. */
         struct comch_add_ring_msg add_msg;
         memset(&add_msg, 0, sizeof(add_msg));
-        add_msg.type = COMCH_MSG_TYPE_ADD_RING;
+        add_msg.type = DPA_MSG_RING_ADD;
         add_msg.ring = ring_info;
 
         result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k]->send,
@@ -1146,7 +1149,7 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         {
             struct comch_msg trigger;
             memset(&trigger, 0, sizeof(trigger));
-            trigger.type = COMCH_MSG_TYPE_TRIGGER;
+            trigger.type = DPA_MSG_WAKE;
             result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k]->send,
                                                &trigger, sizeof(trigger));
             if (result != DOCA_SUCCESS) {
@@ -1244,7 +1247,7 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
 
         struct comch_add_rev_ring_msg rev_msg;
         memset(&rev_msg, 0, sizeof(rev_msg));
-        rev_msg.type = COMCH_MSG_TYPE_ADD_REV_RING;
+        rev_msg.type = DPA_MSG_REV_RING_ADD;
         rev_msg.ring = rev_ring_info;
 
         result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k]->send,
@@ -1258,7 +1261,11 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         }
     }
 
-    pod->dma_ready = 1;
+    /* RELEASE publication: all data-plane fields (dma_buffer,
+     * local_mmap_dpa_handle, tx_ring, ...) are written above; publish dma_ready
+     * last so a thread-A reader that ACQUIRE-loads dma_ready==1
+     * (pod_data_ready) is guaranteed to see them. See object.h pod_data_ready. */
+    __atomic_store_n(&pod->dma_ready, 1, __ATOMIC_RELEASE);
     return DOCA_SUCCESS;
 }
 
@@ -1321,7 +1328,7 @@ update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod)
 
     struct comch_add_rev_ring_msg rev_msg;
     memset(&rev_msg, 0, sizeof(rev_msg));
-    rev_msg.type = COMCH_MSG_TYPE_ADD_REV_RING;
+    rev_msg.type = DPA_MSG_REV_RING_ADD;
     rev_msg.ring = rev_ring_info;
 
     result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k]->send,

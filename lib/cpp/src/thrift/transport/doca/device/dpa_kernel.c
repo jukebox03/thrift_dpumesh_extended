@@ -12,6 +12,13 @@
  * HW supports up to 8KB per single call with 128B-aligned addresses.
  * Verified via DPUMesh_doca byte-level verification test. */
 #define DPA_DMA_COPY_MAX  8192
+/* The host RX staging slot is DPUMESH_SLOT_SIZE bytes; each reverse DMA is
+ * capped at DPA_DMA_COPY_MAX. If the cap exceeded the canonical slot size a
+ * reverse DMA could overflow the host RX slot, so couple them at compile time.
+ * (A host configured with a SMALLER slot_size is caught at runtime in
+ * process_rx_dma_entry.) */
+_Static_assert(DPA_DMA_COPY_MAX <= DPUMESH_SLOT_SIZE,
+               "DPA_DMA_COPY_MAX must not exceed DPUMESH_SLOT_SIZE");
 
 /* Alignment requirements for doca_dpa_dev_comch_producer_dma_copy:
  * - Source and destination addresses: 64B aligned
@@ -66,7 +73,7 @@ __dpa_rpc__ uint64_t thread_init_rpc(doca_dpa_dev_comch_consumer_t consumer, uin
 static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch_msg *msg)
 {
     switch(msg->type) {
-        case COMCH_MSG_TYPE_ADD_RING: {
+        case DPA_MSG_RING_ADD: {
             struct comch_add_ring_msg *add_msg = (struct comch_add_ring_msg *)msg;
             if (thread_arg->num_rings < MAX_DPA_RINGS) {
                 thread_arg->rings[thread_arg->num_rings] = add_msg->ring;
@@ -80,7 +87,7 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             }
             break;
         }
-        case COMCH_MSG_TYPE_ADD_REV_RING: {
+        case DPA_MSG_REV_RING_ADD: {
             struct comch_add_rev_ring_msg *add_msg = (struct comch_add_rev_ring_msg *)msg;
             /* Check if ring for this pod_id already exists (update case) */
             int found = 0;
@@ -105,7 +112,7 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             }
             break;
         }
-        case COMCH_MSG_TYPE_TRIGGER:
+        case DPA_MSG_WAKE:
             break;
         default:
             DOCA_DPA_DEV_LOG_INFO("Unknown msg type received from host: %d\n", msg->type);
@@ -220,7 +227,7 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         if (thread_arg->pos[r] + chunk > ring->dpu_buf_size)
             thread_arg->pos[r] = 0;
 
-        comp.type = COMCH_MSG_TYPE_DMA_COMPLETED;
+        comp.type = DPA_MSG_FWD_DONE;
         comp.pos = thread_arg->pos[r];
         comp.length = desc->size;
         comp.req_id = (uint32_t)desc->idx;
@@ -331,7 +338,7 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         /* src_pod_id is the ORIGINAL forward sender (set by DPU on the desc).
          * The reverse ring's ring->pod_id is the RECEIVER, so the source
          * identity must come from the descriptor. */
-        comp.type = COMCH_MSG_TYPE_REV_DMA_COMPLETED;
+        comp.type = DPA_MSG_REV_DONE;
         comp.pos = thread_arg->rev_pos[r];
         comp.length = desc->size;
         comp.req_id = (uint32_t)desc->idx;

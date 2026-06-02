@@ -108,6 +108,124 @@ typedef struct {
     int32_t   dst_pod_id;
 } deferred_tx_ack_t;
 
+/* ====== DPU ARM functional-split modes (DPUMESH_SPLIT_SEND) ======
+ *   0 SPLIT_OFF   — single worker thread (default, byte-identical to legacy).
+ *   1 SPLIT_SENDS — sends-only cut: A = consumer_pe drain + route + reverse-DMA
+ *                   enqueue; B = comch sends. A→B hand-off = send_spsc (send_req).
+ *                   (Measured a throughput no-op: sends aren't the binding work.)
+ *   2 SPLIT_REBAL — rebalanced cut: A = consumer_pe drain ONLY (feed work_spsc);
+ *                   B = route + reverse-DMA enqueue + inline comch sends.
+ *                   A→B hand-off = work_spsc (raw dpu_comp_entry_t). Tests whether
+ *                   the route/reverse half is the per-RTT cap vs the ingest funnel. */
+#define SPLIT_OFF    0
+#define SPLIT_SENDS  1
+#define SPLIT_REBAL  2
+
+/* ====== A→B egress send hand-off (SPLIT_SENDS) ======
+ * Thread A (consumer_pe) drains DPA→DPU completions, routes, posts reverse DMA
+ * to the destination tx_ring, and on a send pushes a send_req here instead of
+ * calling the comch send path. Thread B (objs->pe) drains this ring and submits
+ * the actual comch sends (DMA_COMPLETION + TX_ACK) + reaps send completions.
+ * A is the sole producer (tail), B the sole consumer (head) — bounded SPSC,
+ * atomic head/tail, no lock. Sized ≥ 2× DPU_COMP_QUEUE_SIZE so a worst case of
+ * "every comp_queue entry is a REV_NOTIFY → 2 sends" still fits without the
+ * SPSC filling before the comp_queue. Backpressure is expressed THROUGH
+ * comp_queue retention (process_completion_queue returns 0 on SPSC-full),
+ * preserving the existing comp_queue≥BP_HIGH → deferred_recv → DPA
+ * is_consumer_empty stall as the single rate-matcher. 8192 ≥ 2×BP_HIGH(3072)
+ * so the comp_queue trips backpressure before the SPSC saturates. */
+#define SEND_SPSC_SIZE 8192    /* power of two */
+
+#define SEND_REQ_DMA_COMPLETION 0
+#define SEND_REQ_TX_ACK         1
+
+typedef struct {
+    struct doca_comch_connection *conn;
+    uint8_t  kind;        /* SEND_REQ_DMA_COMPLETION | SEND_REQ_TX_ACK */
+    int8_t   flags;
+    int32_t  src_pod_id;
+    int32_t  dst_pod_id;
+    uint32_t pos;
+    uint32_t length;
+    uint32_t req_id;
+} send_req_t;
+
+typedef struct {
+    send_req_t entries[SEND_SPSC_SIZE];
+    _Atomic uint32_t head;   /* consumer index (thread B) */
+    _Atomic uint32_t tail;   /* producer index (thread A) */
+} send_spsc_t;
+
+/* Free-running indices masked on access; usable capacity = SIZE-1. */
+CQ_INLINE uint32_t send_spsc_free(const send_spsc_t *q) {
+    uint32_t head = atomic_load_explicit(&q->head, memory_order_acquire);
+    uint32_t tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
+    return (SEND_SPSC_SIZE - 1u) - ((tail - head) & (SEND_SPSC_SIZE - 1u));
+}
+/* Producer (A): caller must ensure send_spsc_free() ≥ 1 first. */
+CQ_INLINE void send_spsc_push(send_spsc_t *q, const send_req_t *r) {
+    uint32_t tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
+    q->entries[tail & (SEND_SPSC_SIZE - 1u)] = *r;
+    atomic_store_explicit(&q->tail, tail + 1u, memory_order_release);
+}
+/* Consumer (B): peek head without removing (NULL if empty). */
+CQ_INLINE send_req_t *send_spsc_peek(send_spsc_t *q) {
+    uint32_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&q->tail, memory_order_acquire);
+    if (head == tail) return NULL;
+    return &q->entries[head & (SEND_SPSC_SIZE - 1u)];
+}
+/* Consumer (B): pop head after a successful send. */
+CQ_INLINE void send_spsc_pop(send_spsc_t *q) {
+    uint32_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
+    atomic_store_explicit(&q->head, head + 1u, memory_order_release);
+}
+
+/* ====== A→B completion hand-off (SPLIT_REBAL) ======
+ * Raw dpu_comp_entry_t SPSC: thread A's recv-cb pushes every completion here
+ * (instead of comp_queue); thread B drains it and does the full route +
+ * reverse-DMA enqueue + inline send. comp_queue stays untouched in this mode so
+ * SPLIT_OFF/SPLIT_SENDS are unaffected. Backpressure: A's recv-cb gates recv-task
+ * resubmission on work_spsc_usage ≥ BP_HIGH (same threshold as comp_queue), so
+ * a slow B → work_spsc fills → DPA is_consumer_empty stall (single rate-matcher,
+ * mirrors the comp_queue chain). Same size as comp_queue. */
+#define WORK_SPSC_SIZE 8192    /* power of two */
+
+typedef struct {
+    dpu_comp_entry_t entries[WORK_SPSC_SIZE];
+    _Atomic uint32_t head;   /* consumer index (thread B) */
+    _Atomic uint32_t tail;   /* producer index (thread A) */
+} work_spsc_t;
+
+CQ_INLINE uint32_t work_spsc_usage(const work_spsc_t *q) {
+    uint32_t head = atomic_load_explicit(&q->head, memory_order_acquire);
+    uint32_t tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
+    return (tail - head) & (WORK_SPSC_SIZE - 1u);
+}
+/* Producer (A): push one completion; returns -1 if full (caller drops, like
+ * comp_queue_enqueue), 0 on success. */
+CQ_INLINE int work_spsc_push(work_spsc_t *q, const dpu_comp_entry_t *e) {
+    uint32_t head = atomic_load_explicit(&q->head, memory_order_acquire);
+    uint32_t tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
+    if (((tail - head) & (WORK_SPSC_SIZE - 1u)) >= (WORK_SPSC_SIZE - 1u))
+        return -1;   /* full */
+    q->entries[tail & (WORK_SPSC_SIZE - 1u)] = *e;
+    atomic_store_explicit(&q->tail, tail + 1u, memory_order_release);
+    return 0;
+}
+/* Consumer (B): peek head (NULL if empty) — pointer stays valid until pop. */
+CQ_INLINE dpu_comp_entry_t *work_spsc_peek(work_spsc_t *q) {
+    uint32_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&q->tail, memory_order_acquire);
+    if (head == tail) return NULL;
+    return &q->entries[head & (WORK_SPSC_SIZE - 1u)];
+}
+/* Consumer (B): pop head after the entry is fully processed. */
+CQ_INLINE void work_spsc_pop(work_spsc_t *q) {
+    uint32_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
+    atomic_store_explicit(&q->head, head + 1u, memory_order_release);
+}
+
 /* ====== DOCA task pool capacity tracking (check-first model) ======
  * DOCA does not expose in-flight task counts, so we mirror them at
  * submit/completion boundaries. Submits are gated on our counter rather
@@ -130,9 +248,8 @@ struct pod_state {
     struct doca_comch_connection *connection;
     int32_t pod_id;
     char app_name[64];
-    int registered;         /* 1 = DMESH_MSG_REGISTER received */
+    int registered;         /* 1 = DMESH_MSG_POD_REGISTER received */
     int dma_ready;          /* 1 = both mmaps arrived, DPA ring added */
-    uint32_t remote_consumer_id; /* Host datapath consumer ID (for DPU->Host payload) */
 
     /* Per-pod mmap (Host에서 export, CPU→DPU forward direction) */
     struct doca_mmap *ring_mmap;
@@ -177,6 +294,18 @@ struct pod_state {
      * Used by DPA admission gate as the cap on in-flight reverse DMAs. */
     uint32_t rq_depth;
 };
+
+/* Data-plane publication gate. `dma_ready` is set with RELEASE at the END of
+ * setup_pod_dma (after dma_buffer / local_mmap_dpa_handle / tx_ring are all
+ * written). Under DPUMESH_SPLIT_SEND the setup writes run on thread B while the
+ * hot path reads run on thread A, so the `registered` gate (published at REGISTER
+ * time, before EXPORT_DESC/setup) is NOT sufficient for the data fields — they
+ * are written later. ACQUIRE-loading dma_ready before dereferencing dma_buffer/
+ * tx_ring/local_mmap_dpa_handle establishes the missing happens-before. In the
+ * single-thread (non-split) build this is a plain "is this pod set up" check. */
+static inline int pod_data_ready(const struct pod_state *pod) {
+    return __atomic_load_n(&pod->dma_ready, __ATOMIC_ACQUIRE);
+}
 
 struct objects {
     struct doca_dev *dev;
@@ -298,7 +427,41 @@ struct objects {
     struct doca_task *consumer_retry[MAX_CONSUMER_RETRY];
     int num_consumer_retry;
     pthread_mutex_t consumer_retry_lock;
+
+    /* ====== Functional pipeline split (DPUMESH_SPLIT_SEND) — DPU only ======
+     * Mode int: SPLIT_OFF(0) / SPLIT_SENDS(1) / SPLIT_REBAL(2). Non-zero spawns
+     * thread B (run_send_thread, owns objs->pe + send pool); thread A
+     * (run_dpu_worker loop) owns consumer_pe. SPLIT_SENDS: A routes + posts
+     * reverse DMA, hands sends to B via send_spsc. SPLIT_REBAL: A only drains
+     * consumer_pe and hands raw completions to B via work_spsc; B routes + posts
+     * reverse DMA + sends inline. */
+    int split_send;
+    pthread_t send_thread;            /* thread B */
+    send_spsc_t send_spsc;            /* A→B egress send hand-off (SPLIT_SENDS) */
+    work_spsc_t work_spsc;            /* A→B completion hand-off (SPLIT_REBAL) */
+    /* Serializes consumer_pe access: thread A's doca_pe_progress(consumer_pe)
+     * + keepalive producer sends VS thread B's setup-time DPU→DPA msgq sends
+     * (ADD_RING/ADD_REV_RING), which progress consumer_pe internally. Held only
+     * on the rare setup path + once per A iteration; uncontended on the hot
+     * path. Unused when split_send == 0. */
+    pthread_mutex_t consumer_lock;
+    int arm_core_a;                  /* DPUMESH_ARM_CORE_A (thread A pin, -1 = none) */
+    int arm_core_b;                  /* DPUMESH_ARM_CORE_B (thread B pin, -1 = none) */
 };
+
+/* Ingest hand-off selector: thread A's recv-cb pushes completions to work_spsc
+ * under SPLIT_REBAL, else to comp_queue. Backpressure reads the matching depth.
+ * Returns 0 on enqueue, -1 if full (caller drops + logs). */
+static inline int ingest_push(struct objects *objs, const dpu_comp_entry_t *e) {
+    if (objs->split_send == SPLIT_REBAL)
+        return work_spsc_push(&objs->work_spsc, e);
+    return comp_queue_enqueue(&objs->comp_queue, e);
+}
+static inline uint32_t ingest_usage(struct objects *objs) {
+    if (objs->split_send == SPLIT_REBAL)
+        return work_spsc_usage(&objs->work_spsc);
+    return comp_queue_usage(&objs->comp_queue);
+}
 
 /* ====== Task-pool helpers ======
  * Acquire/release a slot in an atomic in-flight counter. Acquire may fail

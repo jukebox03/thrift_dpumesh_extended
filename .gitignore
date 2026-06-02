@@ -398,3 +398,6 @@ project.lock.json
 /tutorial/rs/Cargo.lock
 /ylwrap
 
+# Claude Code local files
+.claude/
+
