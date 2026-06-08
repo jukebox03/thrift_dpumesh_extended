@@ -296,3 +296,36 @@ Hypothesis: ARM posts the reverse desc (dpu_enqueue_reverse_dma, dma->valid=1) a
 | **130K DPU hop avg** | (blocking 580µs) | **1009µs** (async, higher in-flight) |
 **Verdict: REFUTED.** At keepalive=100 the max wakeup wait is 100µs, yet the hop is still ~1009µs → ≥900µs of the hop is ARM-bridge SERVICE/QUEUING, not wakeup latency. Ceiling unchanged (the EU is hot at saturation, so keepalive is irrelevant there — as predicted). → the on-demand kick is NOT worth building (it would save <100µs of a ~1ms hop, 0 throughput). The ~135K ceiling and the ~1ms hop are the **single ARM bridge's per-request service rate** (route + comp_queue + comch egress; 135K × 2 ARM-crossings = 270K ARM ops/s), NOT the EU wakeup. Reverted keepalive to default; the per-request "fat" worth removing is the ARM-path software cost, not the wakeup (see cleanup).
 **Direct experiments that raise the ceiling: NONE so far** (async=no, keepalive=no, N=4=no, ARM-shard=no[prior]). The ceiling is robustly the DPU per-request service rate through the single ARM bridge.
+
+## Q5 — pure_dma's DPA scales but the chain doesn't: WHY (what "DPA-bound" actually means) [workflow w56lrbvhz, code-verified]
+Side-by-side read of `/home/jukebox/test_dma/pure_dma/` vs the chain DPA:
+
+**pure_dma = embarrassingly-parallel, share-nothing copy farm:**
+- Each EU: own thread, own comch channel (1p/1c), own completion queue, own buffer slice. **No host, no ARM, no admission gate on the per-op path** (`test_dma/pure_dma/device/dpa_kernel.c:100-134`).
+- **1 dma_copy per op** (the copy carries its own completion immediate). EU self-drives, gates only on its OWN consumer credit.
+- → adding EUs adds fully-independent issue engines → **linear**: N=1 555K → N=2 1.07M (1.93×) → N=4 1.74-1.80M (3.2×), until the physical DMA-engine op-rate (~1.5-1.6M) at N=8.
+
+**chain DPA = request/response pipeline forced through a single ARM bridge:**
+- EU = `pod_id % N` (static; `dpa.c:1091,1278`) → **2-pod = exactly 2 EUs for ANY N** (N=4: 10%4=2, 11%4=3 → still 2; rest idle).
+- One cross-pod message's **forward runs on EU(src%N), reverse on EU(dst%N) = DIFFERENT EUs**; they never talk directly — every completion goes UP to a **single ARM** (one `consumer_pe` + one `comp_queue`) which routes + posts the reverse desc, then the reverse EU picks it up. **ARM crossed 2×/request.**
+
+**Two reasons more EUs don't help a 2-pod chain (both code-true):** (a) `pod%N` caps active EUs at 2; (b) the 2 EUs share one serial ARM bridge per request → N=2 gives **1.76× not 2×** (Amdahl on the serial bridge).
+
+**Is the EU itself maxed?** Use the right reference: the chain's 2 EUs do 416K dma_copy/s @104K and ~540K @135K (RPS×4); M2-N=2 (same 2 EUs doing drain+forward but no full chain) = **626K**. So EU util = 416/626 = **66% @104K → 540/626 = 86% @135K** (matches Q3's "88% of 2-EU capacity"). The looser pure-copy 1.07M reference (no completion handling) overstates headroom — vs M2 the EU is **near its realistic chain-work capacity at the ceiling**, with the residual 14-32% idle being the EU→ARM→EU round-trip wait (shrinks as load rises). → **"DPA-bound" = the DPU's per-request round-trip *service rate* through the single ARM bridge (EU near M2 capacity + ARM-bridge cadence), NOT the DMA engine maxed and NOT EU count.** pure_dma has none of this structure → it scales.
+
+## Option B (EU-sharding) status: FORECLOSED — corrects the earlier "feasible / only lever" framing
+Earlier entries (the line-10 "Code-certain" note + Q3 line 230/232 + Option-A cap-map) framed EU-sharding — *host posts K fwd rings/pod; ARM round-robins reverse to K tx_rings* — as "feasible, the ONLY way to add EU capacity for 2 pods." **Re-reading `multithread_unified_plan.md` §5.0, that is FORECLOSED, and on code grounds (not elimination):**
+- Sharding one pod across K EUs → K EUs write that pod's **tx_ring → breaks single-producer** (`ring.c`) and `dpa_sent_count[e][r]` **single-writer**.
+- The cross-EU completion fan-out (an EU's completion reaching a consumer it doesn't own) is a **×N vs ×N² branch needing SDK `max_num_consumers>1`** (`dpa.c:470,477`), which is **=1** → no SDK support.
+- 2-pod is a **HARD target constraint** (§8) → active EU permanently 2 → even if sharded, no benefit.
+→ So **Option B is blocked by the SDK gate + the 2-pod target**, NOT a near-term lever. (Supersedes the line-10 "foreclosed was elimination, not code-true" — the re-read shows it IS code-true.) The plan's actual forward direction is **not** sharding/more-EUs but **reducing per-request handoff latency on the fixed 2-EU+1-ARM** (plan Levers 1-3: per-request stamp measurement → shorten reverse-desc post → `find_pod_by_id` O(n)→O(1)). NB those are LATENCY levers; per Q4 the keepalive/wake is NOT the throughput cap, so even these are p50/p99 wins, not ceiling wins.
+
+## DPU (ARM) multithreading — current implementation state (+ cleanup decision: KEEP)
+Two ORTHOGONAL multithreading axes (commonly conflated):
+- **DPA (data plane), `DPUMESH_DPA_THREADS=N`** — N EU threads, share-nothing, EU=`pod%N`. **Currently N=2 = active & working** (2-pod → 2 EUs). This is the "DPA multithreading" (tested N=1/2/4).
+- **DPU (ARM control plane), `DPUMESH_SPLIT_SEND` + `DPUMESH_DRAIN_SHARDS`** — splits the ARM completion-processing. **Default = OFF = single ARM thread.** 4 modes (`object.h:140-153`): OFF(0,default,single thread) / SENDS(1: A=drain+route+reverse, B=comch sends, via `send_spsc`) / REBAL(2: A=drain only, B=full work, via `work_spsc`) / **SHARD(3: N-way — A routes by effdst%N → per-EU `shard_work[k]` → N worker threads (each sole writer of its EU's tx_ring) → per-EU `shard_send[k]` → 1 SENDER → cc_server)**; `DRAIN_SHARDS=M` splits the single `consumer_pe` drain into M independent doca_pe drains (`dpu_worker.c:998-1008,1026-1068`).
+
+**Currently deployed = DPA_THREADS=2 + SPLIT_OFF + DRAIN=1 → 2 EUs (parallel data plane) + single ARM thread (serial control plane).** `consumer_pe_shard[0]=consumer_pe`, M=1 byte-identical to single drain (`object.h:997`).
+
+**Status:** the SPLIT/SHARD/DRAIN machinery is **fully implemented (commit 332dcfd53) + correctness-proven (0-fail×30)** but **throughput-neutral for the 2-pod chain** (E2 SPLIT_SHARD=3 flat = baseline; ARM was never the bottleneck, §4.1/§4.4; and 2-pod → only 2 EUs so nothing to scale). Per plan §4.4/§5.0 it is **preserved as a diagnostic toggle + future-multi-pod scaffolding**, NOT dead code.
+**CLEANUP DECISION:** do **NOT** delete SPLIT/DRAIN/SHARD (nor CASE_INGRESS — `project_recv_pool_coupling` "KEPT" it deliberately). My earlier "delete ~600 lines of 0-gain machinery" was wrong: 0-gain is a *2-pod artifact* (pod%N), and the plan keeps the machinery by design. Cleanup, if done, is **readability-only** (stale comments, misnamed macro, clear toggle grouping) with **zero functional removal**. KEEP all leanness knobs too (ZEROCOPY/ADAPTIVE/SKIP/BATCH/ASYNC/TRACE) — the keep-criterion is "does it make the runtime lighter," not "did it raise throughput."
