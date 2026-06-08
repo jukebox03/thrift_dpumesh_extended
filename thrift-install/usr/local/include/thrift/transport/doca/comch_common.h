@@ -26,7 +26,22 @@ enum dmesh_msg_type {
     DMESH_MSG_MMAP_EXPORT  = 2, /* Host→DPU: export an mmap region (ring / TX buf / RX buf) */
     DMESH_MSG_FWD_ACK      = 3, /* DPU→Host: forward DMA (CPU→DPU) consumed — free TX slot */
     DMESH_MSG_REV_DONE     = 4, /* DPU→Host: reverse DMA (DPU→CPU) done — data in Host RX buf */
+    DMESH_MSG_BATCH_FWD_ACK= 5, /* DPU→Host: batch of req_ids whose forward DMA is done — free all */
 };
+
+/* DPU→Host: batched TX_ACK. Coalesces up to BATCH_TXACK_MAX per-request
+ * FWD_ACKs into one comch message so the host PE thread processes 1 message
+ * instead of K — reduces the (single remaining, after SKIP_REQ_TXACK) echo-side
+ * per-request message rate ~K×. Flushed when full or on a periodic tail-flush. */
+#define BATCH_TXACK_MAX 14
+struct dmesh_batch_tx_ack_msg {
+    uint8_t  type;       /* = DMESH_MSG_BATCH_FWD_ACK */
+    uint8_t  count;      /* number of valid entries in req_ids[] (1..BATCH_TXACK_MAX) */
+    uint8_t  _pad[2];    /* align req_ids to 4B */
+    uint32_t req_ids[BATCH_TXACK_MAX];
+};
+_Static_assert(sizeof(struct dmesh_batch_tx_ack_msg) == 4 + 4 * BATCH_TXACK_MAX,
+               "dmesh_batch_tx_ack_msg must pack tightly");
 
 enum mmap_type {
     DMA_BUFFER = 1,

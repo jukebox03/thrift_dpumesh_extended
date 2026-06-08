@@ -26,6 +26,24 @@
 
 static dpumesh_ctx_t *g_ctx = NULL;
 
+/* 1 Hz host-bottleneck stat: rx_queue depth (requests delivered but not yet
+ * dequeued by a worker) + TX slots in-flight. Prints only when busy. */
+static void *stat_thread(void *arg) {
+    (void)arg;
+    struct timespec s = {1, 0};
+    int max_rx = 0;
+    for (;;) {
+        nanosleep(&s, NULL);
+        int rxd = 0, txi = 0;
+        dpumesh_debug_stats(g_ctx, &rxd, &txi);
+        if (rxd > max_rx) max_rx = rxd;
+        if (rxd > 0 || txi > 0)
+            fprintf(stderr, "[echo-stat] rx_queue_depth=%d (max=%d) tx_inflight=%d\n",
+                    rxd, max_rx, txi);
+    }
+    return NULL;
+}
+
 static void process_one(const sw_descriptor_t *req) {
     /* Pull request body */
     if (req->body_buf_slot < 0 || req->body_len == 0) {
@@ -124,6 +142,9 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "[echo] ready: pod_id=%d, threads=%d\n",
             dpumesh_get_pod_id(g_ctx), n_threads);
+
+    pthread_t stat_tid;
+    pthread_create(&stat_tid, NULL, stat_thread, NULL);
 
     pthread_t *tids = calloc((size_t)n_threads, sizeof(pthread_t));
     if (!tids) return 1;

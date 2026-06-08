@@ -60,6 +60,30 @@ export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer
 /* Forward declaration — implemented in dpa.c */
 doca_error_t setup_pod_dma(struct objects *objs, struct pod_state *pod);
 
+#ifdef DOCA_ARCH_DPU
+/* Serialize the rare setup-path DPU→DPA sends (ADD_RING/ADD_REV_RING, which
+ * progress a consumer PE internally) against the drain thread(s) progressing
+ * those PEs. Drain sharding (M>1): lock every per-group lock; else the single
+ * consumer_lock. No deadlock: a drain only ever holds its own one lock briefly,
+ * so this all-groups acquire always makes progress. */
+static inline void dmesh_setup_lock(struct objects *objs)
+{
+    if (objs->split_send == SPLIT_SHARD && objs->num_drain_shards > 1)
+        for (int g = 0; g < objs->num_drain_shards; g++)
+            pthread_mutex_lock(&objs->consumer_lock_shard[g]);
+    else if (objs->split_send)
+        pthread_mutex_lock(&objs->consumer_lock);
+}
+static inline void dmesh_setup_unlock(struct objects *objs)
+{
+    if (objs->split_send == SPLIT_SHARD && objs->num_drain_shards > 1)
+        for (int g = objs->num_drain_shards - 1; g >= 0; g--)
+            pthread_mutex_unlock(&objs->consumer_lock_shard[g]);
+    else if (objs->split_send)
+        pthread_mutex_unlock(&objs->consumer_lock);
+}
+#endif
+
 doca_error_t
 process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
                  struct dmesh_mmap_msg *mmap_msg)
@@ -131,9 +155,9 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 	 * against thread A's consumer_pe progress. Rare (pod registration), so the
 	 * coarse lock costs nothing on the steady path. */
 	if (pod->ring_mmap && pod->remote_mmap && !pod->dma_ready) {
-		if (objs->split_send) pthread_mutex_lock(&objs->consumer_lock);
+		dmesh_setup_lock(objs);
 		result = setup_pod_dma(objs, pod);
-		if (objs->split_send) pthread_mutex_unlock(&objs->consumer_lock);
+		dmesh_setup_unlock(objs);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("setup_pod_dma failed for pod %d: %s",
 				     pod->pod_id, doca_error_get_descr(result));
@@ -143,9 +167,9 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 
 	/* If Host RX buffer arrived after DMA setup, update the DPA reverse ring info */
 	if (mmap_msg->mmap_type == DMA_HOST_RX_BUFFER && pod->dma_ready) {
-		if (objs->split_send) pthread_mutex_lock(&objs->consumer_lock);
+		dmesh_setup_lock(objs);
 		result = update_rev_ring_host_rx(objs, pod);
-		if (objs->split_send) pthread_mutex_unlock(&objs->consumer_lock);
+		dmesh_setup_unlock(objs);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_WARN("update_rev_ring_host_rx failed for pod %d: %s",
 				      pod->pod_id, doca_error_get_descr(result));

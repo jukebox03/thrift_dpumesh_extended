@@ -1,6 +1,10 @@
 project('dpumesh_dpu', 'c',
   version : '1.0.0',
-  default_options : ['buildtype=debug'],
+  # debugoptimized = -O2 -g. The ARM control plane (dpu_worker/comch_server/dpa.c
+  # — the per-RTT hot path) was previously built at -O0 (buildtype=debug), while
+  # only the DPA kernel got -O2 (build_dpacc.sh). This takes effect on a FRESH
+  # `meson setup`; see the -O2 add_project_arguments below for the in-place case.
+  default_options : ['buildtype=debugoptimized'],
   meson_version : '>=0.61.2'
 )
 

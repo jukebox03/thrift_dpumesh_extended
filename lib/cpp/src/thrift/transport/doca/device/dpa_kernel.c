@@ -304,9 +304,12 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
 
         /* Under in-place forwarding desc->mmap is the SOURCE of reverse DMA
          * (DPU ARM set it to the original sender's local_mmap DPA handle).
-         * Fall back to ring->dpu_mmap if a legacy desc arrives with mmap=0. */
-        doca_dpa_dev_mmap_t src_mmap = desc->mmap ? desc->mmap : ring->dpu_mmap;
-        uint64_t src_base = desc->mmap ? desc->addr : (ring->dpu_addr + desc->addr);
+         * dpu_enqueue_reverse_dma always sets a nonzero mmap and refuses to
+         * post a reverse desc when local_mmap_dpa_handle==0 (dpu_worker.c),
+         * so a live reverse desc can never carry mmap==0 — the old
+         * ring->dpu_mmap/dpu_addr fallback was unreachable and is removed. */
+        doca_dpa_dev_mmap_t src_mmap = desc->mmap;
+        uint64_t src_base = desc->addr;
 
         /* === Admission gate using cached_freed[] (refreshed in drain_all_rings) ===
          * If inflight reverse DMAs >= rq_depth, host's RX RQ is at capacity —

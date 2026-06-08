@@ -119,6 +119,12 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
 
+	case DMESH_MSG_BATCH_FWD_ACK:
+		/* Batched TX_ACK — coalesced free of K req_ids (DPUMESH_BATCH_TXACK). */
+		if (objs->rx_data_hook)
+			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
+		break;
+
 	default:
 		DOCA_LOG_INFO("Received unknown message type from server: %u", recv_buffer[0]);
 		break;

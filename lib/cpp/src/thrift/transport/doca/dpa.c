@@ -167,8 +167,15 @@ resubmit_recv_task:
      * DPA will see consumer_empty and naturally pause, giving DPU time to drain.
      * Main loop resubmits when queue drops below BP_LOW.
      * If submit fails (e.g. transient state), also stash so the main loop retries
-     * rather than losing the task. */
-    if (ingest_usage(objs) >= COMP_QUEUE_BP_HIGH &&
+     * rather than losing the task.
+     *
+     * Drain sharding (num_drain_shards>1): this recv-cb runs on M different drain
+     * threads, so the shared objs->deferred_recv array would race. Disable the
+     * deferral path in that mode and always resubmit inline — the per-group
+     * shard_work depth stays well under BP_HIGH at the tested regime, so the
+     * recv-task pool (CC_DPA_MAX_MSG_NUM per channel) is the rate-matcher. */
+    if (objs->num_drain_shards <= 1 &&
+        ingest_usage(objs) >= COMP_QUEUE_BP_HIGH &&
         objs->num_deferred_recv < MAX_DEFERRED_RECV) {
         objs->deferred_recv[objs->num_deferred_recv++] = task;
     } else {
@@ -890,8 +897,8 @@ dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t m
 /* Non-blocking variant: returns DOCA_ERROR_AGAIN immediately on submit
  * failure, no PE progress, no retry. For hot-path DPU→DPA TRIGGER signals
  * where the rev desc is already on the ring and a missed trigger is
- * recoverable by the next successful send. Used by comch_server.c WAKE_DPA
- * forwarder and dpu_worker.c reverse DMA trigger. */
+ * recoverable by the next successful send. Used by the 1 kHz keepalive in
+ * dpu_worker.c (DPA_MSG_WAKE fire-and-forget); no other caller exists. */
 doca_error_t
 dmesh_doca_dpa_msgq_send_try(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t msg_size)
 {
@@ -1165,16 +1172,9 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
 
     /* === Reverse direction (DPU→CPU) setup === */
 
-    /* 7. Allocate DPU TX buffer for reverse direction */
-    result = alloc_buffer_and_set_mmap(&pod->tx_mmap, objs->dev,
-                                       &pod->tx_buffer, DPU_BUFFER_SIZE,
-                                       DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_READ_WRITE);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("setup_pod_dma: alloc TX buffer failed for pod %d: %s",
-                     pod->pod_id, doca_error_get_descr(result));
-        return result;
-    }
-    pod->tx_buf_size = DPU_BUFFER_SIZE;
+    /* (Former step 7 "allocate DPU TX data buffer" removed — in-place
+     * forwarding reads the reverse DMA source from the sender pod's dma_buffer
+     * via desc->mmap, so the per-pod 16MB TX data buffer was never read.) */
 
     /* 8. Create DPU→CPU descriptor ring */
     result = setup_dpu_tx_ring(objs->dev, DMA_RING_SIZE,
@@ -1202,13 +1202,10 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
     {
         struct dpa_ring_info rev_ring_info;
         doca_dpa_dev_buf_arr_t dpa_buf_arr;
-        doca_dpa_dev_mmap_t dpu_tx_mmap_h, host_rx_mmap_h;
+        doca_dpa_dev_mmap_t host_rx_mmap_h;
         doca_dpa_dev_buf_arr_t fwd_buf_arr_h = 0;
 
         result = doca_buf_arr_get_dpa_handle(pod->tx_buf_arr, &dpa_buf_arr);
-        if (result != DOCA_SUCCESS) return result;
-
-        result = doca_mmap_dev_get_dpa_handle(pod->tx_mmap, objs->dev, &dpu_tx_mmap_h);
         if (result != DOCA_SUCCESS) return result;
 
         /* Use Host RX mmap if available */
@@ -1234,10 +1231,10 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
         memset(&rev_ring_info, 0, sizeof(rev_ring_info));
         rev_ring_info.buf_arr = dpa_buf_arr;
         rev_ring_info.buf_arr_size = DMA_RING_SIZE;
-        /* For reverse: dpu=source (TX), host=destination (RX) */
-        rev_ring_info.dpu_mmap = dpu_tx_mmap_h;
-        rev_ring_info.dpu_addr = (uint64_t)pod->tx_buffer;
-        rev_ring_info.dpu_buf_size = DPU_BUFFER_SIZE;
+        /* Reverse: source = sender pod's dma_buffer (carried per-request in
+         * desc->mmap/addr by dpu_enqueue_reverse_dma). dpu_mmap/dpu_addr/
+         * dpu_buf_size stay 0 from the memset above — process_rev_ring never
+         * reads them on the reverse ring (only host_* is the destination). */
         rev_ring_info.host_mmap = host_rx_mmap_h;
         rev_ring_info.host_addr = (uint64_t)pod->host_rx_addr;
         rev_ring_info.host_buf_size = (uint32_t)pod->host_rx_buf_size;
@@ -1287,13 +1284,10 @@ update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod)
 
     struct dpa_ring_info rev_ring_info;
     doca_dpa_dev_buf_arr_t dpa_buf_arr;
-    doca_dpa_dev_mmap_t dpu_tx_mmap_h, host_rx_mmap_h;
+    doca_dpa_dev_mmap_t host_rx_mmap_h;
     doca_dpa_dev_buf_arr_t credit_buf_arr_h = 0;
 
     result = doca_buf_arr_get_dpa_handle(pod->tx_buf_arr, &dpa_buf_arr);
-    if (result != DOCA_SUCCESS) return result;
-
-    result = doca_mmap_dev_get_dpa_handle(pod->tx_mmap, objs->dev, &dpu_tx_mmap_h);
     if (result != DOCA_SUCCESS) return result;
 
     result = doca_mmap_dev_get_dpa_handle(pod->host_rx_mmap, objs->dev, &host_rx_mmap_h);
@@ -1316,9 +1310,8 @@ update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod)
     memset(&rev_ring_info, 0, sizeof(rev_ring_info));
     rev_ring_info.buf_arr = dpa_buf_arr;
     rev_ring_info.buf_arr_size = DMA_RING_SIZE;
-    rev_ring_info.dpu_mmap = dpu_tx_mmap_h;
-    rev_ring_info.dpu_addr = (uint64_t)pod->tx_buffer;
-    rev_ring_info.dpu_buf_size = DPU_BUFFER_SIZE;
+    /* dpu_mmap/dpu_addr/dpu_buf_size stay 0 (memset) — reverse source is the
+     * sender pod's dma_buffer via desc->mmap, not a per-pod TX data buffer. */
     rev_ring_info.host_mmap = host_rx_mmap_h;
     rev_ring_info.host_addr = (uint64_t)pod->host_rx_addr;
     rev_ring_info.host_buf_size = (uint32_t)pod->host_rx_buf_size;

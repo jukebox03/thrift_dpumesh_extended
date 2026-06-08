@@ -508,6 +508,26 @@ server_send_tx_ack_to(struct objects *objs,
 	return server_send_msg_to_conn(objs, conn, (const char *)&ack, sizeof(ack));
 }
 
+/* Send a batched TX_ACK (n req_ids, 1..BATCH_TXACK_MAX) as one message. Only
+ * the first 4 + 4*n bytes are transmitted (the unused tail of req_ids[] is not
+ * sent). DOCA_ERROR_AGAIN if the send pool is full (caller retains the batch). */
+doca_error_t
+server_send_batch_tx_ack_to(struct objects *objs,
+                            struct doca_comch_connection *conn,
+                            const uint32_t *req_ids, int n)
+{
+	if (n <= 0)
+		return DOCA_SUCCESS;
+	struct dmesh_batch_tx_ack_msg m;
+	m.type = DMESH_MSG_BATCH_FWD_ACK;
+	m.count = (uint8_t)n;
+	m._pad[0] = m._pad[1] = 0;
+	for (int i = 0; i < n; i++)
+		m.req_ids[i] = req_ids[i];
+	size_t wire = 4 + 4u * (size_t)n;   /* header + only the valid entries */
+	return server_send_msg_to_conn(objs, conn, (const char *)&m, wire);
+}
+
 /* ====================================================================
  * Pod connection management
  * ==================================================================== */
@@ -570,6 +590,11 @@ pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn)
 		 * DPA-side ring stay registered for now (a follow-up will add
 		 * REMOVE_RING + buffer free once the DPA side is quiesced). */
 		__atomic_store_n(&objs->pods[i].registered, 0, __ATOMIC_RELEASE);
+		/* Clear the O(1) map so the freed pod_id no longer resolves to this
+		 * (now dead) slot, and so the id can be re-registered into a new slot.
+		 * pod_id was captured above before we zero the slot's field below. */
+		if (pod_id >= 0 && pod_id < POD_ID_SPACE)
+			__atomic_store_n(&objs->pod_id_to_slot[pod_id], -1, __ATOMIC_RELEASE);
 		objs->pods[i].dma_ready       = 0;
 		objs->pods[i].connection      = NULL;
 		objs->pods[i].pod_id          = -1;
@@ -624,6 +649,12 @@ pods_register(struct objects *objs, struct doca_comch_connection *conn,
 		         "%s", app_name);
 		__atomic_store_n(&objs->pods[i].registered, 1, __ATOMIC_RELEASE);
 
+		/* Publish the O(1) pod_id->slot map AFTER registered=1, so a reader
+		 * that observes the map entry is guaranteed to also see registered=1.
+		 * (find_pod_by_id re-validates registered + pod_id regardless.) */
+		if (pod_id >= 0 && pod_id < POD_ID_SPACE)
+			__atomic_store_n(&objs->pod_id_to_slot[pod_id], i, __ATOMIC_RELEASE);
+
 		DOCA_LOG_INFO("pods_register: slot %d → pod_id=%d app=%s",
 		              i, pod_id, app_name);
 		return 0;
@@ -635,13 +666,20 @@ pods_register(struct objects *objs, struct doca_comch_connection *conn,
 struct pod_state *
 find_pod_by_id(struct objects *objs, int32_t pod_id)
 {
-	/* Lock-free read. See object.h pods[] concurrency model. */
-	int n = __atomic_load_n(&objs->num_pods, __ATOMIC_ACQUIRE);
-	for (int i = 0; i < n; i++) {
-		if (__atomic_load_n(&objs->pods[i].registered, __ATOMIC_ACQUIRE) &&
-		    objs->pods[i].pod_id == pod_id)
-			return &objs->pods[i];
-	}
+	/* Lock-free O(1) lookup via the pod_id->slot map. The map is only an
+	 * accelerator: the registered ACQUIRE + pod_id re-check below remain the
+	 * authority, so a stale/torn map entry can only yield a re-validated hit
+	 * or NULL — never a wrong pod. See object.h pods[] concurrency model.
+	 * O(1) in the pod count (the old linear scan was O(num_pods) with an
+	 * ACQUIRE fence per slot, ~4-6x per RTT on the hot path). */
+	if (pod_id < 0 || pod_id >= POD_ID_SPACE)
+		return NULL;
+	int idx = __atomic_load_n(&objs->pod_id_to_slot[pod_id], __ATOMIC_ACQUIRE);
+	if (idx < 0 || idx >= MAX_PODS)
+		return NULL;
+	struct pod_state *p = &objs->pods[idx];
+	if (__atomic_load_n(&p->registered, __ATOMIC_ACQUIRE) && p->pod_id == pod_id)
+		return p;
 	return NULL;
 }
 

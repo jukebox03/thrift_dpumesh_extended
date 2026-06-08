@@ -92,7 +92,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o: \
  /opt/mellanox/doca/include/doca_ctx.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/buffer.h \
  /opt/mellanox/doca/include/doca_buf.h \
- /opt/mellanox/doca/include/doca_buf_pool.h \
- /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h
+ /opt/mellanox/doca/include/doca_buf_pool.h

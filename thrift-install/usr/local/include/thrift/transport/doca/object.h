@@ -9,6 +9,7 @@
 #include <doca_ctx.h>
 
 #include "comch_server.h"
+#include "comch_common.h"
 #include "dpumesh_common.h"
 
 struct dmesh_doca_dpa_thread;
@@ -25,8 +26,19 @@ typedef uint32_t doca_dpa_dev_mmap_t;
 
 /* Deferred completion queue — DPU only.
  * Consumer callback enqueues; main loop drains.
- * Single-threaded (same DPU worker), so no lock needed. */
-#define DPU_COMP_QUEUE_SIZE 4096
+ * Single-threaded (same DPU worker), so no lock needed.
+ *
+ * Multi-EU sizing: the single consumer_pe drains ALL active EU channels into
+ * this one queue. comp_queue grows under load until it reaches BP_HIGH, at
+ * which point the DPA recv-cb defers recv-task resubmission to brake the DPA.
+ * After crossing BP_HIGH, in-flight recv tasks can still deliver, so the queue
+ * needs headroom of up to MAX_DPA_RINGS(8) × CC_DPA_MAX_MSG_NUM(1024) = 8192
+ * above BP_HIGH before they are all deferred. 16384 (BP_HIGH 3072 + 13312
+ * headroom) cannot overflow even at 8 active EUs. (Was 4096 — safe only up to
+ * ~2-3 active EUs; at ≥4 EUs the queue could overflow and drop completions →
+ * lost requests. The BP_HIGH/BP_LOW trip points are kept at the legacy 3072/
+ * 2048 so backpressure timing — and ≤2-EU behaviour — is unchanged.) */
+#define DPU_COMP_QUEUE_SIZE 16384
 
 #define COMP_ENTRY_FORWARD     0  /* Forward DMA completed (CPU→DPU), needs TX_ACK + reverse route */
 #define COMP_ENTRY_REV_NOTIFY  1  /* Reverse DMA completed (DPU→CPU), needs Host notification */
@@ -83,13 +95,21 @@ CQ_INLINE uint32_t comp_queue_usage(const dpu_comp_queue_t *q) {
     return DPU_COMP_QUEUE_SIZE - q->head + q->tail;
 }
 
-/* Backpressure threshold: defer recv task resubmission when queue
- * exceeds this fraction (3/4) to slow DPA inflow. */
-#define COMP_QUEUE_BP_HIGH  (DPU_COMP_QUEUE_SIZE * 3 / 4)
-#define COMP_QUEUE_BP_LOW   (DPU_COMP_QUEUE_SIZE / 2)
+/* Backpressure threshold: defer recv task resubmission when queue exceeds
+ * BP_HIGH to slow DPA inflow; resume resubmission below BP_LOW. Kept as ABSOLUTE
+ * values (not a fraction of DPU_COMP_QUEUE_SIZE) so enlarging the queue for
+ * multi-EU overflow headroom does NOT move the trip points — backpressure timing
+ * and ≤2-EU behaviour stay byte-identical to the legacy 4096-queue (3072/2048). */
+#define COMP_QUEUE_BP_HIGH  3072
+#define COMP_QUEUE_BP_LOW   2048
 
-/* Max deferred recv tasks (one per CC_DPA_MAX_MSG_NUM) */
-#define MAX_DEFERRED_RECV  1024
+/* Max deferred recv tasks. When comp_queue ≥ BP_HIGH the DPA recv-cb stashes
+ * completed recv tasks here for the main loop to resubmit once it drains below
+ * BP_LOW. Worst case every in-flight recv task across all EUs can be deferred at
+ * once = MAX_DPA_RINGS(8) × CC_DPA_MAX_MSG_NUM(1024) = 8192, so this must be ≥
+ * that. (Was 1024 — one EU's worth; at ≥4 EUs the overflow dropped recv tasks →
+ * shrinking recv capacity → DPA stall.) */
+#define MAX_DEFERRED_RECV  8192
 
 /* Max deferred TX_ACK sends. Each entry is a small POD (~32B). The DPU
  * MUST eventually deliver every TX_ACK — dropping one parks the host's
@@ -120,6 +140,17 @@ typedef struct {
 #define SPLIT_OFF    0
 #define SPLIT_SENDS  1
 #define SPLIT_REBAL  2
+/*   3 SPLIT_SHARD  — N-way sharded control plane (multi-EU). Thread A drains
+ *                   consumer_pe and routes each completion to
+ *                   shard_work[effdst % num_dpa_threads]; worker k drains
+ *                   shard_work[k], routes + posts reverse DMA to its EU's
+ *                   tx_rings (sole writer), and hands egress sends to
+ *                   shard_send[k]; the SENDER drains all shard_send[k] into the
+ *                   single cc_server. Each shard_work[k]/shard_send[k] is a
+ *                   strict 1-producer/1-consumer SPSC. dst is known at ingress
+ *                   (host-stamped / mock dpu_route), so no N^2 ROUTER shuffle is
+ *                   needed; real L7 (dst from body) would reinstate it. */
+#define SPLIT_SHARD  3
 
 /* ====== A→B egress send hand-off (SPLIT_SENDS) ======
  * Thread A (consumer_pe) drains DPA→DPU completions, routes, posts reverse DMA
@@ -275,12 +306,10 @@ struct pod_state {
 
     /* === Reverse direction (DPU→CPU) === */
 
-    /* DPU TX buffer (DPU writes data here for DPA to DMA to Host) */
-    struct doca_mmap *tx_mmap;
-    void *tx_buffer;
-    size_t tx_buf_size;
-
-    /* DPU→CPU descriptor ring */
+    /* DPU→CPU descriptor ring. (The former per-pod 16MB DPU TX *data* buffer —
+     * tx_mmap/tx_buffer/tx_buf_size — was removed: under in-place forwarding the
+     * reverse DMA reads from the SOURCE pod's dma_buffer via desc->mmap/addr, so
+     * the destination pod's TX data region was never read.) */
     struct dma_ring *tx_ring;
     struct doca_mmap *tx_ring_mmap;
     struct doca_buf_arr *tx_buf_arr;
@@ -293,6 +322,13 @@ struct pod_state {
     /* Host's RX RQ depth (= num_slots), derived from host_rx_buf_size.
      * Used by DPA admission gate as the cap on in-flight reverse DMAs. */
     uint32_t rq_depth;
+
+    /* Batched TX_ACK accumulator (DPUMESH_BATCH_TXACK). Response-forward
+     * TX_ACKs destined to THIS pod accumulate here; flushed as one
+     * dmesh_batch_tx_ack_msg when full or on the periodic tail-flush. Single
+     * ARM thread (split-OFF) owns this — no lock. */
+    uint32_t txack_batch[BATCH_TXACK_MAX];
+    int      txack_batch_n;
 };
 
 /* Data-plane publication gate. `dma_ready` is set with RELEASE at the END of
@@ -392,6 +428,17 @@ struct objects {
     struct pod_state pods[MAX_PODS];
     int num_pods;
 
+    /* O(1) pod_id -> slot-index accelerator for find_pod_by_id (called ~4-6x
+     * per RTT on the hot path). Indexed by pod_id (int8 on the wire, valid
+     * range [0, POD_ID_SPACE)); entry = index into pods[], or -1 if no live
+     * pod holds that id. Published with RELEASE in pods_register, cleared in
+     * pods_remove_connection; read with ACQUIRE in find_pod_by_id which still
+     * re-validates pods[idx].registered + pod_id, so the map is only an
+     * accelerator (the registered gate remains the authority). Sized by the
+     * pod_id space, NOT MAX_PODS, so lookups stay O(1) as the pod count grows.
+     * Must be initialized to all -1 before the worker starts. */
+    int pod_id_to_slot[POD_ID_SPACE];
+
     /* Deferred completion queue (DPU only) */
     dpu_comp_queue_t comp_queue;
 
@@ -436,9 +483,35 @@ struct objects {
      * consumer_pe and hands raw completions to B via work_spsc; B routes + posts
      * reverse DMA + sends inline. */
     int split_send;
-    pthread_t send_thread;            /* thread B */
+    pthread_t send_thread;            /* thread B (SENDER under all split modes) */
     send_spsc_t send_spsc;            /* A→B egress send hand-off (SPLIT_SENDS) */
     work_spsc_t work_spsc;            /* A→B completion hand-off (SPLIT_REBAL) */
+
+    /* ====== SPLIT_SHARD (mode 3) — N-way sharded control plane ======
+     * shard_work[k]: thread A (producer) → worker k (consumer). Routed by
+     * effdst % num_dpa_threads so worker k handles every pod whose pod_id%N==k,
+     * making it the SOLE writer of those pods' tx_rings (single-writer preserved
+     * even all-to-all). shard_send[k]: worker k (producer) → SENDER (consumer).
+     * Both are the existing lock-free SPSC primitives, one instance per EU. */
+    work_spsc_t shard_work[MAX_DPA_RINGS];
+    send_spsc_t shard_send[MAX_DPA_RINGS];
+    pthread_t   shard_workers[MAX_DPA_RINGS];
+    int         shard_worker_core_base;   /* worker k pinned to base+k (-1=relaxed) */
+
+    /* ====== Drain sharding (DPUMESH_DRAIN_SHARDS, SPLIT_SHARD only) ======
+     * Split the single consumer_pe completion-drain into M independent drain
+     * threads, each owning a contiguous EU-channel group [g*N/M, (g+1)*N/M) on
+     * its OWN doca_pe (one-PE-per-thread, the DOCA-idiomatic multi-thread
+     * pattern). Removes the single ARM drain as the shared serial point so
+     * disjoint pod-pairs drain on independent threads. REQUIRES group-affine
+     * traffic (a completion's effective dst%N is in the same group as the EU it
+     * arrived on) so each shard_work[k] keeps a single producer (the one drain
+     * owning group g). M=1 (default) = original single drain (consumer_pe_shard[0]
+     * == consumer_pe). drain[0] runs on the main thread; drain[1..M-1] spawned. */
+    struct doca_pe *consumer_pe_shard[MAX_DPA_RINGS];
+    pthread_t       drain_threads[MAX_DPA_RINGS];
+    pthread_mutex_t consumer_lock_shard[MAX_DPA_RINGS];
+    int             num_drain_shards;     /* M */
     /* Serializes consumer_pe access: thread A's doca_pe_progress(consumer_pe)
      * + keepalive producer sends VS thread B's setup-time DPU→DPA msgq sends
      * (ADD_RING/ADD_REV_RING), which progress consumer_pe internally. Held only
@@ -452,15 +525,51 @@ struct objects {
 /* Ingest hand-off selector: thread A's recv-cb pushes completions to work_spsc
  * under SPLIT_REBAL, else to comp_queue. Backpressure reads the matching depth.
  * Returns 0 on enqueue, -1 if full (caller drops + logs). */
+/* SPLIT_SHARD: pick the worker for a completion by its effective destination pod
+ * (echo / dst==src → src). Worker k owns every pod with pod_id%N==k, so this is
+ * also the key that keeps each tx_ring single-writer. */
+static inline int shard_worker_of(const struct objects *objs, const dpu_comp_entry_t *e) {
+    int32_t eff = (e->dst_pod_id < 0 || e->dst_pod_id == e->src_pod_id)
+                      ? e->src_pod_id : e->dst_pod_id;
+    int n = objs->num_dpa_threads > 0 ? objs->num_dpa_threads : 1;
+    return (int)((uint32_t)eff % (uint32_t)n);
+}
+/* Drain shard owning EU index k: contiguous groups [g*N/M, (g+1)*N/M). */
+static inline int drain_group_of_eu(const struct objects *objs, int k) {
+    int m = objs->num_drain_shards > 0 ? objs->num_drain_shards : 1;
+    int n = objs->num_dpa_threads > 0 ? objs->num_dpa_threads : 1;
+    int g = (k * m) / n;
+    return g >= m ? m - 1 : g;
+}
 static inline int ingest_push(struct objects *objs, const dpu_comp_entry_t *e) {
+    if (objs->split_send == SPLIT_SHARD)
+        return work_spsc_push(&objs->shard_work[shard_worker_of(objs, e)], e);
     if (objs->split_send == SPLIT_REBAL)
         return work_spsc_push(&objs->work_spsc, e);
     return comp_queue_enqueue(&objs->comp_queue, e);
 }
 static inline uint32_t ingest_usage(struct objects *objs) {
+    if (objs->split_send == SPLIT_SHARD) {
+        /* Backpressure on the MOST-backed-up worker queue: if any worker falls
+         * behind, throttle the DPA so its shard_work can't overflow (→ drop). */
+        uint32_t mx = 0;
+        int n = objs->num_dpa_threads > 0 ? objs->num_dpa_threads : 1;
+        for (int k = 0; k < n; k++) {
+            uint32_t u = work_spsc_usage(&objs->shard_work[k]);
+            if (u > mx) mx = u;
+        }
+        return mx;
+    }
     if (objs->split_send == SPLIT_REBAL)
         return work_spsc_usage(&objs->work_spsc);
     return comp_queue_usage(&objs->comp_queue);
+}
+
+/* True when egress sends must be handed to a SENDER thread via an SPSC rather
+ * than submitted inline (SPLIT_SENDS shares one send_spsc; SPLIT_SHARD uses the
+ * per-worker shard_send[k] selected by the worker's thread-local). */
+static inline int send_via_spsc(const struct objects *objs) {
+    return objs->split_send == SPLIT_SENDS || objs->split_send == SPLIT_SHARD;
 }
 
 /* ====== Task-pool helpers ======

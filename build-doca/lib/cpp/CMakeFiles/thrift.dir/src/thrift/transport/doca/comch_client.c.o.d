@@ -95,5 +95,5 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_client.c.o: \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
  /opt/mellanox/doca/include/doca_pe.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
- /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
- /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpumesh_common.h

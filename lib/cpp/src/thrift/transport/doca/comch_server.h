@@ -34,6 +34,12 @@ server_send_tx_ack_to(struct objects *objs,
 					  uint32_t req_id,
 					  int32_t dst_pod_id);
 
+/* Batched TX_ACK: coalesce n req_ids into one message (DPUMESH_BATCH_TXACK). */
+doca_error_t
+server_send_batch_tx_ack_to(struct objects *objs,
+							struct doca_comch_connection *conn,
+							const uint32_t *req_ids, int n);
+
 /* Find a pod by pod_id. Returns NULL if not found. */
 struct pod_state *
 find_pod_by_id(struct objects *objs, int32_t pod_id);
@@ -49,7 +55,7 @@ pods_add_connection(struct objects *objs, struct doca_comch_connection *conn);
 /* Invalidate the pod slot for the given connection on disconnect. Marks the
  * slot as not-registered, clears the connection pointer so future lookups
  * skip it, and destroys the host-exported mmap views held on the DPU side.
- * Local DPU buffers (dma_buffer, tx_buffer, tx_ring) and the DPA-side ring
+ * Local DPU buffers (dma_buffer, tx_ring) and the DPA-side ring
  * registration are deliberately not torn down here — that requires a DPA
  * REMOVE_RING round-trip and is the next step. Returns 0 if a slot was
  * found and invalidated, -1 if no slot matched. */

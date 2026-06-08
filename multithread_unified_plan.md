@@ -10,6 +10,17 @@ M2 대비 왜 낮고, DPU 코어를 더 줬는데 왜 안 늘었나"** 로 다�
 > **이번 세션 USER 결정 (범위)**: ① **host→host direct DMA는 보류** — lever로 고려하지 않는다(§8).
 > ② **"pod 늘려 활성 EU 늘리기"는 초점 아님** — `pod%N`이라 2-pod=2 EU는 사실이나(§2), 그걸 늘리는
 > 게 아니라 *가진 2 EU에서 chain이 M2에 못 미치는 것*이 문제다.
+>
+> **2026-06-05 세션 갱신 (USER 범위 확정 + 코드 재검증 against HEAD `a94e3fe7c`)**:
+> ③ **2-pod이 HARD 제약** — 타깃 배포가 2-pod(1쌍) 고정. 06-02 판의 "활성 EU↑는 초점 아님"을
+>    "`pod%N`상 **활성 EU=2 영구 고정**, >2 pod·4-pod harness는 범위 밖"으로 강화(§8).
+> ④ **목표 = 2-pod raw RPS 최대화** (현 104K = 416K dma_copy/s 천장을 직접 깸).
+> ⑤ host→host **계속 보류**(재확인) · ⑥ **§6 측정 먼저** 경로 확정.
+> → 이번주 "DPA/DPU thread **work distribution 결정**"은 *샤딩 스킴 고르기가 아니다*: 2-pod +
+>    host→host-off 하에서 분배 재설계(data/dst-shard·multi-consumer·>2 pod)는 **foreclosed**(§5.0).
+>    남은 질문은 *고정 2 EU+1 ARM의 per-RTT 작업 배치로 handoff latency를 줄일 수 있나*이고 —
+>    그 답은 **§6 측정이 내린다**(분배가 레버인지 vs 순수 왕복 latency라 분배 무익인지).
+>    코드 인용은 HEAD `a94e3fe7c` 기준 §2·§6·부록 갱신.
 
 ---
 
@@ -50,17 +61,33 @@ chain N=1 = 309K(77K×4) → N=2 = 416K = 2 EU인데 **1.35×뿐**(§4.3).
 | 축 | 무엇 | 자원 (per-EU vs 공유) | 근거 |
 |---|---|---|---|
 | **EU (데이터평면)** | dma_copy 실행 | **per-EU**: `dpa_threads[k]`, `dpa_comches[k]`(1c/1p), `dpu_consumer_id`, `is_consumer_empty` 게이트, admission `dpa_sent_count[e][r]` | object.h:334-349, dpa.c:797-816, dpa_kernel.c:41 |
-| **ARM (제어평면)** | 라우팅 + reverse-DMA enqueue + comch send | **공유 1개**: `consumer_pe`, `comp_queue`, ARM worker thread | object.h:339, dpu_worker.c:696-722 |
+| **ARM (제어평면)** | 라우팅 + reverse-DMA enqueue + comch send | **공유 1개**: `consumer_pe`, `comp_queue`, ARM worker thread | object.h:357,396; dpu_worker.c:696-722 |
 
 ```
 N개 EU (각자 독립 데이터평면)  ──모두──►  단일 consumer_pe ─► 단일 comp_queue ─► 단일 ARM worker
-   pod%N로 ring 할당(dpa.c:1084)              (object.h:339, "consumer k → ARM thread k" 주석만 있고 미구현)
+   pod%N로 ring 할당(dpa.c:1084)              (object.h:341, "consumer k → ARM thread k" 주석만 있고 미구현)
 ```
-- 1 cross-pod RTT = **4 dma_copy**(fwd×2 + rev×2, `dpa_kernel.c:231,342`) + per-RTT ARM 작업:
-  comp_queue 4-entry drain + `find_pod_by_id`(linear, RTT당 ~4-6회, comch_server.c:672) +
-  `dpu_enqueue_reverse_dma`×2(dst tx_ring에 post) + **comch send×4**(hop당 DMA_COMPLETION+TX_ACK).
-- **admission 회계(`dpa_sent_count/cached_freed`)는 ARM이 아니라 DPA-EU 작업**(dpa_kernel.c:41, [정정] — 이전 판이 ARM으로 오기).
-- `pod%N`이라 2-pod echo는 N≥2에서 활성 EU 항상 2개(사실, 단 §USER 초점 아님).
+- 1 cross-pod RTT = **4 dma_copy**(fwd×2 + rev×2, `dpa_kernel.c:238,349`) + per-RTT ARM 작업:
+  comp_queue 4-entry drain + `find_pod_by_id`(linear, RTT당 ~4-6회, `comch_server.c:636`) +
+  `dpu_enqueue_reverse_dma`×2(dst tx_ring에 post, `dpu_worker.c:257`) + **comch send×4**(hop당 DMA_COMPLETION+TX_ACK).
+- **admission 회계(`dpa_sent_count/cached_freed`)는 ARM이 아니라 DPA-EU 작업**(`dpa_kernel.c:48-49,315,365`, [정정] — 이전 판이 ARM으로 오기).
+- `pod%N`이라 2-pod echo는 N≥2에서 활성 EU 항상 2개(사실, 단 2-pod이 HARD 제약이라 영구 2 — §8).
+
+**funnel map (병렬성 붕괴 지점, [코드] HEAD `a94e3fe7c`)** — N EU의 share-nothing 데이터평면이 단일
+제어평면으로 수렴하는 곳:
+
+```
+ EU0  EU1 …  (share-nothing: rings[]/desc_idx[]/admission[e][r] 각자)        ← 진짜 병렬
+   └────┴──►  F1 단일 consumer_pe (object.h:357; N msgq 전부 바인딩)          [귀인] 미측정
+            ►  F2 단일 comp_queue (4096, BP_HIGH 3072, N로 안 스케일 object.h:88,396)  [코드] N≥2 burst 리스크
+            ►  F3 단일 ARM worker (route/reverse/send, dpu_worker.c:577)        [측정] 포화 아님 ~2× 여유
+            ►  F4 tx_ring per-pod = single-producer (ring.c)                    미측정
+            ►  F5 comch send pool (atomic-gated)                               미측정
+```
+- **구조적 게이트**: comch msgq는 **1c/1p 하드코딩**(`max_num_consumers=1`/`max_num_producers=1`,
+  `dpa.c:470,477`). dst-shard 완료 fan-out(EU가 안 가진 consumer 도달)은 ×N vs ×N² 분기라 SDK 지원
+  없이는 불가 → §5.0 data/dst-shard foreclosed의 근거.
+- F3(ARM)만 측정으로 여유 확인됨 → SPLIT 무효(§4.4)의 이유. 나머지 funnel은 미측정 — §6이 다룬다.
 
 ---
 
@@ -112,14 +139,14 @@ N개 EU (각자 독립 데이터평면)  ──모두──►  단일 consumer_
 
 ### 4.2 그러면 416K cap의 정체 = 결합 닫힌 루프의 handoff latency
 각 요청은 슬롯을 RTT 내내 쥐고 `EU(fwd dma_copy) → ARM(route + reverse desc post) → EU(rev dma_copy)
-→ ARM(DMA_COMPLETION + TX_ACK) → 해제`를 돈다(dpu_worker.c:144-148, 426-433). EU와 ARM이 요청마다
+→ ARM(DMA_COMPLETION + TX_ACK) → 해제`를 돈다(`dpu_worker.c:207-257`(route+reverse post)·`:335`(notify+send)). EU와 ARM이 요청마다
 *번갈아 의존*한다. **두 서버가 각각 67%/42%인데 직렬 의존 + handoff 지연 때문에 합산 throughput이
 둘 중 누구의 천장보다도 낮다.** throughput = effective_concurrency / W(per-request RTT latency).
 측정: ~1500 in-flight, W≈14.5ms → 104K. 깊이↑ → W↑, T 평탄(M/M/1, depth 2048→4096 실험).
 
 ### 4.3 EU는 정확히 뭘 기다리나 (knee에서 코드+숫자로 후보 좁힘) [추론, 측정으로 확정 필요]
 104K knee, in-flight ~1500. EU가 dma_copy 전 멈출 수 있는 곳 3개를 숫자로 검정:
-- **admission gate** (dpa_kernel.c:307, inflight≥rq_depth=2048): 1500<2048 → **안 걸림**.
+- **admission gate** (dpa_kernel.c:315, inflight≥rq_depth=2048): 1500<2048 → **안 걸림**.
 - **is_consumer_empty / recv recycle** (dpa.c:171, comp_queue≥BP_HIGH=3072이면 정지): 1500<3072 → **안 걸림**.
 - **reverse desc 미도착**: fwd 완료 → consumer_pe progress → comp_queue → `process_completion_queue`
   → reverse desc `valid=1` → EU의 *다음* drain iter 픽업. **이 handoff latency가 남는 유일한 후보.**
@@ -150,6 +177,24 @@ per-request handoff *latency*(§4.2)를 못 줄인다 — latency는 DMA 왕복 
 레버는 `T = concurrency / W`에서 **W(handoff latency)를 줄여 EU idle을 없애는 것**. EU util 68→90%면
 throughput ~140K RPS(+35%). 우선순위:
 
+### 5.0 이번주 work distribution 결정 — 분배 재설계는 2-pod 제약하 foreclosed [코드+측정]
+
+2-pod HARD 제약(활성 EU=2 고정) + host→host 보류 하에서 "분배를 어떻게 바꿀까"의 옵션은 *재설계*가
+아니라 *고정 2 EU+1 ARM 작업의 배치/타이밍*으로 좁혀진다. §6 측정이 그 배치를 정한다.
+
+| 분배 옵션 | 판정 | 이유 (코드/측정) |
+|---|---|---|
+| DPA: `pod%N` 유지 | ✅ 현행 | `dpa.c:1084`; 2-pod=2 EU. 커널은 분배에 무지, host setup만 결정 |
+| DPA: data/dst-shard | ❌ foreclosed | tx_ring single-producer(`ring.c`)·`dpa_sent_count[e][r]` single-writer 깨짐 + `max_num_consumers=1` 게이트(`dpa.c:470,477`); 게다가 활성 EU 2 고정이라 이득 없음 |
+| DPA: 활성 EU↑(>2 pod) | ❌ 범위 밖 | 2-pod 배포 제약(§8) |
+| ARM: 단일 유지 | ✅ 현행 default | — |
+| ARM: 기능분할(SPLIT 1/2) | ⚠️ 무효(측정) | §4.4, ±1% noise. 진단 토글로만 보존 |
+| ARM: per-shard 복제 + ARM→ARM SPSC | ❌ 후순위 | `consumer_pe`/`comp_queue` 단일 funnel 분해 필요; ARM은 ~2배 여유라 정당성 약함(§4.1). `object.h:341` 주석뿐 |
+
+**남는 진짜 질문**: 고정 2 EU+1 ARM 닫힌 루프에서 33% EU idle을 회수할 수 있나? → **할 수 있으면** ARM
+route/cadence 재배치가 레버(§Lever 2·3), **없으면**(순수 왕복 latency) *어떤 2EU+1ARM 재배치도 무익* —
+host→host(보류)만 가능. **§6 측정이 이 둘을 가른다.**
+
 ### Lever 1 (측정 먼저) — per-request 구간 측정으로 EU 대기 국소화 ★
 정적 코드로는 결합 루프 latency를 정확히 못 짚는다(§4.3은 강한 후보지 확정 아님). **측정이 1·2를
 targeted fix로 바꾼다.** 방법(§6).
@@ -162,7 +207,7 @@ targeted fix로 바꾼다.** 방법(§6).
 - 목표: EU가 reverse 일감을 더 빨리 받아 idle↓.
 
 ### Lever 3 — `find_pod_by_id` O(n)→O(1) (싸고 무해, 어느 가설이든 도움)
-`comch_server.c:672` linear scan, RTT당 ~4-6회. pod_id 인덱스 배열로 per-entry 라우팅 latency 제거.
+`comch_server.c:636` linear scan, RTT당 ~4-6회. pod_id 인덱스 배열로 per-entry 라우팅 latency 제거.
 
 ### 하지 말 것 (측정으로 여유 입증됨)
 - **ARM 코어 추가**: ARM ~2배 여유(§4.1), split 무효(§4.4).
@@ -174,18 +219,38 @@ targeted fix로 바꾼다.** 방법(§6).
 ## 6. 측정 계획 — per-request 구간 분해 (occupancy 대신)
 
 occupancy(top -H / dpa-statistics active%)는 ARM·EU 둘 다 busy-spin이라 항상 ~100%로 무용. **시간이
-어디로 가는지 직접** 측정:
-- **DPA 측**: `__dpa_thread_cycles()`를 fwd dma_copy(dpa_kernel.c:231)·rev dma_copy(:342) 직전 stamp,
-  `{req_id, t_fwd, t_rev}`를 device 버퍼에 적재 → run 후 `doca_dpa_d2h_memcpy`로 회수(§bench.md §5.4 패턴, hot-path PCIe 0).
-- **ARM 측**: req_id별 `CLOCK_MONOTONIC` — `process_forward_entry`(dpu_worker.c:207) dequeue,
-  reverse 직후, `process_rev_notify_entry`(:335) dequeue, send 직후.
-- **구간**: fwd-dma / **ARM-route** / **comp_queue 체류** / **reverse-pickup 대기** / rev-dma / ARM-notify.
-- **판정 맵**: reverse-pickup 대기 + comp_queue 체류가 지배 → handoff latency 확정(Lever 2 타깃).
-  ARM-route/notify가 지배 → find_pod/send 비용(Lever 3 + send 경량화). 모든 구간 평탄한데 T plateau →
-  순수 RTT 직렬 latency(EU↔ARM 왕복 자체).
-- **주의**: EU cycle은 cross-EU 비교 불가; DPA-cycle과 host-MONOTONIC 도메인 혼합 금지(같은 pod의 fwd/rev는
-  같은 EU라 intra-EU delta는 유효); 1/K 샘플; **계측 빌드가 104K/0-fail 재현하는지 먼저 확인**(자기무효 방지);
-  구간 합이 측정 p50(~14.5ms)와 sampling error 내 일치해야 누락 없음.
+어디로 가는지 직접** 측정: per-request `W`를 구간 분해해 33% EU idle을 *positive*로 국소화한다.
+
+**5개 stamp 지점** (device 버퍼 적재 + run 후 `doca_dpa_d2h_memcpy` 회수, hot-path 로그·PCIe 0; bench.md §5.4 패턴):
+
+| # | 지점 | 도메인 | 무엇 |
+|---|---|---|---|
+| ① | EU: fwd dma_copy 직전 `__dpa_thread_cycles()` (`dpa_kernel.c:238`) | DPA cycle | fwd 발행 타임스탬프 |
+| ② | EU: rev dma_copy 직전 (`dpa_kernel.c:349`) | DPA cycle | rev 발행 + **연속 발행 간 idle gap** |
+| ③ | ARM: forward completion dequeue (`process_forward_entry` `dpu_worker.c:207`) | host MONOTONIC | t1 |
+| ④ | ARM: reverse desc post 직후 (`dpu_enqueue_reverse_dma` 호출 `dpu_worker.c:257`) | host MONOTONIC | t2 → **ARM route+reverse 지연 = t2−t1** |
+| ⑤ | ARM: rev-notify dequeue + send 직후 (`process_rev_notify_entry` `dpu_worker.c:335`) | host MONOTONIC | send leg |
+
+**핵심 산출물 = 잔차(residual).** 5점은 *컴포넌트 귀속 가능한* 작업(① ② EU 비용 + ③④ ARM route + ⑤ send)만
+bracket한다. 직접 stamp 못 하는 **[A] DMA 완료 전달(producer→consumer_pe→comp_queue)**·**[B] EU drain
+cadence(rev desc 도착→다음 iter 픽업)**가 남는다. 따라서:
+
+> **잔차 = W − (①② + ③④ + ⑤) = 순수 왕복 전달 latency**
+
+**판정 맵 → 분배 결정(§5.0):**
+- **③④(ARM route) 지배** → ARM이 reverse를 늦게 post → **분배가 레버**: ARM route/cadence 재배치(§Lever 2)
+  + `find_pod_by_id` O(1)(§Lever 3). ← "DPU thread를 어떻게 배치하나"의 답.
+- **잔차 지배** → 닫힌 루프 물리적 왕복 latency → **2 EU+1 ARM 어떤 재배치도 무익**(host→host만, 보류).
+  이번주의 정직한 결론이 *"분배로는 천장 못 올림"*일 수 있고, 그걸 **[측정]으로 단정**하게 된다.
+- **⑤(send) 지배** → send 배치(단 §4.4·bench §6.3 무익 예상).
+- **(옵션) 게이트 발화 카운터** — admission gate(`dpa_kernel.c:315`) hit + `is_consumer_empty`/recv-recycle
+  (`dpa.c:171` BP_HIGH) hit 수를 함께 적재하면 idle을 **admission / recv recycle / reverse 기아**로 분리.
+  §4.3의 "1500<2048이라 안 걸림"을 [추론]→[측정]으로 못박는다.
+
+**주의**: EU cycle은 cross-EU 비교 불가(같은 pod fwd/rev는 같은 EU라 intra-EU delta만 유효); DPA-cycle과
+host-MONOTONIC **도메인 혼합·합산 금지**(크기 비교만, 잔차는 차감으로만); 1/K 샘플; **계측 on/off가
+104K/0-fail를 비회귀 재현하는지 먼저 확인**(자기무효 방지); 구간 합이 측정 p50(~14.5ms)와 sampling error
+내 일치해야 누락 없음.
 
 ---
 
@@ -198,6 +263,11 @@ occupancy(top -H / dpa-statistics active%)는 ARM·EU 둘 다 busy-spin이라 �
 | **2** | handoff latency 단축(§Lever 2) — 측정이 reverse-pickup 대기 확인 시 | Phase 0 | EU util↑ → +~35% | med |
 | **—** | (보류) host→host, data-shard, multi-EU 확장 | §8 | — | — |
 
+**이번주 Phase 0 구체 단계** (2026-06-05): (0) `DPUMESH_TRACE` 토글 + device 버퍼 + d2h 회수 골조,
+기본 off → (1) §6 5점 stamp(+게이트 카운터) 삽입 → (2) **계측 on/off 비회귀 확인**(104K/0-fail,
+`test-bench.sh deploy`→`dpumesh`) → (3) 104K knee에서 run, 1/K 샘플, 구간+잔차 산출 → (4) 판정맵으로
+**이번주 work distribution 결정 확정**. 즉 **Phase 0의 판정이 곧 분배 결정**이다(§5.0·§6).
+
 **핵심**: Phase 0 측정 전에는 구조를 안 바꾼다 — 소거법으로 단정하면 이전 판처럼 결론이 번복된다.
 
 ---
@@ -207,9 +277,10 @@ occupancy(top -H / dpa-statistics active%)는 ARM·EU 둘 다 busy-spin이라 �
 - **host→host direct DMA**: 보류. (참고: RTT당 dma_copy 4→2로 per-request 작업·EU op을 직접 반감하는
   유일한 *구조적* 레버지만, 이번 세션에선 고려하지 않음. 재개 시 admission을 dst rq_depth로 re-key +
   forward-time dst 가시성 + per-EU admission single-writer 불변식 처리 필요 — 별도 검토.)
-- **활성 EU 늘리기(>2 pod / data-shard 7.B)**: 초점 아님. `pod%N`→2-pod=2 EU는 사실이나 이 문제의 핵심이
-  아님. data-shard는 dst-routing demux 미구현 + tx_ring multi-producer + per-EU admission cross-write 등
-  고리스크이고, *ARM이 cap으로 측정된 뒤에만* 의미 있는데 §4에서 ARM은 cap 아님으로 기울어 후순위.
+- **활성 EU 늘리기(>2 pod / data-shard 7.B)**: **범위 밖 (2-pod HARD 제약, 2026-06-05)**. 타깃 배포가
+  2-pod라 `pod%N`→활성 EU=2 영구 고정 → bench.md §8의 lever#1("활성 EU↑")은 *이 배포에서 사용 불가*.
+  data-shard는 그 위에 dst-routing demux 미구현 + tx_ring multi-producer + per-EU admission cross-write
+  + `max_num_consumers=1` 게이트(`dpa.c:470,477`)까지 겹쳐 고리스크 → foreclosed(§5.0).
 - **multi-EU 데이터평면 확장**: 2 EU도 67%로 포화 아니므로 우선순위 낮음.
 
 ---
@@ -229,16 +300,19 @@ occupancy(top -H / dpa-statistics active%)는 ARM·EU 둘 다 busy-spin이라 �
 
 | 사실 | 위치 | 판정 |
 |---|---|---|
-| 4 dma_copy/RTT(fwd×2+rev×2) | dpa_kernel.c:231,342 | ✅ |
-| per-EU 데이터평면 / 공유 단일 제어평면 | object.h:334-349,339; dpa.c:569,797-816 | ✅ |
+| 4 dma_copy/RTT(fwd×2+rev×2) | dpa_kernel.c:238,349 | ✅ |
+| per-EU 데이터평면 / 공유 단일 제어평면 | object.h:347-351,357; dpa.c:797-816 | ✅ |
 | `pod%N` → 2-pod=2 EU | dpa.c:1084 | ✅ |
+| 2-pod HARD 제약 → 활성 EU 영구 2 (USER 2026-06-05) | — | ✅ [범위] |
+| comch 1c/1p 게이트 → dst-shard foreclosed | dpa.c:470,477 | ✅ [코드] |
+| funnel: 단일 consumer_pe / comp_queue / tx_ring(per-pod) | object.h:357,396; ring.c | ✅ [코드] |
 | 단일 ARM send 천장 ≈1.0M (M2 N≥4 plateau) | bench M2 N=4 1.006M/N=8 1.025M | ✅ [측정] |
 | 626K(M2-N=2)는 EU/drain bound (M0≈M2 @N=2) | M0-N2 629K ≈ M2-N2 626K | ✅ [측정] |
 | chain ARM 416K send/s = 천장 42% → ARM 여유 ~2× | 산술(4 send/RTT×104K) | ✅ [추론] |
 | chain EU 416K = M2 EU 626K × 0.68(util) | 산술 | ✅ [추론] |
 | chain N=1 309K → N=2 416K = 1.35× | bench [측정] | ✅ |
 | knee in-flight ~1500 < 2048 slot, < BP_HIGH 3072 | 104K×14.5ms; object.h:88 | ✅ [추론] |
-| admission DPA-EU 작업(ARM 아님) | dpa_kernel.c:41,308,358 | ✅ [정정] |
+| admission DPA-EU 작업(ARM 아님) | dpa_kernel.c:48-49,315,365 | ✅ [정정] |
 | SPLIT_SEND 구현·측정, 2-EU −0.9%/+2%→0% (무효) | dpu_worker.c:526-572; bench [측정] | ✅ [정정 from "계획"] |
 | split 무효 = ARM 여유 + 불균형 절단 + latency 못줄임 | §4.4 | ✅ [추론] |
 | N=8 = 소거뿐, positive 증거 없음 | §3.4, bench §9 | ✅ [정정 from "PROVEN"] |

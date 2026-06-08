@@ -96,13 +96,22 @@ sync_sources() {
 
 build_dpu() {
     step "=== Building on DPU (ninja) ==="
+    # Optimization level for the ARM control plane (dpumesh_dpu). meson bakes
+    # buildtype at `meson setup` time, so a plain `ninja` will NOT re-apply a
+    # buildtype change to an already-configured build dir. `meson configure`
+    # forces it (idempotent) and marks the dir dirty so the .o files actually
+    # rebuild with the new -O level. Default debugoptimized (-O2 -g); override
+    # with DPU_BUILDTYPE=debug for an -O0 debugging build.
+    local bt="${DPU_BUILDTYPE:-debugoptimized}"
     ssh "$DPU_HOST" "rm -f ~/$DPU_BUILD/dpa_kernel.a" 2>/dev/null || true
     local out
-    out=$(ssh "$DPU_HOST" "cd ~/$DPU_BUILD && ninja" 2>&1)
+    out=$(ssh "$DPU_HOST" "cd ~/$DPU_BUILD && meson configure -Dbuildtype=$bt 2>&1; ninja 2>&1" 2>&1)
     if echo "$out" | grep -q "error:"; then
         err "DPU build failed:"; echo "$out"; exit 1
     fi
-    info "DPU build OK"
+    local nobj
+    nobj=$(echo "$out" | grep -cE "Compiling C object" || true)
+    info "DPU build OK (buildtype=$bt, recompiled $nobj C objects)"
 }
 
 build_host() {
@@ -239,11 +248,25 @@ start_dpu() {
     local split_send="${DPUMESH_SPLIT_SEND:-0}"
     local arm_core_a="${DPUMESH_ARM_CORE_A:-2}"
     local arm_core_b="${DPUMESH_ARM_CORE_B:-3}"
-    step "=== Starting dpumesh_dpu on DPU (DPA EU threads=$dpa_threads, affinity=$dpa_affinity, split_send=$split_send A=$arm_core_a B=$arm_core_b) ==="
+    local drain_shards="${DPUMESH_DRAIN_SHARDS:-1}"
+    local shard_core_base="${DPUMESH_SHARD_CORE_BASE:-4}"
+    # Keepalive interval (us) bounding the EU forward->reverse handoff wake-up.
+    local keepalive_us="${DPUMESH_KEEPALIVE_US:-1000}"
+    # DPU log level (40=WARN+ default; 50=INFO+ to see the 1Hz sent/recv/cq_depth
+    # stat. No per-request INFO logs exist, so 50 does not flood — verified.)
+    local log_level="${DPUMESH_LOG_LEVEL:-40}"
+    # DPU-side hop-latency trace (0=off default). Writes avg to /tmp/dpumesh_trace.txt
+    # (overwrite, never grows) — read via `test-bench.sh trace`. Stays at -l 40.
+    local trace="${DPUMESH_TRACE:-0}"
+    # Skip request-forward TX_ACK (client frees TX slot on response arrival).
+    local skip_req_txack="${DPUMESH_SKIP_REQ_TXACK:-0}"
+    # Coalesce response TX_ACKs into batched messages (DPU-side).
+    local batch_txack="${DPUMESH_BATCH_TXACK:-0}"
+    step "=== Starting dpumesh_dpu on DPU (DPA EU threads=$dpa_threads, affinity=$dpa_affinity, split_send=$split_send A=$arm_core_a B=$arm_core_b drain_shards=$drain_shards keepalive_us=$keepalive_us) ==="
     stop_dpu
     ssh "$DPU_HOST" "cat > /tmp/start_dpu_bench.sh << 'LAUNCHER'
 #!/bin/bash
-screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_DPA_THREADS=$dpa_threads DPUMESH_DPA_AFFINITY=$dpa_affinity DPUMESH_SPLIT_SEND=$split_send DPUMESH_ARM_CORE_A=$arm_core_a DPUMESH_ARM_CORE_B=$arm_core_b ./dpumesh_dpu $DPU_PCI -l 40 > $DPU_LOG 2>&1\"
+screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_DPA_THREADS=$dpa_threads DPUMESH_DPA_AFFINITY=$dpa_affinity DPUMESH_SPLIT_SEND=$split_send DPUMESH_ARM_CORE_A=$arm_core_a DPUMESH_ARM_CORE_B=$arm_core_b DPUMESH_DRAIN_SHARDS=$drain_shards DPUMESH_SHARD_CORE_BASE=$shard_core_base DPUMESH_KEEPALIVE_US=$keepalive_us DPUMESH_TRACE=$trace DPUMESH_SKIP_REQ_TXACK=$skip_req_txack DPUMESH_BATCH_TXACK=$batch_txack ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
 sleep 2
 pgrep -f 'dpumesh_dpu.*03:00' || echo NO_PID
 LAUNCHER
@@ -289,6 +312,16 @@ get_pod_cores() {
                 echo-dpumesh)  echo "1,5" ;;
                 bench-tcp)     echo "2" ;;   # untouched
                 echo-tcp)      echo "3" ;;   # untouched
+                *) echo "" ;;
+            esac
+            ;;
+        hw3)
+            # 3 cores/side for dpumesh (cores 2,3 reserved for TCP pods).
+            case "$app" in
+                bench-dpumesh) echo "0,4,6" ;;
+                echo-dpumesh)  echo "1,5,7" ;;
+                bench-tcp)     echo "2" ;;
+                echo-tcp)      echo "3" ;;
                 *) echo "" ;;
             esac
             ;;
@@ -403,6 +436,11 @@ spec:
         - { name: BENCH_WORKER_ID, value: "10" }
         - { name: BENCH_DST_POD_ID, value: "11" }
         - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-2048}" }
+        - { name: DPUMESH_PE_ADAPTIVE, value: "${DPUMESH_PE_ADAPTIVE:-0}" }
+        - { name: DPUMESH_ZEROCOPY_RX, value: "${DPUMESH_ZEROCOPY_RX:-0}" }
+        - { name: DPUMESH_POLL_RX, value: "${DPUMESH_POLL_RX:-0}" }
+        - { name: DPUMESH_ASYNC_CLIENT, value: "${DPUMESH_ASYNC_CLIENT:-0}" }
+        - { name: ASYNC_THREADS, value: "${ASYNC_THREADS:-4}" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리 (CFS quota 미사용).
         volumeMounts:
@@ -437,8 +475,11 @@ spec:
         env:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
         - { name: BENCH_WORKER_ID, value: "11" }
-        - { name: ECHO_THREADS, value: "64" }
+        - { name: ECHO_THREADS, value: "${ECHO_THREADS:-64}" }
         - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-2048}" }
+        - { name: DPUMESH_PE_ADAPTIVE, value: "${DPUMESH_PE_ADAPTIVE:-0}" }
+        - { name: DPUMESH_ZEROCOPY_RX, value: "${DPUMESH_ZEROCOPY_RX:-0}" }
+        - { name: DPUMESH_POLL_RX, value: "${DPUMESH_POLL_RX:-0}" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리.
         volumeMounts:
@@ -777,6 +818,11 @@ case "$CMD" in
         pin_pods hw >/dev/null
         run_bench "dpumesh" "${@:2}"
         ;;
+    dpumesh-hw3)
+        # 3 cores/side — host multi-core scalability test.
+        pin_pods hw3 >/dev/null
+        run_bench "dpumesh" "${@:2}"
+        ;;
     tcp)
         # TCP는 항상 fair-mode로 강제 (B안 자체가 1-core 비교 전제)
         pin_pods fair >/dev/null
@@ -790,6 +836,17 @@ case "$CMD" in
         ;;
     logs)
         show_logs
+        ;;
+    dpulog)
+        # Read-only tail of the dpumesh_dpu log on the DPU (per-second stat lines:
+        # sent/s, recv/s, cq_depth, deferred). Used to observe ARM occupancy under
+        # load. $2 = number of lines (default 40).
+        n="${2:-40}"
+        ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -$n $DPU_LOG" 2>&1 | sed 's/^\[sudo\][^:]*: *//'
+        ;;
+    trace)
+        # Read the DPU-side hop-latency trace file (needs DPUMESH_TRACE=1 deploy).
+        ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S cat /tmp/dpumesh_trace.txt 2>/dev/null" 2>&1 | sed 's/^\[sudo\][^:]*: *//'
         ;;
     status)
         show_status

@@ -90,7 +90,9 @@ struct dpumesh_ctx {
     /* Persistent buffer for initial registration to avoid stack UAF */
     struct dmesh_register_msg reg_msg;
 
-    /* TX slot management */
+    /* TX slot management. (Tested O(1) LIFO free-list 2026-06-08 — REGRESSED the
+     * ceiling 104K→96K vs the lowest-index-first scan, so the scan is retained;
+     * tx_alloc was not the host cap. See bench/scale_log.md E6.) */
     uint8_t *slot_bitmap;
     pthread_mutex_t slot_lock;
     pthread_cond_t  slot_cond;  /* Signaled when a TX slot is freed */
@@ -112,6 +114,42 @@ struct dpumesh_ctx {
     /* PE progress thread */
     pthread_t pe_tid;
     volatile int pe_running;
+    /* Adaptive polling: when set, the PE thread spins while there is RX work
+     * but YIELDS the core (short nanosleep) after a sustained idle stretch,
+     * instead of busy-polling a full core regardless of load. Frees the host
+     * core for the application when the transport is idle (core-efficiency).
+     * Throughput-neutral under load (never idle → never backs off). Off=legacy
+     * busy-poll. Set via DPUMESH_PE_ADAPTIVE. */
+    int pe_adaptive;
+    /* Zero-copy RX (DPUMESH_ZEROCOPY_RX): when set, the PE thread does NOT
+     * rx_slot_alloc (O(n) scan) nor memcpy the reverse-DMA payload into a
+     * separate staging slot. Instead it delivers a descriptor carrying the
+     * landing offset `pos` (in body_buf_slot) and the consumer reads
+     * rx_dma_buffer[pos] DIRECTLY, then rx_free returns the admission credit.
+     * Safe because the DPA admission (rq_depth=num_slots, credit bumped in
+     * rx_free) never reverse-DMAs more than num_slots ahead of freed, so an
+     * unread landing position is never lapped — provided rx_free stays AFTER
+     * the read. Off = legacy staging copy. */
+    int zerocopy_rx;
+    /* Poll-mode RX (DPUMESH_POLL_RX): server consumers (dpumesh_dequeue) spin on
+     * the rx_queue with adaptive backoff instead of blocking on rx_cond, and the
+     * PE thread STOPS pthread_cond_signal(rx_cond) per request. Eliminates the
+     * per-request server-side wakeup (1 futex + 1 context switch) — the dominant
+     * remaining host per-request cost. Only safe when the consumer is productive
+     * (never idle-waiting), which the echo's shared-queue workers are. Off =
+     * legacy cond_wait. */
+    int poll_rx;
+    /* Async client (DPUMESH_ASYNC_CLIENT): when set, the PE thread STOPS the
+     * per-request response wakeup (pthread_cond_signal on the pending cond in
+     * rx_deliver_desc). Clients observe completion via dpumesh_poll_response (a
+     * lock-free state load) instead of blocking in dpumesh_wait_response. This
+     * eliminates the dominant remaining client-side per-request cost (1 futex +
+     * 1 context switch on BOTH the PE thread and the waking worker) and lets a
+     * handful of polling threads carry many in-flight requests — far fewer host
+     * cores than the thread-per-request blocking model. Off = legacy blocking
+     * wait. Process-global: a process in async mode must use poll_response,
+     * never wait_response (which would never be woken). */
+    int async_client;
 
     /* Client-side pending response table */
     dpumesh_pending_t pending[MAX_PENDING];
@@ -122,15 +160,36 @@ struct dpumesh_ctx {
  * PE progress thread — drives DOCA progress engine
  * ==================================================================== */
 
+/* Adaptive-poll tuning: spin this many empty iterations before the first
+ * back-off (catches brief inter-request gaps with no latency cost), then sleep
+ * a short, capped interval per empty iteration (yields the core during
+ * sustained idle). At load there is always work so we never reach the spin
+ * threshold → identical to busy-poll, throughput-neutral. */
+#define PE_IDLE_SPIN     2048
+#define PE_BACKOFF_NS    20000   /* 20 us */
+
 static void *pe_progress_fn(void *arg) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)arg;
+    uint32_t idle = 0;
 
     while (ctx->pe_running) {
+        uint8_t did = 0;
         if (ctx->doca_objs.pe)
-            doca_pe_progress(ctx->doca_objs.pe);
-
+            did |= doca_pe_progress(ctx->doca_objs.pe);
         if (ctx->doca_objs.consumer_pe)
-            doca_pe_progress(ctx->doca_objs.consumer_pe);
+            did |= doca_pe_progress(ctx->doca_objs.consumer_pe);
+
+        if (!ctx->pe_adaptive)
+            continue;                 /* legacy busy-poll */
+
+        if (did) {
+            idle = 0;                 /* work seen — keep spinning tight */
+        } else if (++idle >= PE_IDLE_SPIN) {
+            /* Sustained idle: yield the core to the application. A response
+             * arriving now waits at most PE_BACKOFF_NS for the next poll. */
+            struct timespec t = {0, PE_BACKOFF_NS};
+            nanosleep(&t, NULL);
+        }
     }
     return NULL;
 }
@@ -153,6 +212,31 @@ static int rx_slot_alloc(dpumesh_ctx_t *ctx) {
 }
 
 
+/* Return one unit of reverse-DMA admission credit to the DPA (it polls this
+ * counter at the extra slot past the dma_ring; see dpumesh_rx_free). */
+static inline void rx_credit_return(dpumesh_ctx_t *ctx)
+{
+    if (ctx->dma_ring && ctx->dma_ring->descs) {
+        volatile uint64_t *credit =
+            (volatile uint64_t *)(ctx->dma_ring->descs + ctx->dma_ring->size);
+        __sync_add_and_fetch(credit, 1);
+    }
+}
+
+/* Reclaim an undeliverable RX entry (error/drop paths). Zero-copy: there is no
+ * staging slot — return the landing credit so the DPA can reuse that position.
+ * Staging: free the staging bitmap slot (legacy; credit is returned at rx_free). */
+static void rx_reclaim(dpumesh_ctx_t *ctx, int slot)
+{
+    if (ctx->zerocopy_rx) {
+        rx_credit_return(ctx);
+        return;
+    }
+    pthread_mutex_lock(&ctx->rx_slot_lock);
+    ctx->rx_slot_bitmap[slot] = 0;
+    pthread_mutex_unlock(&ctx->rx_slot_lock);
+}
+
 /*
  * Deliver a fully parsed descriptor to the pending table or RX queue.
  * Common path for both comch-based RX_DATA and DMA-based DMA_COMPLETION.
@@ -166,24 +250,34 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
         if (p->state == 0) {
             p->desc = *desc;
             p->state = 1;
-            pthread_cond_signal(&p->cond);
+            /* Response arrival implies this request round-tripped (was delivered),
+             * so its TX slot is logically free now — release it here instead of
+             * relying on a separate per-request TX_ACK message (which doubles the
+             * host PE-thread's RX message load). No-op if a TX_ACK already freed
+             * it (tx_slot==-1), so this is safe whether or not the DPU still
+             * sends request-TX_ACKs (DPUMESH_SKIP_REQ_TXACK). */
+            if (p->tx_slot >= 0) {
+                dpumesh_tx_free(ctx, p->tx_slot);
+                p->tx_slot = -1;
+            }
+            /* Async clients poll p->state (set to 1 above) and need no wakeup;
+             * skipping the signal removes the per-response futex + context
+             * switch — the dominant remaining client-side host cost. */
+            if (!ctx->async_client)
+                pthread_cond_signal(&p->cond);
         } else if (p->state == -2) {
             /* Cancelled request — DPA finished, now safe to free TX + RX */
             if (p->tx_slot >= 0) {
                 dpumesh_tx_free(ctx, p->tx_slot);
                 p->tx_slot = -1;
             }
-            pthread_mutex_lock(&ctx->rx_slot_lock);
-            ctx->rx_slot_bitmap[slot] = 0;
-            pthread_mutex_unlock(&ctx->rx_slot_lock);
+            rx_reclaim(ctx, slot);
             p->state = -1;
             pthread_cond_broadcast(&p->cond);
         } else {
             DOCA_LOG_ERR("RX deliver: OP_RESPONSE for req_id=%u but no waiter (state=%d)",
                          desc->req_id, p->state);
-            pthread_mutex_lock(&ctx->rx_slot_lock);
-            ctx->rx_slot_bitmap[slot] = 0;
-            pthread_mutex_unlock(&ctx->rx_slot_lock);
+            rx_reclaim(ctx, slot);
         }
         pthread_mutex_unlock(&p->lock);
     } else {
@@ -197,16 +291,16 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
         if (ctx->rx_count >= RX_QUEUE_SIZE) {
             pthread_mutex_unlock(&ctx->rx_lock);
             DOCA_LOG_ERR("RX deliver: queue full, dropping req_id=%u", desc->req_id);
-            pthread_mutex_lock(&ctx->rx_slot_lock);
-            ctx->rx_slot_bitmap[slot] = 0;
-            pthread_mutex_unlock(&ctx->rx_slot_lock);
+            rx_reclaim(ctx, slot);
             return;
         }
 
         ctx->rx_queue[ctx->rx_tail] = *desc;
         ctx->rx_tail = (ctx->rx_tail + 1) % RX_QUEUE_SIZE;
         ctx->rx_count++;
-        pthread_cond_signal(&ctx->rx_cond);
+        /* Poll-mode consumers spin on rx_count — no per-request wakeup needed. */
+        if (!ctx->poll_rx)
+            pthread_cond_signal(&ctx->rx_cond);
         pthread_mutex_unlock(&ctx->rx_lock);
     }
 }
@@ -235,17 +329,27 @@ static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_l
                      dma_len, ctx->slot_size, req_id);
         return -1;
     }
-    uint8_t *body = (uint8_t *)ctx->rx_dma_buffer + pos;
     uint32_t body_len = dma_len;
 
-    int slot = rx_slot_alloc(ctx);
-    if (slot < 0) {
-        DOCA_LOG_ERR("process_rx_dma_entry: no free RX slots, dropping req_id=%u", req_id);
-        return -1;
+    /* Zero-copy: the PE thread does NOT scan for a staging slot nor memcpy the
+     * payload. It delivers the landing byte-offset `pos` in body_buf_slot; the
+     * consumer reads rx_dma_buffer[pos] directly and returns the credit at
+     * rx_free. The DPA admission keeps the landing position un-lapped until then.
+     * Legacy path: alloc a staging slot and memcpy the body into it now. */
+    int slot;
+    if (ctx->zerocopy_rx) {
+        slot = (int)pos;   /* body_buf_slot carries the landing byte offset */
+    } else {
+        uint8_t *body = (uint8_t *)ctx->rx_dma_buffer + pos;
+        slot = rx_slot_alloc(ctx);
+        if (slot < 0) {
+            DOCA_LOG_ERR("process_rx_dma_entry: no free RX slots, dropping req_id=%u", req_id);
+            return -1;
+        }
+        uint8_t *dst = (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
+        if (body_len > 0)
+            memcpy(dst, body, body_len);
     }
-    uint8_t *dst = (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
-    if (body_len > 0)
-        memcpy(dst, body, body_len);
 
     sw_descriptor_t desc;
     memset(&desc, 0, sizeof(desc));
@@ -303,6 +407,39 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         pthread_mutex_unlock(&p->lock);
 
         DOCA_LOG_DBG("TX_ACK: freed TX slot for req_id=%u", ack.req_id);
+        return;
+    }
+
+    if (mtype == DMESH_MSG_BATCH_FWD_ACK) {
+        /* Batched TX_ACK: free the TX slot of each req_id (identical per-request
+         * logic + owner guard as DMESH_MSG_FWD_ACK). One message → K frees. */
+        if (len < 4) {
+            DOCA_LOG_ERR("BATCH_TX_ACK: too short (len=%u)", len);
+            return;
+        }
+        const struct dmesh_batch_tx_ack_msg *b = (const struct dmesh_batch_tx_ack_msg *)data;
+        uint32_t n = b->count;
+        if (n > BATCH_TXACK_MAX) n = BATCH_TXACK_MAX;
+        if (len < 4u + 4u * n) {
+            DOCA_LOG_ERR("BATCH_TX_ACK: len=%u short for count=%u", len, n);
+            return;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t rid = b->req_ids[i];
+            uint32_t idx = rid % MAX_PENDING;
+            dpumesh_pending_t *p = &ctx->pending[idx];
+            pthread_mutex_lock(&p->lock);
+            if ((p->state == 0 || p->state == -2) && p->tx_slot >= 0 &&
+                p->owner_req_id == rid) {
+                dpumesh_tx_free(ctx, p->tx_slot);
+                p->tx_slot = -1;
+                if (p->state == -2) {
+                    p->state = -1;
+                    pthread_cond_broadcast(&p->cond);
+                }
+            }
+            pthread_mutex_unlock(&p->lock);
+        }
         return;
     }
 
@@ -506,6 +643,18 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     ctx->doca_objs.rx_hook_ctx = ctx;
 
     ctx->pe_running = 1;
+    { const char *pa = getenv("DPUMESH_PE_ADAPTIVE"); ctx->pe_adaptive = pa ? atoi(pa) : 0; }
+    if (ctx->pe_adaptive)
+        DOCA_LOG_INFO("PE adaptive polling ON (yields core when transport idle)");
+    { const char *zc = getenv("DPUMESH_ZEROCOPY_RX"); ctx->zerocopy_rx = zc ? atoi(zc) : 0; }
+    if (ctx->zerocopy_rx)
+        DOCA_LOG_INFO("Zero-copy RX ON (PE thread delivers landing offset; no staging scan/copy)");
+    { const char *pr = getenv("DPUMESH_POLL_RX"); ctx->poll_rx = pr ? atoi(pr) : 0; }
+    if (ctx->poll_rx)
+        DOCA_LOG_INFO("Poll-mode RX ON (dequeue spin-polls; PE thread stops per-request rx_cond signal)");
+    { const char *ac = getenv("DPUMESH_ASYNC_CLIENT"); ctx->async_client = ac ? atoi(ac) : 0; }
+    if (ctx->async_client)
+        DOCA_LOG_INFO("Async client ON (PE thread stops per-request response signal; clients poll_response)");
     if (pthread_create(&ctx->pe_tid, NULL, pe_progress_fn, ctx) != 0) goto fail;
 
     DOCA_LOG_INFO("DPUmesh DOCA initialized: worker=%s pod_id=%d", ctx->worker_id, ctx->pod_id);
@@ -712,7 +861,52 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
  * RX functions
  * ==================================================================== */
 
+/* Poll-mode dequeue tuning: spin this many empty racy-checks before yielding
+ * the core; at load the queue is rarely empty so the backoff is never reached
+ * (no wakeup, no context switch). Mirrors the PE adaptive-poll pattern. */
+#define RX_POLL_SPIN       1024
+#define RX_POLL_BACKOFF_NS 20000   /* 20 us */
+
 int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
+    if (ctx->poll_rx) {
+        /* Adaptive spin-poll: no rx_cond block. Racy-check rx_count without the
+         * lock (hint; re-checked under lock), take the lock only to dequeue, back
+         * off after sustained idle. Eliminates the per-request wakeup. */
+        struct timespec deadline; int have_dl = 0;
+        if (timeout_ms > 0) {
+            clock_gettime(CLOCK_MONOTONIC, &deadline);
+            deadline.tv_sec  += timeout_ms / 1000;
+            deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+            if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+            have_dl = 1;
+        }
+        uint32_t idle = 0;
+        for (;;) {
+            if (__atomic_load_n(&ctx->rx_count, __ATOMIC_RELAXED) > 0) {
+                pthread_mutex_lock(&ctx->rx_lock);
+                if (ctx->rx_count > 0) {
+                    *desc = ctx->rx_queue[ctx->rx_head];
+                    ctx->rx_head = (ctx->rx_head + 1) % RX_QUEUE_SIZE;
+                    ctx->rx_count--;
+                    pthread_mutex_unlock(&ctx->rx_lock);
+                    return 0;
+                }
+                pthread_mutex_unlock(&ctx->rx_lock);
+            }
+            if (timeout_ms == 0) return -1;            /* non-blocking try */
+            if (++idle >= RX_POLL_SPIN) {
+                if (have_dl) {
+                    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+                    if (now.tv_sec > deadline.tv_sec ||
+                        (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+                        return -1;
+                }
+                struct timespec t = {0, RX_POLL_BACKOFF_NS};
+                nanosleep(&t, NULL);
+            }
+        }
+    }
+
     pthread_mutex_lock(&ctx->rx_lock);
 
     struct timespec ts;
@@ -751,26 +945,29 @@ int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
 }
 
 uint8_t *dpumesh_rx_buf(dpumesh_ctx_t *ctx, int slot) {
+    if (ctx->zerocopy_rx) {
+        /* slot carries the landing byte-offset (pos) into rx_dma_buffer. */
+        if (slot < 0 || (size_t)slot >= ctx->rx_dma_buf_size) return NULL;
+        return (uint8_t *)ctx->rx_dma_buffer + (size_t)slot;
+    }
     if (slot < 0 || slot >= ctx->num_slots) return NULL;
     return (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
 }
 
 void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot) {
+    /* Zero-copy: no staging slot to free — `slot` is the landing offset, ignored.
+     * Just return the admission credit so the DPA can reuse that landing position
+     * (this is AFTER the consumer finished reading rx_dma_buffer[pos]). */
+    if (ctx->zerocopy_rx) {
+        rx_credit_return(ctx);
+        return;
+    }
     if (slot < 0 || slot >= ctx->num_slots) return;
     /* Flow control ensures no overwrite of unconsumed data — no memset needed */
     pthread_mutex_lock(&ctx->rx_slot_lock);
     ctx->rx_slot_bitmap[slot] = 0;
     pthread_mutex_unlock(&ctx->rx_slot_lock);
-
-    /* DPA-poll credit return: bump the counter at the LAST (extra) slot of
-     * the dma_ring buffer. DPA polls this slot via the same buf_arr it
-     * already uses for forward dma_desc reads — no separate buf_arr, no
-     * extra PCIe read mechanism. ~10ns on host hot path. */
-    if (ctx->dma_ring && ctx->dma_ring->descs) {
-        volatile uint64_t *credit =
-            (volatile uint64_t *)(ctx->dma_ring->descs + ctx->dma_ring->size);
-        __sync_add_and_fetch(credit, 1);
-    }
+    rx_credit_return(ctx);
 }
 
 /* ====================================================================
@@ -779,6 +976,21 @@ void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot) {
 
 int dpumesh_get_slot_size(dpumesh_ctx_t *ctx) {
     return ctx->slot_size;
+}
+
+void dpumesh_debug_stats(dpumesh_ctx_t *ctx, int *rx_depth, int *tx_inflight) {
+    if (rx_depth) {
+        pthread_mutex_lock(&ctx->rx_lock);
+        *rx_depth = ctx->rx_count;
+        pthread_mutex_unlock(&ctx->rx_lock);
+    }
+    if (tx_inflight) {
+        int n = 0;
+        pthread_mutex_lock(&ctx->slot_lock);
+        for (int i = 0; i < ctx->num_slots; i++) n += ctx->slot_bitmap[i];
+        pthread_mutex_unlock(&ctx->slot_lock);
+        *tx_inflight = n;
+    }
 }
 
 int dpumesh_get_notify_fd(dpumesh_ctx_t *ctx) {
@@ -944,6 +1156,45 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
         p->state = -1;
         pthread_cond_broadcast(&p->cond);
     }
+    pthread_mutex_unlock(&p->lock);
+    return -1;
+}
+
+int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint32_t req_id,
+                          sw_descriptor_t *resp) {
+    dpumesh_pending_t *p = &ctx->pending[req_id % MAX_PENDING];
+
+    /* Lock-free fast path: while still waiting, a single acquire-load of the
+     * volatile state avoids the mutex entirely. A racy 0 just polls again; any
+     * non-0 is re-confirmed under the lock below (whose acquire also publishes
+     * p->desc, written before the state=1 store in rx_deliver_desc). Same
+     * racy-read pattern as dpumesh_dequeue's rx_count check. */
+    if (__atomic_load_n(&p->state, __ATOMIC_ACQUIRE) == 0)
+        return 1;
+
+    pthread_mutex_lock(&p->lock);
+    int st = p->state;
+    if (st == 0) {
+        pthread_mutex_unlock(&p->lock);
+        return 1;  /* still in flight */
+    }
+    if (st == 1) {
+        *resp = p->desc;
+        /* Response arrived = DPA finished reading the TX buffer; return it now. */
+        if (p->tx_slot >= 0) {
+            dpumesh_tx_free(ctx, p->tx_slot);
+            p->tx_slot = -1;
+        }
+        p->state = -1;
+        /* Wake a register_pending() that may be colliding on this idx (rare:
+         * only when in-flight ≥ MAX_PENDING). Not a per-request hot path. */
+        pthread_cond_broadcast(&p->cond);
+        pthread_mutex_unlock(&p->lock);
+        return 0;
+    }
+    /* st == -2 (abandoned/cancelled) or -1 (unused/already consumed): no live
+     * response to harvest. A late OP_RESPONSE RX (state -2) is reclaimed by
+     * rx_deliver_desc independently. */
     pthread_mutex_unlock(&p->lock);
     return -1;
 }

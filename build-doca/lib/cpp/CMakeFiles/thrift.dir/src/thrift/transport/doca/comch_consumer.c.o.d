@@ -82,11 +82,12 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_consumer.c.o: \
  /opt/mellanox/doca/include/doca_pe.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h \
+ /opt/mellanox/doca/include/doca_mmap.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/buffer.h \
  /opt/mellanox/doca/include/doca_buf.h \
  /opt/mellanox/doca/include/doca_buf_pool.h \
- /opt/mellanox/doca/include/doca_mmap.h \
  /opt/mellanox/doca/include/doca_log.h /usr/include/stdio.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdarg.h \
  /usr/include/x86_64-linux-gnu/bits/types/__fpos_t.h \
@@ -95,5 +96,4 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_consumer.c.o: \
  /usr/include/x86_64-linux-gnu/bits/types/__FILE.h \
  /usr/include/x86_64-linux-gnu/bits/types/FILE.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
- /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
- /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h
+ /usr/include/x86_64-linux-gnu/bits/stdio_lim.h

@@ -70,6 +70,13 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx);
 /* ====== Query configured values ====== */
 int dpumesh_get_slot_size(dpumesh_ctx_t *ctx);
 
+/* ====== Debug/localization stats (host bottleneck analysis) ======
+ * rx_depth   = current rx_queue occupancy (requests delivered, awaiting a
+ *              worker dequeue). High → this pod's RX consumers can't keep up.
+ * tx_inflight= TX slots currently allocated (held across the RTT). Near
+ *              num_slots → this pod is TX-slot starved (downstream not freeing). */
+void dpumesh_debug_stats(dpumesh_ctx_t *ctx, int *rx_depth, int *tx_inflight);
+
 /* ====== Info ====== */
 int         dpumesh_get_notify_fd(dpumesh_ctx_t *ctx);
 int         dpumesh_get_pod_id(dpumesh_ctx_t *ctx);
@@ -117,6 +124,19 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
  * Caller must free resp->body_buf_slot via dpumesh_rx_free(). */
 int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
                           sw_descriptor_t *resp, int timeout_ms);
+
+/* Non-blocking poll for a response matching req_id (async-client model).
+ * Returns:
+ *    0 = response arrived (resp filled; TX already freed; caller must free the
+ *        body via dpumesh_rx_free(resp->body_buf_slot)),
+ *    1 = not ready yet — caller should poll again later,
+ *   -1 = error/abandoned (no live pending for this req_id).
+ * Pairs with DPUMESH_ASYNC_CLIENT: in that mode the PE thread stops the
+ * per-request response wakeup (pthread_cond_signal), so polling is the only way
+ * to observe completion. A given client process must use EITHER wait_response
+ * (blocking) OR poll_response (async) consistently, never both. */
+int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint32_t req_id,
+                          sw_descriptor_t *resp);
 
 /* Associate a TX slot with a pending request (call after successful enqueue).
  * On timeout, the TX slot is deferred until DPA finishes processing. */
