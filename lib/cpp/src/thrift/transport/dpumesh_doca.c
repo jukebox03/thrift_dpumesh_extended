@@ -64,7 +64,8 @@ typedef struct {
                             * req_id reuses this idx */
 } dpumesh_pending_t;
 
-/* One cell of the lock-free Vyukov bounded MPSC RX ring. `seq` carries the
+/* One cell of the lock-free bounded SPMC RX ring (Vyukov's bounded-MPMC cell/seq
+ * design, producer side specialized to a single producer). `seq` carries the
  * turn-stamp: the producer may write cell i only when seq==enq_pos; a consumer
  * may read it only when seq==deq_pos+1. */
 struct rxq_cell {
@@ -109,7 +110,7 @@ struct dpumesh_ctx {
     atomic_uint_fast64_t free_head;
     uint32_t *slot_next;
 
-    /* RX descriptor queue — lock-free Vyukov bounded MPSC ring (1 producer = PE
+    /* RX descriptor queue — lock-free bounded SPMC ring (1 producer = PE
      * thread, N consumers = server workers). Removes the rx_lock from the hot RX
      * landing path. rx_lock/rx_cond are kept ONLY for the non-poll (Thrift
      * blocking) consumer to sleep when idle; the producer signals them only when
@@ -208,7 +209,7 @@ static void rx_reclaim(dpumesh_ctx_t *ctx, int slot)
     rx_credit_return(ctx, slot);
 }
 
-/* Lock-free Vyukov MPSC dequeue. Multiple worker consumers race via CAS on
+/* Lock-free SPMC dequeue. Multiple worker consumers race via CAS on
  * rx_deq; the single PE producer owns rx_enq. Returns 1 and fills *out on
  * success, 0 if the ring is empty. Never blocks. */
 static inline int rxq_try_pop(dpumesh_ctx_t *ctx, sw_descriptor_t *out)
@@ -640,7 +641,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
         pthread_mutex_init(&ctx->ring_locks[j], NULL);
     atomic_init(&ctx->rr_counter, 0);
 
-    /* Lock-free Vyukov MPSC RX ring: seq[i] = i (cell i first writable at enq
+    /* Lock-free SPMC RX ring: seq[i] = i (cell i first writable at enq
      * position i), enq = deq = 0. */
     ctx->rx_ring = (struct rxq_cell *)malloc((size_t)RX_QUEUE_SIZE * sizeof(struct rxq_cell));
     if (!ctx->rx_ring) goto fail;

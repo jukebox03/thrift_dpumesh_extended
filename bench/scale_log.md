@@ -965,7 +965,7 @@ healthy (p50 1.48ms), 0-fail, back-to-back 218.8K==218.8K = NO SLOT LEAK (free-l
 ~245 -> ~250K (small; host wasn't purely tx-bound). Baked (always-on, no knob).
 
 REMAINING reducible host CPU (next "lighter" levers, all lock-free, no extra cores):
-- rx_queue rx_lock + dpumesh_dequeue (~5.3% + part of mutex) = the echo MPSC. Lock-free Vyukov MPSC ring
+- rx_queue rx_lock + dpumesh_dequeue (~5.3% + part of mutex) = the echo SPMC. Lock-free Vyukov-style SPMC ring
   (1 PE producer, N worker consumers). Biggest remaining. Caveat: needs a lightweight cond kept ONLY for
   the non-poll (Thrift blocking) path; poll_rx (bench) path is pure spin on the ring.
 - pending[req_id] mutex (~2-3%, client side) = lock-free atomic state.
@@ -974,14 +974,17 @@ IRREDUCIBLE FLOOR: the DOCA SDK comch polling (priv_doca_cq_poll_one + doca_pe_p
 RX (completion-free polled, not SDK-supported) would go below it. So the transport's host-CPU floor at
 ~250K is the SDK poll (~12-15%) + the irreducible per-entry deliver. Ladder unchanged (~250K = M2 ceiling).
 
-## Q2.20 — LIGHTER transport: lock-free rx_queue (Vyukov MPSC) (2026-06-10)
+## Q2.20 — LIGHTER transport: lock-free rx_queue (Vyukov-style SPMC) (2026-06-10)
+(Terminology corrected 2026-06-10: this queue is SPMC — 1 PE producer, N worker consumers —
+built on Vyukov's bounded-MPMC cell/seq design with the producer side specialized to a
+single producer, plain store on rx_enq, no CAS. Earlier "MPSC" labels were a misnomer.)
 USER: "rx_queue lock-free 이어서 해줘" (continue the lighter-transport work; rx_queue was the biggest
 remaining reducible host CPU). The echo RX queue was a circular buffer guarded by rx_lock (mutex) + rx_cond
 + rx_not_full (vestigial: signalled, never waited). The single PE producer took rx_lock per enqueue and
 N workers took rx_lock per dequeue — PE<->worker mutex contention on EVERY request, on the bottleneck PE.
 
 CHANGE (dpumesh_doca.c, baked/always-on, no knob): replaced rx_queue[]/head/tail/count + rx_lock +
-rx_cond + rx_not_full with a lock-free **Vyukov bounded MPSC ring** (RX_QUEUE_SIZE=65536, pow2 -> mask):
+rx_cond + rx_not_full with a lock-free **Vyukov-style bounded SPMC ring** (RX_QUEUE_SIZE=65536, pow2 -> mask):
 - struct rxq_cell { sw_descriptor_t desc; atomic_uint_fast32_t seq; } rx_ring[]; atomic rx_enq, rx_deq.
 - Producer (rx_deliver_desc, single PE): seq-gated single-producer enqueue (relaxed load/store rx_enq,
   release-store cell seq), drop+rx_reclaim on full. No rx_lock in poll_rx.
@@ -1005,8 +1008,8 @@ PERF (echo node, crictl PID + sudo perf -g, 240K, self-time):
 Remaining mutex = pending table + ring_lock (next levers). The PE per-request enqueue is now lock-free.
 
 CACHELINE PADDING measured NEUTRAL (rxq_try_pop 10.71% -> 10.50%): rx_enq is producer-PRIVATE (consumers
-never read it) so it never false-shared rx_deq. Kept anyway (textbook MPSC hygiene, ~192B, harmless). The
-residual rxq_try_pop ~10.5% is INTRINSIC: 3 workers CAS the shared rx_deq (true MPSC sharing) + the cell
+never read it) so it never false-shared rx_deq. Kept anyway (textbook lock-free-ring hygiene, ~192B, harmless). The
+residual rxq_try_pop ~10.5% is INTRINSIC: 3 workers CAS the shared rx_deq (true multi-consumer sharing) + the cell
 seq line bounces producer<->consumer near-empty. NOT reducible by layout.
 
 HONEST framing of "lighter": in poll_rx (bench) the workers are DEDICATED spinners (~100% core regardless),
