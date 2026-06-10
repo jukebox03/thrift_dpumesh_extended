@@ -245,10 +245,6 @@ static int process_request(conn_state_t *cs)
     desc.src_pod_id           = dpumesh_get_pod_id(g_ctx);
     desc.flags                = OP_REQUEST | CASE_EXTERNAL;
     desc.valid                = 1;
-    desc.src_body_pool_type   = POOL_HOST_TX_BODY;
-    desc.src_body_pod_id      = dpumesh_get_pod_id(g_ctx);
-    desc.src_body_buf_slot    = tx_slot;
-    desc.src_header_buf_slot  = -1;
 
     rc = dpumesh_enqueue(g_ctx, &desc);
     if (rc < 0) {

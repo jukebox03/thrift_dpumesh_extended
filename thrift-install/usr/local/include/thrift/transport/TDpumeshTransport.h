@@ -4,16 +4,13 @@
  * Hands a single dequeued descriptor to a Thrift connected-client thread on
  * construction, then transparently fetches subsequent descriptors from the
  * same thread on each follow-up read once the previous response has been
- * flushed. Lets a runner thread amortise its pthread-create cost across
- * many dpumesh requests, and gives the rx_queue multiple concurrent
- * consumers (one per runner thread) so the single-threaded accept loop is
- * no longer the bottleneck.
+ * flushed (one runner thread serves many requests; the rx_queue has multiple
+ * concurrent consumers).
  *
- * Write path mirrors the gateway's raw-API layout: the TX slot is
- * lazy-allocated on the first write and written into directly, eliminating
- * the write_buf_ vector + flush memcpy pair. flush() then uses the same
- * register_pending + attach_tx + release_async sequence the gateway uses
- * (pending mechanism owns TX-slot lifetime; TX_ACK frees early).
+ * Write path: the TX slot is lazy-allocated on the first write and written
+ * into directly (no write_buf_ vector). flush() uses register_pending +
+ * attach_tx + release_async (the pending mechanism owns TX-slot lifetime;
+ * TX_ACK frees it).
  */
 
 #ifndef _THRIFT_TRANSPORT_TDPUMESHTRANSPORT_H_

@@ -9,8 +9,7 @@
 #define DMA_DIAG_EMPTY_WAIT_FAIL_LOOPS  0x800000
 
 /* Max DMA size for doca_dpa_dev_comch_producer_dma_copy.
- * HW supports up to 8KB per single call with 128B-aligned addresses.
- * Verified via DPUMesh_doca byte-level verification test. */
+ * HW supports up to 8KB per single call with 128B-aligned addresses. */
 #define DPA_DMA_COPY_MAX  8192
 /* The host RX staging slot is DPUMESH_SLOT_SIZE bytes; each reverse DMA is
  * capped at DPA_DMA_COPY_MAX. If the cap exceeded the canonical slot size a
@@ -36,22 +35,15 @@ _Static_assert(DPA_DMA_COPY_MAX <= DPUMESH_SLOT_SIZE,
 static void drain_producer_completions(struct dpa_thread_arg *thread_arg);
 
 /* Reverse admission accounting — per-EU file-scope globals (fast DPA memory),
- * indexed by [eu_index][ring]. In the multi-EU data plane N EU threads each run
- * run_dma_manager over their own thread_arg; a 1-D global indexed by the EU-local
- * ring index r would alias across EUs (EU_a ring 0 vs EU_b ring 0). The 2-D form
- * gives each EU its OWN row (thread_arg->eu_index) → single-writer per row, no
- * atomics, while staying in fast global memory. (Storing these inside the
- * heap-allocated thread_arg instead cost ~7% of the single-EU ceiling via a
- * per-reverse-desc slow-memory access; globals restore the original fast path.)
+ * indexed by [eu_index][ring]. Each EU owns its own row (thread_arg->eu_index)
+ * → single-writer per row, no atomics.
  *   dpa_cached_freed[e][r] = host's freed_cumulative cached for EU e, ring r
  *   dpa_sent_count[e][r]   = reverse DMAs EU e has issued for ring r */
 uint64_t dpa_cached_freed[MAX_DPA_RINGS][MAX_DPA_RINGS] = {{0}};
 uint64_t dpa_sent_count[MAX_DPA_RINGS][MAX_DPA_RINGS] = {{0}};
 
 /* Lazy-refresh margin: refresh credit when computed inflight is within
- * this many slots of the cap. Smaller = fewer PCIe reads but tighter
- * margin; larger = more reads, more headroom. 64 leaves enough buffer
- * to refresh before false-positive defer at the cap. */
+ * this many slots of the cap. */
 #define CREDIT_REFRESH_MARGIN 64
 
 /*
@@ -144,17 +136,9 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
 }
 
 /*
- * M2-style lazy drain: we do not track per-op inflight here. SDK + producer
- * completion queue (CC_DPA_MAX_MSG_NUM=1024) absorbs the in-flight ops; we
- * just have to keep acking so the queue does not fill. Per wake burst is
- * ~280 dma_copies (§10.1), drain runs every DRAIN_COMPLETIONS_EVERY inner
- * iters in drain_all_rings, and we never let more than that build up.
- *
- * Counter-and-CAP-with-abort pattern (the previous design) was incompatible
- * with the SDK's OPTIMIZE_REPORTS flag: deferred completions caused our
- * inflight counter to look saturated and trigger spurious abort. M2 baseline
- * proves the SDK handles producer-side backpressure internally as long as
- * completions are drained and acked periodically.
+ * Lazy drain: no per-op inflight tracking. The SDK + producer completion queue
+ * absorb in-flight ops; we only ack drained completions periodically so the
+ * queue does not fill.
  */
 static void drain_producer_completions(struct dpa_thread_arg *thread_arg)
 {
@@ -228,7 +212,7 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
             thread_arg->pos[r] = 0;
 
         comp.type = DPA_MSG_FWD_DONE;
-        comp.pos = thread_arg->pos[r];
+        comp.pos = ring->region_off + thread_arg->pos[r];  /* absolute (EU-sharding) */
         comp.length = desc->size;
         comp.req_id = (uint32_t)desc->idx;
         comp.src_pod_id = ring->pod_id;
@@ -315,8 +299,9 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
          * If inflight reverse DMAs >= rq_depth, host's RX RQ is at capacity —
          * stop the batch (desc stays valid, retried next iter after cache refresh). */
         if (ring->host_credit_buf_arr != 0 && ring->rq_depth != 0) {
-            if (dpa_sent_count[e][r] - dpa_cached_freed[e][r] >= ring->rq_depth)
+            if (dpa_sent_count[e][r] - dpa_cached_freed[e][r] >= ring->rq_depth) {
                 break;
+            }
         }
 
         /* Wait for DPU consumer availability; on timeout clear + stop batch. */
@@ -342,7 +327,7 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
          * The reverse ring's ring->pod_id is the RECEIVER, so the source
          * identity must come from the descriptor. */
         comp.type = DPA_MSG_REV_DONE;
-        comp.pos = thread_arg->rev_pos[r];
+        comp.pos = ring->region_off + thread_arg->rev_pos[r];  /* absolute (EU-sharding) */
         comp.length = desc->size;
         comp.req_id = (uint32_t)desc->idx;
         comp.src_pod_id = desc->src_pod_id;
@@ -385,8 +370,8 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
  *
  * Throttled actions inside the inner iter:
  *  - handle_msgs: PCIe-touching consumer-completion poll. Steady-state messages
- *    are only TRIGGER (~1 kHz) and deploy-time ADD_RING / ADD_REV_RING. Every-iter
- *    polling at ~50K iters/s wastes EU cycles on empty completions.
+ *    are only wake triggers and deploy-time ADD_RING / ADD_REV_RING, so every-iter
+ *    polling would waste EU cycles on empty completions.
  *  - drain_producer_completions: acks producer send completions to free queue slots.
  *
  * The outer run_dma_manager loop calls handle_msgs and drain_producer_completions
@@ -475,14 +460,9 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
 
-    /* Yield when no work. Empirically necessary even though dpumesh has
-     * the same busy-spin freedom as M2 baseline. Why: dpumesh DPA polls
-     * num_pods × 2 (forward + reverse) rings each iter, each ring poll is
-     * a host-memory PCIe read of desc->valid. Removing the yield caused
-     * 55K p99 to jump 91 → 224 ms (2.5×) — most plausibly because the
-     * busy-spin's PCIe polling rate contended with actual DMA traffic.
-     * The 1.37 ms idle gap from yield is acting as a throttle, not as
-     * pure wake latency. (M2 has only 1 ring, so busy-spin is fine there.) */
+    /* Yield when no work: each ring poll is a host-memory PCIe read of
+     * desc->valid, so a pure busy-spin would contend with DMA traffic. The
+     * yield throttles polling when all rings are idle. */
     while (1) {
         handle_msgs(thread_arg);
         int chunks = drain_all_rings(thread_arg);

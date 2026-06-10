@@ -1,25 +1,16 @@
 /*
  * TDpumeshTransport.cpp - Thrift transport over DPUmesh (server side)
  *
- * Behaviour highlights:
  *   1. read() transparently fetches the next dpumesh request from the
- *      rx_queue once flush() has been called for the current one. The
- *      Thrift processor's `for(;;) processor->process()` loop in
- *      TConnectedClient::run therefore keeps calling our read/write/flush
- *      on the same transport / same runner thread, processing many
- *      dpumesh requests sequentially without spawning a new pthread per
- *      request. read() returns 0 only when the internal dequeue idles out,
- *      ending the runner thread cleanly.
+ *      rx_queue once flush() has been called for the current one, so one
+ *      runner thread processes many requests sequentially. read() returns 0
+ *      when the internal dequeue idles out, ending the runner thread cleanly.
  *
  *   2. write() lazy-allocates a TX slot on first call after each request
- *      boundary and writes directly into it — no write_buf_ vector
- *      bouncing. This brings the responder write path's user-space memcpy
- *      count down to one (handler → TX slot), matching the gateway's
- *      raw-API path.
+ *      boundary and writes directly into it (no write_buf_ vector).
  *
- *   3. flush() uses dpumesh_register_pending + attach_tx + release_async,
- *      mirroring the gateway's TX-slot lifetime model: TX_ACK frees the
- *      slot as soon as the DPU confirms forward DMA consumption.
+ *   3. flush() uses dpumesh_register_pending + attach_tx + release_async:
+ *      TX_ACK frees the slot once the DPU confirms forward DMA consumption.
  */
 
 #include <thrift/transport/TDpumeshTransport.h>
@@ -125,9 +116,8 @@ uint32_t TDpumeshTransport::read(uint8_t *buf, uint32_t len) {
 }
 
 void TDpumeshTransport::write(const uint8_t *buf, uint32_t len) {
-    /* Lazy-allocate TX slot on first write after each request boundary.
-     * We pay a single tx_alloc per response (matching gateway), then write
-     * directly into the slot — no vector temporary. */
+    /* Lazy-allocate TX slot on first write after each request boundary, then
+     * write directly into the slot (no vector temporary). */
     if (tx_slot_ < 0) {
         tx_slot_ = dpumesh_tx_alloc(ctx_);
         if (tx_slot_ < 0) {
@@ -159,8 +149,8 @@ void TDpumeshTransport::flush() {
         return;
     }
 
-    /* Use the pending machinery so TX_ACK frees the TX slot as soon as
-     * DPU confirms forward DMA consumption (gateway-style early free). */
+    /* Use the pending machinery so TX_ACK frees the TX slot once the DPU
+     * confirms forward DMA consumption. */
     if (dpumesh_register_pending(ctx_, stream_id_) < 0) {
         dpumesh_tx_free(ctx_, tx_slot_);
         tx_slot_ = -1;
@@ -169,20 +159,11 @@ void TDpumeshTransport::flush() {
         throw_exception("DPUmesh pending register failed (collision)", -1);
     }
 
-    /* Attach TX slot to the pending entry BEFORE enqueue. Reason: enqueue
-     * is what makes a TX_ACK eventually arrive; if we attached only after
-     * enqueue, a fast TX_ACK could fire between enqueue() returning and
-     * attach_tx() running — the TX_ACK handler would see tx_slot=-1, no-op,
-     * and the subsequent release_async would park the entry at state=-2
-     * waiting for a TX_ACK that has already come and gone. Future
-     * register_pending hitting the same idx would then stall the full 2s
-     * collision-wait budget before reclaiming, producing the observed
-     * 2-second tail latency under saturation.
-     *
-     * Attaching first is safe: TX_ACK can never precede enqueue (DPU has
-     * nothing to consume yet). Once enqueued, both attach + state are
-     * already set under the pending lock, so the handler's
-     * (state == 0 && tx_slot >= 0) check is satisfied. */
+    /* Invariant: attach the TX slot to the pending entry BEFORE enqueue. A
+     * TX_ACK can never precede enqueue (the DPU has nothing to consume yet),
+     * so attaching first guarantees the TX_ACK handler observes
+     * (state == 0 && tx_slot >= 0); attaching after enqueue would race a fast
+     * TX_ACK and strand the slot/entry. */
     dpumesh_pending_attach_tx(ctx_, stream_id_, tx_slot_);
     /* Ownership of tx_slot_ now lives in the pending entry — clean up
      * cancel paths via dpumesh_cancel_pending, not direct dpumesh_tx_free. */
@@ -193,8 +174,8 @@ void TDpumeshTransport::flush() {
     sw_descriptor_t desc;
     fill_descriptor_base(desc, local_tx_slot, stream_id_, src_pod_id_,
                          (flags_ & ~OP_REQUEST) | OP_RESPONSE);
-    /* fill_descriptor_base reads body_len from write_buf_.size() (legacy
-     * pattern). We bypass that vector entirely, so override here. */
+    /* This transport writes directly into the TX slot (no write_buf_ vector),
+     * so set the real body length here. */
     desc.body_len = tx_pos_;
 
     if (dpumesh_enqueue(ctx_, &desc) < 0) {

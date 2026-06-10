@@ -30,7 +30,11 @@ struct dpa_ring_info {
 	 * or not yet wired). */
 	doca_dpa_dev_buf_arr_t host_credit_buf_arr;
 	uint32_t rq_depth;
-	uint32_t _pad_credit;
+	/* EU-sharding: byte offset of THIS ring's region within the shared per-pod
+	 * buffer (forward: DPU staging; reverse: host RX). The DPA adds it to its
+	 * relative pos cursor so the reported completion pos is absolute. 0 for K=1
+	 * (region == whole buffer) → completion pos == relative pos (legacy). */
+	uint32_t region_off;
 } __attribute__((__packed__, aligned(8)));
 
 struct dpa_thread_arg {
@@ -41,9 +45,7 @@ struct dpa_thread_arg {
 	uint64_t dpa_consumer;
 	uint32_t dpu_consumer_id; /* DPU-side comch consumer ID for DPA->DPU sends */
 	uint32_t eu_index; /* which EU this thread is (0..N-1); indexes the per-EU
-	                    * reverse-admission globals in dpa_kernel.c. Occupies a
-	                    * fixed 4-byte slot so the struct keeps its original
-	                    * size/offsets (host/DPA ABI unchanged). */
+	                    * reverse-admission globals in dpa_kernel.c. */
 
 	/* Forward rings (CPU→DPU, per-pod) */
 	volatile uint32_t num_rings;
@@ -59,10 +61,8 @@ struct dpa_thread_arg {
 	uint32_t rev_desc_idx[MAX_DPA_RINGS];
 	uint32_t rev_pos[MAX_DPA_RINGS];
 	/* Reverse admission accounting (dpa_sent_count/dpa_cached_freed) is NOT
-	 * stored here — it lives in fast file-scope globals in dpa_kernel.c indexed
-	 * by [eu_index][ring]. Keeping them out of this (heap-allocated) struct
-	 * avoids a per-reverse-desc slow-memory access that measurably lowered the
-	 * single-EU ceiling; the globals stay per-EU-isolated via eu_index. */
+	 * stored here — it lives in file-scope globals in dpa_kernel.c indexed by
+	 * [eu_index][ring], kept per-EU-isolated via eu_index. */
 } __attribute__((__packed__, aligned(8)));
 
 /* ====== Per-message payload layout ======
@@ -81,10 +81,7 @@ struct dpa_thread_arg {
 /* ====== Datapath message types (DPU ARM ↔ DPA) ======
  * Exchanged over the doca_comch_msgq between the DPU ARM and the DPA EU kernel.
  * Explicit values, contiguous from 1; 0 is reserved INVALID so a zeroed buffer
- * hits the default-reject arm (fail-safe). The verb vocabulary (RING_, WAKE,
- * FWD_, REV_) mirrors the control enum (enum dmesh_msg_type) for a consistent
- * naming scheme across both channels. (Legacy gaps {0,1,5} held removed types
- * DMA_REQ / NEW_DESC / DMA_CHUNK and are gone.) */
+ * hits the default-reject arm (fail-safe). */
 enum dpa_msg_type {
 	DPA_MSG_INVALID      = 0, /* reserved: zeroed buffer hits default-reject */
 	DPA_MSG_RING_ADD     = 1, /* DPU→DPA: add forward (CPU→DPU) ring */
@@ -103,9 +100,7 @@ enum dpa_msg_type {
  *   length      : 4B  — DMA'd body length (≤ DPUMESH_SLOT_SIZE_DEFAULT)
  *   req_id      : 4B  — Thrift stream/request ID (wraparound counter)
  * All 4B fields land on their natural alignment so no __attribute__((packed)) is
- * needed and DPA accesses stay aligned. Originally 28B (4B enum + 5× uint32 +
- * int8 + 3B pad); §11.3 E5 showed 12B→24B = -8.6% throughput, so dropping the
- * struct from 32B HW quantum to 16B HW quantum is the inverse of that. */
+ * needed and DPA accesses stay aligned. */
 struct comch_dma_comp_msg {
 	uint8_t  type;        /* one of: DPA_MSG_FWD_DONE, DPA_MSG_REV_DONE */
 	int8_t   flags;       /* OP_REQUEST / OP_RESPONSE + CASE_* */
@@ -152,7 +147,7 @@ struct comch_msg {
  * (dpa_ring_info is the RING_ADD/REV_RING_ADD payload and is also h2d_memcpy'd
  * inside dpa_thread_arg; comch_msg is the configured msgq imm_data_len). Lock
  * their layout so any ABI drift between toolchains fails the build instead of
- * silently corrupting the wire. Sizes verified on gcc 11 (x86) / DPACC. */
+ * silently corrupting the wire. */
 _Static_assert(sizeof(struct dpa_ring_info) == 72, "dpa_ring_info ABI drift");
 _Static_assert(sizeof(struct comch_add_ring_msg) == 80, "comch_add_ring_msg ABI drift");
 _Static_assert(sizeof(struct comch_add_rev_ring_msg) == 80, "comch_add_rev_ring_msg ABI drift");
@@ -166,9 +161,8 @@ _Static_assert(sizeof(struct comch_msg) == 84, "comch_msg ABI drift");
  * __dpa_thread_window_writeback(), which operates at cache-line granularity.
  * If two descriptors shared a line, that writeback would read-modify-write the
  * whole line and clobber a neighbouring slot the host had concurrently filled
- * (valid=1) — breaking the lossless single-owner-per-slot handshake. A 32B
- * pack was tried and produced exactly this corruption (stuck slots → timeouts),
- * so keep one descriptor per cache line. */
+ * (valid=1) — breaking the lossless single-owner-per-slot handshake. Keep one
+ * descriptor per cache line. */
 struct dma_desc {
 	doca_dpa_dev_mmap_t mmap;      /* 4B */
 	uint64_t addr;                 /* 8B */

@@ -329,3 +329,812 @@ Two ORTHOGONAL multithreading axes (commonly conflated):
 
 **Status:** the SPLIT/SHARD/DRAIN machinery is **fully implemented (commit 332dcfd53) + correctness-proven (0-fail×30)** but **throughput-neutral for the 2-pod chain** (E2 SPLIT_SHARD=3 flat = baseline; ARM was never the bottleneck, §4.1/§4.4; and 2-pod → only 2 EUs so nothing to scale). Per plan §4.4/§5.0 it is **preserved as a diagnostic toggle + future-multi-pod scaffolding**, NOT dead code.
 **CLEANUP DECISION:** do **NOT** delete SPLIT/DRAIN/SHARD (nor CASE_INGRESS — `project_recv_pool_coupling` "KEPT" it deliberately). My earlier "delete ~600 lines of 0-gain machinery" was wrong: 0-gain is a *2-pod artifact* (pod%N), and the plan keeps the machinery by design. Cleanup, if done, is **readability-only** (stale comments, misnamed macro, clear toggle grouping) with **zero functional removal**. KEEP all leanness knobs too (ZEROCOPY/ADAPTIVE/SKIP/BATCH/ASYNC/TRACE) — the keep-criterion is "does it make the runtime lighter," not "did it raise throughput."
+
+---
+
+# Phase 1 cleanup (2026-06-09) — fix config (no env selection) + compose SHARD with host wins
+
+Goal: remove the runtime SELECTION (env toggles) and bake each feature to its
+enabled/fixed state. KEEP all feature code. Assume "neutral" verdicts may have been
+masked by a different bottleneck → enable everything and RE-MEASURE.
+
+## Baked ON (env selection removed)
+- host transport-internal (always ON): ZEROCOPY_RX, PE_ADAPTIVE.
+- host consumer model (via dpumesh_config_t, not env): bench → async_client=1, echo →
+  poll_rx=1; Thrift keeps blocking (config default 0) — async is unusable by sync Thrift.
+- DPU (always ON): SKIP_REQ_TXACK, BATCH_TXACK, DPA_AFFINITY.
+- DPU control plane fixed to **SPLIT_SHARD** (multi-ARM: thread A route → N workers →
+  SENDER). **DRAIN_SHARDS=1** fixed for correctness (cross-pod echo: fwd EU≠rev EU, a
+  single drain keeps each shard_work single-producer).
+- NUM_SLOTS default 2048 → **4096** (matches DPU_BUFFER_SIZE=32MB invariant).
+- Kept as topology/sizing/measurement env (not feature toggles): DPUMESH_DPA_THREADS(=2),
+  DPUMESH_NUM_SLOTS, DPUMESH_KEEPALIVE_US, DPUMESH_TRACE, DPUMESH_LOG_LEVEL, ECHO_THREADS,
+  ASYNC_THREADS.
+
+## New integration — SHARD now honors SKIP + BATCH
+SHARD's send path (send_via_spsc) predated SKIP/BATCH and ignored both (it always pushed
+DMA_COMPLETION + TX_ACK per request). Composed them so multi-ARM + host wins run together:
+- SKIP: SHARD worker gates the TX_ACK push with `keep_ack = echo_mode || (flags&OP_RESPONSE)`
+  — request forwards send no TX_ACK (client frees on response). (dpu_worker.c process_rev_notify_entry)
+- BATCH: the SENDER (drain_send_spsc) routes each TX_ACK through batch_or_send_tx_ack
+  (per-src-pod coalesce) instead of an immediate send; DMA_COMPLETION still sent inline.
+  SENDER tail-flushes partial batches every 1 ms. The SENDER is the single owner of the
+  per-pod batch (main-loop A's flush is disabled under SHARD → no race).
+
+## Files
+dpu_worker.c (SKIP/BATCH baked; SHARD fixed; SKIP gate + SENDER batching + tail flush);
+dpa.c (affinity baked); dpumesh_doca.c + dpumesh.h (ZEROCOPY/PE_ADAPTIVE baked, poll_rx/
+async_client via config, NUM_SLOTS_DEFAULT=4096); dpumesh_common.h (stale comment);
+bench_dpumesh.c (async-only, cfg.async_client=1); echo_dpumesh.c (cfg.poll_rx=1);
+test-bench.sh (dropped baked-knob env; DPA_THREADS:-2, NUM_SLOTS:-4096).
+
+## Measured (2026-06-09) — build OK (DPU recompiled 13 objs; host OK), all toolchains compile
+
+### hw3 (3-core) — 0-fail, >= prior best + ~2x lower p50
+| target | achieved | p50 | p99 | ok/fail |
+|---|---|---|---|---|
+| 50000  | 49,731  | 1.46ms | 2.90ms | 500000/0 |
+| 105000 | 104,427 | 1.29ms | 3.66ms | 1.05M/0 |
+| 130000 | 129,295 | 3.07ms | 3.44ms | 1.30M/0 |
+| 137000 | 136,245 | 4.99ms | 5.39ms | 1.37M/0 (sustainable ceiling) |
+| 145000 | 142,778 | 55.8ms | 106ms  | 1.45M/0 (overload onset) |
+| 150000 | 138,172 | 372ms  | 795ms  | overload |
+| 160000 | 146,041 | 373ms  | 870ms  | past-knee |
+
+back-to-back hw3: 130K->129,277 / 130K->129,285 / 30K->29,838, ALL 0-fail -> no slot leak.
+DPU log: no ERR / no flood (-l 40). Sustainable ~137K (vs prior ~130K); p50 at 130K halved
+(3.07ms vs ~6ms blocking). SHARD+SKIP+BATCH+async compose correctly.
+
+### 1-core fair — REGRESSED by echo poll_rx=1
+| target | achieved | p50 | ok/fail |
+|---|---|---|---|
+| 105000 | 54,312 | 3.66 s | 812355/0 |
+| 125000 | 58,637 | 4.00 s | 877027/1 |
+
+Prior async 1-core was ~125K. hw3 fine + only 1-core broken => host-core-sensitive => NOT
+SHARD (DPU, identical in both profiles). Only new host variable = echo poll_rx=1: 64 echo
+threads spin-poll -> thrash 1 core (the "POLL_RX regressed" finding, NOT masked — genuinely
+bad at low echo core count). Documented best had echo poll_rx OFF. -> revert echo poll_rx,
+re-measure 1-core (below).
+
+### CONFIRMED: echo poll_rx OFF (rebuild) — 1-core recovers, hw3 unchanged
+1-core fair: 105K -> 104,427 (p50 1.43ms, 0-fail) [was 54K @ p50 3.6s]; 125K -> 117,320
+(p50 272ms, overload). hw3: 130K -> 129,282 (0-fail); 137K -> 134,904 (knee this run; first
+sweep had 137K healthy = run-to-run boundary). => echo poll_rx=1 was the sole 1-core culprit;
+reverting fixes 1-core and is neutral at hw3. poll_rx feature kept in transport, off for echo.
+
+## Phase 1 verdict
+Final config (all baked, no env selection): SHARD + SKIP + BATCH + AFFINITY (DPU),
+ZEROCOPY + PE_ADAPTIVE (host always), async (bench), poll_rx OFF (echo), NUM_SLOTS=4096,
+DPA_THREADS=2.
+- hw3 sustainable ~130K (knee ~135K), 0-fail, back-to-back leak-safe, p50 ~3ms (vs ~6ms
+  blocking) = LATENCY win. Throughput ceiling unchanged vs prior OFF+host-wins (~130-137K).
+- 1-core fair ~105K clean (p50 1.43ms); slightly below prior async-1-core ~125K because
+  SHARD's longer per-request DPU pipeline (A->workerK->SENDER + batch) costs 1-core async
+  throughput where the host is the binding constraint. Neutral at hw3.
+- SHARD (multi-ARM) did NOT raise the 2-pod ceiling -> confirms the 2-pod = 2-EU structural
+  limit (pod%N). Higher throughput needs >2 pods (more active EUs), which costs host cores.
+  Net Phase-1 gain = latency (async) + correctness composition; throughput ceiling flat.
+
+## Phase 1 cleanup (step 2: comments + dead-path) — verified non-regressing (2026-06-09)
+- Comment cleanup: 8-agent workflow trimmed history/rationale/dead-env comments across 39 files.
+  Verified comment-ONLY (comment-stripped diff vs pre-cleanup snapshot = 0 code changes).
+- Host RX staging path removed (zerocopy baked-on made it dead): rx_buffer / rx_slot_bitmap /
+  rx_slot_lock / rx_slot_alloc removed; rx_buf/rx_free/rx_reclaim landing-only; −32MB/pod.
+  Also removed now-dead fields pe_adaptive/zerocopy_rx (always-on baked into pe_progress_fn /
+  process_rx_dma_entry). poll_rx/async_client kept (consumer model via config).
+- BUG FIX (latent): dpumesh_cancel_pending state==1 freed rx_slot_bitmap[body_buf_slot] where
+  body_buf_slot is the zerocopy landing OFFSET (0..32MB) vs a 4096-byte bitmap → heap OOB.
+  Now rx_credit_return(). (Not hit by the 0-fail bench — only on cancel-after-arrival.)
+- Async review (separate): sync Thrift can't get leanness at the stub level (blocking read,
+  1-in-flight/instance). Recommended path = gateway async (raw C API, 0 Thrift change, port
+  worker_fn_async window+poll); cob_style+TDpumeshAsyncChannel only for inter-service callers.
+- Verify (deploy3, all toolchains compile): hw3 130K->129,291 (p50 2.34ms, 0-fail);
+  1-core 105K->104,424 (p50 1.39ms, 0-fail); back-to-back 130K/30K 0-fail (no leak). Non-regressing.
+
+## Phase 2 lightening (2026-06-09) — per-RTT compute, honest verdict
+Investigation (workflow): "completion 제거" is NOT a lever —
+- immediate completion comch_dma_comp_msg (16B) = routing-essential EU→ARM channel, can't remove
+  (already 1 WQE BB).
+- producer completion drain = already batched (every 8 iter), not per-op.
+- request TX_ACK = already skipped (g_skip_req_txack=1); echo/response amortized via BATCH.
+- DPA EU per-op already stripped (bench.md §3.2). Cap = closed-loop round-trip μ, not EU compute.
+Real μ levers: host→host (FORECLOSED by L7-proxy design) or more active EUs (>2 pods → host cores).
+
+Applied (safe leanness, code-lighter, throughput-neutral by design):
+- C2: dpu_enqueue_reverse_dma takes scalars (req_id/dst/src/flags) instead of a 64B sw_descriptor_t
+  → removes per-forward memset(64) + intermediate struct copy on the ARM worker path.
+- H5: register_pending drops the per-request memset(&p->desc,0,64) (desc fully overwritten before
+  state=1, only read at state==1).
+Deferred (medium risk / ~0 throughput payoff since ARM not the bottleneck): C1 (send-buffer pool
+vs per-send malloc/memcpy), H2 (merge register_pending+attach_tx lock), H1 (tx_alloc hint cursor).
+Rejected: H4a (enqueue mfence→release — device-visibility subtle, gain negligible), WORKER inline
+send (cc_server single-submitter), TX_ACK full removal, per-thread ring (foreclosed).
+
+Verify (deploy4, all toolchains compile): hw3 130K->129,292 (0-fail), 137K->136,254 (0-fail),
+back-to-back 130K/30K 0-fail (no leak). Throughput flat ~130-137K (expected — leanness, not a
+ceiling mover). Confirms per-RTT lightening cannot raise the 2-pod closed-loop ceiling.
+
+## 4-pod (2 echo pairs, 4 active EUs) — DOES scale past the 2-pod ceiling (2026-06-09)
+Config: DPUMESH_DPA_THREADS=4 deploy (10%4=2,11%4=3,12%4=0,13%4=1 → 4 distinct EUs), SHARD baked
+(4 workers + 1 SENDER + DRAIN=1 single drain), SKIP+BATCH+async+zerocopy. fair pin: pair1 cores
+0,1 / pair2 cores 4,5 (each pod 1 host core). Single-pair anchor (fair 1-core) = 104,429.
+
+| offered (RPS/pair ×2) | pair1 | pair2 | AGGREGATE | p99 | ok/fail |
+|---|---|---|---|---|---|
+| 120K (60K) | 59,673 | 59,675 | **119,347** | ~3.2ms | 1.2M/0 |
+| 160K (80K) | 79,557 | 79,558 | **159,115** | 4.4-9.1ms | 1.6M/0 |
+| 210K (105K) | 92,469 | 93,292 | **185,761** | overload (p50 0.6s) | 2.1M/0 |
+
+**Verdict: 4-pod scales. Aggregate ~160K healthy / ~186K knee vs single-pair ~105K** — the 2-pod
+"ceiling" is per-pair, NOT a global wall. This OVERTURNS [[project_shard_bottleneck_consumer_pe]]
+("4-pod 2 pairs halve each other ~110K") — that was BEFORE the host fixes (SKIP+async) + SHARD
+multi-ARM + 4 EUs. With the current baked config, 2 pairs scale.
+
+Not perfectly linear: per-pair drops 105K(solo) → ~80-93K(paired) = ~12-24% sharing loss (shared:
+single ARM drain DRAIN=1 + single SENDER + single cc_server + host↔DPU PCIe/comch op-rate). So
+adding pods buys throughput sub-linearly: 2 cores→105K, 4 cores→160-186K (~40-46K/core vs 52K/core
+solo).
+
+ANSWER to "is adding pods worth the host CPU": YES — throughput scales ~1.5-1.8× for 2× pods/cores;
+the per-RTT closed-loop cap is per-pair-parallelizable, not a shared hard wall (anymore). Further
+scaling (>4 pods / >4 EUs) limited by the shared ARM drain+SENDER+cc_server (next lever if needed:
+shard the SENDER / DRAIN_SHARDS>1 with group-affine routing — currently DRAIN=1 for cross-echo).
+
+## Q2 — WHY does 4-pod throughput rise? (attribution, controlled) (2026-06-09)
+Isolated EU count by running 4-pod at DPA_THREADS=2 (4 pods share 2 EUs: 10,12→EU0; 11,13→EU1)
+vs DPA_THREADS=4 (4 distinct EUs). Host cores (4) + pair count (2) held equal.
+
+| config | 120K off | 160K off | knee | healthy aggregate |
+|---|---|---|---|---|
+| 4-pod, 2 EU | 119,350 (0-fail) | 143,406 (p99 1.1s OVERLOAD) | ~144K | ~130K |
+| 4-pod, 4 EU | 119,347 (0-fail) | 159,115 (p99 9ms HEALTHY) | ~186K | ~159K |
+| 1 pair, 2 EU (fair 1c) | — | — | ~105K | ~105K |
+
+Layered attribution (both host cores AND DPA EUs contribute; ARM does NOT):
+- **host cores (= more src/dst pods)**: a single fair pair (1 core/app) is HOST-bound at 105K — it
+  under-drives even 2 EUs. Adding the 2nd pair (more host cores) drives the SAME 2 EUs to ~130K
+  healthy (+25K at fixed EU count). So adding pods adds host cores that saturate the EUs.
+- **DPA threads (EU count)**: 2 EUs cap ~144K knee; 4 EUs reach ~186K knee (+42K). More EUs = more
+  DMA-issue capacity, binding only after host cores have saturated the existing EUs.
+- **DPU ARM cores (SHARD workers): NOT the cause** — cq_depth=0 (ARM starved); ARM was never the bottleneck.
+
+VERDICT: 4-pod is faster because (1) each added pod brings a host core that pushes the EUs past the
+single-fair-pair host limit, and (2) added pods map to added EUs (pod%N) giving more DMA capacity.
+It is host-core + DPA-EU bound, NOT ARM-bound. To scale: add pods (host cores) until EUs saturate,
+then add EUs — both cost host cores (1 core/pod). Shared ARM drain/SENDER/cc_server is the eventual
+ceiling above ~186K.
+
+## Q3/Q4 — completion rethink (workflow + adversarial verify vs DOCA headers) (2026-06-09)
+Q3 (send reverse completion DPA->host directly, skip ARM relay): **NOT possible** in the current
+binding. DOCA: producer sends to a consumer_id on the SAME comch connection (doca_comch_producer.h
+:20-23); the DPA producer msgq is anchored to the DPU device (max_num_consumers=1=ARM, dpa.c:457);
+the host datapath consumer is on a different connection. The EU immediate can only reach the DPU ARM.
+The ARM relay is a 16B metadata endpoint-conversion ONLY — the body already DMA'd straight to host RX
+in hop1 (dpa_kernel.c:336). A NEW host<->DPA msgq is theoretically allowed but device-match for a
+host-side consumer is UNVERIFIED + needs per-dst-host msgq. The TX_ACK-skip analogy does NOT transfer:
+TX_ACK was skippable (response arrival = alternative signal); the reverse completion IS the arrival
+signal, no alternative + no DPA->host path.
+Q4 (do we need completion?): forward completion = irreducible (carries pos/src_pod_id that exist only
+in DPA per-EU state; a flag just moves the PCIe write + adds poll + loses HW copy-then-imm ordering).
+reverse completion-as-polled-flag = possible in principle (data already in host RX) but needs re-adding
+an in-band metadata trailer (undo zerocopy) + body-before-flag fence + wrap redesign; net win unproven.
+Bottom line: completion is needed; the only ARM-relay removal (reverse) is SDK-blocked AND targets
+~2.8% of RTT (host-transport-bound ceiling) — not a throughput lever. Real lever = more pods (Q2/4-pod).
+
+## Q2.2 — EU-sharding (2 pods, >2 EUs) feasibility (workflow + adversarial verify) (2026-06-09)
+Re-examined as K-rings-per-pod (each EU owns its own ring), NOT the old 1-ring-per-pod.
+VERDICT: mechanism foreclosure OVERTURNED — single-producer (ring.c: 1 ring=1p/1c, not 1 pod=1 ring),
+admission [eu][ring] (already isolated), max_num_consumers=1 (per-MsgQ, already worked around by
+per-EU channels), 2-pod-HARD (ring count independent of pod count, MAX_DPA_RINGS=8) all preserved/
+non-binding under K-rings. One real obstacle: reverse ADD_REV_RING keys on pod_id (dpa_kernel.c:84-90)
+→ must re-key to (pod_id, ring_idx).
+BUT performance gate HOLDS: rings alone ~0 gain. Real gates = (1) host 1-core feed/RX ~105K (single
+ring_lock + single pe_progress_fn) — K EUs starve; (2) single ARM bridge ~103K (next ceiling).
+→ Q2.1 (host-library lighten) + host RX multicore are PREREQUISITES; then EU-sharding rings; then ARM
+K-way. Change scope: host dma_ring[K]/ring_lock[K]/enqueue-select + DPA per-pod K rings + reverse-ADD
+re-key + ARM reverse K-ring single-writer routing (the hard part). Coupled multi-layer build.
+
+## Q2.1 — 1-core attribution (TRACE) + SHARD reverted to OFF (measured) (2026-06-09)
+Measured 1-core fair host/DPU split (DPA=2, TRACE=1, -l 50):
+- SHARD (baked): 1-core 105K, DPU hop avg 416µs (max 1343), cq_depth=0, recv 420K/s.
+- OFF (reverted): 1-core **120K** (p50 1.36ms healthy; 125K overloads), DPU hop avg **171µs**.
+- Prior OFF reference (scale_log E5): hop 208µs @105K. SHARD ~2.4x the hop.
+
+Attribution: at 1-core the gate is HOST (cq_depth=0 → DPU has headroom; hw3 reaches 137K). But SHARD
+inflated the DPU pipeline latency (A→worker→SENDER) ~2.4x, and with a fixed async window that cut
+1-core throughput 120→105K. SHARD has NO throughput upside at 2 pods (neutral at hw3) → it was a pure
+latency/1-core cost. => Per user framing (Q2.1: library-core can't be solved by adding cores), the
+biggest 1-core lever was NOT a host micro-op but turning SHARD OFF.
+
+ACTION: split_send baked SPLIT_SHARD → SPLIT_OFF (dpu_worker.c). SHARD/SENDER/shard machinery KEPT
+(dormant) for future EU-sharding (single ARM has headroom: cq_depth=0, so EU-sharding can use OFF+K-rings
+without SHARD until the single ARM saturates).
+Verify (OFF, deploy): 1-core 120K (was 105K, +14%); hop 171µs (was 416µs, -59%); hw3 130K→129,282 /
+137K→136,244 (0-fail, unchanged); back-to-back 130K/30K 0-fail (no leak). Net win, simpler, no 2-pod loss.
+Residual 1-core gap (120K → EU ceiling ~137K) = host CPU (library) → next: host-library lightening (Q2.1).
+
+## Q2.2 — EU-sharding decisive experiment: does EU count cap throughput? (2026-06-09)
+Positive-evidence test (per project_bench_elimination_unreliable: demand positive evidence). Resolve the
+memory conflict (4pod_scales "~160K scales" vs shard_bottleneck "pairs halve"). 4-pod, SPLIT_OFF baseline,
+fair 1-core/app (pair1 cores 0,1; pair2 cores 4,5 — HOST cores constant = 4 client procs). Only variable =
+DPA EU count. Mapping pod_id % N:  N=2 → 10,11,12,13 = EU 0,1,0,1 (2 pairs SHARE 2 EUs);
+N=4 → EU 2,3,0,1 (2 pairs use 4 DISJOINT EUs). size=8192, 10s.
+
+### DPA_THREADS=2 (2 pairs share 2 EUs):
+| offered (RPS/pair x2) | aggregate achieved | fail | p99 |
+|---|---|---|---|
+| 100K (50K) | 99,460  | 0 | 3.2/3.4 ms |
+| 140K (70K) | 139,235 | 0 | 4.5/3.8 ms |
+| 180K (90K) | 143,342 (SAT) | 0 | **2.5 s** (queue blowup; achieved capped ~71.7K/pair) |
+
+=> 2 EUs cap 4-pod aggregate at **~140K** — identical to 2-pod hw3 ceiling (137K). The EU capacity is
+shared across pods: pod count does NOT add throughput when EU count is fixed. Strong positive evidence
+that DPA EU count (not pod count, not host cores here) is the binding throughput resource at the chain
+ceiling. (DPA_THREADS=4 measurement next to confirm 4 EUs ~= 2x.)
+
+### DPA_THREADS=4 (2 pairs use 4 DISJOINT EUs), SPLIT_OFF, fair 1-core/app:
+(NOTE: pair2 fails entirely if probed immediately after `run_4pod up` — DPU pod-register race;
+re-run after a few s and both pairs are healthy. First 90K/pair probe with pair2=fail/1800 was this race.)
+| offered (RPS/pair x2) | aggregate achieved | fail | p99 |
+|---|---|---|---|
+| 60K (30K)  | 59,676  | 0 | 3.2 ms |
+| 140K (70K) | 139,237 | 0 | 4.0/3.1 ms |
+| 180K (90K) | **179,004** | 0 | 11.8/17.3 ms (knee) |
+| 220K (110K)| 178,059 (SAT) | 0 | **2.26 s** (achieved capped ~89K/pair) |
+| 260K (130K)| 176,189 (SAT) | 0 | **4.66 s** |
+
+### VERDICT (positive evidence, resolves 4pod_scales vs shard_bottleneck conflict):
+- 2 EU → 4-pod ceiling ~140K; 4 EU → ~178K. **EU count IS a binding throughput resource** (+27% for 2x
+  EUs, with host cores=4 and pod count=4 held CONSTANT — clean isolation). Memory conflict resolved:
+  4pod_scales (scales) correct; shard_bottleneck (pairs fully halve) was an over-read.
+- BUT sub-linear: per-EU throughput 70K (@2EU) → 44.5K (@4EU). Doubling EUs gives +27%, not +100%.
+  A shared resource BELOW the EUs caps absolute aggregate ~178K. Not the DMA engine (178K x4 dma = 712K
+  ops/s << 1.6M N=8 ceiling) → likely PCIe body BW or host↔DPU comch op-rate. (Confirming needs >4 EUs =
+  >4 pods, not available in 4-pod harness; DPA=8 with 4 pods still uses only 4 EUs: 10,11,12,13 %8=2,3,4,5.)
+- Per-pair under contention: single-pair fair ~120K → 89K/pair when a 2nd pair shares (even on DISJOINT
+  EUs) → the shared sub-EU resource, not the EUs, is what pairs contend for past ~140K.
+
+### Q2 ANSWER ("why does 4-pod throughput rise? dpu core / dpa thread / src,dst pod?"):
+It is the **DPA EU count (= "dpa thread")**, proven by isolation: holding pods=4 and host-cores=4 fixed and
+varying ONLY EUs 2→4 lifts 140K→178K. NOT pod count (4-pod@2EU = 2-pod@2EU = 140K), NOT host cores
+(constant). The original "4-pod scales" was really "more pods activated more EUs" (pod_id % num_dpa_threads).
+
+### EU-SHARDING cost/benefit (for the 2-pod case the user wants to scale):
+EU-sharding (1 pair's traffic split across K EUs via K-rings/pod) would lift the 2-pod pair from ~137K
+toward the ~178K 4-EU shared-resource ceiling = **~+20-30%, NOT linear 2x** (the sub-EU shared resource
+caps it). Build = coupled host (K-ring round-robin post) + DPA (K rings/pod across K EUs) + ARM (K-way
+reverse routing). Decision: modest gain for a large coupled build; it is the only remaining 2-pod
+throughput lever (host-micro exhausted per Q2.1). Above ~178K needs attacking the sub-EU shared resource
+(PCIe body BW / comch op-rate), not more EUs.
+
+### 2-pod EU-sharding BEFORE baseline (DPA=4, no sharding, pods 10,11 -> EU 2,3 = 2 EU), hw3:
+| RPS | p50 | p99 | state |
+|---|---|---|---|
+| 120K | 1.39 ms | 2.73 ms | healthy |
+| 140K | 253 ms  | 495 ms  | SATURATED |
+| 160K | 905 ms  | 1.79 s  | SAT |
+=> 2-pod / 2-EU ceiling ~130K (120K healthy). EU-sharding target: 1 pair using 4 EUs (K=2 rings/pod)
+toward the measured 4-EU ceiling ~178K. This is the "before" for the EU-sharding gain comparison.
+
+## Q2.3 — EU-sharding BUILT (K-rings/pod). K=1 non-regressive verify (2026-06-09)
+Implemented K-rings-per-pod EU-sharding (DPUMESH_RINGS_PER_POD, default 1): host K forward rings +
+round-robin post + per-ring credit (ring_idx = pos/region_size); DPU setup_pod_dma loops K rings across
+K EUs k_j=(pod_id*K+j)%N, partitions DPU staging + host RX into K disjoint regions, region_off makes
+completion pos absolute (dpa_ring_info._pad_credit -> region_off, no ABI size change); ARM tx_rings[K]
+round-robin reverse. DPA kernel unchanged except comp.pos += region_off (2 lines). Host + DPU compile
+clean (recompiled 13 C objects).
+K=1 DPA=4 2-pod hw3 (bit-identical check vs pre-sharding DPA=4 baseline ~120K):
+| RPS | achieved | p50 | p99 | state |
+|---|---|---|---|---|
+| 100K | 99,457  | 1.35 ms | 4.53 ms | healthy |
+| 120K | 119,347 | 1.55 ms | 4.26 ms | healthy |
+| 130K | 129,279 | 4.29 ms | 10.9 ms | knee |
+=> K=1 reproduces the baseline exactly -> refactor is non-regressive. Next: K=2 DPA=4 (pair drives 4 EUs).
+
+## Q2.4 — EU-sharding RESULT: K=2 lifts the 2-pod ceiling (2026-06-09)
+K=2 DPA=4: the SAME 2 pods (10,11) now each shard across 2 EUs -> the pair drives 4 EUs
+(10 -> EU 0,1; 11 -> EU 2,3). 2-pod hw3, size=8192, 10s:
+| RPS | K=1 (2 EU) | K=2 (4 EU) | note |
+|---|---|---|---|
+| 130K | 129K p50 4.3ms (knee) | 129K p50 **1.71ms** | K=2 same rate, far lower latency = EU headroom |
+| 150K | (saturated) | 149K p50 2.16ms healthy | K=1 saturates by 140K |
+| 160K | — | 159K p50 2.45ms 0-fail (peak, borderline: 1 of 2 runs saturated) |
+| 165K | — | saturated p50 675ms | knee |
+
+RESULT: 2-pod healthy ceiling **~130K (K=1) -> ~150-160K (K=2) = +15-23%**. EU-sharding works: making a
+2-pod pair use 4 EUs raises throughput, exactly the user's ask ("even with 2 pods, more DPA threads ->
+more throughput"). 0-fail throughout; back-to-back runs (165K saturate -> 160K healthy) show no slot leak.
+
+Gap to the 4-pod 4-EU ceiling (178K): the 2-pod pair feeds 4 EUs from only 2 host processes (1 PE-RX
+thread each) + a single ARM, vs 4 host procs at 4-pod. So the residual cap is the host PE-RX feed / ARM
+(plan risk R5), not the EUs. Pushing past ~160K on 2 pods needs a leaner/multi-threaded host RX feed.
+
+Knobs: DPUMESH_RINGS_PER_POD=K (default 1=legacy), requires DPUMESH_DPA_THREADS>=K. K=1 verified
+bit-identical (Q2.3). Build: host (K rings + rr post + per-ring credit), DPU setup_pod_dma (K rings/EUs +
+region partition), ARM tx_rings[K] rr, kernel comp.pos += region_off. dpa_ring_info ABI unchanged
+(_pad_credit repurposed). Deployed state: DPA=4 K=2.
+
+## Q2.5 — Where is the 2-pod K=2 cap? HOST CPU measurement (2026-06-09)
+K=2 DPA=4, hw3, 150K (149.5K achieved, 0-fail, p50 2.0ms = healthy). mpstat per-core (bench host10 pinned
+0,4,6; echo host11 pinned 1,5,7):
+| side          | %usr | %sys | %idle | busy |
+|---|---|---|---|---|
+| CLIENT host10 | ~47  | ~2   | ~50   | ~50% (HALF IDLE) |
+| ECHO  host11  | ~20  | ~69  | ~11   | ~89% (near saturation) |
+
+POSITIVE EVIDENCE (confirms the user's "destination re-transmit overhead" intuition):
+- The DESTINATION/server (echo) is the hot side (~89% vs client ~50%). The client has headroom; the cap
+  is the server re-entering its transport to send the response.
+- The server is dominated by **%sys ~69%**, NOT %usr and NOT DMA/PCIe. That is kernel/syscall time =
+  the blocking 64-thread echo model (ECHO_THREADS=64, poll_rx OFF): one pthread_cond_signal (PE thread)
+  + one cond_wait wakeup per request -> ~150K futex ops/s = the %sys wall.
+=> The 2-pod ceiling above ~160K is gated by the HOST SERVER-SIDE WAKEUP/THREADING model, not the EUs,
+   not the dma_copy count, not PCIe BW. Leaning the server RX path (poll instead of per-req cond_signal,
+   or batched wakeup, or an async/fiber server) is the highest-leverage next lever. This is the
+   server-side analogue of [[project_option_a_async_result]] (async client removed per-req wakeup on the
+   CLIENT; the SERVER still pays it). Levers from the perf-levers workflow ranked separately.
+
+## Q2.6 — Perf-lever multi-angle analysis (5 levers, adversarially verified) (2026-06-09)
+Workflow (5 finders + 5 refuters + synthesis) over the code, cross-checked vs the Q2.5 measurement.
+Ranked:
+1. **Lean server RX (poll_rx on echo) — TOP, KEEP.** Only lever with POSITIVE measured evidence (Q2.5:
+   echo 89% busy / %sys~69% futex, client 50% idle). Already built (poll path dpumesh_doca.c:789-826;
+   per-req signal removed = dpumesh_doca.c:251). Server-side twin of the proven async-client win
+   (option_a: +21%). Expected +15-30% (160K -> ~185-210K). Effort XS (config + 1 deploy). Pair with small
+   ECHO_THREADS (~= pinned cores) so spin workers don't oversubscribe.
+2. dma_copy 4->2 (direct host->host DMA) — **DROP, unbuildable.** Forward producer_dma_copy
+   (dpa_kernel.c:222) is a FUSED op: moves body AND delivers the 16B FWD_DONE to the SINGLE
+   dpu_consumer_id (max_num_consumers=1, dpa.c:470; consumer = ARM). EU physically can't deliver the
+   routing completion to a host consumer -> ARM relay irreducible. "4->2" miscounts (best 4->3 on a
+   non-bottleneck path). Forecloses body-L7.
+3. Host PE/RX multi-thread (K PE/consumers) — **DROP, targets nothing.** The host datapath consumer is
+   VESTIGIAL (dpumesh_doca.c:483-495, ID no longer advertised); reverse signal is 16B REV_DONE over the
+   ONE comch control conn. pe_progress is single-threaded but NOT the cap (the server futex is, Q2.5).
+4. Activate SPLIT_SHARD multi-ARM — **DROP, latent DATA RACE + wrong stage.** At M>1 with K-rings, two
+   EUs (p*K, p*K+1)%N can push into the same non-atomic shard_work[effdst%N] SPSC -> corrupts completions
+   -> stall. Egress (SENDER->single cc_server) is NOT sharded anyway. ARM is cq_depth=0 / ~2.8%. KEEP code
+   OFF (preserved scaffolding).
+5. Batch reverse-DMA completions — **DROP, structurally impossible.** The rev completion is a FUSED
+   per-body DMA (distinct src/req, advances rev_pos); K bodies need K calls. Only ARM->host REV_DONE is
+   batchable but it's the ~2.8% non-binding path. Per-body DMA cost irreducible.
+
+ATTACK ORDER: (1) poll_rx now (free, measured-backed). (2) re-mpstat BOTH sides at the new knee + add a
+positive DPU SENDER/cc_server submit-rate + EAGAIN + cq_depth counter to distinguish "single ARM egress
+op-rate" vs "sub-EU PCIe BW / comch op-rate" — the ~178K attribution is elimination-only & has flip-
+flopped, demand a positive counter first. (3) ONLY if egress proven binding, build a NEW K-way cc_server
+egress (NOT the racy SPLIT_SHARD). Running the poll_rx experiment now (ECHO_POLL_RX=1 ECHO_THREADS=3).
+
+## Q2.7 — poll_rx lean server RESULT: the biggest single win (2026-06-09)
+Deployed ECHO_POLL_RX=1 ECHO_THREADS=3 (K=2 DPA=4). The poll path removes the per-request
+cond_signal/cond_wait. 2-pod hw3, size 8192:
+| RPS | achieved | p50 | echo %sys | state |
+|---|---|---|---|---|
+| 150K | 149,631 | 1.70ms | **2%** (was 69%) | echo 40% busy (was 89%) |
+| 180K | 179,008 | 1.77ms | — | healthy |
+| 200K | 198,9xx | 2.30ms | — | healthy 0-fail (x3 runs) |
+| 220K | 200,780 (SAT) | 455ms | — | knee |
+
+RESULT: **echo %sys 69%->2%** (futex eliminated). 2-pod healthy ceiling **~160K -> ~200K (+25%)**.
+Combined with EU-sharding: **K=1 130K -> K=2+poll_rx 200K = +54%**. NB: 200K on 2 pods BEATS the 4-pod
+blocking number (178K) — because 4-pod also paid the server futex. The user's "destination re-transmit
+overhead" intuition was the single biggest lever, larger than EU-sharding itself.
+
+NEXT CAP (mpstat at 200K knee): binding side FLIPPED off the server. client host10 ~72% busy (usr 67%,
+sys 4%), echo host11 ~50% busy (usr 46%, sys 3%). %sys now low on BOTH (futex gone everywhere). Neither
+host fully saturated at the 200K knee + both have idle => the residual cap is now the DPU/PCIe shared
+op-rate (~200K, consistent with the 4-pod sub-EU resource, higher because lean). Per Q2.6 attack order:
+to go above 200K, instrument a POSITIVE DPU SENDER/cc_server submit-rate + EAGAIN + cq_depth counter to
+prove "single ARM egress op-rate" vs "PCIe body BW" BEFORE building a K-way cc_server egress. The client
+72% is partly bench load-gen artifact (real clients are leaner).
+Deployed state: DPA=4 K=2 ECHO_POLL_RX=1 ECHO_THREADS=3 (~200K). Knobs: DPUMESH_RINGS_PER_POD, ECHO_POLL_RX.
+
+## Q2.8 — >200K cap attribution: DPU egress counters (positive evidence) (2026-06-09)
+Added g_egress_again (cc_server DMA_COMPLETION send AGAIN/s) to the 1Hz DPU stat; cq_depth already logged.
+K=2 DPA=4 ECHO_POLL_RX=1, -l 50:
+| offered | achieved | recv (DPA->ARM comp/s) | cq_depth | egress_again/s |
+|---|---|---|---|---|
+| 200K (healthy) | 199K | **~800,000** | 0 | 0 |
+| 220K (saturated) | ~202K | ~813,000 | 0 | 0 |
+(sent=4000/s = the DPU->DPA keepalive WAKE, 4 EUs x 1kHz — NOT the host egress; the host-egress signal is
+egress_again, which is 0.)
+
+ATTRIBUTION (positive, not elimination):
+- egress_again=0 + cq_depth=0 => the single ARM ingest AND the ARM->host cc_server egress both keep up
+  with headroom. The single ARM / egress op-rate is NOT the cap. Refutes the "single ARM egress" lever
+  (Q2.6 ranked #... would-be) with a positive counter.
+- recv PLATEAUS at ~810K/s (200K and 220K offered both ~810K, achieved stuck ~200K) => the binding cap is
+  the **DPA dma_copy + completion op-rate ~810K/s** (4 dma_copy/RTT x 200K = 810K). It is an OP-RATE, not
+  BW (810K x 8KB = 6.4 GB/s << PCIe Gen4). Consistent with [[project_n8_dma_engine_ceiling]] shared op-rate.
+DECISIVE NEXT TEST: is ~810K per-EU-summed (more EUs lift it) or a hard shared cap (DMA engine / comch
+completion)? K=4 DPA=8 makes the 2-pod pair drive 8 EUs (pod10->EU0-3, pod11->EU4-7). If recv rises above
+810K and RPS above 200K => EU-bound, EU-sharding K=4 scales further. If recv stays ~810K => hard shared
+op-rate cap, more EUs won't help and the only lever is fewer dma_copy/RTT.
+
+## Q2.9 — K=4 (8 EU) test: the ~810K op-rate is a HARD shared cap, NOT per-EU (2026-06-09)
+K=4 DPA=8 (2-pod pair drives 8 EUs: pod10->EU0-3, pod11->EU4-7), ECHO_POLL_RX=1, -l 50:
+| offered | achieved | recv (DPA->ARM comp/s) | cq_depth | egress_again |
+|---|---|---|---|---|
+| 220K | 204K (SAT p50 523ms) | ~813,000 | 0 | 0 |
+| 260K | 204K (SAT) | ~816,000 | 0 | 0 |
+| 300K | 202K (SAT) | ~813,000 | 0 | 0 |
+(sent=8000/s = keepalive WAKE, 8 EUs x 1kHz — confirms sent = keepalive, not egress.)
+
+DECISIVE: 8 EUs gives the SAME ~200-204K and recv stays pinned at ~813K/s (= K=2's 4-EU number). So the
+~810K dma_copy+completion/s is a **HARD SHARED op-rate cap that does NOT scale with EUs**. K=2 (4 EUs)
+already saturates it; **K=4 is useless** (same throughput, 2x EUs + 2x memory). EU-sharding sweet spot =
+K=2. cq_depth/egress_again stay 0 at 8 EUs => still not ARM/egress; pure DPA-side op-rate.
+
+Since pure_dma hits ~1.6M ops/s ([[project_n8_dma_engine_ceiling]]) but dma_copy-WITH-completion caps at
+~810K, the per-op COMPLETION (comch msg attached to each dma_copy, EU->ARM) is ~half the op cost. The cap
+is the DPA producer completion delivery op-rate, not DMA BW (6.4 GB/s) and not the DMA engine raw rate.
+
+CONCLUSION (2-pod): architecture ceiling ~200K RTT/s = ~810K dma_copy+completion/s, a GLOBAL DPA op-rate
+resource. Levers that DON'T work (positive evidence): more EUs (K=4 flat), single-ARM egress sharding
+(egress_again=0). The ONLY remaining lever to exceed 200K is REDUCING dma_copy+completion per RTT (the 4):
+either fewer dma_copy (host->host direct = foreclosed for body-L7; refuted 4->2 fused completion) or
+completion-free RX (host polls landed RX buffer instead of a per-resp REV_DONE msg) — an architectural
+redesign. Baking K=2 + poll_rx as the standing 200K config; K=4 reverted.
+
+## Q2.10 — (a) BAKED standing config + (b) DONE + log level reverted (2026-06-09)
+(a) Baked the measured 200K config as test-bench.sh defaults (env still overridable):
+DPUMESH_DPA_THREADS:-4, DPUMESH_RINGS_PER_POD:-2, ECHO_POLL_RX:-1, ECHO_THREADS:-3. A plain
+`test-bench.sh deploy` now yields the K=2 + lean-server 200K config at -l 40.
+VERIFY (no env overrides): baked deploy -> 199K hw3 (p50 1.95ms, 0-fail). Fair-mode sanity (1-core echo
+w/ poll_rx+3 threads) -> 99.5K (p50 1.46ms, 0-fail) — NO regression (the old 1-core poll_rx regression was
+64 threads; 3 threads + adaptive yield is healthy). So poll_rx default-on is safe for both hw3 and fair.
+(b) DONE: cap attributed to the ~810K DPA dma_copy+completion op-rate (Q2.8-2.9), NOT ARM/egress (egress_
+again=0, cq_depth=0) and NOT EU count (K=4 flat). g_egress_again diagnostic kept (1Hz, silent at -l 40).
+Log level reverted to 40 in the final deploy (user request).
+
+FINAL LADDER (2-pod, hw3, 8KB): 130K (K=1) -> 160K (K=2 EU-sharding) -> **200K (K=2 + poll_rx lean server)**
+= +54% over baseline, and above the 4-pod blocking number (178K). 200K is the architecture's 2-pod DPA
+op-rate ceiling; exceeding it needs fewer dma_copy+completion per RTT (architectural), not more EUs/pods.
+
+## Q2.11 — CORRECTION of Q2.8/Q2.9 attribution (per bench.md hierarchy) (2026-06-09)
+Q2.8/Q2.9 claimed "~810K = the DPA dma_copy+completion op-rate; the per-op completion is ~half the cost;
+single comch consumer delivery." **That attribution is WRONG** — bench.md §5 already measured the engine
+hierarchy (test_dma micro-bench, recv/s == dma_copy/s, completions INCLUDED in all):
+- pure single-EU 556K; pure 4-EU **1.8M**; M0 (single consumer_pe drain) N=8 **1.53M**; M2 (single ARM
+  fwd) N>=4 **1.0M**. ALL above ~810K. So 810K is NOT the engine/DMA limit, and NOT the single consumer
+  reaping (M0 uses the SAME single consumer_pe and reaches 1.53M). pure_dma ALSO emits a completion per
+  copy and still does 556K single-EU -> "completion = half the cost" is false.
+
+WHAT 810K ACTUALLY IS: the **chain ceiling at 4 active EUs**. bench.md §5.1 chain 2-active-EU = 416K
+(104K x4). My EU-sharding made 2 pods drive 4 active EUs (the decisive experiment bench.md §8 marked
+"미실시") -> chain 2-EU 416K -> 4-EU ~810K = ~1.95x (near-linear) => CONFIRMS bench.md's untested "chain
+scales with active EUs". Then 4-EU -> 8-EU (K=4) is FLAT (810->813K) => a NEW chain wall at ~810K.
+Per-active-EU: 208K(2EU) -> 200K(4EU) -> 102K(8EU). The chain EU runs ~200K/EU vs pure 556K/EU => the
+chain EU is **STALL-bound (~64% idle), not op-rate-bound**.
+
+CAUSE OF THE 810K CHAIN WALL: UNPROVEN. Per bench.md §7.2 (chain-cap attribution is elimination-only and
+flip-flopped 3x), do NOT name a mechanism without positive evidence. It IS below engine/M0/M2 (so chain-
+specific: closed-loop + reverse DMA + admission per-RTT structure), but the specific stall is unmeasured.
+NEXT (bench.md §8.2): DPA-side stall-cycle instrumentation — measure where the chain EU stalls
+(is_consumer_empty / admission-gate / ring-empty) with POSITIVE counters.
+
+## Q2.12 — POSITIVE cap localization via DPA EU-stall instrumentation (2026-06-09)
+Added device-side EU counters (dpa_thread_arg: stat_dma/consumer_wait/admission_brk/idle_resched),
+incremented in dpa_kernel.c, read back by the ARM via doca_dpa_d2h_memcpy in the 1Hz stat
+(dmesh_log_eu_stats in dpa.c). This is bench.md §8.2's "DPA stall-cycle 계측" — positive, not elimination.
+
+Measured at the ~810K knee (8KB, hw3):
+| config | RPS | recv (dma/s) | dma | consumer_wait | admission_brk | idle_resched |
+|---|---|---|---|---|---|---|
+| K=2 (4 EU) @200K | 199K | 800K | 800,076/s | **0** | **0** | 1,811/s (~9%) |
+| K=3 (6 EU) @200K | 199K | 794K | 793,801/s | **0** | **0** | 5,958/s |
+
+POSITIVE FINDINGS (counters, not elimination):
+1. recv plateaus ~800K for 4 AND 6 AND 8 EU (Q2.9 K=4 also 813K) => chain caps ~800K dma/s (200K RTT),
+   does NOT scale with EUs past 4. (Refutes "K=3/6-EU may beat the engine N=8 regression" — it's a real
+   chain cap, not the pure N=8 dip.)
+2. **consumer_wait=0** => EU NEVER stalls delivering completions to the single DPU consumer (refutes my
+   earlier "810K = single-consumer reaping"; M0=1.53M already implied this).
+3. **admission_brk=0** => EU NEVER stalls on host RX credit (the closed-loop admission gate is not binding).
+4. At 4 EU the EU is COMPUTE-busy (idle 9%); at 6 EU idle_resched scales with EU count (per-EU 453->994/s)
+   while total dma stays ~800K => extra EUs are STARVED. So the cap is UPSTREAM of the EU: the
+   RING-FILL rate (host forward-post + ARM reverse-enqueue) is pinned at ~800K, starving added EUs.
+=> The 2-pod ~200K ceiling is the CLOSED-LOOP RING-FILL rate (host side), NOT the DPA engine (pure 1.8M),
+   NOT the DPU consumer (consumer_wait=0, M0 1.53M), NOT host credit (admission_brk=0), NOT the ARM
+   (cq_depth=0), NOT egress (egress_again=0). Consistent with bench.md §6.1 M/M/1 fixed-service-rate +
+   [[project_chain_host_transport_bound]]/[[project_host_send_serial_cap]] (single host PE progress thread).
+   host->host (dma_copy count) is MOOT for this cap — it is host ring-fill, not DPA op-rate.
+CORRECTS my Q2.8/Q2.9 ("DPA op-rate / single-consumer / completion-half-cost") AND the "stall-bound"
+guess — all refuted by positive counters. Remaining: localize host ring-fill (single PE thread vs posting);
+per-thread CPU probe failed (container ns); headline (host closed-loop ring-fill) is positive-evidenced.
+Diagnostics (egress_again, EU-stall) kept in code, silent at -l 40.
+
+## Q2.13 — Host cap POSITIVELY localized: single PE progress thread (2026-06-09)
+Per-thread CPU (crictl PID + top -H) at K=2/200K, hw3 (3 cores/side):
+- ECHO (server): ONE thread **96.4%** (saturated) + 3 poll workers ~23% each (idle-ish, waiting on PE).
+- CLIENT: ONE thread 77.2% + 4 async workers ~38% each.
+=> The single **PE progress thread (pe_progress_fn, doca_pe_progress + rx_data_hook RX landing) per pod is
+the 200K cap**. Workers have headroom; they starve waiting for the PE thread to land RX. Confirms
+[[project_host_send_serial_cap]] / [[project_chain_host_transport_bound]] positively (per-thread, not
+elimination). The DPU EU starvation (Q2.12 idle_resched) is the downstream symptom of this host-side cap:
+the PE thread can't post/land fast enough to feed >4 EUs.
+LEVER: parallelize/lighten the host RX landing (single pe_progress_fn). Candidates: drop the vestigial
+consumer_pe drain if empty; offload rx_data_hook off the PE callback; or multiple RX PEs.
+
+## Q2.14 — consumer_pe drain removed (lean-up); confirms cap = comch RX reaping (2026-06-09)
+Removed the vestigial doca_pe_progress(consumer_pe) from pe_progress_fn (host datapath consumer ID is never
+advertised → nothing lands on it; RX arrives via the comch client/pe → rx_data_hook). Safe, host-only.
+Result (K=2, hw3): 200K healthy (p50 1.89ms 0-fail); 215K saturates (~204K, p50 296ms). => marginal ~+2%,
+ceiling still ~200-204K. So the single PE thread's saturation is dominated by the REAL comch RX reaping
+(doca_pe_progress on the comch client), NOT the vestigial consumer_pe. Kept the removal as a lean-up
+(runtime lighter), but it is not the lever.
+
+FINAL POSITIVE PICTURE (this session): 130K (K=1) → 160K (EU-sharding K=2) → 200K (lean server poll_rx) →
+~204K (consumer_pe lean-up). The 2-pod ceiling ~200K = the **single host comch-RX PE thread per pod**
+(echo PE 96.4%), positively localized through the whole stack (DPA engine/consumer/ARM/egress/host-credit
+all ruled OUT with counters=0; EU starves at 6 EU; per-thread top -H shows the one PE thread saturated).
+NEXT LEVER to exceed ~204K (all are MAJOR host-transport changes, uncertain payoff, deploy-only verified):
+  (a) completion-free polled RX — host workers poll the RX buffer for landed data (DPA writes a valid/seq
+      marker), eliminating the per-response comch REV_DONE reaping (removes the PE-thread bottleneck +
+      cuts completions). Needs req_id correlation in the landed data + DPA reverse format change.
+  (b) multi-connection comch RX — K host comch connections, ARM round-robins REV_DONE, K PE threads.
+  (c) lock-free rx_queue (echo PE 96% vs client 77% gap may be rx_lock contention: 1 producer PE + 3
+      worker consumers). Smaller, targets the server-side gap only.
+host->host is MOOT here (cap is host comch-RX, not DPA dma_copy) and stays FORECLOSED (DPU L7 proxy).
+Deployed state: baked K=2 DPA=4 poll_rx + consumer_pe-drain-removed, -l 40, ~200K 0-fail.
+
+## Q2.15 — BATCH_REV_DONE built (the real ceiling lever); first deploy WEDGED (gatekeeper) then fixed
+Mirrored BATCH_FWD_ACK for REV_DONE: new DMESH_MSG_BATCH_REV_DONE(6) + dmesh_rev_done_entry(16B) +
+dmesh_batch_rev_done_msg(BATCH_REVDONE_MAX=16); pod_state.rev_done_batch[]; server_send_batch_rev_done_to;
+dpu_worker batch_or_send_rev_done + flush (proc==0 idle-flush + 1kHz tail; cross-pod batched, echo_mode
+un-batched for REV_DONE-before-TX_ACK order); host rx_data_hook BATCH_REV_DONE unpack loop.
+FIRST DEPLOY WEDGED (0 achieved / all fail) — exactly [[project_dpu_host_msg_gatekeeper]]: a new DPU→host
+comch type needs a case in BOTH rx_data_hook AND the comch_client.c client_message_recv_callback switch.
+Added rx_data_hook but missed the client switch → type 6 hit default ("unknown message type") → silent
+drop → no responses → wedge. FIX: added the DMESH_MSG_BATCH_REV_DONE case to comch_client.c:119. Redeploy.
+
+## Q2.16 — BATCH_REV_DONE RESULT: 200K -> ~220-235K, bottleneck redistributed (2026-06-09)
+After the gatekeeper fix (Q2.15), K=2 hw3, 8KB, 0-fail throughout:
+| RPS | achieved | p50 | state |
+|---|---|---|---|
+| 200K | 199,070 | **1.25ms** (was 1.89ms pre-batch) | healthy, lower latency |
+| 220K | 218,956 | 1.42ms | healthy (new sustainable knee) |
+| 235K | 233,866 | 17.9ms | knee edge |
+| 250K | 238,905 | 246ms | saturated |
+=> BATCH_REV_DONE lifts ~200K -> ~220-235K (+10-18%) AND cuts p50 at 200K (PE less loaded). It is the
+user's "batch the completion" idea, realized by mirroring the proven BATCH_FWD_ACK (1 comch reap per K
+responses), always-on for cross-pod (echo_mode un-batched for ordering). 0-fail; effectively baked.
+
+NEW bottleneck (per-thread top -H @220K): echo now has TWO threads ~90%/87% (was a SINGLE 96% PE pre-batch)
++ 2 workers ~18%; client 73%/70% + 2 workers ~33%. => batching relieved the single PE; the bottleneck
+REDISTRIBUTED to the echo node's aggregate per-RTT CPU on its 3 cores (PE reaping the batched msgs + the
+WORKERS doing the 8KB memcpy echo_dpumesh.c:68 + the forward post). So the echo 8KB memcpy (the user's
+point) is now CO-BINDING. Removing it (echo re-send from the RX slot, no rx->tx copy) is the next lever
+BUT is NOT app-local: the forward DMA reads the host TX data buffer (remote_mmap), not the RX buffer, so
+re-sending from RX needs the RX buffer registered as a DMA source (a transport change), not just an
+echo-app edit. Ladder so far: 130K(K=1) -> 160K(EU-shard) -> 200K(poll_rx) -> ~220-235K(BATCH_REV_DONE).
+
+## Q2.17 — Bench restructured to isolate transport (user was RIGHT) (2026-06-09)
+USER INSIGHT (verified correct): the echo memcpy (echo_dpumesh.c:68, 8KB rx->tx) AND the client memset
+(bench_dpumesh.c:132/234, 8KB pattern fill) are per-request APP operations for the content-validation
+bench, NOT dpumesh transport. The transport DMAs body_len bytes regardless of content. bench.md §1's own
+purpose is "application 로직 제거, transport 비용만 분리 측정" — so these 8KB ops polluted the measurement.
+KEY: the validation only ever checked 3 byte positions (rb[0], rb[bl/2], rb[bl-1], bench:171) — the full
+8KB fill/copy was overkill. FIX: replace the 8KB memset/memcpy with a 3-byte fill/copy (same validation,
+no app bandwidth). Transport (8KB DMA x4/RTT) unchanged.
+RESULT (transport-only, K=2 + poll_rx + BATCH_REV_DONE, hw3, 8KB, 0-fail):
+| RPS | achieved | p50 | state |
+|---|---|---|---|
+| 235K | 233,882 | 1.24ms | healthy |
+| 245K | 243,835 | 1.28ms | healthy (new sustainable knee) |
+| 260K | 250,461 | 170ms | saturating |
+| 300K | 254,246 | 1.07s | saturated |
+=> TRUE transport ceiling ~245K healthy / ~252K saturation, vs ~235K with the 8KB app ops = **+5-10%**.
+So the app memcpy/memset CO-BOUND but were NOT dominant (~7%); the main limit is still the transport
+(single host comch-RX PE thread). The bench now correctly isolates transport. The 3-byte validation keeps
+the same corruption sanity (it always only checked 3 positions). Baked (bench app, not a knob).
+LADDER (transport-only is the correct metric): 130K(K=1) -> 160K(EU-shard) -> 200K(poll_rx) ->
+~235K(BATCH_REV_DONE) -> ~250K(bench isolates app overhead). Cap remains the host comch-RX PE thread.
+
+## Q2.18 — "more cores to service" REGRESSES; chain reached the M2 engine ceiling (2026-06-09)
+USER asked: give the echo SERVICE more cores (or one-way bench), since they want dpumesh TRANSPORT perf
+not service perf. Tested hw6 (6 cores/side + ECHO_THREADS=6 ASYNC_THREADS=6), transport-only bench:
+| profile | ceiling |
+|---|---|
+| hw3 (3c/3thr) | ~245-252K |
+| hw6 (6c/6thr) | **195K, then collapses 131K->115K at higher RPS** |
+=> MORE cores/threads REGRESS. Cause: the bottleneck is the SINGLE host PE thread (1 core, processing
+completions); adding workers only adds shared-rx_queue rx_lock contention + poll-spin thrash. So "more
+cores to the service" does NOT raise the ceiling, and (b) lock-free RX alone won't exceed it either (the
+single PE caps). Restored baked ECHO_THREADS=3 / hw3.
+
+KEY: the chain has REACHED the M2 engine ceiling. ~250K RTT x 4 dma_copy = **~1.0M dma_copy/s = bench.md
+M2 (single-ARM one-way forward) N>=4 plateau (1.0M)**. bench.md had the chain at 416K = 67% of M2; the
+session's transport work (EU-sharding 4EU + poll_rx + BATCH_REV_DONE + bench app-isolation) brought it to
+1.0M = 100% of M2. So the chain is now at the single-host-PE / single-ARM-forward limit. Above M2 is M0
+(1.53M, no host forward) and pure (1.8M); exceeding M2 needs to PARALLELIZE the single host PE (multi-conn
+comch, or offload the per-entry process_rx_dma_entry to workers) OR a ONE-WAY bench (no round-trip, no
+service re-send) to measure the forward transport rate directly. One-way needs the request TX_ACK
+re-enabled (g_skip_req_txack) for client TX-slot lifecycle without a response.
+LADDER: 130K -> 160K(EU) -> 200K(poll_rx) -> ~235K(BATCH_REV_DONE) -> ~250K(bench isolates app) = M2 ceiling.
+
+## Q2.19 — LIGHTER transport: lock-free TX slot pool (user: transport must be light) (2026-06-09)
+USER directive: the transport must be LIGHT on host CPU (NOT use more cores). perf (Q-prev) showed the
+reducible host CPU is in MUTEXES + the O(n) TX-slot bitmap scan, not the SDK. Replaced slot_bitmap +
+slot_lock + slot_cond with a lock-free Treiber free-list of slot indices (free_head atomic u64 with ABA
+tag + slot_next[]); tx_alloc = lock-free pop (spin-backoff when empty), tx_free = lock-free push. Removes
+slot_lock (mutex), the O(num_slots) scan, and the per-free cond_signal (futex).
+perf BEFORE -> AFTER (echo self-time @240K): dpumesh_tx_alloc 3.42% -> 1.73% (halved); mutex lock+unlock
+6.5% -> 5.7% (slot_lock gone); tx_free 0.96%. => host CPU per request is LIGHTER. Correctness: 250K
+healthy (p50 1.48ms), 0-fail, back-to-back 218.8K==218.8K = NO SLOT LEAK (free-list correct). Ceiling
+~245 -> ~250K (small; host wasn't purely tx-bound). Baked (always-on, no knob).
+
+REMAINING reducible host CPU (next "lighter" levers, all lock-free, no extra cores):
+- rx_queue rx_lock + dpumesh_dequeue (~5.3% + part of mutex) = the echo MPSC. Lock-free Vyukov MPSC ring
+  (1 PE producer, N worker consumers). Biggest remaining. Caveat: needs a lightweight cond kept ONLY for
+  the non-poll (Thrift blocking) path; poll_rx (bench) path is pure spin on the ring.
+- pending[req_id] mutex (~2-3%, client side) = lock-free atomic state.
+IRREDUCIBLE FLOOR: the DOCA SDK comch polling (priv_doca_cq_poll_one + doca_pe_progress + comch internals)
+~12-15% of a host core at 250K — inherent to a completion-notification RX; only a fundamentally different
+RX (completion-free polled, not SDK-supported) would go below it. So the transport's host-CPU floor at
+~250K is the SDK poll (~12-15%) + the irreducible per-entry deliver. Ladder unchanged (~250K = M2 ceiling).
+
+## Q2.20 — LIGHTER transport: lock-free rx_queue (Vyukov MPSC) (2026-06-10)
+USER: "rx_queue lock-free 이어서 해줘" (continue the lighter-transport work; rx_queue was the biggest
+remaining reducible host CPU). The echo RX queue was a circular buffer guarded by rx_lock (mutex) + rx_cond
++ rx_not_full (vestigial: signalled, never waited). The single PE producer took rx_lock per enqueue and
+N workers took rx_lock per dequeue — PE<->worker mutex contention on EVERY request, on the bottleneck PE.
+
+CHANGE (dpumesh_doca.c, baked/always-on, no knob): replaced rx_queue[]/head/tail/count + rx_lock +
+rx_cond + rx_not_full with a lock-free **Vyukov bounded MPSC ring** (RX_QUEUE_SIZE=65536, pow2 -> mask):
+- struct rxq_cell { sw_descriptor_t desc; atomic_uint_fast32_t seq; } rx_ring[]; atomic rx_enq, rx_deq.
+- Producer (rx_deliver_desc, single PE): seq-gated single-producer enqueue (relaxed load/store rx_enq,
+  release-store cell seq), drop+rx_reclaim on full. No rx_lock in poll_rx.
+- Consumer (dpumesh_dequeue, N workers): rxq_try_pop = acquire-load cell seq, CAS rx_deq, read desc,
+  release-store seq+SIZE. Multi-consumer via CAS.
+- poll_rx (bench): pure lock-free spin + adaptive backoff (RX_POLL_SPIN/20us), NO mutex at all.
+- non-poll (Thrift blocking): lock-free pop; only when empty, lock rx_lock + re-check (closes lost-wakeup)
+  + cond_wait to sleep idle-efficiently. Producer signals rx_cond under rx_lock only when !poll_rx.
+- rx_enq/rx_deq cacheline-padded apart (defensive; see below).
+Single-producer invariant verified: rx_deliver_desc is called only from process_rx_dma_entry <- rx_data_hook
+<- doca_pe_progress <- the single pe_progress_fn thread.
+
+PERF (echo node, crictl PID + sudo perf -g, 240K, self-time):
+| symbol | Q2.19 (locked rx_queue) | Q2.20 (lock-free) |
+|---|---|---|
+| pthread_mutex lock+unlock | 5.7% | **3.48%** (2.07+1.41) |
+| rx_deliver_desc (PE enqueue) | took rx_lock/req | **0.74%, lock-free (no mutex)** |
+| __lll_lock_wait (futex) | (in mutex) | **0.01%** (no contention) |
+| dpumesh_dequeue + rxq_try_pop | dequeue 5.3% + rx_lock share | rxq_try_pop 10.5% + dequeue 2.1% |
+=> MUTEX -39% (5.7->3.48): rx_lock ELIMINATED from both the PE producer (bottleneck) and the workers.
+Remaining mutex = pending table + ring_lock (next levers). The PE per-request enqueue is now lock-free.
+
+CACHELINE PADDING measured NEUTRAL (rxq_try_pop 10.71% -> 10.50%): rx_enq is producer-PRIVATE (consumers
+never read it) so it never false-shared rx_deq. Kept anyway (textbook MPSC hygiene, ~192B, harmless). The
+residual rxq_try_pop ~10.5% is INTRINSIC: 3 workers CAS the shared rx_deq (true MPSC sharing) + the cell
+seq line bounces producer<->consumer near-empty. NOT reducible by layout.
+
+HONEST framing of "lighter": in poll_rx (bench) the workers are DEDICATED spinners (~100% core regardless),
+so wall-clock core use is ~constant; the lock-free win there is (a) the PE BOTTLENECK is now lock-free,
+(b) zero futex/contention stalls. The REAL lightness is the NON-POLL (production Thrift) path: rx_lock is
+gone from the data path entirely — a worker does one lock-free CAS-pop per request and cond_waits only when
+idle (vs old rx_lock per pop + cond). Strictly lighter per request in production.
+
+CORRECTNESS (hw3, 8KB, transport-only bench, K=2 + poll_rx + BATCH_REV_DONE + lock-free TX + lock-free RX):
+| RPS | achieved | p50 | OK/Fail |
+|---|---|---|---|
+| 200K | 199,244 | 1.25ms | 3.0M / 0 |
+| 240K (70s sustained) | 239,713 | 1.30ms | 16.8M / 0 |
+| 245K | 244,080 | 1.37ms | 3.675M / 0 (healthy knee) |
+| 260K | 250,645 | 205ms | 27 fail / 3.9M (saturation cliff timeouts) |
+Back-to-back 200K after the 260K saturation: 199,063 == 199,058, 0-fail = CLEAN recovery, NO leak
+(Vyukov positions self-balance as items drain). Ceiling unchanged ~250K = M2 (throughput-neutral, as
+expected: the cap is the single host PE / M2 engine, NOT rx_lock). Goal was LIGHTER, not faster.
+LADDER (unchanged ceiling): 130K -> 160K(EU) -> 200K(poll_rx) -> 235K(BATCH_REV_DONE) -> ~250K(M2). Host
+CPU per request: TX pool lock-free (Q2.19) + RX queue lock-free (Q2.20) => mutex 6.5% -> 3.48% cumulatively.
+NEXT lighter lever: pending[req_id] lock-free (the remaining ~3.48% mutex = pending + ring_lock).
+
+### Q2.20 verification (adversarial, 2026-06-10) — mutex attribution CONFIRMED + corrected
+Challenged the "3.48% mutex = pending + ring_lock" attribution (memory: elimination is unreliable; demand
+positive evidence). Perf caller-graph was inconclusive: frame-pointer unwind fails (libthrift -O2 omits
+frame ptr); --call-graph dwarf is Heisenberg-perturbed (16KB/sample stack copy -> the recording is dominated
+by nanosleep context-switch storm + perf's own native_write_msr/sched_in; userspace symbols squished below
+threshold). So the AUTHORITATIVE evidence is an EXHAUSTIVE CODE AUDIT (all 14 pthread_mutex_lock sites),
+re-run by 4 independent agents (2 enumerate, 2 adversarial-refute) + synthesis.
+VERDICT: claim CORRECT (no refuter found a missed lock; rx_lock=0 in poll_rx confirmed by all 4). EXACT
+per-request mutex count (poll_rx=1) = **5 acquisitions**:
+- p->lock (pending) = **4x** : register_pending(:1021) + pending_attach_tx(:1068) + pending_release_async
+  (:1248) [worker] + TX_ACK handler(:415) [PE]. ALL on the SAME pending[req_id%65536] slot -> genuinely
+  CROSS-THREAD CONTENDED (worker vs PE) -> this is the DOMINANT mutex self-time (4 of 5).
+- ring_locks[ridx] = **1x** : dpumesh_enqueue(:825). Spread over K=2 rings (test-bench.sh forces
+  DPUMESH_RINGS_PER_POD=2, NOT the K=1 default) -> lightly contended, minor.
+CORRECTIONS to the Q2.20 narrative: (1) "pending + ring_lock" is right but NOT 50/50 — it's ~4/5 pending
+(the cross-thread-contended slot) + ~1/5 ring; "mostly pending" is accurate. (2) bench runs K=2 so the ring
+lock is NOT a single contended object. Lock-free structures (Treiber TX, Vyukov RX, __sync credit) correctly
+do NOT appear as pthread_mutex self-time (single RMW, not lock loops). 3.48% is fully consistent with the 5
+acquisitions; nothing unaccounted. NEXT lever (pending lock-free) correctly targets the dominant 4/5.
+SIDE FINDING (dwarf): at 240K the echo workers are ~84% IDLE (3 workers, ~16% busy) and the worker cores'
+biggest cost is the 20us backoff nanosleep sleep/wake churn (poll_rx-bench artifact), NOT the mutexes or the
+lock-free ring. The mutex (3.48%) + rxq_try_pop (10.5%) are secondary to the idle-poll scheduler traffic.
+
+## Q2.21 — Periodic hot-path log audit + bench stat gated off (2026-06-10)
+USER noticed periodic logs during deploy/test and asked to audit log level + log statements, and whether
+more host-CPU lightening remains.
+LOG AUDIT (positive, by source):
+- The periodic lines the user saw = bench app stat threads: echo_dpumesh.c:31 "[echo-stat] rx_queue_depth=
+  .. tx_inflight=.." and bench_dpumesh.c:51 "[bench-stat] ..", printed every 1s whenever tx_inflight>0.
+  These are raw fprintf(stderr) -> NOT gated by -l or any DOCA log level (that's why they always show).
+  Each also calls dpumesh_debug_stats every 1s, which walks the lock-free TX free-list O(num_slots).
+- DPU 1Hz DOCA_LOG_INFO (dpu_worker.c:1191 "elapsed/sent/recv/cq_depth" + dmesh_log_eu_stats) is INFO(50),
+  correctly FILTERED at -l 40 -> does NOT appear (verified -l stays 40). test-bench.sh:250 documents 50=INFO.
+- Host transport per-request logs are DOCA_LOG_DBG (dpumesh_doca.c:393 TX_ACK, :864 ENQUEUE) = level 60,
+  filtered (host backend shows INFO at init only, one-time, not periodic). No periodic host transport log.
+FIX: gated both stat threads behind BENCH_STAT (default OFF) — the pthread_create is skipped unless
+BENCH_STAT=1, so by default NO periodic [echo-stat]/[bench-stat] line AND no 1Hz debug_stats free-list walk
+(host a touch leaner). Verified post-deploy: 0 stat lines in pod logs, 240K 238,889 p50 1.34ms 0-fail
+(throughput unchanged). Re-enable: `BENCH_STAT=1 ./test-bench.sh deploy` — BENCH_STAT is now plumbed into
+BOTH pod manifests (test-bench.sh bench env :445 + echo env :484, default 0); without that passthrough the
+pods (env comes only from the hardcoded manifest env: lists, NOT the shell) would never see it.
+
+MORE LIGHTENING — analyzed, user chose to STOP. Remaining reducible host mutex = the verified 3.48%, of which
+the DOMINANT 4/5 is the pending p->lock (cross-thread worker<->PE on the same hashed slot). Offered: (A)
+coalesce echo's register+attach+release 3->1 worker lock (total 4->2, moderate risk: must preserve the -2
+deferred-ACK + collision-wait protocol; state=-2 settable pre-enqueue since TX_ACK only arrives post-enqueue),
+(B) full lock-free pending (delicate: slot reuse / late-ACK / owner_req_id guard / client cond). USER PICKED
+"stop here": throughput is at the M2 ceiling so pending lock-free wouldn't raise it, the remaining mutex is
+small, and below it sits the irreducible SDK comch poll (~12-15%). The transport is at its lock-free-
+achievable host-CPU floor. Deployed: baked K=2 + poll_rx + BATCH_REV_DONE + lock-free TX + lock-free RX +
+stat-gated-off, -l 40, ~240K 0-fail.
+
+## Cleanup — bake the winning config fixed, delete everything else (2026-06-10)
+USER directive: keep ONLY the best-performing option (no env/compile toggles — fixed in code); keep only
+thread/EU counts + sizing + pod-identity configurable; delete all dead code / unused vars / inappropriate
+names / record-keeping comments. This intentionally OVERRIDES the earlier "bake ON but KEEP the SHARD/SPLIT/
+DRAIN scaffolding + keep diagnostics + KEEP CASE_INGRESS" decisions ([[project_option_b_foreclosed_cleanup_keep]],
+[[feedback_bake_dont_delete]], [[project_recv_pool_coupling]]). Confirmed by the user before editing.
+
+### Removed (the losing / dormant options)
+- DPU ARM control-plane SPLIT machinery: SPLIT_SEND (SENDS/REBAL/SHARD modes), DRAIN_SHARDS>1, the SENDER /
+  shard-worker / drain-shard threads + send_spsc/work_spsc/shard_work/shard_send SPSC types + consumer_lock(_shard)
+  + arm_core_a/b + shard_worker_of/drain_group_of_eu/send_via_spsc. dpu_worker.c kept ONLY the single-ARM
+  SPLIT_OFF path (the measured winner, Q2.1). ~600 lines from dpu_worker.c + object.h + comch_*.
+- All measurement instrumentation (the bottleneck investigation is DONE): DPU 1 Hz sent/recv/cq_depth stat,
+  dmesh_log_eu_stats + the EU-stall counters (stat_dma/consumer_wait/admission_brk/idle_resched) + their
+  device-side increments + d2h readback; g_egress_again; DPUMESH_TRACE hop-timing; recv_err_count; the bench
+  [echo-stat]/[bench-stat] stat threads + dpumesh_debug_stats + the BENCH_STAT gate.
+- Baked features fixed ON (env/flag selection removed): SKIP_REQ_TXACK, BATCH_TXACK, BATCH_REV_DONE, DPA EU
+  affinity (host); ZEROCOPY_RX + PE_ADAPTIVE were already baked. Consumer model fixed per caller: bench→async,
+  echo→poll_rx, Thrift→blocking (async/poll impossible under the sync Thrift API). DPUMESH_KEEPALIVE_US baked
+  to 1 ms.
+- Dead host code: blocking bench worker_fn + sleep_until (async is the only model now), dpumesh_get_notify_fd
+  (unimplemented -1 stub), 7 never-read sw_descriptor_t fields (step_id, src_body/header_pool_type/pod_id/buf_slot)
+  + their writers in TDpumeshTransportBase/bench/gateway, POOL_NONE/POOL_HOST_TX_BODY (no users left).
+- Record-keeping/history comments across the transport (vestigial-consumer_pe, "~5% host CPU", old handshake,
+  legacy-pattern, SHARD-measurement narrative, backward-compat).
+
+### Kept (delete-before-verify risk check overruled deletion — NOT dead)
+- CASE_INGRESS / CASE_EXTERNAL: the flags byte is wire-ABI (dma_desc.flags offset + comch_dma_comp_msg==16B
+  _Static_asserts) and DMA-copied across the host/ARM/DPA boundary; CASE_INGRESS is live write-once metadata.
+- comch_msg union add_ring_msg/add_rev_ring_msg members: their 80 B size sets the msgq imm_data_len
+  (dpa.c set_imm_data_len(sizeof(comch_msg))==84) that RECEIVES the 80 B ADD_RING — shrinking would truncate
+  ring setup. (A survey agent labelled these "safe to delete"; its own cited evidence proved the opposite —
+  adversarial verification caught it. Kept.)
+
+### Bug fixed during the audit
+- comch_client.c set_recv_queue_size error path logged "Failed to set msg size property" (copy-paste from the
+  set_max_msg_size path); corrected to "recv queue size". Log-only, no behavior change.
+
+### Configurable surface after cleanup (user's choice = thread counts + sizing + identity)
+env kept: DPUMESH_DPA_THREADS, DPUMESH_RINGS_PER_POD (thread/EU counts) · DPUMESH_NUM_SLOTS / SLOT_SIZE /
+MAX_DESCRIPTORS (sizing) · DPUMESH_POD_ID / PCI_ADDR (deploy identity) · ECHO_THREADS / ASYNC_THREADS (bench
+thread counts). Everything else is fixed in code. test-bench.sh dropped the baked-off env (KEEPALIVE_US, TRACE,
+BENCH_STAT, ECHO_POLL_RX) and its dead `trace)` subcommand.
+
+### VERIFIED non-regressing (clean deploy, hw3, 8KB, baked DPA=4 K=2, -l 40)
+The deploy compiled all 3 toolchains clean (host libthrift + DPU ARM + DPA device build_dpu) — a compile
+error would have aborted before pod rollout. Back-to-back, 0-fail throughout:
+| RPS | achieved | p50 | p99 | OK/Fail |
+|---|---|---|---|---|
+| 30000 (warmup) | 29,838 | 1.79 ms | 3.11 ms | 300000/0 |
+| 200000 | 198,917 | 1.40 ms | 3.63 ms | 2.0M/0 |
+| 240000 | 238,691 | 1.46 ms | 3.99 ms | 2.4M/0 (sustainable knee) |
+| 200000 (back-to-back) | 198,895 | 1.39 ms | 3.37 ms | 2.0M/0 |
+| 30000 (recovery) | 29,838 | 1.80 ms | 3.11 ms | 300000/0 |
+Back-to-back 200K==200K (198,917 vs 198,895, <0.02%) → NO slot leak. Ceiling unchanged ~240K = Q2.20
+(240K→239,713). Net: ~810 source lines removed across 16 files; the standing 200-240K config is now the
+only code path (no env/compile toggles), with thread/EU/sizing counts still tunable.

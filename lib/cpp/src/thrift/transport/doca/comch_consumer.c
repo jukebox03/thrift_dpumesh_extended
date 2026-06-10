@@ -186,7 +186,6 @@ static void consumer_recv_task_comp_cb(struct doca_comch_consumer_task_post_recv
 	(void)task_user_data;
 
 	objs = (struct objects *)(ctx_user_data.ptr);
-	objs->recv_msg_cnt++;
 
 	/* Task just completed → it's leaving DOCA's in-flight pool (we are about
 	 * to resubmit it, which re-enters the pool under capacity check). */
@@ -215,22 +214,17 @@ static void consumer_recv_task_comp_cb(struct doca_comch_consumer_task_post_recv
 	doca_buf_reset_data_len(buf);
 	struct doca_task *t = doca_comch_consumer_task_post_recv_as_task(task);
 
-	/* Gate resubmit on our own counter — NO infinite retry loop, never
-	 * block the PE thread. If the gated submit somehow still fails, stash
-	 * the task in consumer_retry[] and let the main PE loop drain it.
-	 *
-	 * Use the _exact variant: this callback (and drain_consumer_retry) run
-	 * only on the PE thread, so there is no concurrent-submitter race. The
-	 * TASK_POOL_MARGIN headroom would otherwise reject every resubmit once
-	 * bootstrap filled the pool to `max`, permanently starving recv. */
+	/* Gate resubmit on our own counter; on failure stash the task in
+	 * consumer_retry[] for the main PE loop to drain. The _exact variant is
+	 * safe because this callback and drain_consumer_retry run only on the PE
+	 * thread (single submitter, no concurrent-submitter race). */
 	if (!doca_pool_try_acquire_exact(&objs->recv_tasks_in_flight, objs->recv_tasks_max))
 		goto stash;
 	result = doca_task_submit(t);
 	if (result == DOCA_SUCCESS)
 		return;
 
-	/* Rare: capacity had room but submit still failed. Release our count
-	 * and stash for later. */
+	/* Capacity had room but submit still failed: release count and stash. */
 	doca_pool_release(&objs->recv_tasks_in_flight);
 	DOCA_LOG_WARN("Recv resubmit gated-submit failed: %s; stashing",
 	              doca_error_get_name(result));
@@ -309,10 +303,7 @@ static doca_error_t prepare_consumer_tasks(struct objects *objs, struct doca_com
 		}
 		task_obj = doca_comch_consumer_task_post_recv_as_task(consumer_task);
 
-		/* Bootstrap: fill the pool up to max. TASK_POOL_MARGIN is meant for
-		 * runtime concurrent-submitter races, not the single-threaded init
-		 * loop — using the gated helper here would cap us short of max and
-		 * break the consumer startup handshake. */
+		/* Bootstrap: fill the pool up to max (single-threaded init loop). */
 		atomic_fetch_add(&objs->recv_tasks_in_flight, 1);
 		result = doca_task_submit(task_obj);
 		if (result != DOCA_SUCCESS) {

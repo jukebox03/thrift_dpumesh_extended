@@ -9,8 +9,7 @@
 
 DOCA_LOG_REGISTER(OBJECT);
 
-/* Call at startup (before any submit / after ctx created) to prime the
- * capacity model. Safe to call from init_comch_ctrl_path_{server,client}. */
+/* Initialize the task-pool counters; call at startup before any submit. */
 void
 objects_init_task_pools(struct objects *objs)
 {

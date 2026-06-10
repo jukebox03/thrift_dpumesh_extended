@@ -32,13 +32,7 @@
 #include <thrift/transport/dpumesh.h>
 
 #define CTRL_PORT          9092
-/* MAX_WORKERS sets the upper bound on closed-loop concurrency. With wrk2-style
- * scheduled-time latency measurement (t0 = scheduled, not now-when-sent), the
- * cap no longer hides saturation in the latency tail — but a low cap still
- * limits achievable throughput to MAX_WORKERS / mean_latency. 4096 is large
- * enough that for any workload where p99 < 75ms at 50K rps, the bench is not
- * the bottleneck. Stack size is shrunk to 128KB so 4096 × 128KB = 512MB worth
- * of stacks, well within 30GB host RAM. */
+/* Upper bound on closed-loop concurrency (worker threads). */
 #define MAX_WORKERS        4096
 #define WORKER_STACK_BYTES (128 * 1024)
 #define WAIT_TIMEOUT_MS    5000
@@ -47,31 +41,9 @@
 static dpumesh_ctx_t *g_ctx = NULL;
 static int            g_dst_pod_id = 11;
 
-/* Async (poll-based) client mode — set from DPUMESH_ASYNC_CLIENT. When on, a
- * few generator threads (ASYNC_THREADS) each keep a window of in-flight
- * requests and harvest them via dpumesh_poll_response (no per-request wakeup),
- * replacing the thread-per-request blocking model. Minimizes host cores. */
-static int g_async         = 0;
+/* Async (poll-based) client: generator threads each keep a window of in-flight
+ * requests harvested via dpumesh_poll_response (no per-request wakeup). */
 static int g_async_threads = 4;
-
-/* 1 Hz host-bottleneck stat. On the client, tx_inflight = requests in flight
- * (TX slots held until TX_ACK). Near num_slots → client is TX-slot-starved =
- * downstream (DPU/echo/RX-delivery) not freeing slots fast enough. */
-static void *bench_stat_thread(void *arg) {
-    (void)arg;
-    struct timespec s = {1, 0};
-    int max_tx = 0;
-    for (;;) {
-        nanosleep(&s, NULL);
-        int rxd = 0, txi = 0;
-        dpumesh_debug_stats(g_ctx, &rxd, &txi);
-        if (txi > max_tx) max_tx = txi;
-        if (txi > 0 || rxd > 0)
-            fprintf(stderr, "[bench-stat] tx_inflight=%d (max=%d) rx_queue_depth=%d\n",
-                    txi, max_tx, rxd);
-    }
-    return NULL;
-}
 
 /* ------------------------------------------------------------ time helpers */
 
@@ -79,16 +51,6 @@ static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
-
-static void sleep_until(double target) {
-    double now = now_sec();
-    if (target <= now) return;
-    double diff = target - now;
-    struct timespec ts;
-    ts.tv_sec  = (time_t)diff;
-    ts.tv_nsec = (long)((diff - (double)ts.tv_sec) * 1e9);
-    nanosleep(&ts, NULL);
 }
 
 /* ------------------------------------------------------------ per-worker  */
@@ -109,95 +71,6 @@ typedef struct {
     size_t     cap;
 } worker_t;
 
-static void *worker_fn(void *arg) {
-    worker_t *w = (worker_t *)arg;
-    int32_t my_pod = dpumesh_get_pod_id(g_ctx);
-
-    for (long i = 0; i < w->budget; i++) {
-        if (atomic_load(w->stop)) break;
-
-        /* wrk2-style scheduled-time semantics. Latency is measured from the
-         * tick this request was *supposed* to fire, not from when the worker
-         * actually got around to sending it. Fixes coordinated omission:
-         * when service slows down, this iter's scheduled is far in the past,
-         * sleep_until returns immediately, and t0 = scheduled captures the
-         * full queuing wait + service time — i.e. what a real client paced
-         * at this rate would observe, not just the part visible to a worker
-         * that froze in lockstep with the system. */
-        double scheduled = w->start_at + (double)i * w->interval_sec;
-        sleep_until(scheduled);
-
-        double t0 = scheduled;
-
-        uint32_t req_id = dpumesh_alloc_req_id(g_ctx);
-        int tx_slot = dpumesh_tx_alloc(g_ctx);
-        if (tx_slot < 0) {
-            atomic_fetch_add(w->fail, 1);
-            continue;
-        }
-
-        if (dpumesh_register_pending(g_ctx, req_id) < 0) {
-            dpumesh_tx_free(g_ctx, tx_slot);
-            atomic_fetch_add(w->fail, 1);
-            continue;
-        }
-
-        uint8_t *buf = dpumesh_tx_buf(g_ctx, tx_slot);
-        /* Fill with deterministic pattern (cheap) */
-        memset(buf, (int)('A' + (i & 0xf)), (size_t)w->msg_size);
-
-        sw_descriptor_t desc;
-        memset(&desc, 0, sizeof(desc));
-        desc.header_buf_slot     = -1;
-        desc.body_buf_slot       = tx_slot;
-        desc.body_len            = (uint32_t)w->msg_size;
-        desc.req_id              = req_id;
-        desc.dst_pod_id          = g_dst_pod_id;
-        desc.src_pod_id          = my_pod;
-        desc.flags               = OP_REQUEST | CASE_EXTERNAL;
-        desc.valid               = 1;
-        desc.src_body_pool_type  = POOL_HOST_TX_BODY;
-        desc.src_body_pod_id     = my_pod;
-        desc.src_body_buf_slot   = tx_slot;
-        desc.src_header_buf_slot = -1;
-
-        if (dpumesh_enqueue(g_ctx, &desc) < 0) {
-            dpumesh_tx_free(g_ctx, tx_slot);
-            dpumesh_cancel_pending(g_ctx, req_id);
-            atomic_fetch_add(w->fail, 1);
-            continue;
-        }
-        dpumesh_pending_attach_tx(g_ctx, req_id, tx_slot);
-
-        sw_descriptor_t resp;
-        if (dpumesh_wait_response(g_ctx, req_id, &resp, WAIT_TIMEOUT_MS) < 0) {
-            dpumesh_cancel_pending(g_ctx, req_id);
-            atomic_fetch_add(w->fail, 1);
-            continue;
-        }
-        /* Validate the echoed body — catches RX corruption that would otherwise
-         * be SILENT (esp. the zero-copy landing-buffer overwrite-near-wrap). The
-         * request body was memset to 'A'+(i&0xf); the echo returns it verbatim. */
-        if (resp.body_buf_slot >= 0) {
-            const uint8_t *rb = dpumesh_rx_buf(g_ctx, resp.body_buf_slot);
-            uint8_t expect = (uint8_t)('A' + (i & 0xf));
-            uint32_t bl = resp.body_len;
-            int bad = (rb == NULL) ||
-                      (bl != (uint32_t)w->msg_size) ||
-                      (bl > 0 && (rb[0] != expect || rb[bl / 2] != expect ||
-                                  rb[bl - 1] != expect));
-            dpumesh_rx_free(g_ctx, resp.body_buf_slot);
-            if (bad) { atomic_fetch_add(w->fail, 1); continue; }
-        }
-
-        double lat_us = (now_sec() - t0) * 1e6;
-        if (w->n_samples < w->cap)
-            w->samples[w->n_samples++] = lat_us;
-        atomic_fetch_add(w->ok, 1);
-    }
-    return NULL;
-}
-
 /* ------------------------------------------------ per-worker (async/poll) */
 
 /* One in-flight request inside a generator thread's window. */
@@ -210,10 +83,8 @@ typedef struct {
 } inflight_slot_t;
 
 /* Async generator: maintains a window of `inflight` outstanding requests rather
- * than blocking one-per-thread. Sends are paced by wrk2 scheduled time (t0 =
- * scheduled, so coordinated omission is still corrected); completions are
- * harvested with dpumesh_poll_response (no per-request wakeup). A handful of
- * these threads replace thousands of blocking workers → minimal host cores. */
+ * than blocking one-per-thread. Sends are paced by scheduled time; completions
+ * are harvested with dpumesh_poll_response (no per-request wakeup). */
 static void *worker_fn_async(void *arg) {
     worker_t *w = (worker_t *)arg;
     int32_t my_pod = dpumesh_get_pod_id(g_ctx);
@@ -249,7 +120,9 @@ static void *worker_fn_async(void *arg) {
             }
 
             uint8_t *buf = dpumesh_tx_buf(g_ctx, tx_slot);
-            memset(buf, (int)('A' + (next_j & 0xf)), (size_t)w->msg_size);
+            /* TRANSPORT-ONLY: fill only the 3 validated bytes (not an 8KB memset). */
+            { uint8_t p = (uint8_t)('A' + (next_j & 0xf));
+              buf[0] = p; buf[w->msg_size / 2] = p; buf[w->msg_size - 1] = p; }
 
             sw_descriptor_t desc;
             memset(&desc, 0, sizeof(desc));
@@ -261,10 +134,6 @@ static void *worker_fn_async(void *arg) {
             desc.src_pod_id          = my_pod;
             desc.flags               = OP_REQUEST | CASE_EXTERNAL;
             desc.valid               = 1;
-            desc.src_body_pool_type  = POOL_HOST_TX_BODY;
-            desc.src_body_pod_id     = my_pod;
-            desc.src_body_buf_slot   = tx_slot;
-            desc.src_header_buf_slot = -1;
 
             if (dpumesh_enqueue(g_ctx, &desc) < 0) {
                 dpumesh_tx_free(g_ctx, tx_slot);
@@ -352,10 +221,7 @@ static void *worker_fn_async(void *arg) {
 /* ------------------------------------------------------------ watchdog  */
 
 /* Hard-deadline watchdog: set *stop=1 after deadline_sec elapses, but exit
- * early if main signals via *early_exit (workers finished naturally). This
- * lets wall time reflect actual completion when workers beat the deadline,
- * instead of being floored by a fixed sleep. Polling at 100ms is fine —
- * we never need sub-second resolution on the deadline. */
+ * early if main signals via *early_exit (workers finished naturally). */
 typedef struct {
     atomic_int *stop;
     atomic_int *early_exit;
@@ -399,26 +265,15 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns) {
         return;
     }
 
-    /* Concurrency model.
-     * Blocking (legacy): n_workers = target concurrency, 1 in-flight each.
-     * Async: a few generator threads (ASYNC_THREADS), each holding a window of
-     * `inflight` outstanding requests, for the SAME total concurrency C — so
-     * RPS is apples-to-apples but the host runs ~thousands fewer threads. */
-    int n_workers, inflight;
-    if (g_async) {
-        n_workers = g_async_threads;
-        if (n_workers < 1) n_workers = 1;
-        if (n_workers > MAX_WORKERS) n_workers = MAX_WORKERS;
-        int C = (conns > 0) ? conns : (rps / 100);   /* target total concurrency */
-        if (C < 1) C = 1;
-        inflight = (C + n_workers - 1) / n_workers;   /* per-thread window */
-        if (inflight < 1) inflight = 1;
-    } else {
-        n_workers = (conns > 0) ? conns : (rps / 100);
-        if (n_workers < 1) n_workers = 1;
-        if (n_workers > MAX_WORKERS) n_workers = MAX_WORKERS;
-        inflight = 1;
-    }
+    /* Concurrency model: a few generator threads, each holding a window of
+     * `inflight` outstanding requests, for the target total concurrency C. */
+    int n_workers = g_async_threads;
+    if (n_workers < 1) n_workers = 1;
+    if (n_workers > MAX_WORKERS) n_workers = MAX_WORKERS;
+    int C = (conns > 0) ? conns : (rps / 100);   /* target total concurrency */
+    if (C < 1) C = 1;
+    int inflight = (C + n_workers - 1) / n_workers;   /* per-thread window */
+    if (inflight < 1) inflight = 1;
 
     /* Spread RPS evenly across workers */
     long total_budget = (long)rps * (long)dur;
@@ -427,8 +282,8 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns) {
     double interval_sec = (double)n_workers / (double)rps;
 
     fprintf(stderr, "[bench] RUN rps=%d dur=%d size=%d conns=%d "
-                    "(async=%d workers=%d inflight=%d interval=%.3fus per worker)\n",
-            rps, dur, msg_size, conns, g_async, n_workers, inflight,
+                    "(workers=%d inflight=%d interval=%.3fus per worker)\n",
+            rps, dur, msg_size, conns, n_workers, inflight,
             interval_sec * 1e6);
 
     pthread_t  *tids   = calloc((size_t)n_workers, sizeof(pthread_t));
@@ -445,14 +300,12 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns) {
 
     double start = now_sec() + 0.05;  /* small offset so all workers warm before t=0 */
 
-    /* Use small per-thread stack — n_workers can reach MAX_WORKERS=4096, and
-     * the default 8MB stack would consume ~32GB. 128KB is plenty for our
-     * worker_fn locals (a sw_descriptor_t is 64B, no recursion, no big arrays). */
+    /* Small per-thread stack so MAX_WORKERS threads fit in host RAM. */
     pthread_attr_t worker_attr;
     pthread_attr_init(&worker_attr);
     pthread_attr_setstacksize(&worker_attr, WORKER_STACK_BYTES);
 
-    void *(*wfn)(void *) = g_async ? worker_fn_async : worker_fn;
+    void *(*wfn)(void *) = worker_fn_async;
     for (int i = 0; i < n_workers; i++) {
         wargs[i].worker_id    = i;
         wargs[i].budget       = per_worker + (i < remainder ? 1 : 0);
@@ -476,11 +329,8 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns) {
     }
     pthread_attr_destroy(&worker_attr);
 
-    /* Watchdog: hard deadline at dur + DRAIN_GRACE_SEC.
-     * Main thread joins workers immediately so wall time reflects actual
-     * completion. If workers beat the deadline, signal watchdog to exit.
-     * Without this, a fixed sleep(deadline) inflates wall time and the
-     * reported RPS is artificially capped at ok / deadline. */
+    /* Watchdog: hard deadline at dur + DRAIN_GRACE_SEC. Main thread joins
+     * workers immediately; if they beat the deadline, signal the watchdog. */
     atomic_int wd_early = 0;
     wd_arg_t wa;
     wa.stop         = &stop;
@@ -605,12 +455,11 @@ int main(int argc, char **argv) {
         worker_id = atoi(getenv("BENCH_WORKER_ID"));
     if (getenv("BENCH_DST_POD_ID"))
         g_dst_pod_id = atoi(getenv("BENCH_DST_POD_ID"));
-    if (getenv("DPUMESH_ASYNC_CLIENT"))
-        g_async = atoi(getenv("DPUMESH_ASYNC_CLIENT"));
     if (getenv("ASYNC_THREADS"))
         g_async_threads = atoi(getenv("ASYNC_THREADS"));
 
     dpumesh_config_t cfg = DPUMESH_CONFIG_DEFAULT;
+    cfg.async_client = 1;   /* bench is a poll-based async client */
     int rc = dpumesh_init(&g_ctx, "bench-dpumesh", worker_id, &cfg);
     if (rc != 0 || !g_ctx) {
         fprintf(stderr, "[bench] dpumesh_init failed: %d\n", rc);
@@ -618,9 +467,6 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "[bench] ready: pod_id=%d, dst_pod_id=%d\n",
             dpumesh_get_pod_id(g_ctx), g_dst_pod_id);
-
-    pthread_t bench_stat_tid;
-    pthread_create(&bench_stat_tid, NULL, bench_stat_thread, NULL);
 
     int srv = ctrl_listen(CTRL_PORT);
     if (srv < 0) return 1;

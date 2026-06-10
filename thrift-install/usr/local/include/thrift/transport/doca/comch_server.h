@@ -5,6 +5,8 @@
 #include <doca_comch.h>
 #include <doca_ctx.h>
 
+#include "comch_common.h"  /* dmesh_rev_done_entry for server_send_batch_rev_done_to */
+
 struct objects; /* Forward declaration */
 
 #define CC_SEND_TASK_NUM 8192 /* Number of CC send tasks (HW max ~65536) */
@@ -25,20 +27,25 @@ doca_error_t
 server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn,
                         const char *msg, size_t len);
 
-/* Send TX ACK to a specific host connection (req_id + dst_pod_id key).
- * Pure per-request notification that forward DMA finished; no flow-control
- * piggyback. */
+/* Send TX ACK to a specific host connection: per-request notification that
+ * forward DMA finished. */
 doca_error_t
 server_send_tx_ack_to(struct objects *objs,
 					  struct doca_comch_connection *conn,
 					  uint32_t req_id,
 					  int32_t dst_pod_id);
 
-/* Batched TX_ACK: coalesce n req_ids into one message (DPUMESH_BATCH_TXACK). */
+/* Batched TX_ACK: coalesce n req_ids into one message. */
 doca_error_t
 server_send_batch_tx_ack_to(struct objects *objs,
 							struct doca_comch_connection *conn,
 							const uint32_t *req_ids, int n);
+
+/* Batched REV_DONE: coalesce n reverse-DMA completions into one message. */
+doca_error_t
+server_send_batch_rev_done_to(struct objects *objs,
+							  struct doca_comch_connection *conn,
+							  const struct dmesh_rev_done_entry *entries, int n);
 
 /* Find a pod by pod_id. Returns NULL if not found. */
 struct pod_state *
@@ -55,10 +62,9 @@ pods_add_connection(struct objects *objs, struct doca_comch_connection *conn);
 /* Invalidate the pod slot for the given connection on disconnect. Marks the
  * slot as not-registered, clears the connection pointer so future lookups
  * skip it, and destroys the host-exported mmap views held on the DPU side.
- * Local DPU buffers (dma_buffer, tx_ring) and the DPA-side ring
- * registration are deliberately not torn down here — that requires a DPA
- * REMOVE_RING round-trip and is the next step. Returns 0 if a slot was
- * found and invalidated, -1 if no slot matched. */
+ * Local DPU buffers (dma_buffer, tx_ring) and the DPA-side ring registration
+ * are not torn down here. Returns 0 if a slot was found and invalidated,
+ * -1 if no slot matched. */
 int
 pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn);
 

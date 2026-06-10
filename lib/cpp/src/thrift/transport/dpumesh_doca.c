@@ -43,30 +43,34 @@ static void cleanup_ctx(struct dpumesh_ctx *ctx);
  * dpumesh_ctx — internal state
  * ==================================================================== */
 
-/* RX queue capacity */
 /* RX queue between PE thread (producer, drains rx_dma_buffer) and the
- * application accept loop (consumer, e.g. TThreadedServer). Sized to be
- * larger than gateway's admission_cap (900) and the server's worst-case
- * concurrent in-flight, so the PE thread never has to drop on enqueue.
- * 65536 entries × ~200B = ~13MB pure RAM, same scale as `pending` pool. */
+ * application consumer. Sized larger than worst-case concurrent in-flight so
+ * the PE thread never has to drop on enqueue. */
 #define RX_QUEUE_SIZE 65536
 
 /* Pending response table for client-side request/response matching.
  * Indexed by req_id % MAX_PENDING. Must exceed expected in-flight requests
- * to avoid hash collisions. Pure software array (host RAM only — no HW limit).
- * 65536 entries × ~200B = ~13 MB. */
+ * to avoid hash collisions. */
 #define MAX_PENDING 65536
 
 typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     sw_descriptor_t desc;
-    volatile int state;   /* -1=unused, -2=abandoned/timed-out (TX freed here, or deferred to TX_ACK), 0=waiting, 1=arrived */
+    volatile int state;   /* -1=unused, -2=abandoned/timed-out, 0=waiting, 1=arrived */
     int tx_slot;          /* TX buffer slot owned by this request, -1 if none */
-    uint32_t owner_req_id; /* req_id currently occupying this idx; guards TX_ACK
-                            * (DMESH_MSG_FWD_ACK) against a late/duplicate ACK
-                            * after req_id wraps every MAX_PENDING requests */
+    uint32_t owner_req_id; /* req_id currently occupying this idx; guards the
+                            * TX_ACK handler against a late/duplicate ACK after
+                            * req_id reuses this idx */
 } dpumesh_pending_t;
+
+/* One cell of the lock-free Vyukov bounded MPSC RX ring. `seq` carries the
+ * turn-stamp: the producer may write cell i only when seq==enq_pos; a consumer
+ * may read it only when seq==deq_pos+1. */
+struct rxq_cell {
+    sw_descriptor_t desc;
+    atomic_uint_fast32_t seq;
+};
 
 struct dpumesh_ctx {
     char app_name[64];
@@ -75,11 +79,20 @@ struct dpumesh_ctx {
     int  num_slots;
     int  slot_size;
     int  max_descriptors;
+    int  k_rings;              /* K = forward rings per pod (EU-sharding); 1 = legacy */
     /* DOCA objects */
     struct objects doca_objs;
     void *dma_buffer;          /* Host TX buffer (PCI mmap, CPU→DPU source) */
-    struct dma_ring *dma_ring;
-    pthread_mutex_t ring_lock;  /* Serializes get_next_dma_desc + descriptor fill + valid=1 */
+    /* K forward descriptor rings (EU-sharding). dpumesh_enqueue round-robins
+     * across them via rr_counter; each ring_locks[j] serializes get_next_dma_desc
+     * + fill + valid=1 for ring j (single-producer per ring). K=1 = legacy. */
+    struct dma_ring *dma_rings[MAX_EU_PER_POD];
+    pthread_mutex_t ring_locks[MAX_EU_PER_POD];
+    atomic_uint rr_counter;
+    /* Reverse credit region size = rx_dma_buf_size / k_rings. The DPA reports an
+     * absolute landing pos; ring_idx = pos / rx_region_size selects which ring's
+     * credit slot to return. K=1 → region = whole buffer → ring_idx always 0. */
+    size_t rx_region_size;
     doca_dpa_dev_mmap_t dpa_mmap_handle;  /* DPA handle for local mmap (used in TX descriptors) */
 
     /* Host RX buffer (PCI mmap, DPU→CPU destination) */
@@ -90,65 +103,43 @@ struct dpumesh_ctx {
     /* Persistent buffer for initial registration to avoid stack UAF */
     struct dmesh_register_msg reg_msg;
 
-    /* TX slot management. (Tested O(1) LIFO free-list 2026-06-08 — REGRESSED the
-     * ceiling 104K→96K vs the lowest-index-first scan, so the scan is retained;
-     * tx_alloc was not the host cap. See bench/scale_log.md E6.) */
-    uint8_t *slot_bitmap;
-    pthread_mutex_t slot_lock;
-    pthread_cond_t  slot_cond;  /* Signaled when a TX slot is freed */
+    /* TX slot management — lock-free Treiber free-list of slot indices.
+     * free_head packs (tag<<32 | head_index); head_index==num_slots = empty.
+     * The tag (bumped per op) defeats ABA. slot_next[i] links free slots. */
+    atomic_uint_fast64_t free_head;
+    uint32_t *slot_next;
 
-    /* RX buffer pool (independent from TX) */
-    void *rx_buffer;
-    uint8_t *rx_slot_bitmap;
-    pthread_mutex_t rx_slot_lock;
-
-    /* RX descriptor queue (circular buffer) */
-    sw_descriptor_t rx_queue[RX_QUEUE_SIZE];
-    int rx_head;
-    int rx_tail;
-    int rx_count;
-    pthread_mutex_t rx_lock;
-    pthread_cond_t rx_cond;
-    pthread_cond_t rx_not_full;  /* Signaled when rx_count drops, for backpressure */
+    /* RX descriptor queue — lock-free Vyukov bounded MPSC ring (1 producer = PE
+     * thread, N consumers = server workers). Removes the rx_lock from the hot RX
+     * landing path. rx_lock/rx_cond are kept ONLY for the non-poll (Thrift
+     * blocking) consumer to sleep when idle; the producer signals them only when
+     * !poll_rx. poll_rx (bench) path is pure lock-free + spin (no mutex). */
+    struct rxq_cell *rx_ring;          /* RX_QUEUE_SIZE cells (power of two) */
+    /* rx_enq (producer-private, written every request) and rx_deq (CAS-hammered
+     * by every worker) sit on separate cachelines: otherwise the PE's per-request
+     * rx_enq store false-shares the line the workers CAS, bouncing it and
+     * inflating CAS-retry CPU. */
+    char _rx_pad0[64];
+    atomic_uint_fast32_t rx_enq;       /* producer position (PE only) */
+    char _rx_pad1[64];
+    atomic_uint_fast32_t rx_deq;       /* consumer position (workers CAS) */
+    char _rx_pad2[64];
+    pthread_mutex_t rx_lock;           /* non-poll block/wake only */
+    pthread_cond_t rx_cond;            /* non-poll block/wake only */
 
     /* PE progress thread */
     pthread_t pe_tid;
     volatile int pe_running;
-    /* Adaptive polling: when set, the PE thread spins while there is RX work
-     * but YIELDS the core (short nanosleep) after a sustained idle stretch,
-     * instead of busy-polling a full core regardless of load. Frees the host
-     * core for the application when the transport is idle (core-efficiency).
-     * Throughput-neutral under load (never idle → never backs off). Off=legacy
-     * busy-poll. Set via DPUMESH_PE_ADAPTIVE. */
-    int pe_adaptive;
-    /* Zero-copy RX (DPUMESH_ZEROCOPY_RX): when set, the PE thread does NOT
-     * rx_slot_alloc (O(n) scan) nor memcpy the reverse-DMA payload into a
-     * separate staging slot. Instead it delivers a descriptor carrying the
-     * landing offset `pos` (in body_buf_slot) and the consumer reads
-     * rx_dma_buffer[pos] DIRECTLY, then rx_free returns the admission credit.
-     * Safe because the DPA admission (rq_depth=num_slots, credit bumped in
-     * rx_free) never reverse-DMAs more than num_slots ahead of freed, so an
-     * unread landing position is never lapped — provided rx_free stays AFTER
-     * the read. Off = legacy staging copy. */
-    int zerocopy_rx;
-    /* Poll-mode RX (DPUMESH_POLL_RX): server consumers (dpumesh_dequeue) spin on
-     * the rx_queue with adaptive backoff instead of blocking on rx_cond, and the
-     * PE thread STOPS pthread_cond_signal(rx_cond) per request. Eliminates the
-     * per-request server-side wakeup (1 futex + 1 context switch) — the dominant
-     * remaining host per-request cost. Only safe when the consumer is productive
-     * (never idle-waiting), which the echo's shared-queue workers are. Off =
-     * legacy cond_wait. */
+    /* Poll-mode RX: server consumers (dpumesh_dequeue) spin on the lock-free
+     * Vyukov ring with adaptive backoff instead of blocking on rx_cond, and the
+     * PE producer stops the per-request rx_cond signal. Safe only when the
+     * consumer is always productive (never idle-waiting). */
     int poll_rx;
-    /* Async client (DPUMESH_ASYNC_CLIENT): when set, the PE thread STOPS the
-     * per-request response wakeup (pthread_cond_signal on the pending cond in
-     * rx_deliver_desc). Clients observe completion via dpumesh_poll_response (a
-     * lock-free state load) instead of blocking in dpumesh_wait_response. This
-     * eliminates the dominant remaining client-side per-request cost (1 futex +
-     * 1 context switch on BOTH the PE thread and the waking worker) and lets a
-     * handful of polling threads carry many in-flight requests — far fewer host
-     * cores than the thread-per-request blocking model. Off = legacy blocking
-     * wait. Process-global: a process in async mode must use poll_response,
-     * never wait_response (which would never be woken). */
+    /* Async client: the PE thread stops the per-request response wakeup
+     * (pthread_cond_signal on the pending cond in rx_deliver_desc). Clients
+     * observe completion via dpumesh_poll_response (a lock-free state load)
+     * instead of blocking in dpumesh_wait_response. Process-global: a process
+     * in async mode must use poll_response, never wait_response. */
     int async_client;
 
     /* Client-side pending response table */
@@ -163,8 +154,7 @@ struct dpumesh_ctx {
 /* Adaptive-poll tuning: spin this many empty iterations before the first
  * back-off (catches brief inter-request gaps with no latency cost), then sleep
  * a short, capped interval per empty iteration (yields the core during
- * sustained idle). At load there is always work so we never reach the spin
- * threshold → identical to busy-poll, throughput-neutral. */
+ * sustained idle). */
 #define PE_IDLE_SPIN     2048
 #define PE_BACKOFF_NS    20000   /* 20 us */
 
@@ -176,12 +166,9 @@ static void *pe_progress_fn(void *arg) {
         uint8_t did = 0;
         if (ctx->doca_objs.pe)
             did |= doca_pe_progress(ctx->doca_objs.pe);
-        if (ctx->doca_objs.consumer_pe)
-            did |= doca_pe_progress(ctx->doca_objs.consumer_pe);
 
-        if (!ctx->pe_adaptive)
-            continue;                 /* legacy busy-poll */
-
+        /* Adaptive: spin while there is RX work; yield the core after a
+         * sustained idle stretch so the app gets the core when transport idle. */
         if (did) {
             idle = 0;                 /* work seen — keep spinning tight */
         } else if (++idle >= PE_IDLE_SPIN) {
@@ -198,43 +185,55 @@ static void *pe_progress_fn(void *arg) {
  * RX data hook — called from PE progress thread via comch callback
  * ==================================================================== */
 
-static int rx_slot_alloc(dpumesh_ctx_t *ctx) {
-    pthread_mutex_lock(&ctx->rx_slot_lock);
-    for (int i = 0; i < ctx->num_slots; i++) {
-        if (ctx->rx_slot_bitmap[i] == 0) {
-            ctx->rx_slot_bitmap[i] = 1;
-            pthread_mutex_unlock(&ctx->rx_slot_lock);
-            return i;
-        }
-    }
-    pthread_mutex_unlock(&ctx->rx_slot_lock);
-    return -1;
-}
-
-
 /* Return one unit of reverse-DMA admission credit to the DPA (it polls this
  * counter at the extra slot past the dma_ring; see dpumesh_rx_free). */
-static inline void rx_credit_return(dpumesh_ctx_t *ctx)
+static inline void rx_credit_return(dpumesh_ctx_t *ctx, int pos)
 {
-    if (ctx->dma_ring && ctx->dma_ring->descs) {
-        volatile uint64_t *credit =
-            (volatile uint64_t *)(ctx->dma_ring->descs + ctx->dma_ring->size);
+    /* Per-ring credit: the reverse region a landing fell in maps 1:1 to a forward
+     * ring (disjoint regions, ring j owns [j*R,(j+1)*R)). Return credit to that
+     * ring's slot so the DPA EU owning rev ring j sees its own freed count. */
+    int idx = (ctx->rx_region_size > 0) ? (int)((size_t)pos / ctx->rx_region_size) : 0;
+    if (idx < 0 || idx >= ctx->k_rings) idx = 0;
+    struct dma_ring *r = ctx->dma_rings[idx];
+    if (r && r->descs) {
+        volatile uint64_t *credit = (volatile uint64_t *)(r->descs + r->size);
         __sync_add_and_fetch(credit, 1);
     }
 }
 
-/* Reclaim an undeliverable RX entry (error/drop paths). Zero-copy: there is no
- * staging slot — return the landing credit so the DPA can reuse that position.
- * Staging: free the staging bitmap slot (legacy; credit is returned at rx_free). */
+/* Reclaim an undeliverable RX entry (error/drop paths): return the landing
+ * credit so the DPA can reuse that position. `slot` is the landing byte pos. */
 static void rx_reclaim(dpumesh_ctx_t *ctx, int slot)
 {
-    if (ctx->zerocopy_rx) {
-        rx_credit_return(ctx);
-        return;
+    rx_credit_return(ctx, slot);
+}
+
+/* Lock-free Vyukov MPSC dequeue. Multiple worker consumers race via CAS on
+ * rx_deq; the single PE producer owns rx_enq. Returns 1 and fills *out on
+ * success, 0 if the ring is empty. Never blocks. */
+static inline int rxq_try_pop(dpumesh_ctx_t *ctx, sw_descriptor_t *out)
+{
+    for (;;) {
+        uint_fast32_t pos = atomic_load_explicit(&ctx->rx_deq, memory_order_relaxed);
+        struct rxq_cell *c = &ctx->rx_ring[pos & (RX_QUEUE_SIZE - 1)];
+        uint_fast32_t seq = atomic_load_explicit(&c->seq, memory_order_acquire);
+        int_fast32_t diff = (int_fast32_t)(seq - (pos + 1));
+        if (diff == 0) {
+            if (atomic_compare_exchange_weak_explicit(
+                    &ctx->rx_deq, &pos, pos + 1,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                *out = c->desc;
+                /* Release the cell for reuse one full lap ahead. */
+                atomic_store_explicit(&c->seq, pos + RX_QUEUE_SIZE,
+                                      memory_order_release);
+                return 1;
+            }
+            /* CAS lost to another consumer — retry. */
+        } else if (diff < 0) {
+            return 0;  /* empty */
+        }
+        /* diff > 0: producer mid-write of the cell we'd claim — retry. */
     }
-    pthread_mutex_lock(&ctx->rx_slot_lock);
-    ctx->rx_slot_bitmap[slot] = 0;
-    pthread_mutex_unlock(&ctx->rx_slot_lock);
 }
 
 /*
@@ -250,19 +249,14 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
         if (p->state == 0) {
             p->desc = *desc;
             p->state = 1;
-            /* Response arrival implies this request round-tripped (was delivered),
-             * so its TX slot is logically free now — release it here instead of
-             * relying on a separate per-request TX_ACK message (which doubles the
-             * host PE-thread's RX message load). No-op if a TX_ACK already freed
-             * it (tx_slot==-1), so this is safe whether or not the DPU still
-             * sends request-TX_ACKs (DPUMESH_SKIP_REQ_TXACK). */
+            /* Response arrival implies the request round-tripped, so its TX slot
+             * is logically free now — release it here. No-op if a TX_ACK already
+             * freed it (tx_slot==-1). */
             if (p->tx_slot >= 0) {
                 dpumesh_tx_free(ctx, p->tx_slot);
                 p->tx_slot = -1;
             }
-            /* Async clients poll p->state (set to 1 above) and need no wakeup;
-             * skipping the signal removes the per-response futex + context
-             * switch — the dominant remaining client-side host cost. */
+            /* Async clients poll p->state and need no wakeup. */
             if (!ctx->async_client)
                 pthread_cond_signal(&p->cond);
         } else if (p->state == -2) {
@@ -281,27 +275,30 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
         }
         pthread_mutex_unlock(&p->lock);
     } else {
-        pthread_mutex_lock(&ctx->rx_lock);
-
-        /* No blocking in PE callback path: if the RX queue is full, drop
-         * immediately so we don't stall the PE thread. Slot-based admission
-         * at the producer side (rx_slot_alloc above + sender's tx_alloc)
-         * keeps in-flight bounded; blocking here while waiting for consumers
-         * starves other PE work and can deadlock under load. */
-        if (ctx->rx_count >= RX_QUEUE_SIZE) {
-            pthread_mutex_unlock(&ctx->rx_lock);
+        /* Lock-free Vyukov single-producer enqueue (PE thread is the only
+         * producer). No blocking in the PE callback path: if the ring is full,
+         * drop immediately so we don't stall the PE. Slot-based admission (DPA
+         * reverse credit + sender's tx_alloc) keeps in-flight bounded. */
+        uint_fast32_t pos = atomic_load_explicit(&ctx->rx_enq, memory_order_relaxed);
+        struct rxq_cell *c = &ctx->rx_ring[pos & (RX_QUEUE_SIZE - 1)];
+        uint_fast32_t seq = atomic_load_explicit(&c->seq, memory_order_acquire);
+        if ((int_fast32_t)(seq - pos) != 0) {
             DOCA_LOG_ERR("RX deliver: queue full, dropping req_id=%u", desc->req_id);
             rx_reclaim(ctx, slot);
             return;
         }
-
-        ctx->rx_queue[ctx->rx_tail] = *desc;
-        ctx->rx_tail = (ctx->rx_tail + 1) % RX_QUEUE_SIZE;
-        ctx->rx_count++;
-        /* Poll-mode consumers spin on rx_count — no per-request wakeup needed. */
-        if (!ctx->poll_rx)
+        c->desc = *desc;
+        atomic_store_explicit(&c->seq, pos + 1, memory_order_release);
+        atomic_store_explicit(&ctx->rx_enq, pos + 1, memory_order_relaxed);
+        /* Poll-mode consumers spin on the ring — no wakeup needed. The non-poll
+         * (Thrift blocking) consumer sleeps on rx_cond; wake one. The signal
+         * takes rx_lock so it serializes with a consumer between its empty
+         * re-check and cond_wait (no lost wakeup). */
+        if (!ctx->poll_rx) {
+            pthread_mutex_lock(&ctx->rx_lock);
             pthread_cond_signal(&ctx->rx_cond);
-        pthread_mutex_unlock(&ctx->rx_lock);
+            pthread_mutex_unlock(&ctx->rx_lock);
+        }
     }
 }
 
@@ -320,10 +317,8 @@ static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_l
                      pos, dma_len, ctx->rx_dma_buf_size);
         return -1;
     }
-    /* The RX staging slot is exactly slot_size bytes; a body longer than that
-     * would overflow into the next slot on the memcpy below. The DPA caps each
-     * reverse DMA at DPA_DMA_COPY_MAX (= default slot_size), but guard here so a
-     * non-default (smaller) slot_size can never corrupt the heap. */
+    /* Body must fit one slot; the DPA caps each reverse DMA at DPA_DMA_COPY_MAX
+     * (= default slot_size), but guard so a non-default slot_size can't overrun. */
     if (dma_len > (uint32_t)ctx->slot_size) {
         DOCA_LOG_ERR("process_rx_dma_entry: len=%u exceeds slot_size=%d (req_id=%u)",
                      dma_len, ctx->slot_size, req_id);
@@ -331,25 +326,9 @@ static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_l
     }
     uint32_t body_len = dma_len;
 
-    /* Zero-copy: the PE thread does NOT scan for a staging slot nor memcpy the
-     * payload. It delivers the landing byte-offset `pos` in body_buf_slot; the
-     * consumer reads rx_dma_buffer[pos] directly and returns the credit at
-     * rx_free. The DPA admission keeps the landing position un-lapped until then.
-     * Legacy path: alloc a staging slot and memcpy the body into it now. */
-    int slot;
-    if (ctx->zerocopy_rx) {
-        slot = (int)pos;   /* body_buf_slot carries the landing byte offset */
-    } else {
-        uint8_t *body = (uint8_t *)ctx->rx_dma_buffer + pos;
-        slot = rx_slot_alloc(ctx);
-        if (slot < 0) {
-            DOCA_LOG_ERR("process_rx_dma_entry: no free RX slots, dropping req_id=%u", req_id);
-            return -1;
-        }
-        uint8_t *dst = (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
-        if (body_len > 0)
-            memcpy(dst, body, body_len);
-    }
+    /* Zero-copy: deliver the landing byte-offset `pos`; the consumer reads
+     * rx_dma_buffer[pos] directly and returns the credit at rx_free. */
+    int slot = (int)pos;
 
     sw_descriptor_t desc;
     memset(&desc, 0, sizeof(desc));
@@ -476,6 +455,36 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         }
         return;
     }
+
+    if (mtype == DMESH_MSG_BATCH_REV_DONE) {
+        /* Batched reverse-DMA notification: deliver each entry (identical per-entry
+         * logic as DMESH_MSG_REV_DONE). One reaped comch msg → K deliveries, so the
+         * single PE thread reaps 1/K — the 2-pod throughput lever. */
+        if (len < 4) {
+            DOCA_LOG_ERR("BATCH_REV_DONE: too short (len=%u)", len);
+            return;
+        }
+        const struct dmesh_batch_rev_done_msg *b = (const struct dmesh_batch_rev_done_msg *)data;
+        uint32_t n = b->count;
+        if (n > BATCH_REVDONE_MAX) n = BATCH_REVDONE_MAX;
+        if (len < 4u + 16u * n) {
+            DOCA_LOG_ERR("BATCH_REV_DONE: len=%u short for count=%u", len, n);
+            return;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            const struct dmesh_rev_done_entry *e = &b->entries[i];
+            if (!ctx->rx_dma_buffer || (size_t)e->pos + e->length > ctx->rx_dma_buf_size) {
+                DOCA_LOG_ERR("BATCH_REV_DONE: invalid pos=%u len=%u buf=%zu",
+                             e->pos, e->length, ctx->rx_dma_buf_size);
+                continue;
+            }
+            if (process_rx_dma_entry(ctx, e->pos, e->length, e->req_id,
+                                     e->src_pod_id, e->dst_pod_id, e->flags) != 0)
+                DOCA_LOG_WARN("BATCH_REV_DONE: process_rx_dma_entry failed pos=%u len=%u",
+                              e->pos, e->length);
+        }
+        return;
+    }
 }
 
 static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, const char *app_name, int worker_num) {
@@ -502,6 +511,14 @@ static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, cons
     else
         ctx->max_descriptors = DPUMESH_MAX_DESCRIPTORS_DEFAULT;
 
+    /* K = forward rings per pod (EU-sharding). Must match the DPU's
+     * DPUMESH_RINGS_PER_POD so host TX rings pair 1:1 with DPU per-pod rings. */
+    if ((env_val = getenv("DPUMESH_RINGS_PER_POD")) != NULL && atoi(env_val) > 0)
+        ctx->k_rings = atoi(env_val);
+    else
+        ctx->k_rings = DPUMESH_RINGS_PER_POD_DEFAULT;
+    if (ctx->k_rings > MAX_EU_PER_POD) ctx->k_rings = MAX_EU_PER_POD;
+
     snprintf(ctx->app_name, sizeof(ctx->app_name), "%s", app_name);
     snprintf(ctx->worker_id, sizeof(ctx->worker_id),
              "%s-worker-%d", app_name, worker_num);
@@ -510,6 +527,10 @@ static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, cons
         ctx->pod_id = atoi(env_val);
     else
         ctx->pod_id = worker_num;
+
+    /* Consumer model: poll/async for bench+echo, blocking for Thrift. */
+    ctx->poll_rx      = config ? config->poll_rx : 0;
+    ctx->async_client = config ? config->async_client : 0;
 }
 
 static doca_error_t init_doca_device(dpumesh_ctx_t *ctx) {
@@ -545,16 +566,15 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
     result = init_comch_datapath_consumer(&ctx->doca_objs);
     if (result != DOCA_SUCCESS) return result;
 
-    /* NOTE: the host datapath consumer object is created above (its PE is
-     * progressed in the RX path), but its consumer ID is no longer advertised
-     * to the DPU. The old POD_CONSUMER_ID / CONSUMER_ID handshake existed so the
-     * host could build a comch producer for CPU→DPU payload; that producer was
-     * removed — CPU→DPU now uses the DMA ring and DPU→CPU uses reverse DMA, so
-     * neither side consumes the other's datapath consumer ID. */
+    /* The host datapath consumer is created here but its ID is not advertised
+     * to the DPU: CPU→DPU uses the DMA ring and DPU→CPU uses reverse DMA. */
 
-    result = setup_dma_ring(&ctx->doca_objs, DMA_RING_SIZE);
-    if (result != DOCA_SUCCESS) return result;
-    ctx->dma_ring = ctx->doca_objs.dma_ring;
+    /* K forward descriptor rings, exported in order as DMA_RING (sent BEFORE
+     * DMA_BUFFER so the DPU's setup trigger sees all K before pairing). */
+    for (int j = 0; j < ctx->k_rings; j++) {
+        result = setup_dma_ring(&ctx->doca_objs, DMA_RING_SIZE, &ctx->dma_rings[j]);
+        if (result != DOCA_SUCCESS) return result;
+    }
 
     size_t buf_size = (size_t)ctx->num_slots * ctx->slot_size;
     result = alloc_buffer_and_set_mmap(&ctx->doca_objs.local_mmap,
@@ -573,8 +593,10 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
     result = doca_mmap_dev_get_dpa_handle(ctx->doca_objs.local_mmap, ctx->doca_objs.dev, &ctx->dpa_mmap_handle);
     if (result != DOCA_SUCCESS) return result;
 
-    /* Allocate Host RX DMA buffer (PCI mmap, DPA writes DPU→CPU data here) */
+    /* Allocate Host RX DMA buffer (PCI mmap, DPA writes DPU→CPU data here).
+     * Partitioned into k_rings disjoint reverse regions (rx_region_size each). */
     ctx->rx_dma_buf_size = buf_size;
+    ctx->rx_region_size = ctx->rx_dma_buf_size / (ctx->k_rings > 0 ? ctx->k_rings : 1);
     result = alloc_buffer_and_set_mmap(&ctx->rx_dma_mmap,
                                        ctx->doca_objs.dev,
                                        &ctx->rx_dma_buffer,
@@ -607,29 +629,28 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     if (init_control_path(ctx) != DOCA_SUCCESS) goto fail;
     if (init_datapath(ctx) != DOCA_SUCCESS) goto fail;
 
-    ctx->slot_bitmap = (uint8_t *)calloc(ctx->num_slots, 1);
-    if (!ctx->slot_bitmap) goto fail;
-    pthread_mutex_init(&ctx->slot_lock, NULL);
-    pthread_cond_init(&ctx->slot_cond, NULL);
-    pthread_mutex_init(&ctx->ring_lock, NULL);
+    /* Build the lock-free TX free-list: link 0->1->...->(num_slots-1)->empty,
+     * head = 0 (all free). slot_next[i] = i+1; the last points to num_slots (empty). */
+    ctx->slot_next = (uint32_t *)malloc((size_t)ctx->num_slots * sizeof(uint32_t));
+    if (!ctx->slot_next) goto fail;
+    for (int i = 0; i < ctx->num_slots; i++)
+        ctx->slot_next[i] = (uint32_t)(i + 1);   /* last = num_slots = empty sentinel */
+    atomic_store(&ctx->free_head, (uint_fast64_t)0);  /* tag 0, head index 0 */
+    for (int j = 0; j < MAX_EU_PER_POD; j++)
+        pthread_mutex_init(&ctx->ring_locks[j], NULL);
+    atomic_init(&ctx->rr_counter, 0);
 
-    /* rx_buffer is the STAGING area for delivered messages — must be separate
-     * from rx_dma_buffer (the DMA landing zone). If they share memory, DPU
-     * can overwrite slot contents after the worker copies them out, corrupting
-     * in-flight messages for the upper layer (seen as "Frame size has negative
-     * value" near wrap). */
-    {
-        size_t rx_buf_bytes = (size_t)ctx->num_slots * ctx->slot_size;
-        ctx->rx_buffer = calloc(1, rx_buf_bytes);
-        if (!ctx->rx_buffer) goto fail;
-    }
-    ctx->rx_slot_bitmap = (uint8_t *)calloc(ctx->num_slots, 1);
-    if (!ctx->rx_slot_bitmap) goto fail;
-    pthread_mutex_init(&ctx->rx_slot_lock, NULL);
+    /* Lock-free Vyukov MPSC RX ring: seq[i] = i (cell i first writable at enq
+     * position i), enq = deq = 0. */
+    ctx->rx_ring = (struct rxq_cell *)malloc((size_t)RX_QUEUE_SIZE * sizeof(struct rxq_cell));
+    if (!ctx->rx_ring) goto fail;
+    for (uint32_t i = 0; i < RX_QUEUE_SIZE; i++)
+        atomic_init(&ctx->rx_ring[i].seq, (uint_fast32_t)i);
+    atomic_init(&ctx->rx_enq, (uint_fast32_t)0);
+    atomic_init(&ctx->rx_deq, (uint_fast32_t)0);
 
     pthread_mutex_init(&ctx->rx_lock, NULL);
     pthread_cond_init(&ctx->rx_cond, NULL);
-    pthread_cond_init(&ctx->rx_not_full, NULL);
 
     atomic_init(&ctx->next_req_id, 1);
     for (int i = 0; i < MAX_PENDING; i++) {
@@ -643,18 +664,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     ctx->doca_objs.rx_hook_ctx = ctx;
 
     ctx->pe_running = 1;
-    { const char *pa = getenv("DPUMESH_PE_ADAPTIVE"); ctx->pe_adaptive = pa ? atoi(pa) : 0; }
-    if (ctx->pe_adaptive)
-        DOCA_LOG_INFO("PE adaptive polling ON (yields core when transport idle)");
-    { const char *zc = getenv("DPUMESH_ZEROCOPY_RX"); ctx->zerocopy_rx = zc ? atoi(zc) : 0; }
-    if (ctx->zerocopy_rx)
-        DOCA_LOG_INFO("Zero-copy RX ON (PE thread delivers landing offset; no staging scan/copy)");
-    { const char *pr = getenv("DPUMESH_POLL_RX"); ctx->poll_rx = pr ? atoi(pr) : 0; }
-    if (ctx->poll_rx)
-        DOCA_LOG_INFO("Poll-mode RX ON (dequeue spin-polls; PE thread stops per-request rx_cond signal)");
-    { const char *ac = getenv("DPUMESH_ASYNC_CLIENT"); ctx->async_client = ac ? atoi(ac) : 0; }
-    if (ctx->async_client)
-        DOCA_LOG_INFO("Async client ON (PE thread stops per-request response signal; clients poll_response)");
+    /* poll_rx / async_client are the consumer model, set in init_config. */
     if (pthread_create(&ctx->pe_tid, NULL, pe_progress_fn, ctx) != 0) goto fail;
 
     DOCA_LOG_INFO("DPUmesh DOCA initialized: worker=%s pod_id=%d", ctx->worker_id, ctx->pod_id);
@@ -675,9 +685,7 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
         pthread_join(ctx->pe_tid, NULL);
     }
 
-    /* Free resources BEFORE destroying locks they depend on.
-     * Pending cleanup calls dpumesh_tx_free/rx_free which acquire
-     * slot_lock/rx_slot_lock. */
+    /* Free resources BEFORE destroying locks they depend on. */
 
     for (int i = 0; i < MAX_PENDING; i++) {
         dpumesh_pending_t *p = &ctx->pending[i];
@@ -708,20 +716,13 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
 
     cleanup_objects(&ctx->doca_objs);
 
-    pthread_mutex_destroy(&ctx->ring_lock);
-    pthread_cond_destroy(&ctx->slot_cond);
-    pthread_mutex_destroy(&ctx->slot_lock);
-    if (ctx->slot_bitmap) free(ctx->slot_bitmap);
+    for (int j = 0; j < MAX_EU_PER_POD; j++)
+        pthread_mutex_destroy(&ctx->ring_locks[j]);
+    if (ctx->slot_next) free(ctx->slot_next);
+    if (ctx->rx_ring) free(ctx->rx_ring);
 
-    pthread_mutex_destroy(&ctx->rx_slot_lock);
-    if (ctx->rx_slot_bitmap) free(ctx->rx_slot_bitmap);
-    if (ctx->rx_buffer) {
-        free(ctx->rx_buffer);
-        ctx->rx_buffer = NULL;
-    }
     pthread_mutex_destroy(&ctx->rx_lock);
     pthread_cond_destroy(&ctx->rx_cond);
-    pthread_cond_destroy(&ctx->rx_not_full);
 
     free(ctx);
 }
@@ -737,34 +738,27 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx) {
  * ==================================================================== */
 
 int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
-    /* Backpressure: block until a TX slot is free. The caller has already
-     * committed to this request, so failure here would propagate as a
-     * Thrift exception — unwanted.
-     *
-     * Latency-tuned wait: at 44K RPS the per-request budget is ~23µs, so
-     * a 1ms cond_timedwait blocks ~44 requests-worth of progress. We use
-     * a 50µs re-poll backstop instead. The cond is signaled directly by
-     * tx_free / TX_ACK handlers, so the timedwait fires only when a
-     * signal was missed (rare race). */
-    pthread_mutex_lock(&ctx->slot_lock);
+    /* Lock-free pop from the Treiber free-list (O(1), no slot_lock / no O(n) scan
+     * / no cond). Backpressure: the caller has committed to this request, so when
+     * the list is empty spin with a short capped backoff until a slot frees —
+     * mirrors the old blocking behavior without the mutex/cond host-CPU cost. */
+    struct timespec backoff = {0, 1000};  /* 1µs initial */
     for (;;) {
-        for (int i = 0; i < ctx->num_slots; i++) {
-            if (ctx->slot_bitmap[i] == 0) {
-                ctx->slot_bitmap[i] = 1;
-                pthread_mutex_unlock(&ctx->slot_lock);
-                return i;
-            }
+        uint_fast64_t old = atomic_load_explicit(&ctx->free_head, memory_order_acquire);
+        int empty = 0;
+        for (;;) {
+            uint32_t head = (uint32_t)(old & 0xFFFFFFFFu);
+            if (head >= (uint32_t)ctx->num_slots) { empty = 1; break; }
+            uint_fast64_t newv = (((old >> 32) + 1) << 32) | (uint_fast64_t)ctx->slot_next[head];
+            if (atomic_compare_exchange_weak_explicit(&ctx->free_head, &old, newv,
+                    memory_order_acquire, memory_order_acquire))
+                return (int)head;
+            /* CAS failed: old reloaded — retry inner loop */
         }
-
-        /* 50µs re-poll backstop (was 1ms — too coarse for cap-region latency). */
-        struct timespec abs_ts;
-        clock_gettime(CLOCK_REALTIME, &abs_ts);
-        abs_ts.tv_nsec += 50000;  /* 50 µs */
-        if (abs_ts.tv_nsec >= 1000000000) {
-            abs_ts.tv_nsec -= 1000000000;
-            abs_ts.tv_sec += 1;
+        if (empty) {
+            nanosleep(&backoff, NULL);
+            if (backoff.tv_nsec < 50000) backoff.tv_nsec *= 2;  /* cap 50µs */
         }
-        pthread_cond_timedwait(&ctx->slot_cond, &ctx->slot_lock, &abs_ts);
     }
 }
 
@@ -775,11 +769,16 @@ uint8_t *dpumesh_tx_buf(dpumesh_ctx_t *ctx, int slot) {
 
 void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
     if (slot < 0 || slot >= ctx->num_slots) return;
-    /* Flow control ensures no stale read — no memset needed */
-    pthread_mutex_lock(&ctx->slot_lock);
-    ctx->slot_bitmap[slot] = 0;
-    pthread_cond_signal(&ctx->slot_cond);
-    pthread_mutex_unlock(&ctx->slot_lock);
+    /* Lock-free push onto the Treiber free-list (no mutex, no cond_signal/futex). */
+    uint_fast64_t old = atomic_load_explicit(&ctx->free_head, memory_order_relaxed);
+    for (;;) {
+        uint32_t head = (uint32_t)(old & 0xFFFFFFFFu);
+        ctx->slot_next[slot] = head;                 /* slot -> old head */
+        uint_fast64_t newv = (((old >> 32) + 1) << 32) | (uint_fast64_t)(uint32_t)slot;
+        if (atomic_compare_exchange_weak_explicit(&ctx->free_head, &old, newv,
+                memory_order_release, memory_order_relaxed))
+            return;
+    }
 }
 
 int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
@@ -803,33 +802,37 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
         return -1;
     }
 
-    /* Lock ring access: serializes get_next_dma_desc + descriptor fill + valid=1.
+    /* EU-sharding: round-robin this request across the K forward rings, so the
+     * pod's traffic spreads over K EUs. Each ring has its own lock (single-
+     * producer per ring). K=1 → always ring 0 (legacy single-ring path).
      *
      * Flow control: end-to-end via slot-based admission only. dpumesh_tx_alloc
-     * has already gated this call on slot_bitmap availability, and num_slots ×
+     * has already gated this call on free-list slot availability, and num_slots ×
      * slot_size = DPU_BUFFER_SIZE, so total in-flight bytes inside DPU's
      * buffer can never exceed buffer size. DPU/DPA do no FC of their own. */
-    pthread_mutex_lock(&ctx->ring_lock);
+    int ridx = (int)(atomic_fetch_add(&ctx->rr_counter, 1) % (unsigned)ctx->k_rings);
+    struct dma_ring *ring = ctx->dma_rings[ridx];
+    pthread_mutex_t *rlock = &ctx->ring_locks[ridx];
+    pthread_mutex_lock(rlock);
 
     /* Block with exponential backoff until a DMA ring slot frees. DPA
-     * advances the ring tail as it consumes descriptors. backoff capped at
-     * 50µs (was 1ms — at 44K RPS, 1ms = 44 requests-worth of latency
-     * stalled in this loop while DPA is actively draining the ring). */
+     * advances the ring tail as it consumes descriptors. Backoff capped at
+     * 50µs. */
     {
         struct timespec backoff = {0, 1000}; /* 1µs initial */
         while (1) {
-            dma = get_next_dma_desc(ctx->dma_ring);
+            dma = get_next_dma_desc(ring);
             if (dma)
                 break;
-            pthread_mutex_unlock(&ctx->ring_lock);
+            pthread_mutex_unlock(rlock);
             nanosleep(&backoff, NULL);
             if (backoff.tv_nsec < 50000) /* cap at 50µs */
                 backoff.tv_nsec *= 2;
-            pthread_mutex_lock(&ctx->ring_lock);
+            pthread_mutex_lock(rlock);
         }
     }
 
-    ring_slot = (uint32_t)(dma - ctx->dma_ring->descs);
+    ring_slot = (uint32_t)(dma - ring->descs);
 
     /* TX slot lifetime is owned by the pending mechanism for BOTH OP_REQUEST
      * (gateway) and OP_RESPONSE (server transport):
@@ -849,10 +852,10 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     __sync_synchronize();
     dma->valid = 1;
 
-    DOCA_LOG_DBG("ENQUEUE: req_id=%u slot=%u len=%u",
-                 desc->req_id, ring_slot, desc->body_len);
+    DOCA_LOG_DBG("ENQUEUE: req_id=%u ring=%d slot=%u len=%u",
+                 desc->req_id, ridx, ring_slot, desc->body_len);
 
-    pthread_mutex_unlock(&ctx->ring_lock);
+    pthread_mutex_unlock(rlock);
 
     return 0;
 }
@@ -869,9 +872,9 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
 
 int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
     if (ctx->poll_rx) {
-        /* Adaptive spin-poll: no rx_cond block. Racy-check rx_count without the
-         * lock (hint; re-checked under lock), take the lock only to dequeue, back
-         * off after sustained idle. Eliminates the per-request wakeup. */
+        /* Pure lock-free spin-poll: try the Vyukov ring with no mutex at all,
+         * back off after sustained idle. At load the ring is rarely empty so the
+         * backoff is never reached (no wakeup, no context switch). */
         struct timespec deadline; int have_dl = 0;
         if (timeout_ms > 0) {
             clock_gettime(CLOCK_MONOTONIC, &deadline);
@@ -882,17 +885,8 @@ int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
         }
         uint32_t idle = 0;
         for (;;) {
-            if (__atomic_load_n(&ctx->rx_count, __ATOMIC_RELAXED) > 0) {
-                pthread_mutex_lock(&ctx->rx_lock);
-                if (ctx->rx_count > 0) {
-                    *desc = ctx->rx_queue[ctx->rx_head];
-                    ctx->rx_head = (ctx->rx_head + 1) % RX_QUEUE_SIZE;
-                    ctx->rx_count--;
-                    pthread_mutex_unlock(&ctx->rx_lock);
-                    return 0;
-                }
-                pthread_mutex_unlock(&ctx->rx_lock);
-            }
+            if (rxq_try_pop(ctx, desc))
+                return 0;
             if (timeout_ms == 0) return -1;            /* non-blocking try */
             if (++idle >= RX_POLL_SPIN) {
                 if (have_dl) {
@@ -907,8 +901,10 @@ int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
         }
     }
 
-    pthread_mutex_lock(&ctx->rx_lock);
-
+    /* Non-poll (Thrift blocking) path: the ring is still lock-free; rx_lock +
+     * rx_cond are used ONLY to sleep when the ring is empty (idle-efficient).
+     * The producer signals rx_cond under rx_lock, so the re-check-under-lock
+     * below closes the lost-wakeup window. */
     struct timespec ts;
     if (timeout_ms > 0) {
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -920,11 +916,20 @@ int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
         }
     }
 
-    while (ctx->rx_count == 0) {
-        if (timeout_ms == 0) {
-            pthread_mutex_unlock(&ctx->rx_lock);
+    for (;;) {
+        if (rxq_try_pop(ctx, desc))
+            return 0;
+        if (timeout_ms == 0)
             return -1;
-        } else if (timeout_ms < 0) {
+        pthread_mutex_lock(&ctx->rx_lock);
+        /* Re-check under the lock: if the producer enqueued + signalled between
+         * the lock-free pop above and here, we either pop it now or are
+         * guaranteed to receive the signal (producer signals under rx_lock). */
+        if (rxq_try_pop(ctx, desc)) {
+            pthread_mutex_unlock(&ctx->rx_lock);
+            return 0;
+        }
+        if (timeout_ms < 0) {
             pthread_cond_wait(&ctx->rx_cond, &ctx->rx_lock);
         } else {
             int rc = pthread_cond_timedwait(&ctx->rx_cond, &ctx->rx_lock, &ts);
@@ -933,41 +938,21 @@ int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
                 return -1;
             }
         }
+        pthread_mutex_unlock(&ctx->rx_lock);
     }
-
-    *desc = ctx->rx_queue[ctx->rx_head];
-    ctx->rx_head = (ctx->rx_head + 1) % RX_QUEUE_SIZE;
-    ctx->rx_count--;
-    pthread_cond_signal(&ctx->rx_not_full);
-
-    pthread_mutex_unlock(&ctx->rx_lock);
-    return 0;
 }
 
 uint8_t *dpumesh_rx_buf(dpumesh_ctx_t *ctx, int slot) {
-    if (ctx->zerocopy_rx) {
-        /* slot carries the landing byte-offset (pos) into rx_dma_buffer. */
-        if (slot < 0 || (size_t)slot >= ctx->rx_dma_buf_size) return NULL;
-        return (uint8_t *)ctx->rx_dma_buffer + (size_t)slot;
-    }
-    if (slot < 0 || slot >= ctx->num_slots) return NULL;
-    return (uint8_t *)ctx->rx_buffer + ((size_t)slot * ctx->slot_size);
+    /* slot carries the landing byte-offset (pos) into rx_dma_buffer. */
+    if (slot < 0 || (size_t)slot >= ctx->rx_dma_buf_size) return NULL;
+    return (uint8_t *)ctx->rx_dma_buffer + (size_t)slot;
 }
 
 void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot) {
-    /* Zero-copy: no staging slot to free — `slot` is the landing offset, ignored.
-     * Just return the admission credit so the DPA can reuse that landing position
-     * (this is AFTER the consumer finished reading rx_dma_buffer[pos]). */
-    if (ctx->zerocopy_rx) {
-        rx_credit_return(ctx);
-        return;
-    }
-    if (slot < 0 || slot >= ctx->num_slots) return;
-    /* Flow control ensures no overwrite of unconsumed data — no memset needed */
-    pthread_mutex_lock(&ctx->rx_slot_lock);
-    ctx->rx_slot_bitmap[slot] = 0;
-    pthread_mutex_unlock(&ctx->rx_slot_lock);
-    rx_credit_return(ctx);
+    /* `slot` is the landing byte offset (pos), not a pool index — return the
+     * admission credit to the matching ring so the DPA can reuse that position
+     * (AFTER the consumer read it). */
+    rx_credit_return(ctx, slot);
 }
 
 /* ====================================================================
@@ -976,26 +961,6 @@ void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot) {
 
 int dpumesh_get_slot_size(dpumesh_ctx_t *ctx) {
     return ctx->slot_size;
-}
-
-void dpumesh_debug_stats(dpumesh_ctx_t *ctx, int *rx_depth, int *tx_inflight) {
-    if (rx_depth) {
-        pthread_mutex_lock(&ctx->rx_lock);
-        *rx_depth = ctx->rx_count;
-        pthread_mutex_unlock(&ctx->rx_lock);
-    }
-    if (tx_inflight) {
-        int n = 0;
-        pthread_mutex_lock(&ctx->slot_lock);
-        for (int i = 0; i < ctx->num_slots; i++) n += ctx->slot_bitmap[i];
-        pthread_mutex_unlock(&ctx->slot_lock);
-        *tx_inflight = n;
-    }
-}
-
-int dpumesh_get_notify_fd(dpumesh_ctx_t *ctx) {
-    (void)ctx;
-    return -1;
 }
 
 int dpumesh_get_pod_id(dpumesh_ctx_t *ctx) {
@@ -1055,7 +1020,8 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
     p->state = 0;
     p->tx_slot = -1;
     p->owner_req_id = req_id;   /* claim this idx; TX_ACK frees only for this req_id */
-    memset(&p->desc, 0, sizeof(p->desc));
+    /* p->desc is fully overwritten by rx_deliver_desc before state=1, and only
+     * read at state==1 — no need to pre-zero it. */
     pthread_mutex_unlock(&p->lock);
     return 0;
 }
@@ -1099,27 +1065,11 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
                 /* Check if response arrived during timeout boundary */
                 if (p->state == 1)
                     break; /* fall through to success path below */
-                /* Timeout: force-free the TX slot here.
-                 *
-                 * The previous design deferred the free to TX_ACK arrival
-                 * out of fear that DPA might still be reading the slot.
-                 * That fear is unfounded at the wait_response timeout
-                 * scale (RESPONSE_TIMEOUT_MS, default 30s) — DPA forward
-                 * DMA completes in microseconds. Deferring instead caused
-                 * a real problem: TX_ACK can be permanently lost when the
-                 * DPU's deferred-ack queue overflows under sustained
-                 * comch backpressure (see deferred_tx_acks DROP path in
-                 * dpu_worker.c). A lost TX_ACK leaked the slot until
-                 * either cancel_pending was invoked or req_id wrapped
-                 * MAX_PENDING (~65k requests later) — the slow drift
-                 * behind the intermittent test hangs. By 30s, regardless
-                 * of TX_ACK delivery, the DPA has long finished, so
-                 * reclaiming here is safe.
-                 *
-                 * State stays at -2 so a late RX of OP_RESPONSE still
-                 * cleans up the rx_slot path (rx_deliver_desc handles
-                 * state=-2). A late TX_ACK now finds tx_slot=-1 and
-                 * no-ops — non-load-bearing for slot lifetime. */
+                /* Timeout: force-free the TX slot here. At the wait_response
+                 * timeout scale the DPA forward DMA has long finished, so
+                 * reclaiming the slot is safe. State stays at -2 so a late RX
+                 * of OP_RESPONSE is reclaimed by rx_deliver_desc, and a late
+                 * TX_ACK finds tx_slot=-1 and no-ops. */
                 if (p->tx_slot >= 0) {
                     dpumesh_tx_free(ctx, p->tx_slot);
                     p->tx_slot = -1;
@@ -1168,7 +1118,7 @@ int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint32_t req_id,
      * volatile state avoids the mutex entirely. A racy 0 just polls again; any
      * non-0 is re-confirmed under the lock below (whose acquire also publishes
      * p->desc, written before the state=1 store in rx_deliver_desc). Same
-     * racy-read pattern as dpumesh_dequeue's rx_count check. */
+     * lock-free spirit as dpumesh_dequeue's Vyukov ring check. */
     if (__atomic_load_n(&p->state, __ATOMIC_ACQUIRE) == 0)
         return 1;
 
@@ -1205,12 +1155,9 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
 
     pthread_mutex_lock(&p->lock);
     if (p->state == 1) {
-        /* Response arrived but was never consumed — free RX + TX */
-        if (p->desc.body_buf_slot >= 0) {
-            pthread_mutex_lock(&ctx->rx_slot_lock);
-            ctx->rx_slot_bitmap[p->desc.body_buf_slot] = 0;
-            pthread_mutex_unlock(&ctx->rx_slot_lock);
-        }
+        /* Response arrived but was never consumed — reclaim RX landing + TX */
+        if (p->desc.body_buf_slot >= 0)
+            rx_credit_return(ctx, p->desc.body_buf_slot);
         if (p->tx_slot >= 0) {
             dpumesh_tx_free(ctx, p->tx_slot);
             p->tx_slot = -1;
@@ -1229,16 +1176,9 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
         p->state = -1;
         pthread_cond_broadcast(&p->cond);
     } else if (p->state == -2) {
-        /* Timeout path: wait_response already returned -1 to the caller and
-         * left state=-2 hoping a late TX_ACK would free the slot. Under
-         * sustained DPU overload the TX_ACK can be lost, leaving the slot
-         * leaked across the test boundary.
-         *
-         * gateway's wait_response timeout is RESPONSE_TIMEOUT_MS = 30s,
-         * many orders of magnitude longer than any DPA forward DMA
-         * (microseconds). By the time we reach this branch the DPA is
-         * guaranteed not to be reading the slot anymore, so it is safe to
-         * force-free here. */
+        /* Timeout path: wait_response already returned -1 and left state=-2
+         * pending a late TX_ACK. By the time we reach this branch the DPA is
+         * guaranteed not to be reading the slot, so it is safe to force-free. */
         if (p->tx_slot >= 0) {
             dpumesh_tx_free(ctx, p->tx_slot);
             p->tx_slot = -1;

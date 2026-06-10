@@ -10,8 +10,8 @@
 # test of whether the sharded control plane scales chain throughput past the
 # 2-EU ~104K ceiling.
 #
-# Prereq: run the standard deploy FIRST, e.g.
-#   DPUMESH_DPA_THREADS=4 DPUMESH_SPLIT_SEND=3 ./test-bench.sh deploy
+# Prereq: run the standard deploy FIRST with 4 EUs (SHARD is baked-on now):
+#   DPUMESH_DPA_THREADS=4 ./test-bench.sh deploy
 # then:
 #   ./bench/run_4pod.sh up                       # add + pin pair2 (cores 4,5)
 #   ./bench/run_4pod.sh run <RPS> <DUR> <SIZE>   # drive BOTH pairs, sum achieved
@@ -37,7 +37,7 @@ DPU_LOG="/tmp/dpumesh_dpu_bench.log"
 IMG_BENCH_DPU="bench/bench-dpumesh:latest"
 IMG_ECHO_DPU="bench/echo-dpumesh:latest"
 CTRL_PORT=9092
-NUM_SLOTS="${DPUMESH_NUM_SLOTS:-2048}"
+NUM_SLOTS="${DPUMESH_NUM_SLOTS:-4096}"
 # Host cores for pair2 (fair profile uses 0-3 for pair1 + tcp; 4-7 free).
 BENCH2_CORE="${BENCH2_CORE:-4}"
 ECHO2_CORE="${ECHO2_CORE:-5}"
@@ -192,7 +192,7 @@ cmd_run() {
 cmd_dpulog() {
     local n="${1:-40}"
     ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -n $n $DPU_LOG" 2>&1 \
-        | sed 's/^\[sudo\][^:]*: *//' | grep -E "SHARD-DIAG|elapsed:" || echo "(no diag lines yet)"
+        | sed 's/^\[sudo\][^:]*: *//' | grep -E "SHARD-DIAG|elapsed:|EU-stall" || echo "(no diag lines yet)"
 }
 
 case "${1:-}" in

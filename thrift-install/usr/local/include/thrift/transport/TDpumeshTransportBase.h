@@ -68,17 +68,10 @@ protected:
         desc.body_buf_slot = tx_slot;
         desc.body_len = static_cast<uint32_t>(write_buf_.size());
         desc.req_id = req_id;
-        desc.step_id = 0;
         desc.dst_pod_id = dst_pod_id;
         desc.src_pod_id = dpumesh_get_pod_id(ctx_);
         desc.flags = flags;
         desc.valid = 1;
-        desc.src_body_pool_type = POOL_HOST_TX_BODY;
-        desc.src_body_pod_id = dpumesh_get_pod_id(ctx_);
-        desc.src_body_buf_slot = tx_slot;
-        desc.src_header_pool_type = POOL_NONE;
-        desc.src_header_pod_id = 0;
-        desc.src_header_buf_slot = -1;
     }
 
     void check_slot_size(size_t len) {

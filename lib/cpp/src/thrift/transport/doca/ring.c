@@ -9,23 +9,19 @@
 
 DOCA_LOG_REGISTER(RING);
 
-/* Rate-limit the "DMA ring busy" WARN. Transient valid==1 is normal
- * backpressure; a genuinely stuck slot (head never advances, §5.10 slot leak)
- * would otherwise flood the host log on every probe and bury the box. We log
- * the first probe of a stuck head and then once per RING_BUSY_LOG_EVERY probes,
- * keeping WARN severity. Must be a power of two (used as a mask). */
+/* Rate-limit the "DMA ring busy" WARN: log first probe of a stuck head, then
+ * once per RING_BUSY_LOG_EVERY probes. Must be a power of two (used as a mask). */
 #define RING_BUSY_LOG_EVERY 4096u
 
-int setup_dma_ring(struct objects *objs, size_t size)
+int setup_dma_ring(struct objects *objs, size_t size, struct dma_ring **out_ring)
 {
     doca_error_t result;
     struct dma_ring *ring;
 
-    if (objs->dma_ring == NULL) {
-        objs->dma_ring = (struct dma_ring *)malloc(sizeof(struct dma_ring));
-    }
-
-    ring = objs->dma_ring;
+    ring = (struct dma_ring *)malloc(sizeof(struct dma_ring));
+    if (!ring)
+        return DOCA_ERROR_NO_MEMORY;
+    *out_ring = ring;
     ring->size = size;          /* logical ring size (host wraps at this) */
     ring->head = 0;
     ring->descs = NULL;
@@ -42,7 +38,8 @@ int setup_dma_ring(struct objects *objs, size_t size)
                            DOCA_ACCESS_FLAG_PCI_READ_WRITE);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to allocate DMA resources: %s", doca_error_get_descr(result));
-        free(objs->dma_ring);
+        free(ring);
+        *out_ring = NULL;
         return result;
     }
 
@@ -56,8 +53,9 @@ int setup_dma_ring(struct objects *objs, size_t size)
                                    DMA_RING, HOST_TO_DPU);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to export mmap and buffer to DPU: %s", doca_error_get_descr(result));
-        free(objs->dma_ring);
         destroy_mmap_and_free_buffer(ring->mmap, ring->descs);
+        free(ring);
+        *out_ring = NULL;
         return result;
     }
     return 0;
@@ -99,9 +97,8 @@ struct dma_desc *get_next_dma_desc(struct dma_ring *ring)
     struct dma_desc *desc = ring->descs + ring->head;
 
     if (desc->valid) {
-        /* Rate-limited: reset the probe counter whenever head moves so a
-         * climbing "[stuck xN]" on the SAME head is the slot-leak signature,
-         * while ordinary transient backpressure logs at most once. */
+        /* Reset the probe counter whenever head moves, so a climbing count
+         * tracks a single stuck head. */
         static uint32_t busy_head = 0xFFFFFFFFu;
         static uint64_t busy_probes = 0;
         if (ring->head != busy_head) {

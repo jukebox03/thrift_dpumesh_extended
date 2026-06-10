@@ -18,7 +18,10 @@ struct dma_ring {
     struct dma_desc *descs;
 };
 
-int setup_dma_ring(struct objects *objs, size_t size);
+/* Create + export one host→DPU forward descriptor ring (with the +1 credit
+ * slot). EU-sharding allocates K of these; each is exported as DMA_RING and the
+ * DPU pairs them in arrival order. */
+int setup_dma_ring(struct objects *objs, size_t size, struct dma_ring **out_ring);
 
 /* Create a DPU-side DMA ring for reverse direction (DPU→CPU).
  * Allocates ring memory locally (PCI-accessible), does NOT export to remote. */

@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <time.h>
 
 DOCA_LOG_REGISTER(DPA);
@@ -83,10 +84,9 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             int32_t dst_pod_id = comp_msg->dst_pod_id;
             uint32_t req_id = comp_msg->req_id;
 
-            /* Find the source pod's local DMA buffer for data. pod_data_ready
-             * ACQUIRE-loads dma_ready so the dma_buffer/handle reads below (and
-             * everything thread A does with this entry afterward) see the
-             * RELEASE-published setup fields under SPLIT_SEND. */
+            /* Find the source pod's local DMA buffer. pod_data_ready ACQUIRE-loads
+             * dma_ready so the dma_buffer/handle reads below see the
+             * RELEASE-published setup fields. */
             struct pod_state *src_pod = find_pod_by_id(objs, src_pod_id);
             if (!src_pod || !pod_data_ready(src_pod) || !src_pod->dma_buffer) {
                 DOCA_LOG_ERR("DMA completed but src_pod %d not found or not ready", src_pod_id);
@@ -113,10 +113,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
              * End-node slot-based admission keeps in-flight bytes ≤ buf_size
              * so DPA cannot lap unconsumed data. */
             entry.buf_offset = body_offset;
-            /* src_pod was already resolved above via find_pod_by_id (ACQUIRE-
-             * gated); derive its index directly instead of an unguarded re-scan
-             * of pods[] (which could observe a half-published slot and runs on
-             * the per-RTT hot path). */
+            /* Derive src_pod index directly from the ACQUIRE-gated pointer
+             * resolved above (avoids an unguarded re-scan of pods[]). */
             entry.pod_idx = (int)(src_pod - objs->pods);
 
             if (ingest_push(objs, &entry) != 0) {
@@ -160,22 +158,12 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             break;
     }
 
-    objs->recv_msg_cnt++;
-
 resubmit_recv_task:
-    /* Backpressure: if comp_queue is nearly full, defer recv task resubmission.
-     * DPA will see consumer_empty and naturally pause, giving DPU time to drain.
-     * Main loop resubmits when queue drops below BP_LOW.
-     * If submit fails (e.g. transient state), also stash so the main loop retries
-     * rather than losing the task.
-     *
-     * Drain sharding (num_drain_shards>1): this recv-cb runs on M different drain
-     * threads, so the shared objs->deferred_recv array would race. Disable the
-     * deferral path in that mode and always resubmit inline — the per-group
-     * shard_work depth stays well under BP_HIGH at the tested regime, so the
-     * recv-task pool (CC_DPA_MAX_MSG_NUM per channel) is the rate-matcher. */
-    if (objs->num_drain_shards <= 1 &&
-        ingest_usage(objs) >= COMP_QUEUE_BP_HIGH &&
+    /* Backpressure: if comp_queue is nearly full, defer recv task resubmission
+     * so DPA sees consumer_empty and pauses; main loop resubmits when the queue
+     * drops below BP_LOW. On submit failure also stash for the main loop to
+     * retry rather than losing the task. */
+    if (ingest_usage(objs) >= COMP_QUEUE_BP_HIGH &&
         objs->num_deferred_recv < MAX_DEFERRED_RECV) {
         objs->deferred_recv[objs->num_deferred_recv++] = task;
     } else {
@@ -206,14 +194,12 @@ static void dmesh_doca_dpa_msgq_recv_error_cb(struct doca_comch_consumer_task_po
 {
 	(void)task_user_data;
 	(void)ctx_user_data;
-	static uint64_t recv_err_count = 0;
-	recv_err_count++;
 
 	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
 	doca_error_t status = doca_task_get_status(task);
 
-	DOCA_LOG_ERR("DPA MsgQ recv ERROR callback #%lu: status=%s(%d)",
-	             recv_err_count, doca_error_get_descr(status), (int)status);
+	DOCA_LOG_ERR("DPA MsgQ recv ERROR callback: status=%s(%d)",
+	             doca_error_get_descr(status), (int)status);
 
 	/* Resubmit to keep the recv task alive — do not free. */
 	doca_error_t resubmit = doca_task_submit(task);
@@ -233,16 +219,13 @@ static void dmesh_doca_dpa_msgq_send_cb(struct doca_comch_producer_task_send *se
 				       union doca_data ctx_user_data)
 {
 	void *payload_copy = task_user_data.ptr;
-	
-    
-    struct objects *objs = (struct objects *)ctx_user_data.ptr;
-    objs->sent_msg_cnt++;
+	(void)ctx_user_data;
 
 	if (payload_copy != NULL)
 		free(payload_copy);
-    
+
 	struct doca_task *task = doca_comch_producer_task_send_as_task(send_task);
-    doca_task_free(task);
+	doca_task_free(task);
 }
 
 /*
@@ -306,9 +289,8 @@ init_dpa_objects(struct objects *objs)
 {
     doca_error_t result;
 
-    /* Resolve N = number of DPA EU threads (multi-EU data plane).
-     * Default 1 (= legacy single-EU behaviour), overridable via
-     * DPUMESH_DPA_THREADS, clamped to [1, MAX_DPA_RINGS]. */
+    /* Resolve N = number of DPA EU threads (multi-EU data plane),
+     * clamped to [1, MAX_DPA_RINGS]. */
     if (objs->num_dpa_threads <= 0) {
         int n = 1;
         const char *env = getenv("DPUMESH_DPA_THREADS");
@@ -319,15 +301,21 @@ init_dpa_objects(struct objects *objs)
         }
         objs->num_dpa_threads = n;
     }
-    /* EU affinity: default ON (pin thread k → EU k). DPUMESH_DPA_AFFINITY=0
-     * leaves placement 'relaxed' (the SDK picks the EU), matching the
-     * pre-multi-EU behaviour. */
-    {
-        const char *aenv = getenv("DPUMESH_DPA_AFFINITY");
-        objs->dpa_affinity = (aenv && aenv[0] == '0') ? 0 : 1;
+    /* Resolve K = rings per pod (EU-sharding), clamped to [1, num_dpa_threads]:
+     * a pod cannot spread across more EUs than exist. */
+    if (objs->k_rings <= 0) {
+        int k = DPUMESH_RINGS_PER_POD_DEFAULT;
+        const char *kenv = getenv("DPUMESH_RINGS_PER_POD");
+        if (kenv && *kenv) {
+            k = atoi(kenv);
+            if (k < 1) k = 1;
+        }
+        if (k > objs->num_dpa_threads) k = objs->num_dpa_threads;
+        if (k > MAX_EU_PER_POD) k = MAX_EU_PER_POD;
+        objs->k_rings = k;
     }
-    DOCA_LOG_INFO("DPA multi-EU: num_dpa_threads=%d affinity=%d (MAX_DPA_RINGS=%d)",
-                  objs->num_dpa_threads, objs->dpa_affinity, MAX_DPA_RINGS);
+    DOCA_LOG_INFO("DPA multi-EU: num_dpa_threads=%d k_rings=%d (MAX_DPA_RINGS=%d)",
+                  objs->num_dpa_threads, objs->k_rings, MAX_DPA_RINGS);
 
     for (int k = 0; k < objs->num_dpa_threads; k++) {
         if (!objs->dpa_threads[k]) {
@@ -359,10 +347,8 @@ init_dpa_objects(struct objects *objs)
         goto destroy_dpa;
     }
 
-    /* DPA log level kept at ERROR. INFO produces per-DMA / per-trigger lines
-     * that pile up at chain throughput rates (54K RPS × 4 dma_copy + 1 kHz
-     * keepalive → GB/min). Forwarded to /tmp/dpumesh_dpu_bench.log on DPU,
-     * filling /tmp and stalling sshd writes (banner-exchange hang seen). */
+    /* DPA log level kept at ERROR: INFO emits per-DMA / per-trigger lines that
+     * flood the DPU log on the hot path. */
     result = doca_dpa_set_log_level(objs->dpa, DOCA_DPA_DEV_LOG_LEVEL_ERROR);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_WARN("Failed to set DPA log level: %s", doca_error_get_name(result));
@@ -413,13 +399,11 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread, int eu_id
         return result;
     }
 
-    /* Pin this thread to a distinct EU so N threads land on N distinct EUs
-     * (avoids the 'relaxed' placement collapsing several threads onto one EU,
-     * the suspected cause of the N=8 multi-EU regression). eu_id < 0 = leave
-     * placement relaxed. Affinity must be set between create and start.
-     * The affinity object is intentionally NOT destroyed (leaked, ≤ MAX_DPA_RINGS
-     * for the process lifetime) so there is no chance of a use-after-free if the
-     * SDK references it past thread_start. */
+    /* Pin this thread to a distinct EU so N threads land on N distinct EUs.
+     * eu_id < 0 = leave placement relaxed. Affinity must be set between create
+     * and start. The affinity object is intentionally NOT destroyed (lives for
+     * the process lifetime) to avoid a use-after-free if the SDK references it
+     * past thread_start. */
     if (eu_id >= 0) {
         struct doca_dpa_eu_affinity *affinity = NULL;
         doca_error_t ar = doca_dpa_eu_affinity_create(dpa_thread->dpa, &affinity);
@@ -895,10 +879,8 @@ dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t m
 }
 
 /* Non-blocking variant: returns DOCA_ERROR_AGAIN immediately on submit
- * failure, no PE progress, no retry. For hot-path DPU→DPA TRIGGER signals
- * where the rev desc is already on the ring and a missed trigger is
- * recoverable by the next successful send. Used by the 1 kHz keepalive in
- * dpu_worker.c (DPA_MSG_WAKE fire-and-forget); no other caller exists. */
+ * failure, no PE progress, no retry. For hot-path DPU→DPA wake signals where
+ * a missed trigger is recoverable by the next successful send. */
 doca_error_t
 dmesh_doca_dpa_msgq_send_try(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t msg_size)
 {
@@ -982,14 +964,18 @@ destroy_buf_arr:
  * Fill ring info for a specific pod.
  */
 static doca_error_t
-dmesh_fill_dpa_ring_info(struct objects *objs, struct pod_state *pod,
-                         struct dpa_ring_info *ring_info)
+dmesh_fill_dpa_ring_info(struct objects *objs, struct pod_state *pod, int j,
+                         uint64_t dpu_region, struct dpa_ring_info *ring_info)
 {
     doca_error_t result;
     doca_dpa_dev_buf_arr_t dpa_buf_arr;
     doca_dpa_dev_mmap_t host_mmap, dpu_mmap;
 
-    result = doca_buf_arr_get_dpa_handle(pod->buf_arr, &dpa_buf_arr);
+    /* Forward ring j reads its own descriptor ring (buf_arrs[j]) but shares the
+     * host TX data mmap (descriptors carry absolute addrs) and writes into the
+     * pod's DPU staging at the disjoint region [j*dpu_region, (j+1)*dpu_region)
+     * so K EUs never collide. region_off makes the reported pos absolute. */
+    result = doca_buf_arr_get_dpa_handle(pod->buf_arrs[j], &dpa_buf_arr);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get buf array DPA handle: %s", doca_error_get_name(result));
         return result;
@@ -1018,8 +1004,9 @@ dmesh_fill_dpa_ring_info(struct objects *objs, struct pod_state *pod,
     ring_info->host_addr = (uint64_t)pod->remote_addr;
     ring_info->host_buf_size = (uint64_t)pod->remote_buf_size;
     ring_info->dpu_mmap = dpu_mmap;
-    ring_info->dpu_addr = (uint64_t)pod->dma_buffer;
-    ring_info->dpu_buf_size = DPU_BUFFER_SIZE;
+    ring_info->dpu_addr = (uint64_t)pod->dma_buffer + (uint64_t)j * dpu_region;
+    ring_info->dpu_buf_size = (uint32_t)dpu_region;
+    ring_info->region_off = (uint32_t)((uint64_t)j * dpu_region);
     ring_info->pod_id = pod->pod_id;
 
     return DOCA_SUCCESS;
@@ -1041,18 +1028,15 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
 
     DOCA_LOG_INFO("setup_pod_dma: pod_id=%d", pod->pod_id);
 
-    /* 1. Create per-pod buf_arr over ring_mmap. Size is DMA_RING_SIZE + 1
-     * because host's setup_dma_ring allocates one extra slot at the end
-     * for the RX credit counter; DPA reads it via this same buf_arr at
-     * index DMA_RING_SIZE (no separate buf_arr needed). */
-    result = setup_dpa_buf_array_pod(objs, DMA_RING_SIZE + 1, pod->ring_mmap, &pod->buf_arr);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("setup_pod_dma: buf_arr failed for pod %d: %s",
-                     pod->pod_id, doca_error_get_descr(result));
-        return result;
-    }
+    int N = objs->num_dpa_threads;
+    int K = objs->k_rings > 0 ? objs->k_rings : 1;
+    if (K > N) K = N;
+    pod->k_rings = K;
+    uint64_t dpu_region = (uint64_t)DPU_BUFFER_SIZE / (uint64_t)K;
 
-    /* 2. Allocate local DMA buffer (DPU working buffer) + PCI export */
+    /* 1. One DPU staging buffer shared by the K forward rings, partitioned into
+     * K disjoint regions of dpu_region bytes (forward ring j writes region j) +
+     * export to host. */
     result = alloc_buffer_and_set_mmap(&pod->local_mmap, objs->dev,
                                        &pod->dma_buffer, DPU_BUFFER_SIZE,
                                        DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_READ_WRITE);
@@ -1061,207 +1045,158 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
                      pod->pod_id, doca_error_get_descr(result));
         return result;
     }
-
-    /* 3. Export local DMA buffer mmap back to Host */
     result = export_mmap_to_remote(objs, pod->local_mmap, pod->dma_buffer,
                                     DPU_BUFFER_SIZE, DMA_BUFFER, DPU_TO_HOST);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_WARN("setup_pod_dma: export to host failed (may be OK if Host doesn't need it): %s",
+        DOCA_LOG_WARN("setup_pod_dma: export to host failed: %s",
                       doca_error_get_descr(result));
-        /* Non-fatal for now */
     }
 
-    /* 4. Fill DPA ring info for this pod */
-    struct dpa_ring_info ring_info;
-    result = dmesh_fill_dpa_ring_info(objs, pod, &ring_info);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("setup_pod_dma: fill ring info failed for pod %d: %s",
-                     pod->pod_id, doca_error_get_descr(result));
-        return result;
-    }
-
-    /* 5. Update DPA thread arg: write ring info first, then increment num_rings.
-     *
-     * Multi-EU: this pod's rings are owned by EU k = pod_id % num_dpa_threads.
-     * dpa_thread_running[k] tracks whether EU k has been bootstrapped yet, so
-     * the FIRST pod landing on each EU does the h2d_memcpy + thread_run, and
-     * every subsequent pod on that EU sends ADD_RING to the SAME channel k.
-     * Each EU is share-nothing (own thread_arg + own 1c/1p comch channel), so
-     * there is no cross-EU lock here. */
-    int k = pod->pod_id % objs->num_dpa_threads;
-    struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_threads[k];
-    struct dpa_thread_arg arg;
-
-    if (!objs->dpa_thread_running[k]) {
-        /* First pod on EU k: fill EU k's handles + first ring, write via h2d_memcpy */
-        result = dmesh_fill_dpa_thread_arg(objs, k, &arg);
-        if (result != DOCA_SUCCESS)
-            return result;
-        arg.rings[0] = ring_info;
-        arg.num_rings = 1;
-
-        result = doca_dpa_h2d_memcpy(objs->dpa, dpa_thread->arg,
-                                      &arg, sizeof(struct dpa_thread_arg));
+    /* 2. Forward rings: ring j -> EU k_j = (pod_id*K + j) % N. K consecutive EUs
+     * per pod; consecutive pods land on disjoint EU sets. The FIRST ring on each
+     * EU does h2d_memcpy + thread_run + WAKE; later rings (this pod or others)
+     * send ADD_RING. */
+    for (int j = 0; j < K; j++) {
+        int k_j = (pod->pod_id * K + j) % N;
+        result = setup_dpa_buf_array_pod(objs, DMA_RING_SIZE + 1, pod->ring_mmaps[j], &pod->buf_arrs[j]);
         if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("setup_pod_dma: h2d_memcpy failed (EU %d): %s",
-                         k, doca_error_get_descr(result));
-            return result;
-        }
-    } else {
-        /* Subsequent pods on EU k: send ADD_RING message via EU k's comch msgq.
-         * This avoids DPA local memory cache coherency issues with h2d_memcpy
-         * — the DPA thread updates its own data structures directly. */
-        struct comch_add_ring_msg add_msg;
-        memset(&add_msg, 0, sizeof(add_msg));
-        add_msg.type = DPA_MSG_RING_ADD;
-        add_msg.ring = ring_info;
-
-        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k]->send,
-                                           &add_msg, sizeof(add_msg));
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("setup_pod_dma: send ADD_RING to EU %d failed: %s",
-                         k, doca_error_get_descr(result));
-            return result;
-        }
-        DOCA_LOG_INFO("Sent ADD_RING to EU %d for pod_id=%d", k, pod->pod_id);
-    }
-
-    /* 6. If first pod on EU k, run that EU's DPA thread */
-    if (!objs->dpa_thread_running[k]) {
-        uint64_t rpc_ret;
-        uint32_t num_msg = CC_DPA_MAX_MSG_NUM;
-        result = doca_dpa_rpc(objs->dpa, thread_init_rpc, &rpc_ret,
-                              arg.dpa_consumer, num_msg);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("setup_pod_dma: thread_init_rpc failed (EU %d): %s",
-                         k, doca_error_get_descr(result));
+            DOCA_LOG_ERR("setup_pod_dma: buf_arr[%d] failed for pod %d: %s",
+                         j, pod->pod_id, doca_error_get_descr(result));
             return result;
         }
 
-        result = doca_dpa_thread_run(dpa_thread->thread);
+        struct dpa_ring_info ring_info;
+        result = dmesh_fill_dpa_ring_info(objs, pod, j, dpu_region, &ring_info);
         if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("setup_pod_dma: dpa_thread_run failed (EU %d): %s",
-                         k, doca_error_get_descr(result));
+            DOCA_LOG_ERR("setup_pod_dma: fill ring info[%d] failed for pod %d: %s",
+                         j, pod->pod_id, doca_error_get_descr(result));
             return result;
         }
-        objs->dpa_thread_running[k] = 1;
-        objs->dpa_thread_running_any = 1;
-        DOCA_LOG_INFO("DPA thread EU %d set to runnable (pod_id=%d), sending trigger msg",
-                      k, pod->pod_id);
 
-        /* Send trigger message to DPA consumer to activate the thread.
-         * DPA thread only runs when its attached completion ctx fires.
-         * The consumer_comp is attached to the thread, so sending any
-         * message via the DPU→DPA msgq triggers the first execution. */
-        {
+        struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_threads[k_j];
+        if (!objs->dpa_thread_running[k_j]) {
+            struct dpa_thread_arg arg;
+            result = dmesh_fill_dpa_thread_arg(objs, k_j, &arg);
+            if (result != DOCA_SUCCESS)
+                return result;
+            arg.rings[0] = ring_info;
+            arg.num_rings = 1;
+            result = doca_dpa_h2d_memcpy(objs->dpa, dpa_thread->arg,
+                                          &arg, sizeof(struct dpa_thread_arg));
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("setup_pod_dma: h2d_memcpy failed (EU %d): %s",
+                             k_j, doca_error_get_descr(result));
+                return result;
+            }
+            uint64_t rpc_ret;
+            result = doca_dpa_rpc(objs->dpa, thread_init_rpc, &rpc_ret,
+                                  arg.dpa_consumer, (uint32_t)CC_DPA_MAX_MSG_NUM);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("setup_pod_dma: thread_init_rpc failed (EU %d): %s",
+                             k_j, doca_error_get_descr(result));
+                return result;
+            }
+            result = doca_dpa_thread_run(dpa_thread->thread);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("setup_pod_dma: dpa_thread_run failed (EU %d): %s",
+                             k_j, doca_error_get_descr(result));
+                return result;
+            }
+            objs->dpa_thread_running[k_j] = 1;
+            objs->dpa_thread_running_any = 1;
+
             struct comch_msg trigger;
             memset(&trigger, 0, sizeof(trigger));
             trigger.type = DPA_MSG_WAKE;
-            result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k]->send,
+            result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k_j]->send,
                                                &trigger, sizeof(trigger));
+            if (result != DOCA_SUCCESS)
+                DOCA_LOG_WARN("Trigger msg to EU %d failed: %s", k_j, doca_error_get_descr(result));
+            DOCA_LOG_INFO("EU %d started (pod_id=%d ring=%d)", k_j, pod->pod_id, j);
+        } else {
+            struct comch_add_ring_msg add_msg;
+            memset(&add_msg, 0, sizeof(add_msg));
+            add_msg.type = DPA_MSG_RING_ADD;
+            add_msg.ring = ring_info;
+            result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k_j]->send,
+                                               &add_msg, sizeof(add_msg));
             if (result != DOCA_SUCCESS) {
-                DOCA_LOG_WARN("Trigger msg to EU %d failed: %s (thread may not start)",
-                              k, doca_error_get_descr(result));
-            } else {
-                DOCA_LOG_INFO("Trigger msg sent to EU %d, thread should activate", k);
+                DOCA_LOG_ERR("setup_pod_dma: send ADD_RING to EU %d failed: %s",
+                             k_j, doca_error_get_descr(result));
+                return result;
             }
+            DOCA_LOG_INFO("Sent ADD_RING to EU %d (pod_id=%d ring=%d)", k_j, pod->pod_id, j);
         }
-    } else {
-        DOCA_LOG_INFO("Sent ADD_RING msg to EU %d for pod_id=%d", k, pod->pod_id);
     }
 
-    /* === Reverse direction (DPU→CPU) setup === */
+    /* 3. Reverse rings: ring j -> EU k_j (same EU as forward ring j). Each writes
+     * a disjoint host RX region [j*host_region, (j+1)*host_region); credit comes
+     * from forward ring j's buf_arr (slot DMA_RING_SIZE); admission depth is
+     * rq_depth/K per region. host_rx may be absent now — update_rev_ring_host_rx
+     * re-sends ADD_REV_RING with the real handle/region when it arrives. */
+    uint64_t host_region = (pod->host_rx_buf_size) ? pod->host_rx_buf_size / (uint64_t)K : 0;
+    for (int j = 0; j < K; j++) {
+        int k_j = (pod->pod_id * K + j) % N;
+        result = setup_dpu_tx_ring(objs->dev, DMA_RING_SIZE,
+                                   &pod->tx_rings[j], &pod->tx_ring_mmaps[j]);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("setup_pod_dma: TX ring[%d] failed for pod %d: %s",
+                         j, pod->pod_id, doca_error_get_descr(result));
+            return result;
+        }
+        result = setup_dpa_buf_array_pod(objs, DMA_RING_SIZE, pod->tx_ring_mmaps[j], &pod->tx_buf_arrs[j]);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("setup_pod_dma: TX buf_arr[%d] failed for pod %d: %s",
+                         j, pod->pod_id, doca_error_get_descr(result));
+            return result;
+        }
 
-    /* (Former step 7 "allocate DPU TX data buffer" removed — in-place
-     * forwarding reads the reverse DMA source from the sender pod's dma_buffer
-     * via desc->mmap, so the per-pod 16MB TX data buffer was never read.) */
-
-    /* 8. Create DPU→CPU descriptor ring */
-    result = setup_dpu_tx_ring(objs->dev, DMA_RING_SIZE,
-                               &pod->tx_ring, &pod->tx_ring_mmap);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("setup_pod_dma: TX ring failed for pod %d: %s",
-                     pod->pod_id, doca_error_get_descr(result));
-        return result;
-    }
-
-    /* 9. Create buf_arr for reverse ring */
-    result = setup_dpa_buf_array_pod(objs, DMA_RING_SIZE, pod->tx_ring_mmap, &pod->tx_buf_arr);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("setup_pod_dma: TX buf_arr failed for pod %d: %s",
-                     pod->pod_id, doca_error_get_descr(result));
-        return result;
-    }
-
-
-    /* 10. Fill reverse ring info and send ADD_REV_RING to DPA.
-     * Credit-handle reuses the FORWARD pod->buf_arr — host writes the freed
-     * counter to the LAST slot (index DMA_RING_SIZE) of the dma_ring buffer,
-     * and DPA polls that slot via the same buf_arr it already uses for
-     * forward desc reads. No separate buf_arr needed. */
-    {
         struct dpa_ring_info rev_ring_info;
         doca_dpa_dev_buf_arr_t dpa_buf_arr;
-        doca_dpa_dev_mmap_t host_rx_mmap_h;
+        doca_dpa_dev_mmap_t host_rx_mmap_h = 0;
         doca_dpa_dev_buf_arr_t fwd_buf_arr_h = 0;
 
-        result = doca_buf_arr_get_dpa_handle(pod->tx_buf_arr, &dpa_buf_arr);
+        result = doca_buf_arr_get_dpa_handle(pod->tx_buf_arrs[j], &dpa_buf_arr);
         if (result != DOCA_SUCCESS) return result;
-
-        /* Use Host RX mmap if available */
-        host_rx_mmap_h = 0;
         if (pod->host_rx_mmap) {
             result = doca_mmap_dev_get_dpa_handle(pod->host_rx_mmap, objs->dev, &host_rx_mmap_h);
-            if (result != DOCA_SUCCESS) {
-                DOCA_LOG_WARN("setup_pod_dma: host_rx_mmap DPA handle failed: %s",
-                              doca_error_get_descr(result));
-            }
+            if (result != DOCA_SUCCESS)
+                DOCA_LOG_WARN("setup_pod_dma: host_rx_mmap DPA handle failed: %s", doca_error_get_descr(result));
         }
-
-        /* Forward buf_arr handle — credit slot is at index DMA_RING_SIZE within it */
-        if (pod->buf_arr) {
-            result = doca_buf_arr_get_dpa_handle(pod->buf_arr, &fwd_buf_arr_h);
-            if (result != DOCA_SUCCESS) {
-                DOCA_LOG_WARN("setup_pod_dma: fwd buf_arr DPA handle failed: %s",
-                              doca_error_get_descr(result));
-                fwd_buf_arr_h = 0;
-            }
+        result = doca_buf_arr_get_dpa_handle(pod->buf_arrs[j], &fwd_buf_arr_h);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_WARN("setup_pod_dma: fwd buf_arr[%d] DPA handle failed: %s", j, doca_error_get_descr(result));
+            fwd_buf_arr_h = 0;
         }
 
         memset(&rev_ring_info, 0, sizeof(rev_ring_info));
         rev_ring_info.buf_arr = dpa_buf_arr;
         rev_ring_info.buf_arr_size = DMA_RING_SIZE;
-        /* Reverse: source = sender pod's dma_buffer (carried per-request in
-         * desc->mmap/addr by dpu_enqueue_reverse_dma). dpu_mmap/dpu_addr/
-         * dpu_buf_size stay 0 from the memset above — process_rev_ring never
-         * reads them on the reverse ring (only host_* is the destination). */
         rev_ring_info.host_mmap = host_rx_mmap_h;
-        rev_ring_info.host_addr = (uint64_t)pod->host_rx_addr;
-        rev_ring_info.host_buf_size = (uint32_t)pod->host_rx_buf_size;
+        rev_ring_info.host_addr = (uint64_t)pod->host_rx_addr + (uint64_t)j * host_region;
+        rev_ring_info.host_buf_size = host_region;
+        rev_ring_info.region_off = (uint32_t)((uint64_t)j * host_region);
         rev_ring_info.pod_id = pod->pod_id;
-        rev_ring_info.host_credit_buf_arr = fwd_buf_arr_h;  /* same buf_arr, slot DMA_RING_SIZE */
-        rev_ring_info.rq_depth = pod->rq_depth;
+        rev_ring_info.host_credit_buf_arr = fwd_buf_arr_h;  /* forward ring j's credit slot */
+        rev_ring_info.rq_depth = pod->rq_depth / (uint32_t)K;
 
         struct comch_add_rev_ring_msg rev_msg;
         memset(&rev_msg, 0, sizeof(rev_msg));
         rev_msg.type = DPA_MSG_REV_RING_ADD;
         rev_msg.ring = rev_ring_info;
-
-        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k]->send,
+        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k_j]->send,
                                            &rev_msg, sizeof(rev_msg));
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_WARN("setup_pod_dma: send ADD_REV_RING to EU %d failed: %s",
-                          k, doca_error_get_descr(result));
-        } else {
-            DOCA_LOG_INFO("Sent ADD_REV_RING to EU %d for pod_id=%d (rq_depth=%u, credit_at_slot=%d)",
-                          k, pod->pod_id, pod->rq_depth, DMA_RING_SIZE);
-        }
+        if (result != DOCA_SUCCESS)
+            DOCA_LOG_WARN("setup_pod_dma: send ADD_REV_RING to EU %d failed: %s", k_j, doca_error_get_descr(result));
+        else
+            DOCA_LOG_INFO("Sent ADD_REV_RING to EU %d (pod_id=%d ring=%d rq_depth=%u host_off=%u)",
+                          k_j, pod->pod_id, j, rev_ring_info.rq_depth, rev_ring_info.region_off);
     }
 
     /* RELEASE publication: all data-plane fields (dma_buffer,
      * local_mmap_dpa_handle, tx_ring, ...) are written above; publish dma_ready
-     * last so a thread-A reader that ACQUIRE-loads dma_ready==1
-     * (pod_data_ready) is guaranteed to see them. See object.h pod_data_ready. */
+     * last so a reader that ACQUIRE-loads dma_ready==1 (pod_data_ready) is
+     * guaranteed to see them. */
     __atomic_store_n(&pod->dma_ready, 1, __ATOMIC_RELEASE);
     return DOCA_SUCCESS;
 }
@@ -1275,21 +1210,15 @@ doca_error_t
 update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod)
 {
     doca_error_t result;
-    int k = pod->pod_id % objs->num_dpa_threads;   /* same EU that owns this pod */
+    int N = objs->num_dpa_threads;
+    int K = pod->k_rings > 0 ? pod->k_rings : 1;
 
-    if (!pod->host_rx_mmap || !pod->tx_buf_arr) {
-        DOCA_LOG_WARN("update_rev_ring_host_rx: missing mmap or buf_arr for pod %d", pod->pod_id);
+    if (!pod->host_rx_mmap) {
+        DOCA_LOG_WARN("update_rev_ring_host_rx: missing host_rx_mmap for pod %d", pod->pod_id);
         return DOCA_ERROR_NOT_FOUND;
     }
 
-    struct dpa_ring_info rev_ring_info;
-    doca_dpa_dev_buf_arr_t dpa_buf_arr;
     doca_dpa_dev_mmap_t host_rx_mmap_h;
-    doca_dpa_dev_buf_arr_t credit_buf_arr_h = 0;
-
-    result = doca_buf_arr_get_dpa_handle(pod->tx_buf_arr, &dpa_buf_arr);
-    if (result != DOCA_SUCCESS) return result;
-
     result = doca_mmap_dev_get_dpa_handle(pod->host_rx_mmap, objs->dev, &host_rx_mmap_h);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("update_rev_ring_host_rx: host_rx_mmap DPA handle failed: %s",
@@ -1297,42 +1226,53 @@ update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod)
         return result;
     }
 
-    /* Forward buf_arr handle — credit slot is at index DMA_RING_SIZE within it */
-    if (pod->buf_arr) {
-        result = doca_buf_arr_get_dpa_handle(pod->buf_arr, &credit_buf_arr_h);
+    /* Re-send ADD_REV_RING for each of the K reverse rings with the now-available
+     * host RX mmap + the partitioned region. The kernel updates the matching
+     * pod_id rev ring in place (one per EU). */
+    uint64_t host_region = pod->host_rx_buf_size / (uint64_t)K;
+    for (int j = 0; j < K; j++) {
+        int k_j = (pod->pod_id * K + j) % N;
+        if (!pod->tx_buf_arrs[j]) {
+            DOCA_LOG_WARN("update_rev_ring_host_rx: missing tx_buf_arr[%d] for pod %d", j, pod->pod_id);
+            continue;
+        }
+        struct dpa_ring_info rev_ring_info;
+        doca_dpa_dev_buf_arr_t dpa_buf_arr;
+        doca_dpa_dev_buf_arr_t credit_buf_arr_h = 0;
+
+        result = doca_buf_arr_get_dpa_handle(pod->tx_buf_arrs[j], &dpa_buf_arr);
+        if (result != DOCA_SUCCESS) return result;
+        result = doca_buf_arr_get_dpa_handle(pod->buf_arrs[j], &credit_buf_arr_h);
         if (result != DOCA_SUCCESS) {
-            DOCA_LOG_WARN("update_rev_ring_host_rx: fwd buf_arr DPA handle failed: %s",
-                          doca_error_get_descr(result));
+            DOCA_LOG_WARN("update_rev_ring_host_rx: fwd buf_arr[%d] DPA handle failed: %s", j, doca_error_get_descr(result));
             credit_buf_arr_h = 0;
         }
+
+        memset(&rev_ring_info, 0, sizeof(rev_ring_info));
+        rev_ring_info.buf_arr = dpa_buf_arr;
+        rev_ring_info.buf_arr_size = DMA_RING_SIZE;
+        rev_ring_info.host_mmap = host_rx_mmap_h;
+        rev_ring_info.host_addr = (uint64_t)pod->host_rx_addr + (uint64_t)j * host_region;
+        rev_ring_info.host_buf_size = host_region;
+        rev_ring_info.region_off = (uint32_t)((uint64_t)j * host_region);
+        rev_ring_info.pod_id = pod->pod_id;
+        rev_ring_info.host_credit_buf_arr = credit_buf_arr_h;
+        rev_ring_info.rq_depth = pod->rq_depth / (uint32_t)K;
+
+        struct comch_add_rev_ring_msg rev_msg;
+        memset(&rev_msg, 0, sizeof(rev_msg));
+        rev_msg.type = DPA_MSG_REV_RING_ADD;
+        rev_msg.ring = rev_ring_info;
+        result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k_j]->send,
+                                           &rev_msg, sizeof(rev_msg));
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("update_rev_ring_host_rx: send ADD_REV_RING to EU %d failed: %s",
+                          k_j, doca_error_get_descr(result));
+            return result;
+        }
+        DOCA_LOG_INFO("Updated rev ring host RX: pod %d ring %d (EU %d host_off=%u rq_depth=%u)",
+                      pod->pod_id, j, k_j, rev_ring_info.region_off, rev_ring_info.rq_depth);
     }
-
-    memset(&rev_ring_info, 0, sizeof(rev_ring_info));
-    rev_ring_info.buf_arr = dpa_buf_arr;
-    rev_ring_info.buf_arr_size = DMA_RING_SIZE;
-    /* dpu_mmap/dpu_addr/dpu_buf_size stay 0 (memset) — reverse source is the
-     * sender pod's dma_buffer via desc->mmap, not a per-pod TX data buffer. */
-    rev_ring_info.host_mmap = host_rx_mmap_h;
-    rev_ring_info.host_addr = (uint64_t)pod->host_rx_addr;
-    rev_ring_info.host_buf_size = (uint32_t)pod->host_rx_buf_size;
-    rev_ring_info.pod_id = pod->pod_id;
-    rev_ring_info.host_credit_buf_arr = credit_buf_arr_h;
-    rev_ring_info.rq_depth = pod->rq_depth;
-
-    struct comch_add_rev_ring_msg rev_msg;
-    memset(&rev_msg, 0, sizeof(rev_msg));
-    rev_msg.type = DPA_MSG_REV_RING_ADD;
-    rev_msg.ring = rev_ring_info;
-
-    result = dmesh_doca_dpa_msgq_send(&objs->dpa_comches[k]->send,
-                                       &rev_msg, sizeof(rev_msg));
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("update_rev_ring_host_rx: send ADD_REV_RING to EU %d failed: %s",
-                      k, doca_error_get_descr(result));
-        return result;
-    }
-
-    DOCA_LOG_INFO("Updated DPA reverse ring with Host RX mmap for pod %d (EU %d)", pod->pod_id, k);
     return DOCA_SUCCESS;
 }
 

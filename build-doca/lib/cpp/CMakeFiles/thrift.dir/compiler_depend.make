@@ -20948,6 +20948,8 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_server.c.o: ../lib
   /usr/include/x86_64-linux-gnu/asm/posix_types_64.h \
   /usr/include/asm-generic/posix_types.h \
   /opt/mellanox/doca/include/doca_ctx.h \
+  ../lib/cpp/src/thrift/transport/doca/comch_common.h \
+  /opt/mellanox/doca/include/doca_mmap.h \
   /usr/include/time.h \
   /usr/include/x86_64-linux-gnu/bits/time.h \
   /usr/include/x86_64-linux-gnu/bits/types/struct_tm.h \
@@ -20958,7 +20960,6 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_server.c.o: ../lib
   /opt/mellanox/doca/include/doca_buf.h \
   /opt/mellanox/doca/include/doca_buf_inventory.h \
   /opt/mellanox/doca/include/doca_dev.h \
-  /opt/mellanox/doca/include/doca_mmap.h \
   ../lib/cpp/src/thrift/transport/doca/object.h \
   /usr/include/pthread.h \
   /usr/include/sched.h \
@@ -20971,7 +20972,6 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_server.c.o: ../lib
   /usr/include/x86_64-linux-gnu/bits/pthread_stack_min.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stdatomic.h \
   /opt/mellanox/doca/include/doca_pe.h \
-  ../lib/cpp/src/thrift/transport/doca/comch_common.h \
   ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/dpa.h \
   /opt/mellanox/doca/include/doca_dpa.h \

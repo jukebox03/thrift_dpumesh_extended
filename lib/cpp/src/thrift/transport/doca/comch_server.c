@@ -73,20 +73,12 @@ server_send_msg(struct objects *objs, const char *msg, size_t len)
 	union doca_data task_user_data;
 	struct doca_task *task_obj;
 
-	/* Capacity check: gate on our mirror of DOCA's send pool so we never
-	 * trigger DOCA_ERROR_AGAIN. Caller treats AGAIN the same as us (retry
-	 * later). This path is init-only (mmap/handle export), so we
+	/* Capacity gate on our mirror of DOCA's send pool so we never trigger
+	 * DOCA_ERROR_AGAIN. This path is init-only (mmap/handle export), so we
 	 * progress PE while waiting to make room. */
 	int acq_retry = 0;
 	while (!doca_pool_try_acquire(&objs->send_tasks_in_flight, objs->send_tasks_max)) {
-		/* Under SPLIT_SEND, consumer_pe belongs to thread A; this path runs
-		 * on thread B (pod-setup export). Progress only objs->pe so we never
-		 * cross-progress A's PE (DOCA: one thread per PE). The send completes
-		 * on objs->pe anyway, so this still drains the pool. */
-		if (objs->split_send)
-			doca_pe_progress(objs->pe);
-		else
-			progress_all_pes(objs);
+		progress_all_pes(objs);
 		if (++acq_retry > 10000) {
 			DOCA_LOG_ERR("server_send_msg: send pool full after %d PE progresses", acq_retry);
 			return DOCA_ERROR_AGAIN;
@@ -116,8 +108,7 @@ server_send_msg(struct objects *objs, const char *msg, size_t len)
 
 	result = doca_task_submit(task_obj);
 	if (result != DOCA_SUCCESS) {
-		/* With capacity gated ahead of time this should not happen, but
-		 * handle defensively — DOCA internal state can briefly refuse. */
+		/* Capacity gated ahead of time; handle defensively. */
 		DOCA_LOG_ERR("Failed to send server task with error = %s",
 		             doca_error_get_name(result));
 		doca_pool_release(&objs->send_tasks_in_flight);
@@ -158,7 +149,7 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 
 	objs = (struct objects *)user_data.ptr;
 
-	/* Update connection for primary (first) client — backward compat */
+	/* Track the primary (first) client's connection */
 	if (objs->connection == NULL)
 		objs->connection = comch_connection;
 
@@ -225,7 +216,7 @@ static void server_connection_event_callback(struct doca_comch_event_connection_
 
 	objs = (struct objects *)user_data.ptr;
 
-	/* First connection is the primary (backward compatible) */
+	/* First connection is the primary */
 	if (objs->connection == NULL)
 		objs->connection = comch_connection;
 
@@ -451,10 +442,9 @@ server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn
 	union doca_data task_user_data;
 	struct doca_task *task_obj;
 
-	/* Capacity check — gate on our mirror of DOCA's send pool.
-	 * If full, return DOCA_ERROR_AGAIN so the caller (process_completion_queue
-	 * or server_message_recv_callback) can retain the work and retry later.
-	 * NO retry loop here: PE re-entry from a callback is unsafe. */
+	/* Capacity gate on our mirror of DOCA's send pool. If full, return
+	 * DOCA_ERROR_AGAIN so the caller can retain the work and retry later.
+	 * No retry loop here: PE re-entry from a callback is unsafe. */
 	if (!doca_pool_try_acquire(&objs->send_tasks_in_flight, objs->send_tasks_max))
 		return DOCA_ERROR_AGAIN;
 
@@ -504,7 +494,7 @@ server_send_tx_ack_to(struct objects *objs,
 	ack.type = DMESH_MSG_FWD_ACK;
 	ack._pad[0] = ack._pad[1] = ack._pad[2] = 0;
 	ack.req_id = req_id;
-	(void)dst_pod_id;   /* retained in signature for callers/debug; no longer on the wire */
+	(void)dst_pod_id;   /* not on the wire; kept in signature for callers */
 	return server_send_msg_to_conn(objs, conn, (const char *)&ack, sizeof(ack));
 }
 
@@ -528,6 +518,26 @@ server_send_batch_tx_ack_to(struct objects *objs,
 	return server_send_msg_to_conn(objs, conn, (const char *)&m, wire);
 }
 
+/* Send a batched REV_DONE (n completions, 1..BATCH_REVDONE_MAX) as one message.
+ * Only 4 + 16*n bytes are transmitted. AGAIN if the send pool is full (caller
+ * retains the batch). Mirrors server_send_batch_tx_ack_to. */
+doca_error_t
+server_send_batch_rev_done_to(struct objects *objs,
+                              struct doca_comch_connection *conn,
+                              const struct dmesh_rev_done_entry *entries, int n)
+{
+	if (n <= 0)
+		return DOCA_SUCCESS;
+	struct dmesh_batch_rev_done_msg m;
+	m.type = DMESH_MSG_BATCH_REV_DONE;
+	m.count = (uint8_t)n;
+	m._pad[0] = m._pad[1] = 0;
+	for (int i = 0; i < n; i++)
+		m.entries[i] = entries[i];
+	size_t wire = 4 + 16u * (size_t)n;   /* header + only the valid entries */
+	return server_send_msg_to_conn(objs, conn, (const char *)&m, wire);
+}
+
 /* ====================================================================
  * Pod connection management
  * ==================================================================== */
@@ -535,10 +545,10 @@ server_send_batch_tx_ack_to(struct objects *objs,
 int
 pods_add_connection(struct objects *objs, struct doca_comch_connection *conn)
 {
-	/* See object.h pods[] concurrency comment. Single writer (control PE
-	 * callback); registered=0 so readers will skip until pods_register
-	 * publishes the slot. num_pods bump is the visibility gate for the
-	 * slot's existence; do it last. */
+	/* See object.h pods[] concurrency model. Single writer (control PE
+	 * callback); registered=0 so readers skip the slot until pods_register
+	 * publishes it. The num_pods bump is the visibility gate for the slot's
+	 * existence; do it last. */
 	if (objs->num_pods >= MAX_PODS) {
 		DOCA_LOG_ERR("pods_add_connection: table full (%d)", MAX_PODS);
 		return -1;
@@ -558,7 +568,8 @@ pods_add_connection(struct objects *objs, struct doca_comch_connection *conn)
 int
 pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn)
 {
-	struct doca_mmap *ring_mmap = NULL;
+	struct doca_mmap *ring_mmaps[MAX_EU_PER_POD] = {0};
+	int ring_mmap_count = 0;
 	struct doca_mmap *remote_mmap = NULL;
 	struct doca_mmap *host_rx_mmap = NULL;
 	int32_t pod_id = -1;
@@ -571,35 +582,34 @@ pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn)
 		found_idx = i;
 		pod_id = objs->pods[i].pod_id;
 
-		/* Capture the host-exported mmap views so we can destroy them
-		 * after tearing the slot down. These are local DPU representations
-		 * of host memory exports, created via doca_mmap_create_from_export,
-		 * so destroying them only releases the DPU-side handle. */
-		ring_mmap    = objs->pods[i].ring_mmap;
+		/* Capture the host-exported mmap views to destroy after tearing
+		 * the slot down. These are DPU-side handles created via
+		 * doca_mmap_create_from_export, so destroying them only releases
+		 * the DPU-side handle. */
+		ring_mmap_count = objs->pods[i].ring_mmap_count;
+		for (int j = 0; j < ring_mmap_count && j < MAX_EU_PER_POD; j++)
+			ring_mmaps[j] = objs->pods[i].ring_mmaps[j];
 		remote_mmap  = objs->pods[i].remote_mmap;
 		host_rx_mmap = objs->pods[i].host_rx_mmap;
 
-		/* Mark slot dead. Per the object.h pods[] concurrency comment,
-		 * we tear down in PUBLICATION-INVERSE order: store registered=0
-		 * with RELEASE FIRST so any reader that subsequently observes
-		 * registered=1 is guaranteed to also see a still-valid slot. The
-		 * slot is not compacted out — keeping the index stable means
-		 * any in-flight comp_queue entries with pod_idx == i will hit
-		 * the (connection == NULL) branch and ACK the originator instead
-		 * of dereferencing freed memory. Local DPU buffers and the
-		 * DPA-side ring stay registered for now (a follow-up will add
-		 * REMOVE_RING + buffer free once the DPA side is quiesced). */
+		/* Mark slot dead in PUBLICATION-INVERSE order: store registered=0
+		 * with RELEASE FIRST so any reader that observes registered=1 is
+		 * guaranteed to also see a still-valid slot. The slot index is kept
+		 * stable (not compacted) so any in-flight comp_queue entry with
+		 * pod_idx == i hits the (connection == NULL) branch and ACKs the
+		 * originator instead of dereferencing freed memory. */
 		__atomic_store_n(&objs->pods[i].registered, 0, __ATOMIC_RELEASE);
 		/* Clear the O(1) map so the freed pod_id no longer resolves to this
-		 * (now dead) slot, and so the id can be re-registered into a new slot.
-		 * pod_id was captured above before we zero the slot's field below. */
+		 * dead slot and can be re-registered into a new slot. */
 		if (pod_id >= 0 && pod_id < POD_ID_SPACE)
 			__atomic_store_n(&objs->pod_id_to_slot[pod_id], -1, __ATOMIC_RELEASE);
 		objs->pods[i].dma_ready       = 0;
 		objs->pods[i].connection      = NULL;
 		objs->pods[i].pod_id          = -1;
 		objs->pods[i].app_name[0]     = '\0';
-		objs->pods[i].ring_mmap       = NULL;
+		for (int j = 0; j < ring_mmap_count && j < MAX_EU_PER_POD; j++)
+			objs->pods[i].ring_mmaps[j] = NULL;
+		objs->pods[i].ring_mmap_count = 0;
 		objs->pods[i].remote_mmap     = NULL;
 		objs->pods[i].host_rx_mmap    = NULL;
 		break;
@@ -608,11 +618,13 @@ pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn)
 	if (found_idx < 0)
 		return -1;
 
-	if (ring_mmap) {
-		doca_error_t r = doca_mmap_destroy(ring_mmap);
+	for (int j = 0; j < ring_mmap_count && j < MAX_EU_PER_POD; j++) {
+		if (!ring_mmaps[j])
+			continue;
+		doca_error_t r = doca_mmap_destroy(ring_mmaps[j]);
 		if (r != DOCA_SUCCESS)
-			DOCA_LOG_WARN("disconnect: ring_mmap destroy failed: %s",
-				      doca_error_get_name(r));
+			DOCA_LOG_WARN("disconnect: ring_mmap[%d] destroy failed: %s",
+				      j, doca_error_get_name(r));
 	}
 	if (remote_mmap) {
 		doca_error_t r = doca_mmap_destroy(remote_mmap);
@@ -642,8 +654,8 @@ pods_register(struct objects *objs, struct doca_comch_connection *conn,
 			continue;
 
 		/* Publication order: write all fields first, then the gate.
-		 * Readers that observe registered=1 are guaranteed (via ACQUIRE
-		 * load) to see the prior pod_id/app_name writes. */
+		 * Readers that observe registered=1 (ACQUIRE load) are guaranteed
+		 * to see the prior pod_id/app_name writes. */
 		objs->pods[i].pod_id = pod_id;
 		snprintf(objs->pods[i].app_name, sizeof(objs->pods[i].app_name),
 		         "%s", app_name);
@@ -669,9 +681,7 @@ find_pod_by_id(struct objects *objs, int32_t pod_id)
 	/* Lock-free O(1) lookup via the pod_id->slot map. The map is only an
 	 * accelerator: the registered ACQUIRE + pod_id re-check below remain the
 	 * authority, so a stale/torn map entry can only yield a re-validated hit
-	 * or NULL — never a wrong pod. See object.h pods[] concurrency model.
-	 * O(1) in the pod count (the old linear scan was O(num_pods) with an
-	 * ACQUIRE fence per slot, ~4-6x per RTT on the hot path). */
+	 * or NULL — never a wrong pod. See object.h pods[] concurrency model. */
 	if (pod_id < 0 || pod_id >= POD_ID_SPACE)
 		return NULL;
 	int idx = __atomic_load_n(&objs->pod_id_to_slot[pod_id], __ATOMIC_ACQUIRE);
@@ -686,12 +696,10 @@ find_pod_by_id(struct objects *objs, int32_t pod_id)
 struct pod_state *
 find_pod_by_connection(struct objects *objs, struct doca_comch_connection *conn)
 {
-	/* Lock-free read. Caller cares about the connection field (not the
-	 * registered gate) since this is used both pre-register (REGISTER
-	 * handler resolving its own conn) and post-register paths. The
-	 * connection pointer is NULL-ed in pods_remove_connection AFTER the
-	 * registered=0 RELEASE store, so observing a non-NULL connection
-	 * always corresponds to a valid slot. */
+	/* Lock-free read keyed on the connection field (not the registered gate),
+	 * used both pre-register and post-register. The connection pointer is
+	 * NULL-ed in pods_remove_connection AFTER the registered=0 RELEASE store,
+	 * so a non-NULL connection always corresponds to a valid slot. */
 	int n = __atomic_load_n(&objs->num_pods, __ATOMIC_ACQUIRE);
 	for (int i = 0; i < n; i++) {
 		if (objs->pods[i].connection == conn)

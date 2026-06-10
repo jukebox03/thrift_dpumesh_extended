@@ -22,10 +22,8 @@ DOCA_LOG_REGISTER(DPU_MAIN);
 
 int main(int argc, char **argv)
 {
-    /* Heap-allocated: struct objects is large (per-EU SPSC arrays + the 16K
-     * comp_queue push it into the MBs) and would risk a main-thread stack
-     * overflow if placed on the stack. Never freed — the process runs until
-     * killed, and run_dpu_worker() below blocks forever. */
+    /* Heap-allocated (struct objects is large); never freed — the process runs
+     * until killed and run_dpu_worker() below blocks forever. */
     struct objects *objs = calloc(1, sizeof(*objs));
     struct global_config gcfg = {0};
     doca_error_t result;

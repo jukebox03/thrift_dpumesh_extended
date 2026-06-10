@@ -32,9 +32,7 @@ export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer
                   export_desc_len);
 
     /* Bound the export descriptor against the fixed staging buffer before the
-     * memcpy below. The DOCA PCI export descriptor is normally small, but a
-     * future DOCA/firmware version could exceed this; without the guard that
-     * would smash the stack. */
+     * memcpy below, so an oversized descriptor cannot smash the stack. */
     if (export_desc_len > sizeof(export_msg) - sizeof(struct dmesh_mmap_msg)) {
         DOCA_LOG_ERR("export_desc_len=%zu exceeds staging buffer capacity %zu",
                      export_desc_len, sizeof(export_msg) - sizeof(struct dmesh_mmap_msg));
@@ -60,30 +58,6 @@ export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer
 /* Forward declaration — implemented in dpa.c */
 doca_error_t setup_pod_dma(struct objects *objs, struct pod_state *pod);
 
-#ifdef DOCA_ARCH_DPU
-/* Serialize the rare setup-path DPU→DPA sends (ADD_RING/ADD_REV_RING, which
- * progress a consumer PE internally) against the drain thread(s) progressing
- * those PEs. Drain sharding (M>1): lock every per-group lock; else the single
- * consumer_lock. No deadlock: a drain only ever holds its own one lock briefly,
- * so this all-groups acquire always makes progress. */
-static inline void dmesh_setup_lock(struct objects *objs)
-{
-    if (objs->split_send == SPLIT_SHARD && objs->num_drain_shards > 1)
-        for (int g = 0; g < objs->num_drain_shards; g++)
-            pthread_mutex_lock(&objs->consumer_lock_shard[g]);
-    else if (objs->split_send)
-        pthread_mutex_lock(&objs->consumer_lock);
-}
-static inline void dmesh_setup_unlock(struct objects *objs)
-{
-    if (objs->split_send == SPLIT_SHARD && objs->num_drain_shards > 1)
-        for (int g = objs->num_drain_shards - 1; g >= 0; g--)
-            pthread_mutex_unlock(&objs->consumer_lock_shard[g]);
-    else if (objs->split_send)
-        pthread_mutex_unlock(&objs->consumer_lock);
-}
-#endif
-
 doca_error_t
 process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
                  struct dmesh_mmap_msg *mmap_msg)
@@ -105,8 +79,15 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		return DOCA_ERROR_NOT_FOUND;
 	}
 
+	int kmax = objs->k_rings > 0 ? objs->k_rings : 1;
 	if (mmap_msg->mmap_type == DMA_RING) {
-		mmap = &pod->ring_mmap;
+		/* K forward rings arrive in order; store into ring_mmaps[0..K-1]. */
+		if (pod->ring_mmap_count >= kmax) {
+			DOCA_LOG_ERR("Pod %d: extra DMA_RING export (count=%d k=%d) ignored",
+				     pod->pod_id, pod->ring_mmap_count, kmax);
+			return DOCA_ERROR_INVALID_VALUE;
+		}
+		mmap = &pod->ring_mmaps[pod->ring_mmap_count];
 	} else if (mmap_msg->mmap_type == DMA_BUFFER) {
 		mmap = &pod->remote_mmap;
 	} else if (mmap_msg->mmap_type == DMA_HOST_RX_BUFFER) {
@@ -139,25 +120,24 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		pod->rq_depth = (uint32_t)(buf_size / DPUMESH_SLOT_SIZE);
 		DOCA_LOG_INFO("Pod %d: Host RX buffer stored (addr=%p, size=%zu, rq_depth=%u)",
 			      pod->pod_id, remote_addr, buf_size, pod->rq_depth);
-	} else {
+	} else if (mmap_msg->mmap_type == DMA_BUFFER) {
 		pod->remote_addr = remote_addr;
 		pod->remote_buf_size = buf_size;
+	} else { /* DMA_RING */
+		pod->ring_mmap_count++;
 	}
 
-	DOCA_LOG_INFO("Pod %d: mmap_type=%d stored (ring_mmap=%p, remote_mmap=%p, host_rx_mmap=%p)",
+	DOCA_LOG_INFO("Pod %d: mmap_type=%d stored (ring_mmaps=%d/%d, remote_mmap=%p, host_rx_mmap=%p)",
 		      pod->pod_id, mmap_msg->mmap_type,
-		      (void *)pod->ring_mmap, (void *)pod->remote_mmap, (void *)pod->host_rx_mmap);
+		      pod->ring_mmap_count, kmax,
+		      (void *)pod->remote_mmap, (void *)pod->host_rx_mmap);
 
 	/* Trigger per-pod DMA setup when both forward-direction mmaps have arrived.
 	 * setup_pod_dma / update_rev_ring_host_rx send ADD_RING/ADD_REV_RING to the
-	 * DPA, which progress consumer_pe internally. This callback runs on
-	 * objs->pe (thread B under SPLIT_SEND), so take consumer_lock to serialize
-	 * against thread A's consumer_pe progress. Rare (pod registration), so the
-	 * coarse lock costs nothing on the steady path. */
-	if (pod->ring_mmap && pod->remote_mmap && !pod->dma_ready) {
-		dmesh_setup_lock(objs);
+	 * DPA. Rare (pod registration), off the steady path; runs on the single
+	 * worker thread that also drains consumer_pe, so no lock is needed. */
+	if (pod->ring_mmap_count >= kmax && pod->remote_mmap && !pod->dma_ready) {
 		result = setup_pod_dma(objs, pod);
-		dmesh_setup_unlock(objs);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("setup_pod_dma failed for pod %d: %s",
 				     pod->pod_id, doca_error_get_descr(result));
@@ -167,9 +147,7 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 
 	/* If Host RX buffer arrived after DMA setup, update the DPA reverse ring info */
 	if (mmap_msg->mmap_type == DMA_HOST_RX_BUFFER && pod->dma_ready) {
-		dmesh_setup_lock(objs);
 		result = update_rev_ring_host_rx(objs, pod);
-		dmesh_setup_unlock(objs);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_WARN("update_rev_ring_host_rx failed for pod %d: %s",
 				      pod->pod_id, doca_error_get_descr(result));

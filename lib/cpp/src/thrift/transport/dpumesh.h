@@ -20,43 +20,33 @@ extern "C" {
 
 /* ====== Default constants ====== */
 #define DPUMESH_SLOT_SIZE_DEFAULT       8192            /* 8KB */
-/* Slot pool size — used both for host TX (outgoing) and host RX (incoming
- * application data). num_slots × slot_size MUST equal DPU_BUFFER_SIZE
- * so slot-based admission directly bounds in-flight bytes inside DPU.
- * Bumped 1024 → 2048 (16 MB per buffer): provides 2× headroom which lets
- * the DPA-side admission gate's lazy-refresh tolerate larger cache lag
- * without false-positive defers, smoothing the latency curve at cap. */
-#define DPUMESH_NUM_SLOTS_DEFAULT       2048
+/* Slot pool size (host TX + host RX). num_slots × slot_size MUST equal
+ * DPU_BUFFER_SIZE so slot-based admission bounds in-flight bytes inside DPU. */
+#define DPUMESH_NUM_SLOTS_DEFAULT       4096
 #define DPUMESH_MAX_DESCRIPTORS_DEFAULT 2048
 
 /* ====== Configuration ====== */
 typedef struct {
-    int num_slots;        /* slots per pool (0 = use default 2048) */
-    int slot_size;        /* bytes per slot (0 = use default 8192 = 8KB) */
-    int max_descriptors;  /* descriptor ring capacity (0 = use default 2048) */
+    int num_slots;        /* slots per pool (0 = default) */
+    int slot_size;        /* bytes per slot (0 = default) */
+    int max_descriptors;  /* descriptor ring capacity (0 = default) */
+    int poll_rx;          /* 1 = dequeue spin-polls (no rx_cond); for echo/server pools */
+    int async_client;     /* 1 = poll_response model (no response cond); for async clients */
 } dpumesh_config_t;
 
-#define DPUMESH_CONFIG_DEFAULT { 0, 0, 0 }
+#define DPUMESH_CONFIG_DEFAULT { 0, 0, 0, 0, 0 }
 
-/* ====== SwDescriptor (64 bytes, packed; little-endian field layout) ====== */
+/* ====== SwDescriptor (host-internal RX/TX descriptor, packed) ====== */
 typedef struct __attribute__((packed)) {
     int32_t  header_buf_slot;       /* i  (always -1 for Thrift) */
     uint32_t header_len;            /* I  (always 0 for Thrift)  */
     int32_t  body_buf_slot;         /* i */
     uint32_t body_len;              /* I */
     uint32_t req_id;                /* I  (stream_id) */
-    uint32_t step_id;               /* I */
     int32_t  dst_pod_id;            /* i */
     int32_t  src_pod_id;            /* i */
     int8_t   flags;                 /* b */
     int8_t   valid;                 /* b */
-    uint8_t  src_body_pool_type;    /* B */
-    uint8_t  src_header_pool_type;  /* B  (always 0 for Thrift) */
-    int32_t  src_body_pod_id;       /* i */
-    int32_t  src_header_pod_id;     /* i  (always 0 for Thrift) */
-    int32_t  src_body_buf_slot;     /* i */
-    int32_t  src_header_buf_slot;   /* i  (always -1 for Thrift) */
-    uint8_t  _pad[12];             /* 12x */
 } sw_descriptor_t;
 
 /* ====== Opaque context ====== */
@@ -70,15 +60,7 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx);
 /* ====== Query configured values ====== */
 int dpumesh_get_slot_size(dpumesh_ctx_t *ctx);
 
-/* ====== Debug/localization stats (host bottleneck analysis) ======
- * rx_depth   = current rx_queue occupancy (requests delivered, awaiting a
- *              worker dequeue). High → this pod's RX consumers can't keep up.
- * tx_inflight= TX slots currently allocated (held across the RTT). Near
- *              num_slots → this pod is TX-slot starved (downstream not freeing). */
-void dpumesh_debug_stats(dpumesh_ctx_t *ctx, int *rx_depth, int *tx_inflight);
-
 /* ====== Info ====== */
-int         dpumesh_get_notify_fd(dpumesh_ctx_t *ctx);
 int         dpumesh_get_pod_id(dpumesh_ctx_t *ctx);
 const char *dpumesh_get_worker_id(dpumesh_ctx_t *ctx);
 
@@ -131,10 +113,10 @@ int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
  *        body via dpumesh_rx_free(resp->body_buf_slot)),
  *    1 = not ready yet — caller should poll again later,
  *   -1 = error/abandoned (no live pending for this req_id).
- * Pairs with DPUMESH_ASYNC_CLIENT: in that mode the PE thread stops the
- * per-request response wakeup (pthread_cond_signal), so polling is the only way
- * to observe completion. A given client process must use EITHER wait_response
- * (blocking) OR poll_response (async) consistently, never both. */
+ * In async-client mode the PE thread stops the per-request response wakeup
+ * (pthread_cond_signal), so polling is the only way to observe completion. A
+ * given client process must use EITHER wait_response (blocking) OR
+ * poll_response (async) consistently, never both. */
 int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint32_t req_id,
                           sw_descriptor_t *resp);
 

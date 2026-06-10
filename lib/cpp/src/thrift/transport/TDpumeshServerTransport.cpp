@@ -56,12 +56,8 @@ stdcxx::shared_ptr<TTransport> TDpumeshServerTransport::acceptImpl() {
     while (listening_) {
         int rc = dpumesh_dequeue(ctx_, &desc, 1000);  /* 1 second timeout */
         if (rc == 0) {
-            /* HOT PATH — no logging here. Per-accept printf was a major
-             * throughput bottleneck for TThreadedServer-based services
-             * (e.g. unique-id-service): the accept loop is single-threaded,
-             * and printf to a pipe (kubectl logs) takes the stdio mutex +
-             * blocks on pipe writes, capping accept rate at ~1k/s and
-             * defeating the per-request thread parallelism. */
+            /* HOT PATH — no logging here (the accept loop is single-threaded;
+             * a per-accept printf serializes it). */
             return stdcxx::make_shared<TDpumeshTransport>(ctx_, desc);
         }
         /* timeout: loop and check listening_ flag */

@@ -94,9 +94,7 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 
 	objs = (struct objects *)user_data.ptr;
 
-	/* Dispatch on the 1-byte type. The legacy 4-byte enum messages carry their
-	 * value in the little-endian low byte, and the 16B completion carries a
-	 * 1-byte type at offset 0 — so a single-byte read handles both. */
+	/* Dispatch on the 1-byte type at offset 0. */
 	switch (recv_buffer[0])
 	{
 	case DMESH_MSG_MMAP_EXPORT:
@@ -113,14 +111,19 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 
 	case DMESH_MSG_REV_DONE:
 		/* Reverse DMA (DPU→CPU) completion: data is already in Host RX DMA
-		 * buffer. The 16B notification (struct dmesh_dma_completion_msg)
-		 * carries pos/length/req_id/src/dst/flags. */
+		 * buffer; notification carries pos/length/req_id/src/dst/flags. */
 		if (objs->rx_data_hook)
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
 
 	case DMESH_MSG_BATCH_FWD_ACK:
-		/* Batched TX_ACK — coalesced free of K req_ids (DPUMESH_BATCH_TXACK). */
+		/* Batched TX_ACK — coalesced free of K req_ids. */
+		if (objs->rx_data_hook)
+			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
+		break;
+
+	case DMESH_MSG_BATCH_REV_DONE:
+		/* Batched reverse-DMA completion — coalesced delivery of K responses. */
 		if (objs->rx_data_hook)
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
@@ -147,9 +150,8 @@ doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
 	union doca_data task_user_data;
 	struct doca_task *task_obj;
 
-	/* Capacity check: gate on our mirror of DOCA's send pool.
-	 * Client calls are init-only (REGISTER, POD_CONSUMER_ID) and rare, so
-	 * it's safe to progress PE while waiting for room. */
+	/* Capacity check: gate on our mirror of DOCA's send pool, progressing
+	 * the PE while waiting for room. */
 	int acq_retry = 0;
 	while (!doca_pool_try_acquire(&objs->send_tasks_in_flight, objs->send_tasks_max)) {
 		if (objs->pe)
@@ -287,7 +289,7 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 		}
 	}
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to set msg size property with error = %s", doca_error_get_name(result));
+		DOCA_LOG_ERR("Failed to set recv queue size property with error = %s", doca_error_get_name(result));
 		goto destroy_client;
 	}
 
