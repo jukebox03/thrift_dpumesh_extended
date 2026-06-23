@@ -456,18 +456,43 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
     return total_dma_calls;
 }
 
+/* Consecutive empty drains before the EU parks. The EU runs on a dedicated FlexIO
+ * EU (zero ARM/host CPU), so it should POLL as continuously as possible for the
+ * lowest latency — it parks only on SUSTAINED idle, purely to satisfy the FlexIO
+ * watchdog (a never-yielding thread is descheduled after ~120s; measured). Each
+ * empty drain is ~µs (a few PCIe desc->valid reads), so this grace window is
+ * ~tens-to-hundreds of ms — far longer than any real inter-request gap (so under
+ * load the counter resets every request and the EU NEVER parks → no park/WAKE
+ * latency on the hot path) yet far shorter than the ~120s watchdog. */
+#define IDLE_SPINS_BEFORE_PARK  262144u
+
 __dpa_global__ void run_dma_manager(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
+    uint32_t idle_spins = 0;
 
-    /* Yield when no work: each ring poll is a host-memory PCIe read of
-     * desc->valid, so a pure busy-spin would contend with DMA traffic. The
-     * yield throttles polling when all rings are idle. */
+    /* Poll continuously while there is work OR within the grace window; PARK
+     * (reschedule) only after IDLE_SPINS_BEFORE_PARK consecutive empty drains.
+     * reschedule releases the EU and needs a completion trigger (the ARM's 1 ms
+     * DPA_MSG_WAKE) — it does NOT self-sustain (measured). Before parking we
+     * RE-ARM both attached completion contexts (DOCA contract: without
+     * request_notification a newly-arrived completion is not populated/triggered,
+     * so the WAKE would not re-activate the parked EU), then RE-SCAN the rings once
+     * — this closes the race where a silent host desc->valid=1 store lands during
+     * the re-arm window. Canonical ack→request_notification→reschedule idiom. */
     while (1) {
         handle_msgs(thread_arg);
         int chunks = drain_all_rings(thread_arg);
         drain_producer_completions(thread_arg);
-        if (chunks == 0)
-            doca_dpa_dev_thread_reschedule();
+        if (chunks > 0) {
+            idle_spins = 0;                       /* work found → keep polling HOT */
+        } else if (++idle_spins >= IDLE_SPINS_BEFORE_PARK) {
+            doca_dpa_dev_comch_consumer_completion_request_notification(thread_arg->dpa_consumer_comp);
+            doca_dpa_dev_completion_request_notification(thread_arg->dpa_producer_comp);
+            if (drain_all_rings(thread_arg) == 0)   /* re-scan after re-arm */
+                doca_dpa_dev_thread_reschedule();   /* park; woken by WAKE completion */
+            idle_spins = 0;                       /* reset after wake */
+        }
+        /* else: empty but within grace window → loop again (keep polling) */
     }
 }

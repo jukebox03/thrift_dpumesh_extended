@@ -14,6 +14,8 @@
 #include <string.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <unistd.h>        /* close() for the host epoll RX path */
+#include <sys/epoll.h>     /* event-driven host PE progress (DPUMESH_HOST_EPOLL) */
 
 #include <doca_log.h>
 #include <doca_mmap.h>
@@ -161,20 +163,58 @@ struct dpumesh_ctx {
 
 static void *pe_progress_fn(void *arg) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)arg;
-    uint32_t idle = 0;
+    struct doca_pe *pe = ctx->doca_objs.pe;
 
+    /* DPUMESH_HOST_EPOLL=1: sleep on the PE notification fd instead of spinning.
+     * The host comch PE receives ONLY real completions (REV_DONE / TX_ACK from
+     * the DPU), each of which raises the notification fd — there is NO silent-
+     * wakeup path here (unlike the DPU forward ring), so epoll is safe and cuts
+     * this thread's idle CPU to ~0. Default 0 = the baked adaptive-spin loop. */
+    int want_epoll = 0;
+    { const char *e = getenv("DPUMESH_HOST_EPOLL"); if (e && atoi(e) != 0) want_epoll = 1; }
+
+    doca_notification_handle_t pfd = 0;
+    int ep = -1;
+    if (want_epoll && pe &&
+        doca_pe_get_notification_handle(pe, &pfd) == DOCA_SUCCESS) {
+        ep = epoll_create1(0);
+        if (ep >= 0) {
+            struct epoll_event ev = { .events = EPOLLIN, .data = { .u32 = 0 } };
+            if (epoll_ctl(ep, EPOLL_CTL_ADD, (int)pfd, &ev) != 0) { close(ep); ep = -1; }
+        }
+    }
+
+    if (ep >= 0) {
+        /* ===== Event-driven: drain → arm → re-check → block ===== */
+        while (ctx->pe_running) {
+            while (doca_pe_progress(pe)) { /* drain all ready completions */ }
+
+            /* Arm, then re-check once to close the drain→arm race: a completion
+             * landing between the last drain and the arm must not be stranded. */
+            (void)doca_pe_request_notification(pe);
+            if (doca_pe_progress(pe)) {
+                (void)doca_pe_clear_notification(pe, pfd);
+                continue;
+            }
+            /* Block until a completion raises the fd, or 200 ms so a pe_running=0
+             * shutdown is observed promptly (vs a busy spin). */
+            struct epoll_event evs[1];
+            (void)epoll_wait(ep, evs, 1, 200);
+            (void)doca_pe_clear_notification(pe, pfd);
+        }
+        close(ep);
+        return NULL;
+    }
+
+    /* ===== Fallback: adaptive spin + nanosleep (baked default) ===== */
+    uint32_t idle = 0;
     while (ctx->pe_running) {
         uint8_t did = 0;
-        if (ctx->doca_objs.pe)
-            did |= doca_pe_progress(ctx->doca_objs.pe);
-
-        /* Adaptive: spin while there is RX work; yield the core after a
-         * sustained idle stretch so the app gets the core when transport idle. */
+        if (pe)
+            did |= doca_pe_progress(pe);
         if (did) {
             idle = 0;                 /* work seen — keep spinning tight */
         } else if (++idle >= PE_IDLE_SPIN) {
-            /* Sustained idle: yield the core to the application. A response
-             * arriving now waits at most PE_BACKOFF_NS for the next poll. */
             struct timespec t = {0, PE_BACKOFF_NS};
             nanosleep(&t, NULL);
         }

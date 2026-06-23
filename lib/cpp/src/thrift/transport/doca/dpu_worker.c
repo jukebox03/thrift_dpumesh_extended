@@ -23,6 +23,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdint.h>
+#include <sys/epoll.h>     /* event-driven DPU main loop (epoll on PE handles) */
 
 DOCA_LOG_REGISTER(DPU_WORKER);
 
@@ -450,18 +452,101 @@ process_completion_queue(struct objects *objs, int max_batch)
 
 /* ====== DPU Worker ====== */
 
+/* One pass of the DPU worker's drain work: progress both PEs, retry deferred
+ * TX_ACKs, drain the completion queue, release backpressure, drain consumer
+ * retries. Returns non-zero if any progress was made (a PE advanced or a
+ * completion was processed). The event-driven driver uses this to detect the
+ * idle point (when it is safe to arm + block); the busy-poll driver calls it
+ * once per iteration. Shared by both drivers so they cannot drift. */
+static int
+dpu_drain_iteration(struct objects *objs)
+{
+    uint8_t did_consumer = doca_pe_progress(objs->consumer_pe);
+    uint8_t did_ctrl     = doca_pe_progress(objs->pe);  /* new conns, REGISTER, TX_DATA */
+
+    /* Retry deferred TX_ACKs right after pe_progress so just-released send-pool
+     * slots are available. */
+    drain_deferred_tx_acks(objs);
+
+    /* Drain deferred completion queue (reverse DMA enqueue). 128/pass — safe
+     * because consumer_pe is progressed above, keeping DPA recv tasks recycled. */
+    int proc = process_completion_queue(objs, 128);
+    /* Idle (no completions this pass) → flush partial TX_ACK + REV_DONE batches so
+     * low-load latency is not held by coalescing. This is the ONLY batch-flush
+     * site now (the periodic keepalive that also flushed is gone — the EU
+     * busy-loops, so no DPA_MSG_WAKE keepalive is needed). */
+    if (proc == 0)
+        for (int i = 0; i < objs->num_pods; i++) {
+            flush_txack_batch(objs, &objs->pods[i]);
+            flush_rev_done_batch(objs, &objs->pods[i]);
+        }
+
+    /* Backpressure release: resubmit deferred recv tasks once the ingest
+     * hand-off (comp_queue) drains below BP_LOW. */
+    if (objs->num_deferred_recv > 0 &&
+        ingest_usage(objs) < COMP_QUEUE_BP_LOW) {
+        int remaining = 0, resubmitted = 0, original = objs->num_deferred_recv;
+        for (int i = 0; i < original; i++) {
+            struct doca_task *t = objs->deferred_recv[i];
+            doca_error_t rs = doca_task_submit(t);
+            if (rs == DOCA_SUCCESS) {
+                resubmitted++;
+            } else {
+                objs->deferred_recv[remaining++] = t;
+                DOCA_LOG_WARN("Deferred recv resubmit failed: %s; retaining",
+                              doca_error_get_descr(rs));
+            }
+        }
+        objs->num_deferred_recv = remaining;
+        if (resubmitted > 0)
+            DOCA_LOG_INFO("Backpressure release: resubmitted %d/%d deferred recv tasks (retained %d)",
+                          resubmitted, original, remaining);
+    }
+
+    /* Drain consumer_retry tasks stashed by the consumer completion callback. */
+    objects_drain_consumer_retry(objs);
+
+    return (did_consumer || did_ctrl || proc > 0);
+}
+
+/* Send DPA_MSG_WAKE to every running EU (the ~1 ms keepalive). A DPA EU parks
+ * (reschedule) when its rings are idle, and a forward-ring desc->valid=1 store is
+ * a SILENT host write that raises no completion — so it never wakes the EU on its
+ * own. The ARM therefore pokes the EUs on a steady ~1 ms cadence; a parked EU
+ * that re-armed its completion notifications before reschedule re-scans its rings
+ * on the WAKE. Under load the EU is busy draining and the WAKE is a no-op. */
+static void
+dpu_send_wake(struct objects *objs)
+{
+    if (!objs->dpa_thread_running_any)
+        return;
+    struct comch_msg trigger;
+    memset(&trigger, 0, sizeof(trigger));
+    trigger.type = DPA_MSG_WAKE;
+    for (int k = 0; k < objs->num_dpa_threads; k++)
+        if (objs->dpa_thread_running[k])
+            (void)dmesh_doca_dpa_msgq_send_try(&objs->dpa_comches[k]->send,
+                                                &trigger, sizeof(trigger));
+}
+
 void
 run_dpu_worker(struct objects *objs)
 {
     doca_error_t result;
-    struct timespec now, last_kick;
-    double kick_elapsed = 0.0;
 
-    /* Keepalive interval (DPU→DPA WAKE). A yielded EU re-checks its reverse
-     * tx_ring only when woken by a msgq message; the ARM's reverse-desc post is
-     * a silent memory write, so this interval bounds the worst-case
-     * forward→reverse handoff latency when the EU out-runs the ARM and yields. */
-    const double keepalive_sec = 0.001;
+    /* Driver selection. DPUMESH_EVENT_LOOP=1 (default) runs the event-driven main
+     * loop: the ARM SLEEPS on epoll over the two PE notification handles, waking on
+     * a real DPA→DPU completion (FWD_DONE/REV_DONE), a host control message, OR a
+     * ~1 ms epoll timeout. On each tick it sends the 1 ms DPU→DPA WAKE keepalive
+     * (the DPA EU parks when idle and a silent desc->valid=1 store can't wake it,
+     * so the ARM pokes it ~1 kHz). This is NOT busy-poll — the ARM sleeps between
+     * ticks, so idle CPU is a few % (≈1 kHz wakeups), vs a full core for busy-poll.
+     * EVENT_LOOP=0 = the legacy busy-poll loop (burns a full ARM core), fallback. */
+    const double keepalive_sec = 0.001;   /* 1 ms DPU→DPA WAKE cadence */
+    struct timespec now, last_kick;
+    double kick_elapsed;
+    int event_loop = 1;
+    { const char *e = getenv("DPUMESH_EVENT_LOOP"); if (e) event_loop = (atoi(e) != 0); }
 
     DOCA_LOG_INFO("Starting DPU worker");
 
@@ -536,92 +621,104 @@ run_dpu_worker(struct objects *objs)
 
     DOCA_LOG_INFO("DPU worker initialized (event-based), entering main loop");
 
-    /* Main loop: poll consumer PE + ctrl path PE + per-pod producer PE */
+    if (!event_loop) {
+        /* ===== Legacy busy-poll driver (fallback) =====
+         * Spin dpu_drain_iteration() continuously (burns a full ARM core) + the
+         * 1 ms keepalive WAKE to poke the parked EU, same as the event loop. */
+        clock_gettime(CLOCK_MONOTONIC, &last_kick);
+        while (true) {
+            dpu_drain_iteration(objs);
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            kick_elapsed = (now.tv_sec - last_kick.tv_sec) +
+                           (now.tv_nsec - last_kick.tv_nsec) / 1e9;
+            if (kick_elapsed >= keepalive_sec) {
+                dpu_send_wake(objs);
+                last_kick = now;
+            }
+        }
+        return;  /* not reached */
+    }
+
+    /* ===== Event-driven driver (default) =====
+     * epoll over {consumer_pe fd, ctrl pe fd}. Each pass: drain → send the 1 ms
+     * keepalive WAKE on cadence → if idle, arm → re-poll → block on epoll with a
+     * 1 ms timeout (so we wake to re-send the keepalive even with no completion).
+     * The ARM SLEEPS between ticks (epoll), so idle CPU is a few % (~1 kHz wakeups)
+     * — not the full core busy-poll burns. Falls back to busy-poll if setup fails. */
+    doca_notification_handle_t cfd = 0, pfd = 0;
+    doca_error_t hc = doca_pe_get_notification_handle(objs->consumer_pe, &cfd);
+    doca_error_t hp = doca_pe_get_notification_handle(objs->pe, &pfd);
+    int ep  = (hc == DOCA_SUCCESS && hp == DOCA_SUCCESS) ? epoll_create1(0) : -1;
+    int setup_ok = (ep >= 0);
+    if (setup_ok) {
+        struct epoll_event ec = { .events = EPOLLIN, .data = { .u32 = 0 } };  /* consumer_pe */
+        struct epoll_event ept = { .events = EPOLLIN, .data = { .u32 = 1 } }; /* ctrl pe    */
+        if (epoll_ctl(ep, EPOLL_CTL_ADD, (int)cfd, &ec) != 0 ||
+            epoll_ctl(ep, EPOLL_CTL_ADD, (int)pfd, &ept) != 0)
+            setup_ok = 0;
+    }
+    if (!setup_ok) {
+        DOCA_LOG_WARN("Event-loop setup failed (consumer_pe=%s ctrl_pe=%s ep=%d) → falling back to busy-poll",
+                      doca_error_get_name(hc), doca_error_get_name(hp), ep);
+        if (ep >= 0) close(ep);
+        clock_gettime(CLOCK_MONOTONIC, &last_kick);
+        while (true) {
+            dpu_drain_iteration(objs);
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            kick_elapsed = (now.tv_sec - last_kick.tv_sec) +
+                           (now.tv_nsec - last_kick.tv_nsec) / 1e9;
+            if (kick_elapsed >= keepalive_sec) {
+                dpu_send_wake(objs);
+                last_kick = now;
+            }
+        }
+        return;  /* not reached */
+    }
+
+    DOCA_LOG_INFO("DPU worker: EVENT-DRIVEN main loop armed (consumer_pe fd=%d, ctrl_pe fd=%d)",
+                  (int)cfd, (int)pfd);
+
     clock_gettime(CLOCK_MONOTONIC, &last_kick);
     while (true) {
-        doca_pe_progress(objs->consumer_pe);
-        doca_pe_progress(objs->pe);  /* handle new connections, REGISTER, TX_DATA */
+        int progressed = dpu_drain_iteration(objs);   /* ONE pass */
 
-        /* Retry any TX_ACKs that were deferred when the comch send pool was
-         * full. Done right after pe_progress so the just-released send-pool
-         * slots are available. */
-        drain_deferred_tx_acks(objs);
-
-        /* Drain deferred completion queue (reverse DMA enqueue). 128 entries per
-         * batch — safe because consumer_pe is progressed inside the loop, keeping
-         * DPA recv tasks recycled. */
-        int proc = process_completion_queue(objs, 128);
-        /* Idle (no completions this iter) → flush partial REV_DONE batches so
-         * low-load latency is not held by coalescing. Under steady load proc>0
-         * keeps batches accumulating to BATCH_REVDONE_MAX (full coalescing). */
-        if (proc == 0)
-            for (int i = 0; i < objs->num_pods; i++)
-                flush_rev_done_batch(objs, &objs->pods[i]);
-
-        /* Backpressure release: resubmit deferred recv tasks when the ingest
-         * hand-off (comp_queue) drains below BP_LOW. This resumes DPA→DPU
-         * message flow. */
-        if (objs->num_deferred_recv > 0 &&
-            ingest_usage(objs) < COMP_QUEUE_BP_LOW) {
-            int remaining = 0;
-            int resubmitted = 0;
-            int original = objs->num_deferred_recv;
-            for (int i = 0; i < original; i++) {
-                struct doca_task *t = objs->deferred_recv[i];
-                /* These are per-EU DPA→DPU msgq recv tasks — a FIXED per-channel
-                 * allocation (CC_DPA_MAX_MSG_NUM each), NOT the standalone
-                 * consumer's recv_tasks_in_flight pool. Resubmit merely recycles
-                 * an existing task, so it must not gate on that pool.
-                 * Backpressure is governed entirely by ingest_usage (deferred at
-                 * BP_HIGH, resumed here below BP_LOW). */
-                doca_error_t rs = doca_task_submit(t);
-                if (rs == DOCA_SUCCESS) {
-                    resubmitted++;
-                } else {
-                    objs->deferred_recv[remaining++] = t;
-                    DOCA_LOG_WARN("Deferred recv resubmit failed: %s; retaining",
-                                  doca_error_get_descr(rs));
-                }
-            }
-            objs->num_deferred_recv = remaining;
-            if (resubmitted > 0)
-                DOCA_LOG_INFO("Backpressure release: resubmitted %d/%d deferred recv tasks (retained %d)",
-                              resubmitted, original, remaining);
-        }
-
-        /* Drain any consumer_retry tasks that were stashed by the consumer
-         * completion callback when capacity was full. */
-        objects_drain_consumer_retry(objs);
-
+        /* 1 ms DPU→DPA keepalive WAKE, gated to ~1 kHz (checked every pass, not
+         * only when sleeping, so a sustained-load stretch still pokes a briefly-
+         * parked reverse EU). At idle the 1 ms epoll timeout below brings us back
+         * here to re-send it. */
         clock_gettime(CLOCK_MONOTONIC, &now);
-
-        /* Keepalive trigger: bounds the idle→active wake-up latency for DPA to
-         * the keepalive interval when no other event arrives on its
-         * consumer_comp. During a busy burst DPA keeps spinning so this does
-         * nothing; during idle (DPA reschedules) the next kick pulls it back to
-         * drain. Fire-and-forget: a missed kick is recovered by the next one. */
         kick_elapsed = (now.tv_sec - last_kick.tv_sec) +
                        (now.tv_nsec - last_kick.tv_nsec) / 1e9;
         if (kick_elapsed >= keepalive_sec) {
-            if (objs->dpa_thread_running_any) {
-                struct comch_msg trigger;
-                memset(&trigger, 0, sizeof(trigger));
-                trigger.type = DPA_MSG_WAKE;
-                /* Each running EU has its own channel and reschedules
-                 * independently when idle, so every started EU needs its own
-                 * keepalive to be woken within ~1 ms. */
-                for (int k = 0; k < objs->num_dpa_threads; k++) {
-                    if (objs->dpa_thread_running[k])
-                        (void)dmesh_doca_dpa_msgq_send_try(&objs->dpa_comches[k]->send,
-                                                            &trigger, sizeof(trigger));
-                }
-            }
-            /* Tail flush partial TX_ACK + REV_DONE batches. */
-            for (int i = 0; i < objs->num_pods; i++) {
-                flush_txack_batch(objs, &objs->pods[i]);
-                flush_rev_done_batch(objs, &objs->pods[i]);
-            }
+            dpu_send_wake(objs);
             last_kick = now;
         }
+
+        if (progressed)
+            continue;   /* work this pass → poll again (no sleep under load) */
+
+        /* Idle: arm both PEs, then RE-POLL once before blocking (arm→re-check→
+         * block) to close the drain→arm race — a completion landing between the
+         * last drain and the arm must not be stranded. */
+        (void)doca_pe_request_notification(objs->consumer_pe);
+        (void)doca_pe_request_notification(objs->pe);
+
+        if (dpu_drain_iteration(objs)) {
+            /* Work arrived during/just before arm — handle it, don't sleep. */
+            (void)doca_pe_clear_notification(objs->consumer_pe, cfd);
+            (void)doca_pe_clear_notification(objs->pe, pfd);
+            continue;
+        }
+
+        /* SLEEP on epoll with a 1 ms timeout: wake on a real completion (FWD_DONE/
+         * REV_DONE/ctrl) OR after ≤1 ms to re-send the keepalive WAKE. The ARM
+         * sleeps between ticks → idle CPU a few % (~1 kHz wakeups), NOT a busy-poll
+         * full core. The timeout also backstops any missed PE notification. */
+        struct epoll_event evs[2];
+        (void)epoll_wait(ep, evs, 2, 1);
+
+        /* Clear PE notifications so they can be re-armed (SELECTIVE contract). */
+        (void)doca_pe_clear_notification(objs->consumer_pe, cfd);
+        (void)doca_pe_clear_notification(objs->pe, pfd);
     }
 }

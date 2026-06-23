@@ -1141,3 +1141,176 @@ error would have aborted before pod rollout. Back-to-back, 0-fail throughout:
 Back-to-back 200K==200K (198,917 vs 198,895, <0.02%) → NO slot leak. Ceiling unchanged ~240K = Q2.20
 (240K→239,713). Net: ~810 source lines removed across 16 files; the standing 200-240K config is now the
 only code path (no env/compile toggles), with thread/EU/sizing counts still tunable.
+
+---
+
+# Event-driven PE notification — feasibility (CPU-leanness, NOT throughput) (2026-06-22)
+
+GOAL: cut the idle-CPU waste of busy-polling (`doca_pe_progress` loops burn a full core even when
+idle). DOCA exposes an event-driven path (`doca_pe_get_notification_handle` → `doca_pe_request_notification`
+→ `epoll_wait` → `doca_pe_clear_notification`) so the progress thread can SLEEP on an fd instead of spinning.
+This is a leanness/power lever, NOT a throughput lever (ceiling is the M2/host-PE service rate, Q2.18) — a
+correct drain-then-arm hybrid polls under load (never arms) and only blocks when idle, so 240K is unaffected.
+
+The two always-on busy-pollers: host `pe_progress_fn` (dpumesh_doca.c, has adaptive nanosleep(20µs) backoff)
+and the DPU `run_dpu_worker` main loop (dpu_worker.c, NO backoff → full ARM core 100% even idle). DPA EUs are
+HW, out of scope. The one real uncertainty (prior workflow, medium-confidence): does the DPU `consumer_pe`
+(the hot DPA→DPU msgq drain) raise a USABLE epoll notification, or is it poll-only?
+
+## Spike — DPU consumer_pe notification probe (DPUMESH_EVENT_PROBE, gated, default off; hang-safe 1ms timeout)
+Gated diagnostic in run_dpu_worker: drain consumer_pe to 0 → `doca_pe_request_notification` → `epoll_wait(1ms)`
+→ count wake reason. EVENT = fd fired; WORK = timeout but a completion was waiting (= silent miss = poll-only);
+idle = timeout, nothing waiting. 1Hz summary. Default off ⇒ baked busy-poll byte-identical. Deploy DPA=4 K=2,
+`-l 50`, fair 1-core.
+
+| regime | wake_EVENT/s | timeout_WORK/s | timeout_idle/s |
+|---|---|---|---|
+| idle (no client traffic) | ~960 | **0** | ~933 |
+| **20K RPS bench (19,925 ach, 0-fail)** | **~6,800–7,960** | **0** | ~847 |
+| post-bench (idle) | ~960 | **0** | ~933 |
+
+VERDICT (positive, measured): **consumer_pe DOES raise a usable epoll notification.** wake_EVENT tracks request
+load (idle ~960 → 20K ~7,000), proving real FWD_DONE/REV_DONE completions fire the fd. timeout_WORK=0 in EVERY
+window ⇒ there is NO silent-miss path (a completion never arrives without firing the fd). Resolves the prior
+"medium confidence / unproven" residual risk with direct evidence. get_notification_handle succeeds for BOTH
+consumer_pe and the ctrl pe. (idle ~960 EVENT/s = keepalive/producer-completion traffic on the consumer_pe-
+connected DPU→DPA producer, dpa.c:607; not request traffic.)
+
+⇒ The DPU hot path CAN be converted to event-driven blocking: epoll on {consumer_pe fd, ctrl pe fd} + a timerfd
+for the 1 ms keepalive cadence, drain-then-arm hybrid (poll under load, block when idle). This unlocks the
+biggest idle-CPU win (the DPU ARM full-core busy-spin → ~0% idle). Host `pe_progress_fn` is the lower-risk twin
+(swap its nanosleep(20µs) idle path for epoll). NEXT: implement the real DPU event-loop + measure ARM idle-CPU%
+(busy-poll vs event) and confirm 240K/0-fail non-regression. Probe reverted; baked config restored (-l 40).
+
+---
+
+## 2026-06-22 — Idle wedge: two root causes found + fixed (DPA re-arm + ARM event-loop re-poll)
+
+**Symptom (user report):** after deploy + idle > threshold, first load `dpumesh 220000 10 8192`
+returned `0.0 RPS, OK/Fail 0/4400` (total wedge). DPU log silent at `-l 40`.
+
+**Bug 1 — DPA EU `reschedule()` without `request_notification`** (device/dpa_kernel.c run_dma_manager).
+DOCA contract (doca_dpa_dev.h:544 + dpa_initiator_target sample) requires re-arming both completion
+contexts before yielding, else a parked EU is never re-triggered by the 1 ms DPA_MSG_WAKE.
+Fix: arm consumer_comp + producer_comp before reschedule (idle branch only → hot path byte-identical).
+Validated on **busy-poll (EVENT_LOOP=0)**: 30K/100K/200K all 0-fail, ceiling ~199K.
+
+**Bug 2 — ARM event-loop driver wedge at non-saturating load** (EVENT_LOOP=1, dpu_worker.c epoll loop).
+HEISENBUG (debug counters masked it; counters proved timerfd=1000/s, wake_send_fail=0, consumer_pe wakes
+prompt). Root cause: drain→arm→block race — a FWD_DONE landing between last drain and request_notification
+isn't guaranteed to make the PE fd readable, so the ARM blocks on pending work; the stranded completion
+delays recycling the per-EU recv slot → EU starves → permanent compounding wedge. 220K-saturation masked it
+(loop never reaches epoll_wait). Busy-poll never hit it (re-polls continuously).
+Fix: **arm → re-poll → block** (after arm, dpu_drain_iteration once; if progress, clear+continue, don't sleep).
+
+**Validation (EVENT_LOOP=1, both fixes, -l 40, fair 1-core/pod, 8KB):**
+
+| test | Achieved RPS | OK/Fail |
+|---|---|---|
+| back-to-back 30K ×8 | ~29,740 | 180000 / **0** each |
+| 100K | 99,460 | 1000000 / **0** |
+| 200K | 198,920 | 2000000 / **0** |
+| 90s idle → cold 30K | 29,801 | 240000 / **0** |
+| **90s idle → cold 220K (user's exact failing cmd)** | **218,754** | **2200000 / 0** |
+| 3× 30K after the 220K run | ~29,740 | 180000 / **0** each |
+
+Unfixed event-loop baseline wedged on run #2 (20–30 RPS, 300/600). Deploy requires `DPUMESH_EVENT_LOOP=1`
+(.env unset → default 0 = busy-poll).
+
+---
+
+## 2026-06-23 — Phase A: host pe_progress spin → epoll (DPUMESH_HOST_EPOLL)
+
+Goal: reduce host CPU from the polling/while loops (user directive: "notification 올 때만 pe_progress").
+Change: `pe_progress_fn` (dpumesh_doca.c) spin+nanosleep(20µs) → **epoll on the host comch PE notification
+handle** (drain→arm→re-poll→block). Safe because the host comch PE receives ONLY real completions
+(REV_DONE/TX_ACK) — no silent-wake path (unlike the DPU forward ring). Env-gated `DPUMESH_HOST_EPOLL`
+(default 0). DPU = busy-poll (EVENT_LOOP=0, stable), DPA=4/K=2, 8KB, fair-pin.
+
+A/B latency sweep (0-fail both, achieved ≈ target):
+
+| target | EPOLL=0 p99/p999 (ms) | EPOLL=1 p99/p999 (ms) |
+|---:|---|---|
+| 30K  | 2.17 / 12.99 | 2.98 / 3.10 |
+| 100K | 2.58 / 9.97  | 2.61 / 3.02 |
+| 200K | **46.46 / 57.74** | **2.83 / 4.69** |
+
+Idle host CPU (per-thread top, 2nd sample): echo 7%→6%, bench ~2-3%→**0%** (pe_progress thread 0% under
+epoll). pe_progress idle savings modest (~2-3%/pod; old spin already had a nanosleep backoff).
+
+VERDICT: **big win, but mostly via TAIL LATENCY not idle CPU.** The spinning pe_progress was contending
+for the pinned core and inflating tails — 200K p99 46ms→2.8ms (~16×), p999 58ms→4.7ms. CPU-wise the real
+remaining host idle consumer is the 3 echo poll_rx workers (~6%), which HOST_EPOLL does NOT touch (separate
+throughput-sensitive app-side spin — needs poll_rx→cond, a throughput tradeoff). DPU ARM still busy-poll
+(~full core) — that's Phase B (host enqueue→comch kick so the ARM epoll wakes on real forward data, killing
+the racy 1ms keepalive + idle wedge).
+
+---
+
+## 2026-06-23 — DPU ARM event-driven (epoll + 1ms keepalive) + EU park+re-arm+re-scan: idle wedge GONE
+
+User decision: keep the 1ms DPU→DPA keepalive but make the DPU ARM epoll-based (not busy-poll).
+Config (default EVENT_LOOP=1): DPU ARM = epoll over {consumer_pe, ctrl_pe} with a 1ms epoll-timeout that
+re-sends DPA_MSG_WAKE every 1ms; DPA EU = park(reschedule) on idle, RE-ARM both completion contexts
+(request_notification consumer+producer) + RE-SCAN rings before parking; host pe_progress = epoll (Phase A).
+
+KEY FIX vs all prior wedging configs: the EU **re-scan after re-arm** (catches a silent desc->valid=1 that
+lands during the re-arm window) — prior event-loop had re-arm but NOT the re-scan → wedged after multi-min idle.
+
+Results (8KB, fair-pin, DPA=4/K=2):
+- 30K x3 back-to-back: 180000/0 each.
+- DPU ARM idle CPU: **~2%** (epoll sleeps between 1ms ticks; vs busy-poll ~100% full core).
+- **150s idle → cold 30K: 29,801 RPS, 240000/0, p99 3.83ms (NO WEDGE)**.
+- cold 200K: 198,929 RPS, 2000000/0, p99 3.48ms (throughput intact).
+
+Caveat: 150s passed; prior failure was after "several minutes" — longer-idle (7min) re-validation pending.
+
+---
+
+## 2026-06-23 — DPA EU grace-period polling: p50 → sub-ms (poll continuously, park only on sustained idle)
+
+User insight: the DPA EU is dedicated FlexIO silicon (zero ARM/host CPU), so it should POLL as continuously as
+possible for latency; parking on every empty drain (prior config) was too eager → parked in inter-request gaps
+at moderate load → ~1ms WAKE wait per hop → p50 ~2ms.
+
+Change (dpa_kernel.c run_dma_manager): consecutive-empty-drain counter; park (reschedule + re-arm + re-scan)
+ONLY after IDLE_SPINS_BEFORE_PARK=262144 consecutive empty drains. Under any real load the gap << grace window
+→ counter resets every request → EU NEVER parks → continuous polling → no park/WAKE latency. At sustained idle
+the counter hits the threshold → park (satisfies the ~120s FlexIO watchdog). ARM unchanged (epoll + 1ms keepalive).
+
+Results (8KB, fair-pin, DPA=4/K=2, EVENT_LOOP=1):
+
+| target | p50 (ms) | p99 (ms) | p999 (ms) | OK/Fail |
+|---:|---|---|---|---|
+| 30K  | **0.21** (was 2.03) | 0.54 | 3.55 | 300000/0 |
+| 100K | **0.23** (was 2.12) | 0.43 | 5.66 | 1000000/0 |
+| 200K | **0.31** (was 1.59) | 38.83 | 55.58 | 2000000/0 |
+| 90s idle → cold 30K | **0.22** | — | — | 240000/0 |
+
+→ p50 ~10× better (sub-ms), 0-fail, idle-stable (90s). CAVEAT: 200K p99/p999 (38/55ms) regressed vs the
+park config (3.5ms) — high-load tail from continuous-poll PCIe contention (bench.md §3.3) and/or the 1ms
+keepalive overhead (unnecessary under load since the EU never parks there); to verify/tune. Median-vs-tail trade.
+
+### 200K tail re-check (5 runs) — the p99 "regression" was SATURATION NOISE, not a grace-period cost
+
+grace-period config, 200K x5: p50 = 0.30/0.30/0.30/0.30/0.31ms (rock-stable); p99 = 31.55/28.41/19.35/**0.62**/35.74ms
+(run #4 = 0.62ms!); all 0-fail. → the p99 swings 0.6–36ms run-to-run because 200K sits just under the ~220K
+ceiling (bursty queueing at the saturation knee), NOT a deterministic grace-vs-park regression — one grace run
+beat the park config's single 3.5ms sample. CORRECTION to the prior entry: grace-period does NOT inherently
+worsen the tail; the high-load tail is a saturation-edge artifact. Normal load (30K/100K) p99 stays 0.4–0.5ms.
+Verdict: grace-period polling is a clean win (p50 ~0.3ms stable, idle-stable, 0-fail).
+
+### Max-RPS ramp (grace-period config, DPA=4/K=2, 8KB, default conns)
+
+| target | achieved | p50 | p99 | OK/Fail | verdict |
+|---:|---:|---:|---:|---|---|
+| 200K | 198,660 | 0.31 | 35.03 | 0 fail | ok (p99=saturation noise) |
+| **240K** | **238,381** | **0.35ms** | **0.69ms** | **0 fail** | **sustainable max (clean)** |
+| 280K | 252,934 | 417ms | 830ms | 0 fail | overload (latency explodes) |
+| 320K | 251,233 | 1065ms | 2111ms | 8071 fail | throughput ceiling ~252K |
+| 360K | 137,162 | 1727ms | 3397ms | 1.3M fail | collapse |
+| 400K | 136,841 | 2246ms | 4521ms | 1.5M fail | collapse |
+
+→ **Sustainable max ≈ 240K** (238K achieved, p50 0.35ms / p99 0.69ms, 0-fail). Throughput hard ceiling ≈ 252K
+(280K/320K both plateau ~252K but latency unusable). Beyond ~320K → overload collapse (achieved drops to 137K).
+Recovery: 30K x2 after the 400K overload = 180000/0, p50 0.22ms — full recovery, no slot-leak/wedge.

@@ -251,11 +251,15 @@ start_dpu() {
     # 4 EUs; K=4 is flat — the DPA op-rate caps ~810K dma_copy/s). needs
     # DPA_THREADS >= K. bench/echo host pods must use the SAME value (apply_k8s).
     local rings_per_pod="${DPUMESH_RINGS_PER_POD:-2}"
-    step "=== Starting dpumesh_dpu (DPA EU threads=$dpa_threads, rings_per_pod=$rings_per_pod) ==="
+    # Event-driven DPU main loop (default 1): the DPU ARM sleeps on epoll over the
+    # PE notification handles, woken only by real DPA→DPU completions (the EU
+    # busy-loops, so no WAKE/timerfd needed). 0 = legacy busy-poll fallback.
+    local event_loop="${DPUMESH_EVENT_LOOP:-1}"
+    step "=== Starting dpumesh_dpu (DPA EU threads=$dpa_threads, rings_per_pod=$rings_per_pod, event_loop=$event_loop) ==="
     stop_dpu
     ssh "$DPU_HOST" "cat > /tmp/start_dpu_bench.sh << 'LAUNCHER'
 #!/bin/bash
-screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_DPA_THREADS=$dpa_threads DPUMESH_RINGS_PER_POD=$rings_per_pod ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
+screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_DPA_THREADS=$dpa_threads DPUMESH_RINGS_PER_POD=$rings_per_pod DPUMESH_EVENT_LOOP=$event_loop ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
 sleep 2
 pgrep -f 'dpumesh_dpu.*03:00' || echo NO_PID
 LAUNCHER
@@ -437,6 +441,7 @@ spec:
         - { name: BENCH_DST_POD_ID, value: "11" }
         - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
         - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
+        - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
         - { name: ASYNC_THREADS, value: "${ASYNC_THREADS:-4}" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리 (CFS quota 미사용).
@@ -475,6 +480,7 @@ spec:
         - { name: ECHO_THREADS, value: "${ECHO_THREADS:-3}" }
         - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
         - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
+        - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리.
         volumeMounts:
@@ -841,6 +847,12 @@ case "$CMD" in
         # Read-only tail of the dpumesh_dpu log on the DPU. $2 = lines (default 40).
         n="${2:-40}"
         ssh "$DPU_HOST" "echo '$DPU_PASS' | sudo -S tail -$n $DPU_LOG" 2>&1 | sed 's/^\[sudo\][^:]*: *//'
+        ;;
+    dpucpu)
+        # Read-only per-thread CPU snapshot of dpumesh_dpu on the DPU ARM (2 top
+        # samples 1s apart; the 2nd is the accurate one). Compares the busy-poll
+        # driver (full-core spin) vs the event-loop driver (epoll sleep).
+        dpu_sudo 'pid=$(pgrep -x dpumesh_dpu | head -1); [ -z "$pid" ] && { echo "dpumesh_dpu not running"; exit 0; }; echo "=== dpumesh_dpu pid=$pid per-thread %CPU (2nd of 2 samples) ==="; top -bH -d 1 -n 2 -p "$pid" | awk "/ PID +USER/{n++} n==2{print}"'
         ;;
     status)
         show_status
