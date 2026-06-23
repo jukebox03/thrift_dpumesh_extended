@@ -1314,3 +1314,332 @@ Verdict: grace-period polling is a clean win (p50 ~0.3ms stable, idle-stable, 0-
 → **Sustainable max ≈ 240K** (238K achieved, p50 0.35ms / p99 0.69ms, 0-fail). Throughput hard ceiling ≈ 252K
 (280K/320K both plateau ~252K but latency unusable). Beyond ~320K → overload collapse (achieved drops to 137K).
 Recovery: 30K x2 after the 400K overload = 180000/0, p50 0.22ms — full recovery, no slot-leak/wedge.
+
+---
+
+## 2026-06-23 — DEBUG: EVENT_LOOP=1 long-idle wedge (0 RPS / all-fail, needs redeploy)
+
+**Symptom.** `DPUMESH_EVENT_LOOP=1` deploy + `dpumesh 240000 10 8192`: works fine initially and under load
+(238K 0-fail validated), but after a LONG idle (multi-minute; 90s was NOT enough — see ramp entry above) the
+first test returns `Achieved RPS 0.0, OK/Fail 0/4800`. Permanent until redeploy.
+
+**Root cause (static analysis, dpa_kernel.c `run_dma_manager` park/wake).** NOT the ARM event loop — that
+loop has a 1ms epoll timeout backstop, so it always re-drains + re-sends the keepalive WAKE and cannot wedge.
+The wedge is the **DPA EU park/wake re-scan race**:
+
+```
+} else if (++idle_spins >= IDLE_SPINS_BEFORE_PARK) {     // EU parks every ~262ms of idle
+    request_notification(consumer_comp);   // arm (one-shot edge)
+    request_notification(producer_comp);
+    if (drain_all_rings(thread_arg) == 0)  // re-scan ALSO calls handle_msgs() → drains consumer comps
+        reschedule();                      // ...but only checks DMA count, ignores drained WAKE
+    idle_spins = 0;
+}
+```
+
+`drain_all_rings()` internally calls `handle_msgs()`, which drains+acks the ARM's 1ms `DPA_MSG_WAKE`. If a
+WAKE lands in the arm→reschedule window, the re-scan **consumes the very wake-signal** yet returns 0 DMA calls,
+so the EU parks anyway — with its one-shot notification already fired-and-consumed → **parked + disarmed**.
+Subsequent WAKEs no longer trigger an activation; they pile up in the DPA consumer completion queue. With
+`CC_DPA_MAX_MSG_NUM=1024` recv credits, after ~1024 undrained WAKEs (~1s at 1kHz) the ARM producer runs out of
+recv credit and **can no longer post any WAKE at all** → permanent wedge needing redeploy.
+
+Why "after LONG idle": the EU parks every ~262ms of idle (IDLE_SPINS_BEFORE_PARK=262144 × ~1µs/empty-drain).
+The arm→reschedule race window is ~tens-of-ns wide, so each park has a tiny hit probability; ~90s idle (≈340
+parks) rarely hits it, but multi-minute idle (thousands of parks) makes the cumulative probability approach 1.
+This is the previously-recorded "re-poll fix insufficient" bug — the re-poll checks ring DMA, not the WAKE.
+
+**Fix (FIX 2, canonical arm→re-poll→don't-sleep-if-found).** Make `handle_msgs()` return the # of messages
+drained; in the pre-park re-check, reschedule ONLY if BOTH rings AND the consumer-completion queue came up
+empty after arming. A WAKE drained in the race window now means "a signal arrived → loop, re-arm next cycle",
+never "park with a consumed notification". Closes the race under both edge-from-empty and latched-activation
+SDK semantics (see fix commit). EU/host code unchanged otherwise; ARM loop unchanged.
+
+**Validation pending** (user deploy): `EVENT_LOOP=1` deploy → idle ≥5 min → `dpumesh 240000 10 8192` must be
+0-fail. (Results appended below after test.)
+
+### FIX 2 validation — AMPLIFIED STRESS build (IDLE_SPINS_BEFORE_PARK=256, ~1000× more parking), EVENT_LOOP=1
+
+Deployed `DPUMESH_EVENT_LOOP=1 bash test-bench.sh deploy` with FIX 2 + the temporary 256-spin park threshold.
+At 256-spin grace the EU stays HOT under sustained load (inter-arrival ≪ grace) but parks in every idle gap, so
+back-to-back/idle accumulates park/wake cycles ~1000× faster than the production 262144 → a multi-minute wedge
+should reproduce in seconds if the race were still open.
+
+Cold ramp (fresh deploy, never cold-jumped to 240K):
+
+| target | achieved | p50 (us) | p99 (us) | p999 (us) | OK/Fail |
+|---:|---:|---:|---:|---:|---|
+| 30K (cold)  | 29,838  | 227 | 494   | 1,302  | 300000/0 |
+| 100K        | 99,453  | 232 | 317   | 1,780  | 1000000/0 |
+| 200K        | 198,920 | 307 | 29,786| 52,794 | 2000000/0 |
+| 240K        | 238,697 | 353 | 29,739| 40,278 | 2400000/0 |
+| 1K × 30s (park/wake torture) | 998 | 344 | 475 | 1,441 | 30000/0 |
+
+→ Full ramp 0-fail on the stress build; back-to-back (ramp steps are back-to-back with gaps) 0-fail; the
+low-RPS run (EU parks in the inter-request gaps) 0-fail with sub-ms latency. 200K/240K p99 ~29ms = the known
+saturation-edge noise (see prior ramp entry), not a park artifact. Long-idle (300s) soak running next.
+
+**STRESS-BUILD 300s idle soak (the user's exact failing scenario, ~1000× amplified parking):**
+
+| after 300s idle | achieved | p50 (us) | p99 (us) | p999 (us) | OK/Fail |
+|---|---:|---:|---:|---:|---|
+| cold 30K (warmup) | 29,838  | 222 | 487   | 858   | 300000/0 |
+| then 240K         | 238,682 | 357 | 1,099 | 4,592 | 2400000/0 |
+
+→ **DECISIVE: 0 fail, no wedge, no redeploy.** At IDLE_SPINS=256 a 300s idle ≈ ~1M park/wake cycles — orders
+of magnitude more than the few-hundred-to-thousand parks that wedged the OLD code in "several minutes". The
+lost-wakeup race is closed. (240K p99 here = 1.1ms, better than the cold-ramp 240K's 29ms because the 30K
+warmup pre-warmed the rings.) Next: revert IDLE_SPINS→262144 (production) and re-confirm the shipping build.
+
+### FIX 2 validation — PRODUCTION build (IDLE_SPINS_BEFORE_PARK=262144, shipping config), EVENT_LOOP=1
+
+Reverted the stress override; redeployed `DPUMESH_EVENT_LOOP=1 bash test-bench.sh deploy`. Same FIX 2 code,
+shipping park threshold. Ramp (never cold-jumped to 240K):
+
+| target | achieved | p50 (us) | p99 (us) | p999 (us) | OK/Fail |
+|---:|---:|---:|---:|---:|---|
+| 30K (cold) | 29,838  | 229 | 511    | 1,449  | 300000/0 |
+| 100K       | 99,452  | 233 | 426    | 1,879  | 1000000/0 |
+| 240K       | 238,705 | 346 | 12,909 | 24,748 | 2400000/0 |
+
+→ 0-fail. 600s (10-min) idle soak running next — exceeds the "several minutes" that triggered the original wedge.
+
+**PRODUCTION 600s (10-min) idle soak + exact original command:**
+
+| test | achieved | p50 (us) | p99 (us) | p999 (us) | OK/Fail |
+|---|---:|---:|---:|---:|---|
+| after 600s idle: cold 30K (warmup) | 29,838  | 230 | 496    | 860    | 300000/0 |
+| then 240K                          | 238,697 | 347 | 45,538 | 54,742 | 2400000/0 |
+| **exact orig cmd: `dpumesh 240000 10 8192`** | **238,676** | **348** | **674** | **1,448** | **2400000/0** |
+
+→ **RESOLVED.** 10-min idle (exceeds the "several minutes" that wedged the old build) → 0 fail. The literal
+failing command (`dpumesh 240000 10 8192`, which returned `0/4800`) now returns 2.4M/0. Shipping config =
+EVENT_LOOP=1 + IDLE_SPINS_BEFORE_PARK=262144 + FIX 2 (handle_msgs returns count; pre-park re-scan parks only if
+BOTH the consumer-completion queue AND the rings are empty → a WAKE in the arm→reschedule window is detected,
+never silently consumed). 200K/240K p99 swings (0.7–45ms) remain saturation-edge noise, unchanged by the fix.
+
+---
+
+## 2026-06-24 — Limit + CPU/DPU + latency characterization (FIX 2 prod build, EVENT_LOOP=1, DPA=4/K=2, 8KB)
+
+### Latency-vs-load curve (each 10s, fair pin)
+
+| target | achieved | p50 (us) | p99 (us) | p999 (us) | OK/Fail |
+|---:|---:|---:|---:|---:|---|
+| 1K   | 995     | 371 | 497   | 867   | 10000/0 |
+| 10K  | 9,946   | 252 | 499   | 1,245 | 100000/0 |
+| 30K  | 29,839  | 233 | 510   | 879   | 300000/0 |
+| 60K  | 59,671  | 222 | 309   | 1,065 | 600000/0 |
+| 100K | 99,450  | 230 | 317   | 5,896 | 1000000/0 |
+| 150K | 149,168 | 268 | 437   | 673   | 1500000/0 |
+| 200K | 198,892 | 295 | 443   | 626   | 2000000/0 |
+| 240K | 238,669 | 340 | 586   | 1,272 | 2400000/0 |
+
+### Ceiling probe
+
+| target | achieved | p50 (us) | p99 (us) | OK/Fail | verdict |
+|---:|---:|---:|---:|---|---|
+| 260K | 256,039 | 622     | 67,857    | 2.6M/0    | 0-fail but p99 collapses (knee) |
+| 280K | 257,860 | 418,456 | 832,886   | 2.8M/380  | overload |
+| 300K | 257,308 | 798,317 | 1,572,452 | 3.0M/373  | overload |
+| 320K | 258,508 | 1,170,388| 2,318,966| 3.19M/5289| overload |
+| recover 30K | 29,839 | 231 | — | 300000/0 | full recovery, no slot-leak |
+
+→ **Sustainable max ≈ 240K** (p50 340µs, p99<1.3ms, 0-fail). **Throughput hard ceiling ≈ 257–258K** (achieved
+plateaus there regardless of target). At 240K×4 dma_copy/RTT ≈ 960K ops/s; 257K×4 ≈ 1.03M ops/s ≈ the DPA
+DMA-engine op-rate ceiling (cf. [[project_n8_dma_engine_ceiling]] ~810K–1.6M). Beyond ceiling latency explodes (M/M/1).
+
+### CPU / DPU usage (idle vs 240K load)
+
+| component | idle | 240K load |
+|---|---|---|
+| Host client (core0, bench-dpumesh) | ~0% | **52.3%** (usr 33.2 / sys 19.2) |
+| Host echo server (core1, echo-dpumesh) | ~0% | **21.2%** (usr 13.3 / sys 7.9) |
+| DPU ARM main thread (event loop) | ~1–2% | **~98% (≈1 core)** |
+| DPU ARM worker threads (×2) | ~1% / 0% | ~1% / 0% |
+| DPA EU | dedicated HW EU (×4, K=2) | dma_copy op-rate ceiling ~1M/s |
+
+→ Idle: host ~0% (HOST_EPOLL sleeps), DPU ARM ~2% (event-loop epoll). Load: DPU ARM busy-spins ~1 full core
+(under load `dpu_drain_iteration` always progresses → never hits epoll_wait; event-loop saves CPU only at idle).
+Host client core is the heaviest host consumer (52%); none of host client/server/ARM is saturated at 240K →
+the ceiling is the DPA dma_copy op-rate (4 DMAs/RTT), NOT a host or ARM CPU wall.
+
+### Latency decomposition — payload-size sweep at 30K (EU hot, no queueing)
+
+| size (B) | p50 (us) | p99 (us) |
+|---:|---:|---:|
+| 64   | 226 | 496 |
+| 512  | 217 | 480 |
+| 1024 | 227 | 496 |
+| 2048 | 228 | 500 |
+| 4096 | 224 | 494 |
+| 8192 | 234 | 503 |
+
+→ **p50 is FLAT vs payload size** (217–234µs, within noise). 8KB (4×8KB DMA) adds only ~8µs over 64B. So the
+~220µs floor is **fixed per-RTT overhead, NOT data-transfer time** — DMA bandwidth is not the latency limiter.
+The floor = 4 dma_copy call/completion setups + fwd+rev completion relay (DPA→ARM→host) + EU/host polling
+cadence + 2 host network stacks + PCIe round-trips. Latency reduction must attack FIXED OVERHEAD / hop count,
+not transfer size. (Also: 1K RPS p50=371µs > 30K p50=222µs because the EU parks between requests at <~4K RPS
+and pays the keepalive park/wake tax; ≥10K it stays hot.)
+
+### Context: TCP+Envoy-sidecar baseline (fair 1-core, app+sidecar shared, 8KB) — same harness
+
+| target | DPUmesh p50 | TCP+sidecar p50 | TCP OK/Fail |
+|---:|---:|---:|---|
+| 1K   | 371us | 1,194us (1.2ms)  | 10000/0 |
+| 30K  | 233us | 9,347us (9.3ms)  | 300000/0 (p99 205ms) |
+| 100K | 230us | 54,488us (54ms)  | 15/1000 (collapsed) |
+
+→ DPUmesh ≈ **40× lower p50 at 30K** and sustains 240K 0-fail; TCP+Envoy collapses by ~100K (1 shared core,
+sidecar contention = the Istio tax). DPUmesh also frees the host core (transport on DPU). The ~220us DPUmesh
+floor is already far below the sidecar path — the analysis below targets shaving that floor further.
+
+### Deep latency attribution (4-lens code+data workflow) — where the ~220µs RTT floor goes
+
+TOTAL is MEASURED (220µs p50 floor); the per-stage split is an ESTIMATE (Med confidence) — the lenses agreed on
+direction but not exact per-hop µs. Allocation that closes to the measured 220µs (full wall-clock RTT model):
+
+| # | stage (one RTT) | ~µs | reducible |
+|---|---|---:|---|
+| 1 | client post (lock-free tx_alloc + silent valid=1 store, no doorbell) | 3 | no (already lean) |
+| 2 | FWD leg1 host→DPU: EU poll-detect + 8KB dma_copy(~2µs) + FWD_DONE | 28 | partial (poll cadence) |
+| 3 | FWD_DONE DPA→ARM completion + ARM route(O(1)) + post delivery | 30 | partial (ARM=2.8% RTT) |
+| 4 | FWD leg2 DPU→echo: poll-detect + 8KB dma_copy | 28 | partial |
+| 5 | echo poll_rx spin + 3B copy + reply enqueue | 18 | no (lean poll_rx) |
+| 6 | REV leg3 echo→DPU + leg4 DPU→client + their completions | 84 | partial (mirror of fwd) |
+| 7 | ARM→client REV_DONE relay + host PE reap + HOST_EPOLL wakeup | 29 | partial |
+| | **TOTAL** | **~220** | |
+
+**Dominant buckets:** (1) the 4 DMA legs' PCIe poll-detect ≈ 112µs (silent valid=1 store, no doorbell — host→DPA
+wake SDK-foreclosed), (2) the 2 DPA→ARM→client completion relays ≈ 60µs (completion can't go DPA→host direct),
+(3) the structural 4-leg chain (host→DPU→echo→DPU→host; host→host foreclosed). NOT data transfer (flat vs size),
+NOT host/ARM CPU (none saturated).
+
+**Reduction roadmap (proposed, pending implement+measure):**
+- Quick wins: (A) load-adaptive REV_DONE partial-batch flush → ~3-6µs p50 + big p99 win at mid-load, but must be
+  load-gated vs the +12-18% throughput batching buys [[project_batch_rev_done]]; (B) HOST_EPOLL=0 → ~2-4µs p50
+  but 16× p99 regression + burns a core (floor-measure only, NOT prod) [[project_host_epoll_tail_win]];
+  (C) pin host PE thread off the worker core → ~1-2µs + sys% relief, throughput-neutral.
+- Structural: (D) tighten DPA EU drain cadence (scan just-signaled ring first; keep single per-iter read_inv) →
+  ~12µs, the ONLY lever hitting the dominant ~112µs bucket; risk = extra PCIe read-fence could lower the
+  ~257K op-rate ceiling → must guard throughput.
+- Non-levers: host→host (foreclosed [[project_no_host_to_host]]), ARM-relay removal (foreclosed
+  [[project_completion_required]]), more EUs/cores (throughput, not single-RTT latency).
+- Realistic combined floor: ~220µs → ~195-205µs (7-12%). Throughput ceiling (DPA ~1.03M dma_copy/s) is orthogonal.
+
+**Highest-leverage first = Lever D**, decision rule: accept only if 30K p50 drops ≥10µs AND 260K ceiling stays
+≥257K AND the 1K-vs-30K park tax is unchanged; else revert to A+C (throughput-safe). Exact per-hop µs would need
+DPA-side timestamping (counter in DPA mem read by ARM — avoids DPU-log flood).
+
+### Per-load CPU/DPU scaling (8KB, fair pin, FIX2 prod build)
+
+| rate | host client core0 | host echo core1 | DPU ARM (Σ threads) | achieved |
+|---:|---:|---:|---:|---:|
+| 30K  | 18% | 18% | **39%** | 29,948 |
+| 60K  | 13% | 16% | **67%** | 59,892 |
+| 100K | 32% | 19% | **81%** | 99,795 |
+| 150K | 44% | 36% | **88%** | 149,716 |
+| 200K | 46% | 30% | **96%** | 199,634 |
+| 240K | 51% | 20% | **98%** | 239,580 |
+
+→ **DPU ARM rises steeply toward 1-core saturation (98% @240K)** — the most-loaded host-managed component;
+host client (51%) and echo (≤36%) keep headroom. The ARM is the single event-loop drain thread: under load
+`dpu_drain_iteration` keeps returning progressed=1 so it busy-spins (never sleeps on epoll). NOTE: 98% is the
+spin, not proven compute-bound — [[project_dpu_arm_built_o0]] showed -O0→-O2 throughput-NEUTRAL, so the ARM is
+busy POLLING the PEs, not CPU-starved on useful work. But at the ~257K ceiling the ARM single thread is
+effectively continuously busy → it is a co-candidate for the ceiling alongside the DPA op-rate (~1.03M dma_copy/s).
+At low load (30K) ARM=39% because work is intermittent → it sleeps on epoll part of the time (event-loop CPU win
+is real at low load, gone at high load).
+
+### Host per-thread CPU split @240K (logic vs data-plane), fair 1-core pin
+
+Bench client daemon threads (peak %CPU across the load window; sum > mpstat avg because peaks aren't simultaneous):
+- pe_progress thread (DATA PLANE: comch completion reaping, HOST_EPOLL): **~10%**
+- 4× async worker threads (LOGIC: request gen + poll_response harvest): **~53%** (~13-14% each)
+- main/control thread: ~0%
+
+→ On the HOST, **logic dominates (~53%), data-plane is light (~10%)** because HOST_EPOLL lets the completion
+poller sleep. So the host 1-core (core0=51% @240K) is mostly the request-generation/harvest logic, not transport.
+Implication: pinning data-plane to a separate core frees little (it's only 10%); and host core0 is NOT saturated
+at 240K (51%) → the host 1-core cap is NOT the throughput binder. (Echo side core1 ≤36%, even lighter via poll_rx.)
+
+### Multi-core host test (dpumesh-hw: bench cores 0,4 + echo 1,5) @240K — the "separate cores" idea
+
+| | core0 | core4 | core1 | core5 | achieved | p50 | p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| HW (2-core/side) | 26% | 25% | 22% | 22% | 239,560 | 323us | 618us |
+| (fair 1-core ref) | 51% | — | 20% | — | 238,669 | 340us | 586us |
+
+→ Bench client total CPU is the SAME ~51% on 1 core or split 26+25 across 2 cores → **giving the host more cores
+does NOT lift throughput** (239K≈238K), only halves per-core util + slightly improves p50 (323 vs 340us, less
+worker/scheduler contention). CONFIRMS the host 1-core is NOT the throughput binder; the ceiling is DPU ARM /
+DPA op-rate. (Pinning data-plane to its own core would free only ~10% — not worthwhile for throughput; useful
+only for cleaner attribution.)
+
+### ITEM 2 — Multi-DPA-thread / EU-sharding sweep (measured, 2-pod, 8KB)
+
+Knobs: `DPUMESH_DPA_THREADS` (N = EU count, env, deploy-time, clamp[1,8]), `DPUMESH_RINGS_PER_POD` (K = rings/pod,
+env, K≤N), `MAX_DPA_RINGS=8` (compile cap). Topology: ring j of pod p → EU (p*K+j)%N; 2-pod active EUs = min(2K,N).
+
+| config | active EUs | 30K p50 | ceiling (achieved) | knee behavior |
+|---|---:|---:|---:|---|
+| DPA=1, K=1 | 1 | 247us | **~72K** | 80K→overload (single-EU trap) |
+| DPA=4, K=2 (default) | 4 | 233us | **~257K** | 240K 0-fail clean; 260K p99 67ms |
+| DPA=8, K=4 | 8 | 266us | **~253-256K** | 260K 600-fail/118ms (slightly WORSE) |
+
+→ **EU count is a throughput resource only up to ~4 EUs**: 1 EU=72K → 4 EU/K2=257K (~3.5×). Beyond that,
+**8 EU/K4 does NOT exceed 257K** — the shared DPA dma_copy op-rate (~1M ops/s = 257K×4) is the hard wall, and
+K=4 is slightly worse (per-ring DPU/host buffer & admission rq_depth split K-ways → earlier throttle). For a
+2-pod pair, N>2 only helps if K>1 (else pod%N locks to 2 EUs). **Sweet spot = the current default DPA=4/K=2.**
+Latency floor is ~EU-count-independent (233-266us). NOTE: more EUs all funnel completions through the single
+ARM drain thread (98% @240K) — Amdahl on that serial bridge + op-rate ceiling = why scaling is sub-linear.
+
+### ITEM 3 — Batching options (all compile-time #defines; need rebuild, NOT env)
+
+Knobs: `BATCH_REVDONE_MAX=16` (reverse-done coalesce, comch_common.h, **on critical RTT path**),
+`BATCH_TXACK_MAX=14` (forward TX-ACK coalesce, off critical path), `RING_BATCH_CAP=32` (descs/ring/EU-iter),
+`HANDLE_MSGS_EVERY=32` + `DRAIN_COMPLETIONS_EVERY=8` (DPA poll cadences), `CREDIT_REFRESH_MARGIN=64`.
+Both BATCH_* flush partial batches at the idle/proc==0 tail-flush (dpu_worker.c); under load the ARM busy-spins
+(never proc==0) so batches flush on-full. BATCH_REVDONE is the load-bearing one (only critical-path knob).
+
+**Measured: BATCH_REVDONE_MAX = 1 (disabled) vs 16 (default), DPA=4/K=2, 8KB:**
+
+| target | BATCH=16 (default) | BATCH=1 (off) |
+|---:|---|---|
+| 30K p50  | 233us | **217us** (−16us, no coalesce delay) |
+| 100K p50 | 230us | 223us |
+| 200K p50 | 295us | **1,835us** (PE-reap can't keep up) |
+| 240K achieved | 238K (0-fail) | **200K** (526 fail, p50 928ms) |
+| ceiling | **~257K** | **~200K** |
+
+→ **Reverse batching buys +28% throughput ceiling (200K→257K) for ~16us of low-load latency.** Disabling it
+shaves 16us at 30K but craters the ceiling to 200K and explodes mid-load latency (PE reap = per-RTT host cap
+without coalescing, confirming [[project_batch_rev_done]]). The default 16 is well-chosen (16 already lifts the
+PE-reap above the DPA op-rate wall → ceiling=257K=op-rate; raising to 32 wouldn't help, already op-rate-bound).
+**ACTIONABLE: a LOAD-ADAPTIVE flush (flush-small <100K, full-batch near ceiling) would capture BOTH the ~217us
+floor AND the 257K ceiling** — the one validated latency win (~16us, ~7%) that doesn't cost throughput.
+RING_BATCH_CAP / HANDLE_MSGS_EVERY / DRAIN_COMPLETIONS_EVERY / CREDIT_REFRESH_MARGIN: no isolated sweep; analysis
+says low-leverage (cycle-efficiency knobs), DRAIN_COMPLETIONS_EVERY is the only throughput-sensitive one (guard ≥257K).
+
+### 2026-06-24 CAMPAIGN SUMMARY (bottleneck map + actionable levers)
+
+**Bottleneck map (8KB, 2-pod, FIX2 prod build):**
+- THROUGHPUT ceiling ≈ **257K RPS** = the shared **DPA dma_copy op-rate (~1.03M ops/s, 4 DMA/RTT)**. Co-binder:
+  the single **DPU ARM drain thread** (98% @240K). NOT host CPU (client 52%, echo ≤36%, neither saturated),
+  NOT EU count (8 EU/K4 = same 257K).
+- LATENCY floor ≈ **220µs** = fixed per-RTT overhead (4-leg poll-detect ~112µs + 2 completion relays ~60µs +
+  host stacks). NOT data transfer (flat vs payload), NOT host/ARM CPU.
+
+**What each option does (measured):**
+1. CPU/DPU per load: DPU ARM 39%→98% (30K→240K, busy-spins under load); host client 18%→52%; echo ≤36%; idle
+   host~0%/ARM~2%. Host logic(53%)≫data-plane(10%). Multi-core host = no throughput gain (host not the binder).
+2. DPA threads: 1EU=72K, 4EU/K2=257K (sweet spot=current default), 8EU/K4=no gain (op-rate wall). More EUs/cores
+   are NOT a lever past 4.
+3. Batching: BATCH_REVDONE_MAX=16 buys +28% ceiling (200K→257K) for ~16µs low-load latency. Default well-chosen.
+
+**Actionable levers (ranked):**
+- (best latency win, throughput-safe) **Load-adaptive REV_DONE flush** — flush partial batch at low/mid load,
+  full batch near ceiling → captures BOTH the ~217µs floor (−16µs/−7%) AND the 257K ceiling. MEASURE-VALIDATED
+  tradeoff (BATCH=1 gave 217µs but 200K ceiling; BATCH=16 gave 233µs + 257K → adaptive gets 217µs + 257K).
+- (cleaner attribution only) pin host data-plane (pe_progress, ~10%) to its own core — no throughput gain.
+- Pushing ceiling >257K needs fewer DMA legs/RTT (4→2 = host→host), which is DESIGN-FORECLOSED → ceiling is structural.

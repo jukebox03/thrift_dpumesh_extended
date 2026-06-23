@@ -112,7 +112,12 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
     }
 }
 
-static void handle_msgs(struct dpa_thread_arg *thread_arg)
+/* Returns the number of consumer-completion messages drained this call (WAKE,
+ * RING_ADD, REV_RING_ADD). The pre-park re-scan in run_dma_manager uses this:
+ * a nonzero return after arming means a signal landed in the arm→reschedule
+ * race window, so the EU must NOT park (it would do so with a consumed
+ * one-shot notification → lost wakeup). */
+static uint32_t handle_msgs(struct dpa_thread_arg *thread_arg)
 {
     doca_dpa_dev_comch_consumer_completion_element_t completion;
     struct comch_msg *msg;
@@ -133,6 +138,8 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
         doca_dpa_dev_comch_consumer_completion_ack(consumer_comp, num_msgs);
         doca_dpa_dev_comch_consumer_ack(consumer, num_msgs);
     }
+
+    return num_msgs;
 }
 
 /*
@@ -380,7 +387,11 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
 #define HANDLE_MSGS_EVERY 32
 #define DRAIN_COMPLETIONS_EVERY 8
 
-static int drain_all_rings(struct dpa_thread_arg *thread_arg)
+/* poll_msgs: when 0, this scan does NOT touch the consumer-completion queue
+ * (no handle_msgs). The pre-park re-scan uses poll_msgs=0 so it cannot silently
+ * consume a WAKE that lands in the arm→reschedule window — the caller drains and
+ * COUNTS messages explicitly so a racing wake is detected, not lost. */
+static int drain_all_rings(struct dpa_thread_arg *thread_arg, int poll_msgs)
 {
     int total_dma_calls = 0;
     int found;
@@ -389,7 +400,7 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg)
 
     do {
         found = 0;
-        if ((iter_counter & (HANDLE_MSGS_EVERY - 1)) == 0)
+        if (poll_msgs && (iter_counter & (HANDLE_MSGS_EVERY - 1)) == 0)
             handle_msgs(thread_arg);
         if ((iter_counter & (DRAIN_COMPLETIONS_EVERY - 1)) == 0)
             drain_producer_completions(thread_arg);
@@ -477,19 +488,33 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
      * DPA_MSG_WAKE) — it does NOT self-sustain (measured). Before parking we
      * RE-ARM both attached completion contexts (DOCA contract: without
      * request_notification a newly-arrived completion is not populated/triggered,
-     * so the WAKE would not re-activate the parked EU), then RE-SCAN the rings once
-     * — this closes the race where a silent host desc->valid=1 store lands during
-     * the re-arm window. Canonical ack→request_notification→reschedule idiom. */
+     * so the WAKE would not re-activate the parked EU), then RE-SCAN once — both
+     * the rings (closes the silent host desc->valid=1 store race) AND the consumer
+     * completion queue. We park ONLY if BOTH come up empty. A WAKE/RING_ADD drained
+     * by the re-scan's handle_msgs means a signal landed in the arm→reschedule
+     * window: parking then would consume the one-shot notification yet still sleep
+     * → lost wakeup → the EU is parked+disarmed and subsequent WAKEs never
+     * re-activate it (they fill the consumer queue until recv credits exhaust →
+     * permanent wedge needing redeploy). Counting drained messages here turns that
+     * into "loop, re-arm next cycle" — the canonical arm→re-poll→don't-sleep-if-
+     * found idiom applied to BOTH wake sources. */
     while (1) {
         handle_msgs(thread_arg);
-        int chunks = drain_all_rings(thread_arg);
+        int chunks = drain_all_rings(thread_arg, 1);
         drain_producer_completions(thread_arg);
         if (chunks > 0) {
             idle_spins = 0;                       /* work found → keep polling HOT */
         } else if (++idle_spins >= IDLE_SPINS_BEFORE_PARK) {
             doca_dpa_dev_comch_consumer_completion_request_notification(thread_arg->dpa_consumer_comp);
             doca_dpa_dev_completion_request_notification(thread_arg->dpa_producer_comp);
-            if (drain_all_rings(thread_arg) == 0)   /* re-scan after re-arm */
+            /* Re-scan after arming. handle_msgs() drains+COUNTS the consumer queue
+             * so a WAKE/RING_ADD that landed in the arm window is DETECTED; the ring
+             * re-scan runs with poll_msgs=0 so it cannot silently consume a WAKE.
+             * Park only if BOTH sources came up empty — otherwise loop and re-arm
+             * next cycle (never park with a consumed one-shot notification). */
+            uint32_t msgs = handle_msgs(thread_arg);
+            int rescan = drain_all_rings(thread_arg, 0);   /* rings only (silent host writes) */
+            if (msgs == 0 && rescan == 0)
                 doca_dpa_dev_thread_reschedule();   /* park; woken by WAKE completion */
             idle_spins = 0;                       /* reset after wake */
         }
