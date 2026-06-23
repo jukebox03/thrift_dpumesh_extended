@@ -1643,3 +1643,53 @@ says low-leverage (cycle-efficiency knobs), DRAIN_COMPLETIONS_EVERY is the only 
   tradeoff (BATCH=1 gave 217µs but 200K ceiling; BATCH=16 gave 233µs + 257K → adaptive gets 217µs + 257K).
 - (cleaner attribution only) pin host data-plane (pe_progress, ~10%) to its own core — no throughput gain.
 - Pushing ceiling >257K needs fewer DMA legs/RTT (4→2 = host→host), which is DESIGN-FORECLOSED → ceiling is structural.
+
+### 2026-06-24 — Experiment: event-driven ARM (epoll-block under load) vs busy-spin (DPUMESH_EVENT_BLOCK)
+
+Added diagnostic knob DPUMESH_EVENT_BLOCK (default 0). =1 forces the ARM event loop through epoll EVERY iteration
+(skips the busy-poll spin fast-paths `if(progressed)continue` + the re-poll continue) → fully event-driven ARM,
+like the host. Tests "what if the DPU ARM blocked on epoll under load instead of spinning?"
+
+| target | PRODUCTION (spin under load, EVENT_BLOCK=0) | EVENT_BLOCK=1 (event-driven) |
+|---:|---|---|
+| 30K p50  | 233us | **676us** (~3× worse) |
+| 100K | 99,450 achieved | **55,895 achieved**, p50 3.3s (collapsed) |
+| 240K | 238,719 / p50 340us | **56,592 achieved**, p50 5.7s |
+| ceiling | **~257K** | **~56K** (4.5× WORSE) |
+
+→ **DECISIVE: event-driven ARM is catastrophic** — ceiling collapses 257K→~56K and latency explodes (30K 233→676us,
+high-load to multi-second). Each loop iteration's epoll_wait + doca_pe_request_notification×2 + clear×2 (~5
+syscalls + CQ doorbell touches) crushes the single ARM drain thread's reap rate. Even at 30K (where prod ARM is
+only 39% = already mostly blocking) it's 3× worse, because prod drains a burst across multiple spin passes before
+blocking, whereas EVENT_BLOCK pays the full arm/epoll/clear cycle PER completion. CONFIRMS the busy-spin-under-load
+design is ESSENTIAL (not a minor opt): the ARM is the central per-RTT relay; spinning reaps completions instantly,
+event-driving adds ~5 syscalls/completion that the ~1µs inter-completion interval cannot absorb. The DPU core is
+dedicated, so spinning it is free; event-driving it to "save" that core would cost 4.5× throughput. Knob left in
+off-by-default (production byte-identical); can be removed.
+
+### 2026-06-24 FINAL — performance-lever analysis (what can actually raise perf)
+
+**Hard wall (measured, one DPU, 2-pod):** ceiling ~257K RPS = DPA dma_copy op-rate (~1.03M ops/s) ÷ 4 DMA/RTT.
+Decisive evidence that NOTHING within the current arch beats it:
+- 8 EU/K4 = 4 EU/K2 = ~256K (op-rate is shared across EUs; more EUs don't add).
+- event-driven ARM = 4.5× WORSE (busy-spin essential, not a waste).
+- host CPU 51%, echo ≤36%, ARM = spin not compute (-O2 neutral) → none is the binder.
+- batching=16 already reaches the op-rate ceiling; more batching can't exceed it.
+
+**Key deduction (no new test needed):** 8 EUs already cap at 256K, so a 2nd pod-pair on the SAME DPU
+(also ~8 EUs) would SHARE the same op-rate → aggregate stays ~256K, NOT 2×. So **more pod-pairs per DPU does
+NOT raise aggregate throughput** — the DMA op-rate is a shared DEVICE wall. (This overturns naive "scale-out
+helps" for a single DPU; the old 4pod_scales gain was on a host/ARM-bound config below the op-rate, not here.)
+
+**Levers, ranked:**
+1. THROUGHPUT step-change = **reduce DMAs/RTT 4→2 via host→host direct DMA** (~2× per DPU + lower latency).
+   FORECLOSED in current design (body staged at DPU); needs a control plane distributing remote mmap handles so
+   the source DPA DMAs straight to the dest host while the DPU still routes on dst_pod_id metadata. The big project.
+2. THROUGHPUT horizontal = **more DPUs** (each adds ~1M ops/s). The only real scale-out (more pairs/EUs/cores on
+   one DPU do not help — measured).
+3. LATENCY = **load-adaptive REV_DONE flush** (~16µs / ~7% at low/mid load, zero throughput cost — measured:
+   BATCH=1 gave 217µs but 200K ceiling; adaptive = 217µs + 257K). The only clean single-RTT win.
+4. (marginal) Lever D EU drain cadence ~12µs but risks the op-rate ceiling; HOST_EPOLL=0 ~2-4µs but 16× p99 + host core.
+
+→ Bottom line: within one DPU you are AT the structural wall (~257K, ~220µs). Free latency win = load-adaptive
+flush. Real throughput gain needs either the host→host re-architecture (≈2×) or more DPUs (horizontal).
