@@ -102,15 +102,13 @@ typedef struct dpm_conn {
 
 /* ===== Endpoint lifecycle (socket + bind + listen, folded) ===== */
 
-/* Create an endpoint bound to `pod_id` with identity `app_name`. Non-blocking
- * native (poll_rx + async_client). Returns NULL on failure (errno set by init).
- * `pod_id` is overridden by env DPUMESH_POD_ID if set. */
+/* Create an endpoint bound to `pod_id` with identity `app_name`. RX is
+ * non-blocking poll-only (the transport has no cond-blocking path). Returns NULL
+ * on failure (errno set by init). `pod_id` is overridden by env DPUMESH_POD_ID. */
 static inline dpm_t *socket_dpumesh(const char *app_name, int pod_id) {
     dpm_t *s = (dpm_t *)calloc(1, sizeof(*s));
     if (!s) return NULL;
     dpumesh_config_t cfg = DPUMESH_CONFIG_DEFAULT;
-    cfg.poll_rx      = 1;   /* server RX: non-blocking dequeue (no cond)   */
-    cfg.async_client = 1;   /* client RX: non-blocking poll_response       */
     if (dpumesh_init(&s->ctx, app_name, pod_id, &cfg) != 0 || !s->ctx) {
         free(s);
         return NULL;

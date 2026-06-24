@@ -489,52 +489,10 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TThreadedServer.cpp.s: cm
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/thrift_static.dir/src/thrift/server/TThreadedServer.cpp.s"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/server/TThreadedServer.cpp -o CMakeFiles/thrift_static.dir/src/thrift/server/TThreadedServer.cpp.s
 
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.o: ../lib/cpp/src/thrift/transport/TDpumeshTransport.cpp
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_31) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.o"
-	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshTransport.cpp
-
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.i"
-	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshTransport.cpp > CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.i
-
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.s"
-	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshTransport.cpp -o CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.s
-
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.o: ../lib/cpp/src/thrift/transport/TDpumeshServerTransport.cpp
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_32) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.o"
-	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshServerTransport.cpp
-
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.i"
-	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshServerTransport.cpp > CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.i
-
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.s"
-	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshServerTransport.cpp -o CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.s
-
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.o: ../lib/cpp/src/thrift/transport/TDpumeshClientTransport.cpp
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_33) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.o"
-	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshClientTransport.cpp
-
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.i"
-	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshClientTransport.cpp > CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.i
-
-lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.s"
-	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TDpumeshClientTransport.cpp -o CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.s
-
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: ../lib/cpp/src/thrift/transport/dpumesh_doca.c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_34) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_31) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/dpumesh_doca.c
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.i: cmake_force
@@ -548,7 +506,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.s: cmak
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.o: ../lib/cpp/src/thrift/transport/doca/common.c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_35) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_32) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/common.c
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.i: cmake_force
@@ -562,7 +520,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.s: cmake
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o: ../lib/cpp/src/thrift/transport/doca/object.c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_36) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_33) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/object.c
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.i: cmake_force
@@ -576,7 +534,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.s: cmake
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/buffer.c.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/buffer.c.o: ../lib/cpp/src/thrift/transport/doca/buffer.c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/buffer.c.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_37) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/buffer.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_34) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/buffer.c.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/buffer.c.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/doca/buffer.c.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/buffer.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/buffer.c
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/buffer.c.i: cmake_force
@@ -590,7 +548,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/buffer.c.s: cmake
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o: ../lib/cpp/src/thrift/transport/doca/ring.c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_38) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_35) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/ring.c
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.i: cmake_force
@@ -604,7 +562,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.s: cmake_f
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o: ../lib/cpp/src/thrift/transport/doca/comch_common.c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_39) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_36) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.c
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.i: cmake_force
@@ -618,7 +576,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.s:
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.o: ../lib/cpp/src/thrift/transport/doca/comch_client.c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_40) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_37) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_client.c
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.i: cmake_force
@@ -632,7 +590,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_client.c.s:
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o: ../lib/cpp/src/thrift/transport/doca/comch_server.c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_41) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_38) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.c
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.i: cmake_force
@@ -646,7 +604,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_server.c.s:
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.o: ../lib/cpp/src/thrift/transport/doca/comch_consumer.c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_42) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_39) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_consumer.c
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.i: cmake_force
@@ -660,7 +618,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o: ../lib/cpp/src/thrift/transport/doca/comch_msgq.c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_43) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_40) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_msgq.c
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.i: cmake_force
@@ -674,7 +632,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_msgq.c.s: c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o: ../lib/cpp/src/thrift/transport/doca/dpa.c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_44) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_41) "Building C object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa.c
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.i: cmake_force
@@ -688,7 +646,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.s: cmake_fo
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipe.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipe.cpp.o: ../lib/cpp/src/thrift/transport/TPipe.cpp
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipe.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_45) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipe.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_42) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipe.cpp.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipe.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/TPipe.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/TPipe.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TPipe.cpp
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipe.cpp.i: cmake_force
@@ -702,7 +660,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipe.cpp.s: cmake_for
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipeServer.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipeServer.cpp.o: ../lib/cpp/src/thrift/transport/TPipeServer.cpp
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipeServer.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_46) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipeServer.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_43) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipeServer.cpp.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipeServer.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/TPipeServer.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/TPipeServer.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TPipeServer.cpp
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipeServer.cpp.i: cmake_force
@@ -716,7 +674,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TPipeServer.cpp.s: cma
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TFileTransport.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TFileTransport.cpp.o: ../lib/cpp/src/thrift/transport/TFileTransport.cpp
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TFileTransport.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_47) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TFileTransport.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_44) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TFileTransport.cpp.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TFileTransport.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/TFileTransport.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/TFileTransport.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TFileTransport.cpp
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TFileTransport.cpp.i: cmake_force
@@ -730,7 +688,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TFileTransport.cpp.s: 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/VirtualProfiling.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/VirtualProfiling.cpp.o: ../lib/cpp/src/thrift/VirtualProfiling.cpp
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/VirtualProfiling.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_48) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/VirtualProfiling.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_45) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/VirtualProfiling.cpp.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/VirtualProfiling.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/VirtualProfiling.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/VirtualProfiling.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/VirtualProfiling.cpp
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/VirtualProfiling.cpp.i: cmake_force
@@ -744,7 +702,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/VirtualProfiling.cpp.s: cmake_fo
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TServer.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TServer.cpp.o: ../lib/cpp/src/thrift/server/TServer.cpp
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TServer.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_49) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TServer.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_46) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TServer.cpp.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TServer.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/server/TServer.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/server/TServer.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/server/TServer.cpp
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TServer.cpp.i: cmake_force
@@ -758,7 +716,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TServer.cpp.s: cmake_forc
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLSocket.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLSocket.cpp.o: ../lib/cpp/src/thrift/transport/TSSLSocket.cpp
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLSocket.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_50) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLSocket.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_47) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLSocket.cpp.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLSocket.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLSocket.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLSocket.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TSSLSocket.cpp
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLSocket.cpp.i: cmake_force
@@ -772,7 +730,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLSocket.cpp.s: cmak
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLServerSocket.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLServerSocket.cpp.o: ../lib/cpp/src/thrift/transport/TSSLServerSocket.cpp
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLServerSocket.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_51) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLServerSocket.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_48) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLServerSocket.cpp.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLServerSocket.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLServerSocket.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLServerSocket.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/TSSLServerSocket.cpp
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLServerSocket.cpp.i: cmake_force
@@ -786,7 +744,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TSSLServerSocket.cpp.s
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/PosixThreadFactory.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/PosixThreadFactory.cpp.o: ../lib/cpp/src/thrift/concurrency/PosixThreadFactory.cpp
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/PosixThreadFactory.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_52) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/PosixThreadFactory.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_49) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/PosixThreadFactory.cpp.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/PosixThreadFactory.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/concurrency/PosixThreadFactory.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/concurrency/PosixThreadFactory.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/concurrency/PosixThreadFactory.cpp
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/PosixThreadFactory.cpp.i: cmake_force
@@ -800,7 +758,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/PosixThreadFactory.c
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Mutex.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Mutex.cpp.o: ../lib/cpp/src/thrift/concurrency/Mutex.cpp
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Mutex.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_53) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Mutex.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_50) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Mutex.cpp.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Mutex.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/concurrency/Mutex.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/concurrency/Mutex.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/concurrency/Mutex.cpp
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Mutex.cpp.i: cmake_force
@@ -814,7 +772,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Mutex.cpp.s: cmake_f
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Monitor.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/flags.make
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Monitor.cpp.o: ../lib/cpp/src/thrift/concurrency/Monitor.cpp
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Monitor.cpp.o: lib/cpp/CMakeFiles/thrift_static.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_54) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Monitor.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_51) "Building CXX object lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Monitor.cpp.o"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Monitor.cpp.o -MF CMakeFiles/thrift_static.dir/src/thrift/concurrency/Monitor.cpp.o.d -o CMakeFiles/thrift_static.dir/src/thrift/concurrency/Monitor.cpp.o -c /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/concurrency/Monitor.cpp
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Monitor.cpp.i: cmake_force
@@ -857,9 +815,6 @@ thrift_static_OBJECTS = \
 "CMakeFiles/thrift_static.dir/src/thrift/server/TSimpleServer.cpp.o" \
 "CMakeFiles/thrift_static.dir/src/thrift/server/TThreadPoolServer.cpp.o" \
 "CMakeFiles/thrift_static.dir/src/thrift/server/TThreadedServer.cpp.o" \
-"CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.o" \
-"CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.o" \
-"CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.o" \
 "CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o" \
 "CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.o" \
 "CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o" \
@@ -915,9 +870,6 @@ lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TServerF
 lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TSimpleServer.cpp.o
 lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TThreadPoolServer.cpp.o
 lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/server/TThreadedServer.cpp.o
-lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshTransport.cpp.o
-lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshServerTransport.cpp.o
-lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/TDpumeshClientTransport.cpp.o
 lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o
 lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/common.c.o
 lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o
@@ -941,7 +893,7 @@ lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Mut
 lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/concurrency/Monitor.cpp.o
 lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/build.make
 lib/libthrift.a: lib/cpp/CMakeFiles/thrift_static.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_55) "Linking CXX static library ../libthrift.a"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/CMakeFiles --progress-num=$(CMAKE_PROGRESS_52) "Linking CXX static library ../libthrift.a"
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && $(CMAKE_COMMAND) -P CMakeFiles/thrift_static.dir/cmake_clean_target.cmake
 	cd /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/build-doca/lib/cpp && $(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/thrift_static.dir/link.txt --verbose=$(VERBOSE)
 

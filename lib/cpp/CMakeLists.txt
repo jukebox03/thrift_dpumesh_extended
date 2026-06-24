@@ -61,11 +61,13 @@ set( thriftcpp_SOURCES
 )
 
 # DPUmesh transport (host side) — built only with the NVIDIA DOCA backend.
+# NOTE: the Thrift transport wrappers (TDpumesh*.cpp) are TEMPORARILY excluded from
+# the build — they depend on the now-deleted blocking API (dpumesh_wait_response /
+# cond-dequeue) and will be re-enabled once ported onto the dpumesh_sock.h façade.
+# The .cpp/.h files remain on disk untouched. The façade (dpumesh_sock.h, header-only)
+# is the supported host API and needs only dpumesh_doca.c + the doca/ engine below.
 if(WITH_DOCA)
     list(APPEND thriftcpp_SOURCES
-        src/thrift/transport/TDpumeshTransport.cpp
-        src/thrift/transport/TDpumeshServerTransport.cpp
-        src/thrift/transport/TDpumeshClientTransport.cpp
         src/thrift/transport/dpumesh_doca.c
         src/thrift/transport/doca/common.c
         src/thrift/transport/doca/object.c

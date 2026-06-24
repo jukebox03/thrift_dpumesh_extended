@@ -1739,3 +1739,39 @@ on dpumesh_event_fd). No raw dpumesh.h calls in either. BENCH_SRC/ECHO_SRC toggl
 ceiling as the raw-API stack. The client's per-request malloc/free (single-shot conns) did NOT cap throughput.
 Latency competitive (170–255µs low-mid). Confirms a normal async request/response CLIENT ports with just the
 `_dpumesh` suffix, exactly like the server. The benchmark now runs on the new API by default with these toggles.
+
+### 2026-06-24 — Cleanup: deleted blocking code + raw bench/echo; Thrift excluded from build
+
+Removed (now that the façade stack is validated): raw bench/echo sources (bench_dpumesh.c, echo_dpumesh.c) +
+the BENCH_SRC/ECHO_SRC toggles (build hardcodes bench_sock.c/echo_sock.c). Blocking I/O code deleted from
+dpumesh_doca.c + dpumesh.h: dpumesh_wait_response, rx_cond/rx_lock + the non-poll cond-dequeue branch (dequeue
+is now poll-only), the poll_rx/async_client config flags. KEPT the per-pending p->cond (register_pending's
+collision-wait uses it — admission, not I/O blocking). The Thrift transport (TDpumesh*.cpp) is excluded from the
+libthrift build (cmake) — its .cpp/.h stay on disk untouched for a later port onto the façade.
+
+Smoke test after cleanup (slimmed transport, façade stack): 30K=29,838/0 p50 174µs · 100K=99,451/0 p50 202µs ·
+240K=238,708/0 p50 580µs. → **0-fail, unchanged performance** — the deletions broke nothing.
+
+### 2026-06-24 — Stability investigation (façade stack): the "instability" is the saturation knee + cold-jump
+
+WARM (proper ramp 30K→200K first), each rate ×3 back-to-back:
+| rate | achieved | p50 | p99 | fail (×3) |
+|---:|---:|---:|---:|---|
+| 200K | 198,9K | 260–263µs | 0.4–2.5ms | 0/0/0 |
+| 220K | 218,8K | 283–302µs | 0.5–0.8ms | 0/0/0 |
+| 235K | 233,7K | 370–404µs | 0.8–1.1ms | 0/0/0 |
+| 240K | 238,7K | 615–633µs | 1.2–2.6ms | 0/0/0 |
+
+→ WARM, 200K–240K are ALL 0-fail and CONSISTENT. The knee is ~235→240K: p50 ~doubles (370→620µs) as utilization
+approaches the ~257K op-rate ceiling. So 240K is stable-when-warm but sits AT the knee (little headroom).
+
+The user's instability came from: (1) **COLD-JUMP to 240K** (no warmup) — overshoots the forward ring at a
+near-ceiling rate → transient wedge / degraded run (the 207K/1.7s/361-fail run), recovers warm; (2) **260K is
+OVER the ~257K ceiling** → always degraded/failing. (3) SEVERE: hammering over-ceiling (260K + cold 240K ×5)
+WEDGED the bench_sock daemon — worker threads stuck (sleeping 0% CPU, no PING reply, RUN never completes) →
+needed a redeploy. The façade load-gen does not shed load gracefully under sustained overload (register_pending
+2s collision-wait + enqueue busy-spin when the forward ring can't drain). NOT a cleanup regression — the ceiling
+is the DPA op-rate, unchanged.
+
+**Stable operating point: ≤235K** (p50 ≤400µs, 0-fail, repeatable). 240K = warm-only knee. Never exceed ~245K.
+Always warmup-ramp before high-RPS measurement ([[feedback_bench_warmup_ramp]]).

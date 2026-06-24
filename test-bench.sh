@@ -162,26 +162,20 @@ build_bench_binaries() {
     if [ ! -e "$BUILD_DOCA/lib/libthriftd.so" ] && [ ! -e "$BUILD_DOCA/lib/libthriftd.a" ]; then
         THRIFT_LINK_LIB="-lthrift"
     fi
-    # Client source: DEFAULT is the façade load-generator (dpumesh_sock.h). The
-    # raw low-level-API client is still available via BENCH_SRC=bench_dpumesh.c. Same binary name.
-    local bench_src="${BENCH_SRC:-bench_sock.c}"
-    info "Bench client source: $bench_src"
-    gcc -O2 -o "$BENCH_DIR/bench_dpumesh" "$BENCH_DIR/$bench_src" \
+    # Client + echo server are the socket/epoll-façade implementations
+    # (bench_sock.c / echo_sock.c over dpumesh_sock.h). Binary names stay
+    # bench_dpumesh / echo_dpumesh (the Docker images + k8s reference those names).
+    gcc -O2 -o "$BENCH_DIR/bench_dpumesh" "$BENCH_DIR/bench_sock.c" \
         -I"$PROJ_ROOT/lib/cpp/src" \
         -L"$BUILD_DOCA/lib" -L"$DOCA_LIB_DIR" \
         $THRIFT_LINK_LIB -lpthread -ldoca_common -ldoca_comch \
         -Wl,-rpath,/usr/local/lib -Wl,-rpath,"$DOCA_LIB_DIR"
-    # Echo server source: DEFAULT is the native-epoll façade server (dpumesh_sock.h).
-    # The raw low-level-API echo is still available via ECHO_SRC=echo_dpumesh.c.
-    # Both compile to the same binary name so the image/k8s are unchanged.
-    local echo_src="${ECHO_SRC:-echo_sock.c}"
-    info "Echo server source: $echo_src"
-    gcc -O2 -o "$BENCH_DIR/echo_dpumesh" "$BENCH_DIR/$echo_src" \
+    gcc -O2 -o "$BENCH_DIR/echo_dpumesh" "$BENCH_DIR/echo_sock.c" \
         -I"$PROJ_ROOT/lib/cpp/src" \
         -L"$BUILD_DOCA/lib" -L"$DOCA_LIB_DIR" \
         $THRIFT_LINK_LIB -lpthread -ldoca_common -ldoca_comch \
         -Wl,-rpath,/usr/local/lib -Wl,-rpath,"$DOCA_LIB_DIR"
-    info "C bench binaries built"
+    info "C bench binaries built (façade: bench_sock.c + echo_sock.c)"
 
     if ! command -v go >/dev/null 2>&1; then
         err "go not found in PATH"; exit 1

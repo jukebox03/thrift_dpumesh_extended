@@ -30,11 +30,9 @@ typedef struct {
     int num_slots;        /* slots per pool (0 = default) */
     int slot_size;        /* bytes per slot (0 = default) */
     int max_descriptors;  /* descriptor ring capacity (0 = default) */
-    int poll_rx;          /* 1 = dequeue spin-polls (no rx_cond); for echo/server pools */
-    int async_client;     /* 1 = poll_response model (no response cond); for async clients */
 } dpumesh_config_t;
 
-#define DPUMESH_CONFIG_DEFAULT { 0, 0, 0, 0, 0 }
+#define DPUMESH_CONFIG_DEFAULT { 0, 0, 0 }
 
 /* ====== SwDescriptor (host-internal RX/TX descriptor, packed) ====== */
 typedef struct __attribute__((packed)) {
@@ -109,23 +107,15 @@ uint32_t dpumesh_alloc_req_id(dpumesh_ctx_t *ctx);
  * Returns 0 on success, -1 on failure. */
 int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
 
-/* Wait for a response matching req_id.
- * Blocks up to timeout_ms (-1 = forever, 0 = non-blocking).
- * On success, fills resp and returns 0. On timeout, returns -1.
- * Caller must free resp->body_buf_slot via dpumesh_rx_free(). */
-int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
-                          sw_descriptor_t *resp, int timeout_ms);
-
-/* Non-blocking poll for a response matching req_id (async-client model).
+/* Non-blocking poll for a response matching req_id.
  * Returns:
  *    0 = response arrived (resp filled; TX already freed; caller must free the
  *        body via dpumesh_rx_free(resp->body_buf_slot)),
  *    1 = not ready yet — caller should poll again later,
  *   -1 = error/abandoned (no live pending for this req_id).
- * In async-client mode the PE thread stops the per-request response wakeup
- * (pthread_cond_signal), so polling is the only way to observe completion. A
- * given client process must use EITHER wait_response (blocking) OR
- * poll_response (async) consistently, never both. */
+ * Polling is the only completion model (there is no blocking wait); the PE
+ * thread delivers responses into the pending table + raises the readiness
+ * eventfd (dpumesh_get_event_fd) for a native epoll_wait(). */
 int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint32_t req_id,
                           sw_descriptor_t *resp);
 

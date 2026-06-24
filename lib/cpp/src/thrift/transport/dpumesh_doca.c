@@ -114,10 +114,9 @@ struct dpumesh_ctx {
     uint32_t *slot_next;
 
     /* RX descriptor queue — lock-free bounded SPMC ring (1 producer = PE
-     * thread, N consumers = server workers). Removes the rx_lock from the hot RX
-     * landing path. rx_lock/rx_cond are kept ONLY for the non-poll (Thrift
-     * blocking) consumer to sleep when idle; the producer signals them only when
-     * !poll_rx. poll_rx (bench) path is pure lock-free + spin (no mutex). */
+     * thread, N consumers = server workers). dpumesh_dequeue spin-polls it
+     * (pure lock-free + adaptive backoff); a native epoll_wait() on the readiness
+     * eventfd is the idle-sleep path. No mutex/cond on the RX landing path. */
     struct rxq_cell *rx_ring;          /* RX_QUEUE_SIZE cells (power of two) */
     /* rx_enq (producer-private, written every request) and rx_deq (CAS-hammered
      * by every worker) sit on separate cachelines: otherwise the PE's per-request
@@ -128,23 +127,10 @@ struct dpumesh_ctx {
     char _rx_pad1[64];
     atomic_uint_fast32_t rx_deq;       /* consumer position (workers CAS) */
     char _rx_pad2[64];
-    pthread_mutex_t rx_lock;           /* non-poll block/wake only */
-    pthread_cond_t rx_cond;            /* non-poll block/wake only */
 
     /* PE progress thread */
     pthread_t pe_tid;
     volatile int pe_running;
-    /* Poll-mode RX: server consumers (dpumesh_dequeue) spin on the lock-free
-     * Vyukov ring with adaptive backoff instead of blocking on rx_cond, and the
-     * PE producer stops the per-request rx_cond signal. Safe only when the
-     * consumer is always productive (never idle-waiting). */
-    int poll_rx;
-    /* Async client: the PE thread stops the per-request response wakeup
-     * (pthread_cond_signal on the pending cond in rx_deliver_desc). Clients
-     * observe completion via dpumesh_poll_response (a lock-free state load)
-     * instead of blocking in dpumesh_wait_response. Process-global: a process
-     * in async mode must use poll_response, never wait_response. */
-    int async_client;
 
     /* Readiness eventfd for native-epoll integration. Lazily enabled by
      * dpumesh_get_event_fd(): once enabled, rx_deliver_desc writes the eventfd on
@@ -320,10 +306,9 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
                 dpumesh_tx_free(ctx, p->tx_slot);
                 p->tx_slot = -1;
             }
-            /* Async clients poll p->state and need no wakeup. */
-            if (!ctx->async_client)
-                pthread_cond_signal(&p->cond);
-            dpumesh_notify(ctx);   /* wake a native epoll_wait() on the eventfd */
+            /* Response delivered. Clients harvest via dpumesh_poll_response (a
+             * lock-free state load); wake a native epoll_wait() on the eventfd. */
+            dpumesh_notify(ctx);
         } else if (p->state == -2) {
             /* Cancelled request — DPA finished, now safe to free TX + RX */
             if (p->tx_slot >= 0) {
@@ -355,16 +340,9 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
         c->desc = *desc;
         atomic_store_explicit(&c->seq, pos + 1, memory_order_release);
         atomic_store_explicit(&ctx->rx_enq, pos + 1, memory_order_relaxed);
-        /* Poll-mode consumers spin on the ring — no wakeup needed. The non-poll
-         * (Thrift blocking) consumer sleeps on rx_cond; wake one. The signal
-         * takes rx_lock so it serializes with a consumer between its empty
-         * re-check and cond_wait (no lost wakeup). */
-        if (!ctx->poll_rx) {
-            pthread_mutex_lock(&ctx->rx_lock);
-            pthread_cond_signal(&ctx->rx_cond);
-            pthread_mutex_unlock(&ctx->rx_lock);
-        }
-        dpumesh_notify(ctx);   /* wake a native epoll_wait() on the eventfd */
+        /* Consumers spin-poll the ring (dpumesh_dequeue); wake a native
+         * epoll_wait() on the eventfd. No cond wakeup. */
+        dpumesh_notify(ctx);
     }
 }
 
@@ -594,9 +572,6 @@ static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, cons
     else
         ctx->pod_id = worker_num;
 
-    /* Consumer model: poll/async for bench+echo, blocking for Thrift. */
-    ctx->poll_rx      = config ? config->poll_rx : 0;
-    ctx->async_client = config ? config->async_client : 0;
 }
 
 static doca_error_t init_doca_device(dpumesh_ctx_t *ctx) {
@@ -716,9 +691,6 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     atomic_init(&ctx->rx_enq, (uint_fast32_t)0);
     atomic_init(&ctx->rx_deq, (uint_fast32_t)0);
 
-    pthread_mutex_init(&ctx->rx_lock, NULL);
-    pthread_cond_init(&ctx->rx_cond, NULL);
-
     /* Readiness eventfd (non-blocking, close-on-exec). Non-fatal if it fails —
      * dpumesh_get_event_fd() then returns -1 and the caller falls back to polling. */
     ctx->notify_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -736,7 +708,6 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     ctx->doca_objs.rx_hook_ctx = ctx;
 
     ctx->pe_running = 1;
-    /* poll_rx / async_client are the consumer model, set in init_config. */
     if (pthread_create(&ctx->pe_tid, NULL, pe_progress_fn, ctx) != 0) goto fail;
 
     DOCA_LOG_INFO("DPUmesh DOCA initialized: worker=%s pod_id=%d", ctx->worker_id, ctx->pod_id);
@@ -794,9 +765,6 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
         pthread_mutex_destroy(&ctx->ring_locks[j]);
     if (ctx->slot_next) free(ctx->slot_next);
     if (ctx->rx_ring) free(ctx->rx_ring);
-
-    pthread_mutex_destroy(&ctx->rx_lock);
-    pthread_cond_destroy(&ctx->rx_cond);
 
     free(ctx);
 }
@@ -945,10 +913,10 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
 #define RX_POLL_BACKOFF_NS 20000   /* 20 us */
 
 int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
-    if (ctx->poll_rx) {
-        /* Pure lock-free spin-poll: try the Vyukov ring with no mutex at all,
-         * back off after sustained idle. At load the ring is rarely empty so the
-         * backoff is never reached (no wakeup, no context switch). */
+    {
+        /* Lock-free spin-poll on the Vyukov RX ring; back off after sustained
+         * idle. timeout_ms: 0 = non-blocking try, >0 = poll to deadline, <0 =
+         * poll forever. There is NO cond-blocking path — the façade always polls. */
         struct timespec deadline; int have_dl = 0;
         if (timeout_ms > 0) {
             clock_gettime(CLOCK_MONOTONIC, &deadline);
@@ -973,46 +941,6 @@ int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms) {
                 nanosleep(&t, NULL);
             }
         }
-    }
-
-    /* Non-poll (Thrift blocking) path: the ring is still lock-free; rx_lock +
-     * rx_cond are used ONLY to sleep when the ring is empty (idle-efficient).
-     * The producer signals rx_cond under rx_lock, so the re-check-under-lock
-     * below closes the lost-wakeup window. */
-    struct timespec ts;
-    if (timeout_ms > 0) {
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += timeout_ms / 1000;
-        ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-    }
-
-    for (;;) {
-        if (rxq_try_pop(ctx, desc))
-            return 0;
-        if (timeout_ms == 0)
-            return -1;
-        pthread_mutex_lock(&ctx->rx_lock);
-        /* Re-check under the lock: if the producer enqueued + signalled between
-         * the lock-free pop above and here, we either pop it now or are
-         * guaranteed to receive the signal (producer signals under rx_lock). */
-        if (rxq_try_pop(ctx, desc)) {
-            pthread_mutex_unlock(&ctx->rx_lock);
-            return 0;
-        }
-        if (timeout_ms < 0) {
-            pthread_cond_wait(&ctx->rx_cond, &ctx->rx_lock);
-        } else {
-            int rc = pthread_cond_timedwait(&ctx->rx_cond, &ctx->rx_lock, &ts);
-            if (rc != 0) {
-                pthread_mutex_unlock(&ctx->rx_lock);
-                return -1;
-            }
-        }
-        pthread_mutex_unlock(&ctx->rx_lock);
     }
 }
 
@@ -1120,81 +1048,6 @@ void dpumesh_pending_attach_tx(dpumesh_ctx_t *ctx, uint32_t req_id, int tx_slot)
     pthread_mutex_lock(&p->lock);
     p->tx_slot = tx_slot;
     pthread_mutex_unlock(&p->lock);
-}
-
-int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id,
-                          sw_descriptor_t *resp, int timeout_ms) {
-    uint32_t idx = req_id % MAX_PENDING;
-    dpumesh_pending_t *p = &ctx->pending[idx];
-
-    pthread_mutex_lock(&p->lock);
-
-    struct timespec ts;
-    if (timeout_ms > 0) {
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += timeout_ms / 1000;
-        ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-    }
-
-    while (p->state == 0) {
-        if (timeout_ms < 0) {
-            pthread_cond_wait(&p->cond, &p->lock);
-        } else if (timeout_ms == 0) {
-            pthread_mutex_unlock(&p->lock);
-            return -1;
-        } else {
-            int rc = pthread_cond_timedwait(&p->cond, &p->lock, &ts);
-            if (rc != 0) {
-                /* Check if response arrived during timeout boundary */
-                if (p->state == 1)
-                    break; /* fall through to success path below */
-                /* Timeout: force-free the TX slot here. At the wait_response
-                 * timeout scale the DPA forward DMA has long finished, so
-                 * reclaiming the slot is safe. State stays at -2 so a late RX
-                 * of OP_RESPONSE is reclaimed by rx_deliver_desc, and a late
-                 * TX_ACK finds tx_slot=-1 and no-ops. */
-                if (p->tx_slot >= 0) {
-                    dpumesh_tx_free(ctx, p->tx_slot);
-                    p->tx_slot = -1;
-                }
-                p->state = -2;
-                pthread_cond_broadcast(&p->cond);
-                pthread_mutex_unlock(&p->lock);
-                return -1;
-            }
-        }
-    }
-
-    if (p->state == 1) {
-        *resp = p->desc;
-        /* Response arrived = DPA finished reading TX buffer. Free TX now
-         * to return the slot to the pool ASAP under high load. */
-        if (p->tx_slot >= 0) {
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
-        }
-        p->state = -1;
-        pthread_cond_broadcast(&p->cond);
-        pthread_mutex_unlock(&p->lock);
-        return 0;
-    }
-
-    /* Unreachable in practice — state left the wait loop without being 1
-     * only via the timeout/-2 branch above. Clear the slot defensively. */
-    if (p->state != -2) {
-        if (p->tx_slot >= 0) {
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
-        }
-        p->state = -1;
-        pthread_cond_broadcast(&p->cond);
-    }
-    pthread_mutex_unlock(&p->lock);
-    return -1;
 }
 
 int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint32_t req_id,
