@@ -163,7 +163,7 @@ build_bench_binaries() {
         THRIFT_LINK_LIB="-lthrift"
     fi
     # Client + echo server are the socket/epoll-façade implementations
-    # (bench_sock.c / echo_sock.c over dpumesh_sock.h). Binary names stay
+    # (bench_sock.c / echo_sock.c over dpm.h). Binary names stay
     # bench_dpumesh / echo_dpumesh (the Docker images + k8s reference those names).
     gcc -O2 -o "$BENCH_DIR/bench_dpumesh" "$BENCH_DIR/bench_sock.c" \
         -I"$PROJ_ROOT/lib/cpp/src" \

@@ -1,15 +1,15 @@
 /*
  * bench_sock.c — DPUmesh load-generator, written with ONLY the socket/epoll
- * façade (dpumesh_sock.h). A port of an ordinary async request/response client:
+ * façade (dpm.h). A port of an ordinary async request/response client:
  *
- *     socket()/bind()  ->  socket_dpumesh()
- *     connect()        ->  connect_dpumesh()
- *     write()          ->  write_dpumesh()  (+ send_dpumesh() to ship the request)
- *     read()           ->  read_dpumesh()   (the response; EAGAIN until it arrives)
- *     close()          ->  close_dpumesh()
+ *     socket()/bind()  ->  socket_dpm()
+ *     connect()        ->  connect_dpm()
+ *     write()          ->  write_dpm()  (buffers; the read below ships it)
+ *     read()           ->  read_dpm()   (implicit send + the response; EAGAIN until it arrives)
+ *     close()          ->  close_dpm()
  *
  * Each in-flight request is one dpmconn_t (single-shot). A worker keeps a window
- * of W conns: it connect/write/send to launch, and read_dpumesh (non-blocking) to
+ * of W conns: it connect/write/send to launch, and read_dpm (non-blocking) to
  * harvest. The control daemon / pacing / latency stats are identical to the
  * raw-API bench — only the per-request data path uses the façade.
  */
@@ -28,7 +28,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include "thrift/transport/dpumesh_sock.h"
+#include "thrift/transport/dpm.h"
 
 #define CTRL_PORT          9092
 #define MAX_WORKERS        4096
@@ -95,17 +95,13 @@ static void *worker_fn_async(void *arg) {
             double scheduled = w->start_at + (double)next_j * w->interval_sec;
             if (now_sec() < scheduled) break;          /* paced */
 
-            dpmconn_t *c = connect_dpumesh(g_s, g_dst_pod_id);     /* connect() */
+            dpmconn_t *c = connect_dpm(g_s, g_dst_pod_id);     /* connect() */
             if (!c) break;                              /* transient OOM: retry next sweep */
 
             uint8_t p = (uint8_t)('A' + (next_j & 0xf));
             body[0] = p; body[w->msg_size / 2] = p; body[w->msg_size - 1] = p;
-            write_dpumesh(c, body, (size_t)w->msg_size);           /* write() (buffers) */
-            if (send_dpumesh(c) < 0) {                              /* send() */
-                close_dpumesh(c);
-                atomic_fetch_add(w->fail, 1);
-                next_j++; completed++; did_work = 1; continue;
-            }
+            write_dpm(c, body, (size_t)w->msg_size);  /* write() buffers; the */
+            /* harvest read_dpm() below ships it (implicit send) — no send(). */
             fl[s].c = c; fl[s].scheduled = scheduled; fl[s].launched = now_sec();
             fl[s].j = next_j; fl[s].active = 1;
             next_j++; did_work = 1;
@@ -114,10 +110,10 @@ static void *worker_fn_async(void *arg) {
         /* ---- 2. Harvest completed (and time out stalled) slots ---- */
         for (int s = 0; s < W; s++) {
             if (!fl[s].active) continue;
-            ssize_t n = read_dpumesh(fl[s].c, rb, (size_t)w->msg_size);   /* read() */
+            ssize_t n = read_dpm(fl[s].c, rb, (size_t)w->msg_size);   /* read() */
             if (n < 0 && errno == EAGAIN) {            /* response not in yet */
                 if (now_sec() - fl[s].launched > timeout_s) {
-                    close_dpumesh(fl[s].c);
+                    close_dpm(fl[s].c);
                     atomic_fetch_add(w->fail, 1);
                     fl[s].active = 0; completed++; did_work = 1;
                 }
@@ -131,7 +127,7 @@ static void *worker_fn_async(void *arg) {
                 bad = (n != (ssize_t)w->msg_size) ||
                       (n > 0 && (rb[0] != expect || rb[n / 2] != expect || rb[n - 1] != expect));
             }
-            close_dpumesh(fl[s].c);                     /* close() */
+            close_dpm(fl[s].c);                     /* close() */
             if (bad) {
                 atomic_fetch_add(w->fail, 1);
             } else {
@@ -149,10 +145,10 @@ static void *worker_fn_async(void *arg) {
         }
     }
 
-    /* Drain slots still active at stop/deadline — close_dpumesh cancels the
+    /* Drain slots still active at stop/deadline — close_dpm cancels the
      * pending entry + reclaims the TX slot (no leak across back-to-back runs). */
     for (int s = 0; s < W; s++)
-        if (fl[s].active) close_dpumesh(fl[s].c);
+        if (fl[s].active) close_dpm(fl[s].c);
     free(fl); free(body); free(rb);
     return NULL;
 }
@@ -197,9 +193,9 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns) {
         write(conn_fd, e, strlen(e));
         return;
     }
-    if (msg_size > dpm_msg_max(g_s)) {
+    if (msg_size > msg_max_dpm(g_s)) {
         int n = snprintf(reply, sizeof(reply), "ERR size %d > slot_size %d\n",
-                         msg_size, dpm_msg_max(g_s));
+                         msg_size, msg_max_dpm(g_s));
         write(conn_fd, reply, (size_t)n);
         return;
     }
@@ -359,10 +355,10 @@ int main(void) {
     if (getenv("BENCH_DST_POD_ID")) g_dst_pod_id   = atoi(getenv("BENCH_DST_POD_ID"));
     if (getenv("ASYNC_THREADS"))    g_async_threads = atoi(getenv("ASYNC_THREADS"));
 
-    g_s = socket_dpumesh("bench-sock", worker_id);     /* socket() + bind() */
-    if (!g_s) { fprintf(stderr, "[bench_sock] socket_dpumesh failed\n"); return 1; }
+    g_s = socket_dpm("bench-sock", worker_id);     /* socket() + bind() */
+    if (!g_s) { fprintf(stderr, "[bench_sock] socket_dpm failed\n"); return 1; }
     fprintf(stderr, "[bench_sock] ready: pod_id=%d dst_pod_id=%d (façade client)\n",
-            dpm_pod_id(g_s), g_dst_pod_id);
+            pod_id_dpm(g_s), g_dst_pod_id);
 
     int srv = ctrl_listen(CTRL_PORT);
     if (srv < 0) return 1;

@@ -1819,3 +1819,65 @@ immediately after, and a 220K re-run (no redeploy) returned 218.8K/p50 300µs. R
 state/slot leak** ([[feedback_no_slot_leak]]); the blip is the known knee overshoot ([[feedback_bench_warmup_ramp]]),
 not a cleanup regression. Conclusion: the cleanup is **functionally correct and performance-neutral** — no logic,
 timing, ordering, or wire-format changed, exactly as intended.
+
+---
+
+## 2026-06-24 — Stage 1: implicit send (socket-transparent `write`/`read`)
+
+Goal (user): make the façade behave like the BSD socket API so the caller can't tell socket vs DPUmesh — step 1 =
+remove the explicit `send_dpumesh()` so `write`→`read` (client) / `write`→`close` (server) work like sockets.
+
+**Change (host façade ONLY — datapath / DPU / wire ABI untouched):** `dpumesh_sock.h` gains `dpm__autoflush()`, called
+from `read_dpumesh()` (client: ships a buffered-but-unsent request before polling) and `close_dpumesh()` (server: ships
+a buffered response before teardown). `send_dpumesh()` is **kept and back-compatible** (auto-flush no-ops once sent), so
+existing explicit-send code is unaffected. `echo_sock.c` (server) and `bench_sock.c` (client) were both rewritten to use
+**NO explicit send** — proving the transparency end-to-end through the real DMA path. The ≤8KB cap + single-shot conn are
+unchanged (those need the byte-stream backend = Stage 2).
+
+The async client's send moved from the launch loop to the first harvest `read` (~same sweep), so pipelining is preserved
+— confirmed by the numbers below being identical to the explicit-send baseline.
+
+**Validation (fair 1-core, 8 KB, warm ramp; client+server BOTH send-free):**
+
+| target | achieved | p50 (µs) | p99 (µs) | OK / Fail |
+|---:|---:|---:|---:|---|
+| 30K  | 29,838  | 168 | 496   | 300000/0 |
+| 100K | 99,454  | 204 | 429   | 1000000/0 |
+| 200K | 198,909 | 269 | 691   | 2000000/0 |
+| 220K | 218,786 | 299 | 598   | 2200000/0 |
+| 235K | 233,706 | 367–375 | 866–1,112 | 2350000/0 (×2 back-to-back) |
+| 240K | 238,672 | 590 | 5,579 | 2400000/0 |
+
+→ **0-fail across the whole ladder, latencies identical to the explicit-send baseline, repeatable (235K ×2).** Echo
+correctness is implicit in 0-fail (a wrong/short echo is counted as a failure). So the implicit-send path is correct and
+**performance-neutral**: removing `send_dpumesh()` from user code costs nothing. Stage 1 done. Next (Stage 2, optional) =
+true byte-stream over a real `int fd` (socketpair) for literal socket-indistinguishability — trades an extra host copy
+for transparency (see design discussion).
+
+### 2026-06-24 — Façade suffix renamed `_dpumesh` → `_dpm` (cosmetic, for naming uniformity)
+
+The 9 BSD-twin façade funcs + the readiness-fd accessor were renamed for consistency with the `dpm_t`/`dpmconn_t`/`dpm_*`
+family: `socket_dpm`, `destroy_dpm`, `accept_dpm`, `connect_dpm`, `read_dpm`, `write_dpm`, `sendfile_dpm`, `send_dpm`,
+`close_dpm`, `dpm_event_fd`. **Untouched:** the low-level C core API (`dpumesh.h`: `dpumesh_init`/`dpumesh_dequeue`/…),
+the header filename `dpumesh_sock.h`, and the `dpm_*` accessors. Scope = `dpumesh_sock.h` + `bench/{bench,echo}_sock.c`
+(the only façade users) + `api.md`. Behavior-preserving rename — smoke ladder (8 KB, warm): 30K 29,838/0 p50 170µs ·
+100K 99,453/0 p50 207µs · 200K 198,924/0 p50 278µs · 235K 233,678/0 p50 530µs → all 0-fail, latencies unchanged.
+
+### 2026-06-24 — Façade naming unified to `*_dpm` suffix + header renamed `dpumesh_sock.h` → `dpm.h`
+
+Accessor funcs unified from mixed prefix/suffix to all-suffix: `dpm_pod_id`→`pod_id_dpm`, `dpm_msg_max`→`msg_max_dpm`,
+`dpm_event_fd`→`event_fd_dpm`, `dpm_is_server`→`is_server_dpm`, `dpm_peer`→`peer_dpm`, `dpm_set_data/get_data`→
+`set_data_dpm/get_data_dpm` (+ internal `dpm__*` helpers). Types `dpm_t`/`dpmconn_t` and the low-level core `dpumesh_*`
+kept (user's choice). Header file `dpumesh_sock.h` → `dpm.h` (guard `DPM_H`, include `thrift/transport/dpm.h`).
+Behavior-preserving rename — smoke ladder (8 KB, warm): 30K 29,837/0 · 100K 99,451/0 · 200K 198,923/0 p50 264µs ·
+235K 233,733/0 p50 365µs → all 0-fail, latencies unchanged.
+
+### 2026-06-24 — Review fixes E + A (+ light F); B/C/D deferred by user
+
+E (close swallowed send failure): `close_dpm` now RETURNS the auto-flush result (`0`/`-1`) instead of always `0`, so a
+server can detect a dropped reply; `send_dpm` re-documented as the explicit confirm/retry path (conn freed on close, so
+`-1` is observe-only). A (idle-CPU claim): restored `DPUMESH_HOST_EPOLL` to api.md and qualified the "idle ~1% / no
+busy-poll" claim as `HOST_EPOLL=1`-only (library default = internal RX thread adaptive-busy-poll). F: 4d sendfile
+return now checked; connect dead-pod behavior noted; client multi-conn epoll pattern (event_fd is per-endpoint) noted.
+Behavior-preserving (bench ignores close's return) — smoke ladder 30K 29,839/0 · 100K 99,452/0 · 200K 198,920/0 p50
+265µs · 235K 233,738/0 → all 0-fail. Deferred per user: one-way path (B), slot_size>8192 reject (C), req_id 2s stall (D).
