@@ -177,7 +177,59 @@ for (;;) {                                   // poll for the response (non-block
 close_dpm(c);   // REQUIRED on every path — also reclaims the pending entry on ECONNRESET
 ```
 
-### 4c. NATIVE epoll server — a normal epoll loop, only the data calls suffixed
+### 4c. Client with native epoll — many in-flight requests
+Fire a window of requests and harvest the responses via native epoll on `event_fd_dpm(s)`.
+Two things matter here: **(1) send explicitly** — you sleep on `epoll_wait` *before* reading,
+so you can't rely on read-triggered implicit send; **(2)** `event_fd_dpm` is **per-endpoint**,
+so a readiness event doesn't say *which* conn — tag each with `set_data_dpm` and scan your
+in-flight conns on wakeup.
+```c
+#include <thrift/transport/dpm.h>
+#include <sys/epoll.h>
+#define W 64                                        // up to W requests in flight
+
+dpm_t *s = socket_dpm("client", /*pod_id*/10);
+int dfd  = event_fd_dpm(s);
+int epfd = epoll_create1(0);
+struct epoll_event ev = { .events = EPOLLIN }; ev.data.fd = dfd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, dfd, &ev);
+
+dpmconn_t *inflight[W] = {0};
+int pending = 0;
+
+for (int i = 0; i < W; i++) {                        // ── launch the window ──
+    dpmconn_t *c = connect_dpm(s, /*dst_pod_id*/11);
+    set_data_dpm(c, (void *)(intptr_t)i);            // tag it (e.g. the request index)
+    write_dpm(c, req[i], req_len[i]);
+    while (send_dpm(c) < 0 && errno == EAGAIN) sched_yield();   // ship NOW (we'll sleep on epoll)
+    inflight[i] = c; pending++;
+}
+
+struct epoll_event events[8];
+while (pending > 0) {                                 // ── harvest via epoll ──
+    int nfds = epoll_wait(epfd, events, 8, -1);      // SLEEP until a response lands
+    for (int e = 0; e < nfds; e++) {
+        if (events[e].data.fd != dfd) continue;
+        uint64_t cnt; while (read(dfd, &cnt, sizeof cnt) > 0) {}   // drain readiness fd
+
+        for (int i = 0; i < W; i++) {                // per-endpoint fd → scan in-flight conns
+            dpmconn_t *c = inflight[i];
+            if (!c) continue;
+            char resp[8192];
+            ssize_t n = read_dpm(c, resp, sizeof resp);
+            if (n < 0 && errno == EAGAIN) continue;  // this one's reply not in yet
+            int idx = (int)(intptr_t)get_data_dpm(c);            // recover the tag
+            handle_response(idx, resp, n);           // n>=0 = reply (0 = empty); n<0 = ECONNRESET
+            close_dpm(c); inflight[i] = NULL; pending--;
+        }
+    }
+}
+```
+> A reply is a whole ≤8 KB message, so one `read_dpm` returns it in full. For a large window,
+> replace the linear scan with your own bookkeeping — the readiness fd only says "something
+> arrived," not *which* conn.
+
+### 4d. NATIVE epoll server — a normal epoll loop, only the data calls suffixed
 This is `bench/echo_sock.c` (validated: 240K RPS, 0-fail; **idle CPU ~1% requires
 `DPUMESH_HOST_EPOLL=1`** — the default adaptive-busy-polls the internal RX thread). The epoll
 machinery is **stock kernel epoll**; `event_fd_dpm(s)` is the "listen socket".
@@ -210,7 +262,7 @@ for (;;) {
 > `socket/accept/read/write/close` (no extra send — `close` auto-flushes the reply) and
 > using `event_fd_dpm(s)` as the listen fd. The epoll loop is unchanged.
 
-### 4d. Porting an ordinary epoll HTTP server
+### 4e. Porting an ordinary epoll HTTP server
 A standard `epoll_wait`/`accept`/`read`/`write`/`sendfile` server maps almost
 1:1 — and gets **simpler**, because the message is atomic (no `STATE_SEND_HDR`/
 `STATE_SEND_BODY`, no partial-write retry). The full request is in hand at accept;
