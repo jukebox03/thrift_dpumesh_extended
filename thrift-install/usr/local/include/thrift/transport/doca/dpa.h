@@ -23,7 +23,6 @@ struct dmesh_doca_dpa_msgq {
 	struct doca_comch_msgq *msgq;	      /**< The DOCA Comch MsgQ */
 	struct doca_comch_producer *producer; /**< The DOCA Comch Producer */
 	struct doca_comch_consumer *consumer; /**< The DOCA Comch Consumer */
-	bool is_send;			      /**< Indicates if MsgQ is used for sending from DPU to DPA */
 	uint32_t target_consumer_id;          /**< Remote consumer target used by producer send tasks */
 	
 };

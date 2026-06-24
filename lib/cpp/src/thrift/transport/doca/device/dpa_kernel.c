@@ -6,7 +6,7 @@
 
 /* Spin iterations waiting for DPU consumer to resubmit recv tasks before
  * dropping the descriptor (consumer stalled). */
-#define DMA_DIAG_EMPTY_WAIT_FAIL_LOOPS  0x800000
+#define DMA_CONSUMER_EMPTY_WAIT_LOOPS  0x800000
 
 /* Max DMA size for doca_dpa_dev_comch_producer_dma_copy.
  * HW supports up to 8KB per single call with 128B-aligned addresses. */
@@ -201,7 +201,7 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         {
             uint32_t wait = 0;
             while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
-                if (++wait >= DMA_DIAG_EMPTY_WAIT_FAIL_LOOPS) { aborted = 1; break; }
+                if (++wait >= DMA_CONSUMER_EMPTY_WAIT_LOOPS) { aborted = 1; break; }
             }
         }
         if (aborted) {
@@ -316,7 +316,7 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         {
             uint32_t wait = 0;
             while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
-                if (++wait >= DMA_DIAG_EMPTY_WAIT_FAIL_LOOPS) { aborted = 1; break; }
+                if (++wait >= DMA_CONSUMER_EMPTY_WAIT_LOOPS) { aborted = 1; break; }
             }
         }
         if (aborted) {
@@ -436,8 +436,6 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg, int poll_msgs)
             uint64_t inflight = dpa_sent_count[e][r] - dpa_cached_freed[e][r];
             if (inflight + CREDIT_REFRESH_MARGIN < (uint64_t)rev->rq_depth)
                 continue;  /* still plenty of headroom — skip PCIe read */
-            /* Credit slot sits one past the DMA_RING_SIZE descriptors in the
-             * forward dma_ring, so it lives at index DMA_RING_SIZE. */
             doca_dpa_dev_buf_t cbuf =
                 doca_dpa_dev_buf_array_get_buf(rev->host_credit_buf_arr,
                                                DMA_RING_SIZE);

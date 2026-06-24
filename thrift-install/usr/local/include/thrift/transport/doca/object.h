@@ -250,7 +250,7 @@ struct objects {
     struct doca_comch_consumer *consumer;
     struct doca_pe *consumer_pe;
 
-	doca_error_t consumer_result;		  /* Holds result will be updated in consumer callbacks */
+	doca_error_t consumer_result;  /* Last result from a consumer callback (comch_consumer.c). */
 
     /* RX data hook (comch control path → dpumesh_ctx) */
     void (*rx_data_hook)(void *hook_ctx, const uint8_t *data, uint32_t len);

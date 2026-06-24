@@ -18,7 +18,6 @@
 #include <doca_comch.h>
 #include <doca_comch_consumer.h>
 #include <doca_log.h>
-#include <doca_comch_producer.h>
 
 /* Forward declaration — defined below server_message_recv_callback */
 doca_error_t

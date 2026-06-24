@@ -19,7 +19,6 @@
 #include <doca_pe.h>
 
 #include <time.h>
-#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -472,9 +471,8 @@ dpu_drain_iteration(struct objects *objs)
      * because consumer_pe is progressed above, keeping DPA recv tasks recycled. */
     int proc = process_completion_queue(objs, 128);
     /* Idle (no completions this pass) → flush partial TX_ACK + REV_DONE batches so
-     * low-load latency is not held by coalescing. This is the ONLY batch-flush
-     * site now (the periodic keepalive that also flushed is gone — the EU
-     * busy-loops, so no DPA_MSG_WAKE keepalive is needed). */
+     * low-load latency is not held by coalescing. This is the only batch-flush
+     * site (the periodic keepalive no longer flushes here). */
     if (proc == 0)
         for (int i = 0; i < objs->num_pods; i++) {
             flush_txack_batch(objs, &objs->pods[i]);
@@ -509,12 +507,9 @@ dpu_drain_iteration(struct objects *objs)
     return (did_consumer || did_ctrl || proc > 0);
 }
 
-/* Send DPA_MSG_WAKE to every running EU (the ~1 ms keepalive). A DPA EU parks
- * (reschedule) when its rings are idle, and a forward-ring desc->valid=1 store is
- * a SILENT host write that raises no completion — so it never wakes the EU on its
- * own. The ARM therefore pokes the EUs on a steady ~1 ms cadence; a parked EU
- * that re-armed its completion notifications before reschedule re-scans its rings
- * on the WAKE. Under load the EU is busy draining and the WAKE is a no-op. */
+/* Send DPA_MSG_WAKE to every running EU (the ~1 ms keepalive). A parked EU is not
+ * woken by a silent forward-ring desc->valid=1 store (no completion), so the ARM
+ * pokes it on cadence; it re-scans its rings on the WAKE. No-op under load. */
 static void
 dpu_send_wake(struct objects *objs)
 {

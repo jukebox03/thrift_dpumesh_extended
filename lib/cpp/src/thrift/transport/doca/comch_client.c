@@ -1,7 +1,6 @@
 #include "comch_client.h"
 
 #include <time.h>
-#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -137,7 +136,7 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 /**
  * Client sends a message to server
  *
- * @sample_objects [in]: The sample object to use
+ * @objs [in]: Transport objects context
  * @msg [in]: The msg to send
  * @len [in]: The msg length
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise

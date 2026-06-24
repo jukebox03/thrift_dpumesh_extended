@@ -40,11 +40,7 @@
 
 DOCA_LOG_REGISTER(COMMON);
 
-doca_error_t open_doca_device_with_pci_and_callback(const char *pci_addr,
-						    tasks_check func,
-						    open_dev_cb open_dev_cb,
-						    void *usr_ctx,
-						    struct doca_dev **retval)
+doca_error_t open_doca_device_with_pci(const char *pci_addr, tasks_check func, struct doca_dev **retval)
 {
 	struct doca_devinfo **dev_list;
 	uint32_t nb_devs;
@@ -69,14 +65,6 @@ doca_error_t open_doca_device_with_pci_and_callback(const char *pci_addr,
 			if (func != NULL && func(dev_list[i]) != DOCA_SUCCESS)
 				continue;
 
-			/* if device can be opened */
-			if (open_dev_cb != NULL) {
-				res = open_dev_cb(dev_list[i], usr_ctx, retval);
-				if (res == DOCA_SUCCESS) {
-					doca_devinfo_destroy_list(dev_list);
-					return res;
-				}
-			}
 			res = doca_dev_open(dev_list[i], retval);
 			if (res == DOCA_SUCCESS) {
 				doca_devinfo_destroy_list(dev_list);
@@ -90,11 +78,6 @@ doca_error_t open_doca_device_with_pci_and_callback(const char *pci_addr,
 
 	doca_devinfo_destroy_list(dev_list);
 	return res;
-}
-
-doca_error_t open_doca_device_with_pci(const char *pci_addr, tasks_check func, struct doca_dev **retval)
-{
-	return open_doca_device_with_pci_and_callback(pci_addr, func, NULL, NULL, retval);
 }
 
 doca_error_t open_doca_device_rep_with_pci(struct doca_dev *local,

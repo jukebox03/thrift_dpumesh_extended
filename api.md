@@ -67,7 +67,7 @@ All calls are **non-blocking**. "would-block" = the listed sentinel **with `errn
 |---|---|
 | `ssize_t read_dpumesh(dpmconn_t *c, void *buf, size_t len)` | `>0` bytes copied from the inbound body; `0` = end of message; `-1` = would-block (client response not in yet, `EAGAIN`) or abandoned (`ECONNRESET`). |
 | `ssize_t write_dpumesh(dpmconn_t *c, const void *buf, size_t len)` | **Buffers** outbound body bytes → returns `len`; `-1` = would exceed `slot_size` (`EMSGSIZE`) or conn already sent (`EINVAL`). Acquiring a TX slot busy-spins under saturation (never fails). |
-| `ssize_t sendfile_dpumesh(dpmconn_t *c, int in_fd, off_t *offset, size_t count)` | Appends ≤`count` bytes from `in_fd` into the body (**capped at `slot_size` → may be SHORT; check the return**); advances `*offset` if non-NULL. Returns bytes appended (`0` = EOF), `-1` on read error / already-sent (`EINVAL`). |
+| `ssize_t sendfile_dpumesh(dpmconn_t *c, int in_fd, off_t *offset, size_t count)` | Appends ≤`count` bytes from `in_fd` into the body (**capped at `slot_size` → may be SHORT; check the return**); advances `*offset` if non-NULL. Returns bytes appended (`0` = EOF), `-1` on read error, already-sent (`EINVAL`), or no remaining slot room (`EMSGSIZE`). |
 | `int send_dpumesh(dpmconn_t *c)` | **Transmits** the buffered message (client → request; server → response matched to the inbound `req_id`). `0` sent; `-1` = already sent (`EINVAL`), a rare `req_id` pending-table collision (`EAGAIN`, ~2 s hard timeout — retry), or an enqueue validation error. Buffered body retained on `-1`. |
 | `int close_dpumesh(dpmconn_t *c)` | Frees the conn's slots/pending. Always `0`. Safe on `NULL`. |
 
@@ -233,26 +233,24 @@ All are thread-safe.
 | `int dpumesh_enqueue(ctx, const sw_descriptor_t *desc)` | Submit a filled descriptor. `0`/`-1`. |
 | `uint32_t dpumesh_alloc_req_id(ctx)` | Atomic unique request id (starts at 1). |
 | `int dpumesh_register_pending(ctx, uint32_t req_id)` | Register **before** enqueue. `0`/`-1`. |
-| `int dpumesh_wait_response(ctx, req_id, sw_descriptor_t *resp, int timeout_ms)` | **Blocking** match (`-1`/`0`/`>0`). `0`=`resp` filled (free its `body_buf_slot`), `-1`=timeout. |
-| `int dpumesh_poll_response(ctx, req_id, sw_descriptor_t *resp)` | Non-blocking: `0`=arrived (TX already freed; free body), `1`=not ready, `-1`=abandoned. |
+| `int dpumesh_poll_response(ctx, req_id, sw_descriptor_t *resp)` | Non-blocking: `0`=arrived (TX already freed; free body), `1`=not ready, `-1`=abandoned. The only completion model — there is no blocking-wait variant. |
 | `void dpumesh_pending_attach_tx(ctx, req_id, int tx_slot)` | Bind TX slot **after** a successful enqueue (TX_ACK owns it now). |
 | `void dpumesh_cancel_pending(ctx, req_id)` | Cancel (error path); defers TX cleanup if in flight. |
 | `void dpumesh_pending_release_async(ctx, req_id)` | Responder fire-and-forget after enqueue+attach_tx (no response expected). Idempotent. |
 
-> A process uses **either** `wait_response` (set `config.async_client=0`) **or**
-> `poll_response` (set `config.async_client=1`) — never both. The façade selects
-> the non-blocking (`poll_response`) model.
+> Completion is **poll-only**: harvest responses with `dpumesh_poll_response`, or
+> sleep on `dpumesh_get_event_fd` with native epoll/poll/select. There is no
+> blocking-wait variant and no consumer-model selector.
 
 ### `dpumesh_config_t`
 | Field | Meaning | 0 / default |
 |---|---|---|
 | `num_slots` | slots per pool | env `DPUMESH_NUM_SLOTS` → **4096** |
 | `slot_size` | bytes per slot (≤ 8192 effective) | env `DPUMESH_SLOT_SIZE` → **8192** |
-| `max_descriptors` | descriptor ring capacity | env `DPUMESH_MAX_DESCRIPTORS` → **2048** |
-| `poll_rx` | `1` = `dequeue` spin-polls (lean server) | `0` |
-| `async_client` | `1` = `poll_response` model | `0` |
 
 Precedence: explicit field (`> 0`) → env var → default. Invariant: `num_slots × slot_size == 32 MB` (`DPU_BUFFER_SIZE`).
+The host→DPU descriptor ring depth is **not** configurable — it is the wire-ABI constant `DMA_RING_SIZE` (4096), which
+the host and the DPA kernel agree on at build time.
 
 ### `sw_descriptor_t` (fill for `dpumesh_enqueue`)
 `header_buf_slot=-1`, `header_len=0`, `body_buf_slot` (TX/RX slot), `body_len`
@@ -274,6 +272,5 @@ Precedence `config field (>0) → env → default`:
 | `DPUMESH_POD_ID` | Override this node's pod id | = `worker_id` arg |
 | `DPUMESH_NUM_SLOTS` | Slots per pool | `4096` |
 | `DPUMESH_SLOT_SIZE` | Bytes per slot | `8192` |
-| `DPUMESH_MAX_DESCRIPTORS` | Descriptor ring capacity | `2048` |
 | `DPUMESH_RINGS_PER_POD` | EU-sharding rings/pod `K` (must match the DPU process) | `1` |
 | `DPUMESH_HOST_EPOLL` | `1` = host PE-progress thread sleeps on epoll; `0` = busy-poll | `0` |

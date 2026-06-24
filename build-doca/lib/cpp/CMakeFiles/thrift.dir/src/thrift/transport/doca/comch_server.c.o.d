@@ -102,5 +102,4 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_server.c.o: \
  /usr/include/x86_64-linux-gnu/bits/types/__FILE.h \
  /usr/include/x86_64-linux-gnu/bits/types/FILE.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
- /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
- /opt/mellanox/doca/include/doca_comch_producer.h
+ /usr/include/x86_64-linux-gnu/bits/stdio_lim.h

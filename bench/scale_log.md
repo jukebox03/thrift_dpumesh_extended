@@ -1775,3 +1775,47 @@ is the DPA op-rate, unchanged.
 
 **Stable operating point: ≤235K** (p50 ≤400µs, 0-fail, repeatable). 240K = warm-only knee. Never exceed ~245K.
 Always warmup-ramp before high-RPS measurement ([[feedback_bench_warmup_ramp]]).
+
+---
+
+## 2026-06-24 — Code-cleanup pass (dead code / stale comments / naming), perf-neutral validation
+
+Pass over the LIVE code (façade `dpumesh_sock.h`, core `dpumesh.h` + `dpumesh_doca.c`, bench `bench_sock.c`/`echo_sock.c`,
+and the DPU/DPA `doca/` engine). The dead Thrift transport wrappers (`TDpumesh*.cpp/.h`) and `gateway.c` were left
+untouched (already excluded from the build). 33 cleanups applied — all behavior/timing/ordering/wire-format-preserving:
+
+- **Dead code removed:** inert `max_descriptors` config knob end-to-end (the host→DPU descriptor ring depth is the
+  wire-ABI constant `DMA_RING_SIZE`, NOT configurable — knob was write-only & DPUMESH_MAX_DESCRIPTORS had no effect);
+  write-only `dmesh_doca_dpa_msgq.is_send` field; `worker_t.worker_id` (bench); the unused DOCA-sample callback variant
+  `open_doca_device_with_pci_and_callback` + `open_dev_cb` typedef (folded into `open_doca_device_with_pci`); the unused
+  `dmesh_comch_msg` anonymous union; dead `objs` locals in the new-consumer callbacks; redundant `setup_pod_dma` forward
+  decl; ~8 unused `#include`s (stdio/time/assert/strings/doca_comch_producer/doca_comch in headers).
+- **Stale comments fixed:** removed all `dpumesh_wait_response` references (API deleted); corrected the rx_data_hook
+  "legacy 4-byte enum" dispatch note, the dpu_worker "EU busy-loops, no keepalive needed" claim (the ~1 ms DPA_MSG_WAKE
+  keepalive IS live), config.h "host reads PCI from env" (always doca_argp), `@sample_objects`/`@data_path`/`@task Send`
+  doxygen leftovers, "NVMf" jargon in a DPA log string.
+- **Naming:** `DMA_DIAG_EMPTY_WAIT_FAIL_LOOPS` → `DMA_CONSUMER_EMPTY_WAIT_LOOPS` (DPA kernel; "DIAG" wrongly implied
+  removable scaffolding — it bounds a real consumer-stall spin). Tightened a few over-long comments.
+
+Build: host libthrift `make` clean (exit 0); DPU `ninja` recompiled all 13 C objects + DPA kernel clean; bench façade
+binaries built. Deploy via `test-bench.sh deploy` (exit 0, fresh pods Ready).
+
+**Validation (fair 1-core, 8 KB, warm ramp):** perf is byte-for-byte the same ladder as the pre-cleanup 240K config.
+
+| target | achieved | p50 (µs) | p99 (µs) | OK / Fail |
+|---:|---:|---:|---:|---|
+| 30K  | 29,837  | 178 | 520   | 300000/0 |
+| 60K  | 59,672  | 167 | 523   | 600000/0 |
+| 100K | 99,454  | 204 | 549   | 1000000/0 |
+| 150K | 149,118 | 230 | 9,705 | 1500000/0 |
+| 200K | 198,903 | 272 | 380   | 2000000/0 |
+| 220K | 218,783 | 298 | 652–1,725 | 2200000/0 |
+| 235K | 233,703 | 516–539 | 990–1,626 | 2350000/0 |
+| 240K | 238,672 | 613 | 2,098 | 2400000/0 |
+
+→ **0 failures across the whole ladder; latencies match the documented baseline.** One transient 220K stall on the
+first knee touch (182K achieved, ~2 s p99, still 0-fail) recovered on the very next runs — 235K/240K were clean
+immediately after, and a 220K re-run (no redeploy) returned 218.8K/p50 300µs. Recovery without redeploy confirms **no
+state/slot leak** ([[feedback_no_slot_leak]]); the blip is the known knee overshoot ([[feedback_bench_warmup_ramp]]),
+not a cleanup regression. Conclusion: the cleanup is **functionally correct and performance-neutral** — no logic,
+timing, ordering, or wire-format changed, exactly as intended.

@@ -31,12 +31,12 @@
  *      ~2s on a req_id collision. There is no cond-blocking mode. To SLEEP until
  *      a request/response is ready, wait on dpumesh_event_fd(s) with native
  *      epoll/poll/select — it is notification-driven (no busy-poll).
- *   5. SINGLE-SHOT conn. One dpmconn_t carries exactly one request/response; after
+ *   3. SINGLE-SHOT conn. One dpmconn_t carries exactly one request/response; after
  *      send_dpumesh() it cannot be written/sent again — close_dpumesh() and make a
  *      new connect_dpumesh()/accept_dpumesh().
- *   3. ADDRESS = pod_id (a small integer), not an IP/port. A "connection" is one
+ *   4. ADDRESS = pod_id (a small integer), not an IP/port. A "connection" is one
  *      request/response conversation, not a persistent stream; reuse is per-call.
- *   4. write_dpumesh() BUFFERS into the TX slot; the message is transmitted only
+ *   5. write_dpumesh() BUFFERS into the TX slot; the message is transmitted only
  *      by send_dpumesh(). (write() does not auto-flush.)
  *
  * Thread-safety: the underlying ctx is internally locked, so multiple threads may

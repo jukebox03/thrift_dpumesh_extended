@@ -1,7 +1,6 @@
 #include "config.h"
 
 #include <string.h>
-#include <strings.h>
 
 #include <doca_argp.h>
 #include <doca_log.h>

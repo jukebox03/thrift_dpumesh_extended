@@ -2,7 +2,6 @@
 #include "object.h"
 #include "buffer.h"
 #include "comch_common.h"
-#include <time.h>
 
 #include <doca_comch.h>
 #include <doca_comch_consumer.h>
@@ -23,7 +22,6 @@ void server_new_consumer_callback(struct doca_comch_event_consumer *event,
 {
 	union doca_data user_data;
 	struct doca_comch_server *comch_server;
-	struct objects *objs;
 	doca_error_t result;
 
 	/* This argument is not in use */
@@ -40,8 +38,6 @@ void server_new_consumer_callback(struct doca_comch_event_consumer *event,
 		return;
 	}
 
-	objs = (struct objects *)(user_data.ptr);
-
 	DOCA_LOG_INFO("Got a new remote consumer with ID = [%d]", id);
 }
 
@@ -51,7 +47,6 @@ void client_new_consumer_callback(struct doca_comch_event_consumer *event,
 {
 	union doca_data user_data;
 	struct doca_comch_client *comch_client;
-	struct objects *objs;
 	doca_error_t result;
 
 	/* This argument is not in use */
@@ -67,8 +62,6 @@ void client_new_consumer_callback(struct doca_comch_event_consumer *event,
 		DOCA_LOG_ERR("Failed to get user data from ctx with error = %s", doca_error_get_name(result));
 		return;
 	}
-
-	objs = (struct objects *)(user_data.ptr);
 
 	DOCA_LOG_INFO("Got a new remote consumer with ID = [%d]", id);
 }
@@ -249,7 +242,7 @@ err_out:
 /**
  * Callback for consumer post recv task completion with error
  *
- * @task [in]: Send task object
+ * @task [in]: Recv task object
  * @task_user_data [in]: User data for task
  * @ctx_user_data [in]: User data for context
  */
@@ -277,9 +270,11 @@ static void consumer_recv_task_comp_err_cb(struct doca_comch_consumer_task_post_
 }
 
 /**
- * Use consumer to recv a msg
+ * Post the initial pool of recv tasks on the consumer.
  *
- * @data_path [in]: CC data path resources
+ * @objs [in]: transport objects
+ * @consumer [in]: comch consumer to post recv tasks on
+ * @cmem [in]: consumer-side buf pool
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
 static doca_error_t prepare_consumer_tasks(struct objects *objs, struct doca_comch_consumer *consumer, struct local_mem_bufs *cmem)

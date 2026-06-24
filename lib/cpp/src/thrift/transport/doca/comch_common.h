@@ -126,12 +126,10 @@ _Static_assert(sizeof(struct dmesh_dma_completion_msg) == 16,
 
 
 
+/* Type-peek wrapper: control-path recv buffers are cast to this to read the
+ * leading type, then re-cast to the concrete message struct (mmap/register). */
 struct dmesh_comch_msg {
     enum dmesh_msg_type type;
-    union 
-    {
-        struct dmesh_mmap_msg mmap_msg;
-    };
 };
 doca_error_t
 export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer, size_t buf_size, enum mmap_type mmap_type, enum msg_direction direction);

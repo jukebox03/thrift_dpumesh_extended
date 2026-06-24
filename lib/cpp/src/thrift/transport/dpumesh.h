@@ -23,16 +23,17 @@ extern "C" {
 /* Slot pool size (host TX + host RX). num_slots × slot_size MUST equal
  * DPU_BUFFER_SIZE so slot-based admission bounds in-flight bytes inside DPU. */
 #define DPUMESH_NUM_SLOTS_DEFAULT       4096
-#define DPUMESH_MAX_DESCRIPTORS_DEFAULT 2048
+/* The host→DPU descriptor ring depth is NOT configurable: it is the wire-ABI
+ * constant DMA_RING_SIZE (doca/dpumesh_common.h), which the host and the DPA
+ * kernel must agree on at build time. */
 
 /* ====== Configuration ====== */
 typedef struct {
     int num_slots;        /* slots per pool (0 = default) */
     int slot_size;        /* bytes per slot (0 = default) */
-    int max_descriptors;  /* descriptor ring capacity (0 = default) */
 } dpumesh_config_t;
 
-#define DPUMESH_CONFIG_DEFAULT { 0, 0, 0 }
+#define DPUMESH_CONFIG_DEFAULT { 0, 0 }
 
 /* ====== SwDescriptor (host-internal RX/TX descriptor, packed) ====== */
 typedef struct __attribute__((packed)) {
@@ -130,8 +131,8 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
 
 /* Asynchronously release a pending entry registered via dpumesh_register_pending.
  * Intended for responder-side use (e.g. server sending OP_RESPONSE) after
- * enqueue + attach_tx, when no response is expected on this req_id and the
- * caller does NOT want to call dpumesh_wait_response.
+ * enqueue + attach_tx, when no response is expected on this req_id (so the
+ * pending entry is released without polling for a response).
  *
  * Behavior (only acts on state == 0):
  *   - tx_slot still attached: transition to state -2; TX_ACK handler will

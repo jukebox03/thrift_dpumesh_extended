@@ -264,6 +264,7 @@ void dmesh_doca_dpa_comch_msgq_ctx_state_changed_cb(const union doca_data user_d
 							  enum doca_ctx_states next_state)
 {
 	(void)prev_state;
+	(void)ctx;
 
 	switch (next_state) {
 	case DOCA_CTX_STATE_IDLE:
@@ -274,7 +275,6 @@ void dmesh_doca_dpa_comch_msgq_ctx_state_changed_cb(const union doca_data user_d
         break;
     case DOCA_CTX_STATE_RUNNING:
         DOCA_LOG_INFO("DPA comch msgQ ctx RUNNING.");
-        (void)ctx;
         break;
 	case DOCA_CTX_STATE_STOPPING:
 	default:
@@ -439,8 +439,6 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
     uint32_t consumer_id;
 
     memset(msgq, 0, sizeof(*msgq));
-
-    msgq->is_send = attr->is_send;
 
     if (msgq->pe == NULL) {
         result = doca_pe_create(&msgq->pe);
@@ -846,7 +844,7 @@ dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t m
                               msgq->target_consumer_id,
 							  &send_task);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to send msg using NVMf DOCA DPA MsgQ: Failed to allocate send task - %s",
+		DOCA_LOG_ERR("DPA MsgQ send failed: failed to allocate send task - %s",
 			     doca_error_get_name(result));
         free(msg_copy);
 		return result;

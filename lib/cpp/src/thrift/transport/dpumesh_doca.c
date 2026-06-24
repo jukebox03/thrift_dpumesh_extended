@@ -82,7 +82,6 @@ struct dpumesh_ctx {
     int  pod_id;
     int  num_slots;
     int  slot_size;
-    int  max_descriptors;
     int  k_rings;              /* K = forward rings per pod (EU-sharding); 1 = legacy */
     /* DOCA objects */
     struct objects doca_objs;
@@ -273,10 +272,6 @@ static inline int rxq_try_pop(dpumesh_ctx_t *ctx, sw_descriptor_t *out)
     }
 }
 
-/*
- * Deliver a fully parsed descriptor to the pending table or RX queue.
- * Common path for both comch-based RX_DATA and DMA-based DMA_COMPLETION.
- */
 /* Wake a caller blocked in a vanilla epoll_wait() on the readiness eventfd.
  * No-op until dpumesh_get_event_fd() enables it. Per-delivery write (no
  * coalescing) → cannot lose a wakeup; the eventfd is a plain counter, drained by
@@ -290,6 +285,8 @@ static inline void dpumesh_notify(dpumesh_ctx_t *ctx)
     }
 }
 
+/* Deliver a fully parsed descriptor: OP_RESPONSE -> client pending table,
+ * otherwise -> the SPMC RX ring for server workers. */
 static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int slot)
 {
     if (desc->flags & OP_RESPONSE) {
@@ -391,9 +388,10 @@ static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_l
 
 static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)hook_ctx;
-    /* Dispatch on the 1-byte type (see comch_client.c: the legacy 4-byte enum
-     * carries its value in the LE low byte, and the completion uses a 1-byte
-     * type at offset 0, so a single-byte read handles both). */
+    /* Dispatch on the 1-byte type at offset 0. Every DPU->Host message this hook
+     * receives (FWD_ACK / BATCH_FWD_ACK / REV_DONE / BATCH_REV_DONE) has a
+     * uint8_t type as its first field, and type values stay < 256, so a single
+     * byte read is sufficient. */
     uint8_t mtype = data[0];
 
     if (mtype == DMESH_MSG_FWD_ACK) {
@@ -547,13 +545,6 @@ static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, cons
         ctx->slot_size = atoi(env_val);
     else
         ctx->slot_size = DPUMESH_SLOT_SIZE_DEFAULT;
-
-    if (config && config->max_descriptors > 0)
-        ctx->max_descriptors = config->max_descriptors;
-    else if ((env_val = getenv("DPUMESH_MAX_DESCRIPTORS")) != NULL && atoi(env_val) > 0)
-        ctx->max_descriptors = atoi(env_val);
-    else
-        ctx->max_descriptors = DPUMESH_MAX_DESCRIPTORS_DEFAULT;
 
     /* K = forward rings per pod (EU-sharding). Must match the DPU's
      * DPUMESH_RINGS_PER_POD so host TX rings pair 1:1 with DPU per-pod rings. */
@@ -878,8 +869,8 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
 
     /* TX slot lifetime is owned by the pending mechanism for BOTH OP_REQUEST
      * (gateway) and OP_RESPONSE (server transport):
-     *   - OP_REQUEST: caller registers + attach_tx; wait_response/timeout
-     *     paths or TX_ACK handler free the TX slot.
+     *   - OP_REQUEST: caller registers + attach_tx; the poll_response /
+     *     cancel_pending paths or the TX_ACK handler free the TX slot.
      *   - OP_RESPONSE: caller registers + attach_tx + release_async; TX_ACK
      *     handler frees the TX slot via the deferred state -2 → -1 path. */
 

@@ -26,11 +26,10 @@ int setup_dma_ring(struct objects *objs, size_t size, struct dma_ring **out_ring
     ring->head = 0;
     ring->descs = NULL;
 
-    /* Allocate one EXTRA slot at the end. Slots 0..size-1 are normal dma_desc
-     * entries; slot `size` (index DMA_RING_SIZE) is reserved for the RX credit
-     * counter. Host atomically increments slot[size].first 8 bytes on rx_free;
-     * DPA polls the same slot via the same buf_arr (no separate mmap, no
-     * separate buf_arr, no race with other PCIe reads). */
+    /* Allocate one EXTRA slot. Slots 0..size-1 are normal dma_desc entries;
+     * slot `size` holds the RX credit counter. Host atomically bumps its first
+     * 8 bytes on rx_free; DPA polls it via the same buf_arr (no separate mmap,
+     * so no race with other PCIe reads). */
     size_t alloc_slots = ring->size + 1;
     result = alloc_buffer_and_set_mmap(&ring->mmap, objs->dev,
                            (void **)&ring->descs,

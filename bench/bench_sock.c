@@ -49,7 +49,6 @@ static double now_sec(void) {
 
 /* ------------------------------------------------------------ per-worker  */
 typedef struct {
-    int        worker_id;
     long       budget;
     double     interval_sec;
     int        msg_size;
@@ -240,7 +239,6 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns) {
     pthread_attr_setstacksize(&worker_attr, WORKER_STACK_BYTES);
 
     for (int i = 0; i < n_workers; i++) {
-        wargs[i].worker_id    = i;
         wargs[i].budget       = per_worker + (i < remainder ? 1 : 0);
         wargs[i].interval_sec = interval_sec;
         wargs[i].msg_size     = msg_size;

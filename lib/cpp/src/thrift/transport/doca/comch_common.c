@@ -55,9 +55,6 @@ export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer
     }
 }
 
-/* Forward declaration — implemented in dpa.c */
-doca_error_t setup_pod_dma(struct objects *objs, struct pod_state *pod);
-
 doca_error_t
 process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
                  struct dmesh_mmap_msg *mmap_msg)
