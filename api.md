@@ -1,334 +1,279 @@
-# DPUmesh API — Whitepaper
+# DPUmesh API — Whitepaper (user-facing)
 
-A service-mesh **data plane** built on NVIDIA DOCA (Comch + DMA). The transport
-runs on the **BlueField DPU/DPA** instead of host CPU, so the application keeps
-its full host core (no in-host sidecar tax). Two pods exchange messages
-**host → DPU → host**: the DPU routes on `dst_pod_id` (metadata only, never reads
-the body) and the DPA EU performs the DMA copies.
+A service-mesh **data plane** on NVIDIA DOCA (Comch + DMA). The transport runs on
+the **BlueField DPU/DPA**, not host CPU, so the application keeps its full host
+core (no in-host sidecar tax). Two pods exchange messages **host → DPU → host**;
+the DPU routes on `dst_pod_id` (metadata only — it never reads the body) and the
+DPA EU performs the DMA copies.
 
-This document is the complete API reference for the current code
-(`lib/cpp/src/thrift/transport/`). It covers two layers:
+The public API is shaped like **BSD sockets + epoll**, so an ordinary
+non-blocking epoll server/client ports by swapping each call for its `_dpumesh`
+twin (`read` → `read_dpumesh`, …). Header: `thrift/transport/dpumesh_sock.h`
+(header-only, built on the C core `dpumesh.h`).
 
-- **Layer 1 — Low-level C API** (`dpumesh.h`): zero-copy slot/descriptor API. Use directly for custom clients/servers.
-- **Layer 2 — Thrift C++ transports**: drop-in replacements for `TServerSocket` / `TSocket`.
+## 0. Read this first — how DPUmesh differs from sockets
+
+| Property | DPUmesh | Why |
+|---|---|---|
+| **Non-blocking RX** | `accept`/`read` + epoll readiness never block; "not ready" → sentinel + `errno=EAGAIN`. **TX** (`write`/`sendfile`/`send`) never blocks on the peer but **busy-spins** (capped ~50µs backoff) while the local TX-slot pool / DMA ring is saturated — it self-throttles, never fails with backpressure. `send`'s `register_pending` can stall up to ~2s on a rare `req_id` collision. | RX is poll-based; TX uses slot-admission with spin backoff. No cond-blocking mode. |
+| **Message-oriented** | One **request ↔ one response**; not a byte stream. | DMA delivers whole messages. |
+| **Atomic delivery** | `accept_dpumesh()` already holds the **entire** request body. No partial-read loop, no `EPOLLOUT` body dance. | The message arrives in one RX slot. |
+| **Single-shot conn** | A `dpmconn_t` carries **one** request/response; after `send_dpumesh()` it cannot be reused. | `close_dpumesh()` then a new `connect`/`accept`. |
+| **8 KB body cap** | `body_len ≤ slot_size`; **8192 B is the DPA `dma_copy` hard limit**. `slot_size` is **not** host-clamped, so setting it > 8192 silently **drops** messages at the DPA — keep `slot_size ≤ 8192`. `write`/`sendfile` past `slot_size` → `EMSGSIZE`. | Larger payloads must be chunked at the app layer. |
+| **Address = `pod_id`** | A small integer `[0,127]`, not IP:port. | Pods register with the DPU by id. |
+| **`write` buffers** | `write_dpumesh()` accumulates; `send_dpumesh()` transmits. | A message is sent as a unit. |
+| **Per-request "connection"** | A `dpmconn_t` is one conversation, not a persistent stream. | "keep-alive" = simply accept the next request. |
+
+> **No cond-blocking calls** (by design). RX (`accept`/`read`) polls; TX spins under local
+> saturation. To SLEEP until work is ready, wait on `dpumesh_event_fd(s)` with **native**
+> kernel epoll/poll/select — it is notification-driven (the PE thread sleeps on the DOCA
+> notification fd and signals this fd; idle CPU stays ~0). A `dpmconn_t` is **single-shot**.
 
 ---
 
-## 1. Model in one paragraph
+## 1. Types
 
-Each node owns two fixed **slot pools** (TX and RX), `num_slots × slot_size`
-bytes each. To send: allocate a TX slot, write the body into it (zero-copy),
-fill a `sw_descriptor_t`, and `enqueue`. The DPA EU DMAs the body to the
-destination's RX pool and the destination `dequeue`s a descriptor pointing at an
-RX slot. Requests carry a `req_id`; clients match responses to requests via the
-**pending** API (blocking `wait_response` or async `poll_response`). Slot-based
-admission bounds in-flight bytes: `num_slots × slot_size` **must equal**
-`DPU_BUFFER_SIZE` (32 MB = 4096 × 8 KB).
+```c
+typedef struct dpm_endpoint dpm_t;     // a bound, listening endpoint (one per process)
+typedef struct dpm_conn     dpmconn_t; // one request/response conversation (≈ an fd)
+```
+Only two handles. Event-loop multiplexing uses **native** kernel epoll/poll/select on
+`dpumesh_event_fd(s)` — there are no DPUmesh-specific epoll types or functions.
+
+Accessors: `int dpm_pod_id(dpm_t*)`, `int dpm_msg_max(dpm_t*)` (= `slot_size`),
+`int dpm_is_server(dpmconn_t*)`, `int32_t dpm_peer(dpmconn_t*)`,
+`void dpm_set_data(dpmconn_t*, void*)` / `void *dpm_get_data(dpmconn_t*)` (mirrors `epoll_event.data.ptr`).
 
 ---
 
-## 2. Data types & constants
+## 2. API reference
+
+All calls are **non-blocking**. "would-block" = the listed sentinel **with `errno=EAGAIN`**.
+
+### Endpoint (socket + bind + listen, folded)
+| Function | Returns / errno |
+|---|---|
+| `dpm_t *socket_dpumesh(const char *app_name, int pod_id)` | Endpoint handle, or `NULL` on init failure. `app_name` = service identity (pod registration); `pod_id` = this node's address (overridden by env `DPUMESH_POD_ID`). |
+| `void destroy_dpumesh(dpm_t *s)` | — (releases all DOCA resources; safe on `NULL`). |
+
+### Accept / connect
+| Function | Returns / errno |
+|---|---|
+| `dpmconn_t *accept_dpumesh(dpm_t *s)` | New **server** conn holding the next request (body ready), or `NULL`+`EAGAIN` if none pending. **Non-blocking.** |
+| `dpmconn_t *connect_dpumesh(dpm_t *s, int dst_pod_id)` | New **client** conn targeting `dst_pod_id`. No round-trip (just binds the target). `NULL` on OOM. |
+
+### Read / write / send
+| Function | Returns / errno |
+|---|---|
+| `ssize_t read_dpumesh(dpmconn_t *c, void *buf, size_t len)` | `>0` bytes copied from the inbound body; `0` = end of message; `-1` = would-block (client response not in yet, `EAGAIN`) or abandoned (`ECONNRESET`). |
+| `ssize_t write_dpumesh(dpmconn_t *c, const void *buf, size_t len)` | **Buffers** outbound body bytes → returns `len`; `-1` = would exceed `slot_size` (`EMSGSIZE`) or conn already sent (`EINVAL`). Acquiring a TX slot busy-spins under saturation (never fails). |
+| `ssize_t sendfile_dpumesh(dpmconn_t *c, int in_fd, off_t *offset, size_t count)` | Appends ≤`count` bytes from `in_fd` into the body (**capped at `slot_size` → may be SHORT; check the return**); advances `*offset` if non-NULL. Returns bytes appended (`0` = EOF), `-1` on read error / already-sent (`EINVAL`). |
+| `int send_dpumesh(dpmconn_t *c)` | **Transmits** the buffered message (client → request; server → response matched to the inbound `req_id`). `0` sent; `-1` = already sent (`EINVAL`), a rare `req_id` pending-table collision (`EAGAIN`, ~2 s hard timeout — retry), or an enqueue validation error. Buffered body retained on `-1`. |
+| `int close_dpumesh(dpmconn_t *c)` | Frees the conn's slots/pending. Always `0`. Safe on `NULL`. |
+
+**Lifecycles (the only correct orderings):**
+```
+server:  c = accept_dpumesh(s);  read_dpumesh(c,…)…(EOF);  write_dpumesh(c,…)…;  send_dpumesh(c);  close_dpumesh(c);
+client:  c = connect_dpumesh(s,dst);  write_dpumesh(c,…)…;  send_dpumesh(c);  // then later:
+         while (read_dpumesh(c,buf,len) < 0 && errno==EAGAIN) {/* poll / epoll_wait */}  …;  close_dpumesh(c);
+```
+
+### Event-loop readiness fd (for NATIVE epoll/poll/select)
+| Function | Returns |
+|---|---|
+| `int dpumesh_event_fd(dpm_t *s)` | A real fd that becomes **readable** whenever an inbound request/response is delivered, or `-1` if unavailable. Register it in your own `epoll`/`poll`/`select` like a listen socket. |
+
+> **Usage:** register `dpumesh_event_fd(s)` with `EPOLLIN`. On a readiness event,
+> **drain** it (`while (read(dfd,&u64,8) > 0) {}`), then `accept_dpumesh(s)` in a loop
+> until it returns `NULL` (a server) or `read_dpumesh()` your client conns. The fd is
+> raised per delivery and is **notification-driven** (no busy-poll; the PE thread sleeps
+> on the DOCA notification fd). It mixes freely with real sockets in one epoll set.
+
+---
+
+## 3. Examples
+
+### 3a. Echo server — the natural accept-loop (no epoll needed)
+Because a request arrives atomically, the kernel server's READ/SEND_HDR/SEND_BODY
+state machine collapses into accept → handle → reply.
+```c
+#include <thrift/transport/dpumesh_sock.h>
+
+dpm_t *s = socket_dpumesh("echo", /*pod_id*/11);
+for (;;) {
+    dpmconn_t *c = accept_dpumesh(s);          // non-blocking
+    if (!c) { /* errno==EAGAIN: idle — sched_yield() or do other work */ continue; }
+
+    char buf[8192]; ssize_t n, off = 0;
+    while ((n = read_dpumesh(c, buf+off, sizeof buf-off)) > 0) off += n;   // whole request
+    write_dpumesh(c, buf, off);                 // echo it back (<= 8 KB)
+    while (send_dpumesh(c) < 0 && errno == EAGAIN) sched_yield();   // reply exactly once
+    close_dpumesh(c);                            // frees the request RX slot
+}
+```
+*(For throughput, run this loop on N threads — the endpoint is shared and thread-safe.)*
+
+### 3b. Client (request → response)
+```c
+dpm_t *s = socket_dpumesh("client", /*pod_id*/10);
+dpmconn_t *c = connect_dpumesh(s, /*dst_pod_id*/11);
+
+write_dpumesh(c, "ping", 4);
+while (send_dpumesh(c) < 0 && errno == EAGAIN) sched_yield();   // request out
+
+char resp[8192]; ssize_t n;
+for (;;) {                                   // poll for the response (non-blocking)
+    n = read_dpumesh(c, resp, sizeof resp);
+    if (n >= 0) break;                       // got it (n bytes; 0 = empty reply)
+    if (errno != EAGAIN) { /* ECONNRESET: lost */ break; }
+    sched_yield();
+}
+close_dpumesh(c);   // REQUIRED on every path — also reclaims the pending entry on ECONNRESET
+```
+
+### 3c. NATIVE epoll server — a normal epoll loop, only the data calls suffixed
+This is `bench/echo_sock.c` (validated: 240K RPS, 0-fail, idle CPU ~1%). The epoll
+machinery is **stock kernel epoll**; `dpumesh_event_fd(s)` is the "listen socket".
+```c
+dpm_t *s = socket_dpumesh("echo", 11);
+int dfd  = dpumesh_event_fd(s);                          // the DPUmesh readiness fd
+
+int epfd = epoll_create1(0);                             // ── vanilla kernel epoll ──
+struct epoll_event ev = { .events = EPOLLIN }; ev.data.fd = dfd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, dfd, &ev);
+
+struct epoll_event events[64];
+for (;;) {
+    int nfds = epoll_wait(epfd, events, 64, -1);         // SLEEPS until activity (no busy-poll)
+    for (int n = 0; n < nfds; n++) {
+        if (events[n].data.fd != dfd) continue;          // (real sockets can share this loop)
+        uint64_t cnt; while (read(dfd, &cnt, sizeof cnt) > 0) {}   // drain readiness fd
+
+        dpmconn_t *c;
+        while ((c = accept_dpumesh(s)) != NULL) {         // accept every queued request
+            char b[8192]; ssize_t off = 0, r;
+            while ((r = read_dpumesh(c, b+off, sizeof b-off)) > 0) off += r;   // full request
+            if (off > 0) write_dpumesh(c, b, off);        // echo it back
+            while (send_dpumesh(c) < 0 && errno == EAGAIN) sched_yield();
+            close_dpumesh(c);
+        }
+    }
+}
+```
+> The diff from an ordinary TCP epoll echo server is **only** the `_dpumesh` suffix on
+> `socket/accept/read/write/send/close` and using `dpumesh_event_fd(s)` as the listen fd.
+> The epoll loop is unchanged.
+
+### 3d. Porting an ordinary epoll HTTP server
+A standard `epoll_wait`/`accept`/`read`/`write`/`sendfile` server maps almost
+1:1 — and gets **simpler**, because the message is atomic (no `STATE_SEND_HDR`/
+`STATE_SEND_BODY`, no partial-write retry). The full request is in hand at accept;
+build the whole response and `send_dpumesh` once:
+```c
+dpm_t *s = socket_dpumesh("httpd", pod_id);
+for (;;) {
+    dpmconn_t *c = accept_dpumesh(s);
+    if (!c) { sched_yield(); continue; }
+
+    char req[8192]; ssize_t off = 0, n;
+    while ((n = read_dpumesh(c, req+off, sizeof req-off)) > 0) off += n;   // full request header
+
+    if (parse_request(req, off) < 0) {
+        write_dpumesh(c, ERR_400, strlen(ERR_400));
+    } else {
+        int fd = open_file(url);
+        if (fd < 0) write_dpumesh(c, ERR_404, strlen(ERR_404));
+        else if (flen + 256 > (long)dpm_msg_max(s))      // header + body won't fit one ≤8KB msg
+            write_dpumesh(c, ERR_500, strlen(ERR_500));   // (or chunk across round-trips)
+        else {
+            char hdr[256];
+            int hl = snprintf(hdr, sizeof hdr, "HTTP/1.0 200 OK\r\nContent-Length: %ld\r\n\r\n", flen);
+            write_dpumesh(c, hdr, hl);
+            sendfile_dpumesh(c, fd, NULL, flen);   // header + body in ONE message
+            close(fd);
+        }
+    }
+    while (send_dpumesh(c) < 0 && errno == EAGAIN) sched_yield();   // one atomic response
+    close_dpumesh(c);
+}
+```
+> **Caveat (8 KB cap):** header + file body must fit in one `slot_size` (≤ 8 KB)
+> message. For larger files you must chunk at the app layer (multiple
+> request/response round-trips) — DPUmesh has no multi-segment streaming.
+
+---
+
+## 4. Limitations & rules (explicit)
+
+- **No cond-blocking calls.** RX (`accept`/`read`) polls; the TX side (`write`/`sendfile`/`send`) **busy-spins** under local TX-slot/DMA-ring saturation (it never fails with backpressure), and `send`'s `register_pending` can stall ~2 s on a rare collision. To sleep until work is ready, use **native epoll on `dpumesh_event_fd(s)`** (notification-driven).
+- **Single-shot conn.** A `dpmconn_t` carries one request/response; after `send_dpumesh()`, `write`/`sendfile`/`send` on it return `-1`+`EINVAL`. Reuse = `close_dpumesh()` + a new `connect`/`accept`.
+- **Message ≤ `slot_size` (≤ 8 KB).** `write`/`sendfile` past `slot_size` → `EMSGSIZE`. 8192 B is the DPA hard limit; `slot_size` is **not** host-clamped, so `> 8192` silently drops at the DPA. No streaming/segmentation.
+- **Ownership:** every `accept`/successful response `read` owns an RX slot freed by `close_dpumesh`; `write` owns a TX slot handed to the transport by `send` (freed by the DPU), or freed by `close` if never sent. **Pair every conn with exactly one `close_dpumesh` — including the abandoned/`ECONNRESET` path, where `close` reclaims the still-live pending entry.**
+- **`send` then read (client):** poll `read_dpumesh` (or wait on `dpumesh_event_fd`) only **after** `send_dpumesh`.
+- **Addressing:** `dst_pod_id` must be a live, registered pod `[0,127]`; there is no name resolution.
+- **Thread-safety:** the endpoint is shared/thread-safe; a single `dpmconn_t` is single-thread. The native-epoll reactor is single-threaded (validated at 240K, 0-fail).
+
+---
+
+## Appendix A — Low-level C primitives (`dpumesh.h`)
+
+The façade is a thin wrapper over these; use them directly only for custom paths.
+All are thread-safe.
+
+| Function | Purpose / returns |
+|---|---|
+| `int dpumesh_init(dpumesh_ctx_t **ctx, const char *app_name, int worker_id, const dpumesh_config_t *config)` | Create context (`NULL` config = defaults). `0`/non-zero. |
+| `void dpumesh_destroy(dpumesh_ctx_t *ctx)` | Tear down. |
+| `int dpumesh_get_slot_size(ctx)` / `int dpumesh_get_pod_id(ctx)` / `const char *dpumesh_get_worker_id(ctx)` | Configured slot size / this pod id / `"<app>-worker-<n>"`. |
+| `int dpumesh_get_event_fd(ctx)` | Enable + return the readiness eventfd (readable on inbound delivery) for native epoll/poll/select; `-1` if unavailable. (`dpumesh_event_fd(s)` in the façade wraps this.) |
+| `int dpumesh_dequeue(ctx, sw_descriptor_t *desc, int timeout_ms)` | RX one message. `-1`=block forever, `0`=non-blocking, `>0`=ms. `0`/`-1`. `desc->body_buf_slot` must be `rx_free`'d. |
+| `uint8_t *dpumesh_rx_buf(ctx, int slot)` / `void dpumesh_rx_free(ctx, int slot)` | RX body pointer (zero-copy) / release it. |
+| `int dpumesh_tx_alloc(ctx)` | TX slot index `≥0`; under backpressure BUSY-SPINS (capped backoff) until a slot frees — never returns `-1`. (`dpumesh_enqueue` likewise blocks on a full DMA ring; it returns `-1` only on descriptor validation: NULL / bad slot / `body_len > slot_size`.) |
+| `uint8_t *dpumesh_tx_buf(ctx, int slot)` / `void dpumesh_tx_free(ctx, int slot)` | TX body pointer / free on error before handoff. |
+| `int dpumesh_enqueue(ctx, const sw_descriptor_t *desc)` | Submit a filled descriptor. `0`/`-1`. |
+| `uint32_t dpumesh_alloc_req_id(ctx)` | Atomic unique request id (starts at 1). |
+| `int dpumesh_register_pending(ctx, uint32_t req_id)` | Register **before** enqueue. `0`/`-1`. |
+| `int dpumesh_wait_response(ctx, req_id, sw_descriptor_t *resp, int timeout_ms)` | **Blocking** match (`-1`/`0`/`>0`). `0`=`resp` filled (free its `body_buf_slot`), `-1`=timeout. |
+| `int dpumesh_poll_response(ctx, req_id, sw_descriptor_t *resp)` | Non-blocking: `0`=arrived (TX already freed; free body), `1`=not ready, `-1`=abandoned. |
+| `void dpumesh_pending_attach_tx(ctx, req_id, int tx_slot)` | Bind TX slot **after** a successful enqueue (TX_ACK owns it now). |
+| `void dpumesh_cancel_pending(ctx, req_id)` | Cancel (error path); defers TX cleanup if in flight. |
+| `void dpumesh_pending_release_async(ctx, req_id)` | Responder fire-and-forget after enqueue+attach_tx (no response expected). Idempotent. |
+
+> A process uses **either** `wait_response` (set `config.async_client=0`) **or**
+> `poll_response` (set `config.async_client=1`) — never both. The façade selects
+> the non-blocking (`poll_response`) model.
 
 ### `dpumesh_config_t`
-| Field | Type | Meaning | 0 / default |
-|---|---|---|---|
-| `num_slots` | `int` | Slots per pool (TX and RX each) | 0 → env `DPUMESH_NUM_SLOTS` → **4096** |
-| `slot_size` | `int` | Bytes per slot (max body per message) | 0 → env `DPUMESH_SLOT_SIZE` → **8192** |
-| `max_descriptors` | `int` | Descriptor ring capacity | 0 → env `DPUMESH_MAX_DESCRIPTORS` → **2048** |
-| `poll_rx` | `int` | `1` = `dequeue` spin-polls the RX ring (no cond wakeup). For echo/server pools. | `0` = cond-wait |
-| `async_client` | `int` | `1` = response delivered via `poll_response` (PE thread does **not** signal a per-request cond). For async clients. | `0` = `wait_response` |
-
-`#define DPUMESH_CONFIG_DEFAULT { 0, 0, 0, 0, 0 }` — pass `NULL` to `dpumesh_init` for the same effect.
-
-**Precedence for sizing fields:** explicit `config` field (if `> 0`) → environment variable → compile-time default.
-
-### `sw_descriptor_t` (packed)
-| Field | Type | Meaning |
+| Field | Meaning | 0 / default |
 |---|---|---|
-| `header_buf_slot` | `int32_t` | Header slot; **always `-1`** (Thrift has no separate header) |
-| `header_len` | `uint32_t` | **always `0`** |
-| `body_buf_slot` | `int32_t` | TX slot (send) / RX slot (receive) holding the body |
-| `body_len` | `uint32_t` | Body length in bytes (**≤ `slot_size`**) |
-| `req_id` | `uint32_t` | Request/stream id (for response matching) |
-| `dst_pod_id` | `int32_t` | Destination pod id `[0,127]` |
-| `src_pod_id` | `int32_t` | Source pod id (set to `dpumesh_get_pod_id(ctx)`) |
-| `flags` | `int8_t` | `OpFlag | CaseFlag` (see below) |
-| `valid` | `int8_t` | Must be `1` for a live descriptor |
+| `num_slots` | slots per pool | env `DPUMESH_NUM_SLOTS` → **4096** |
+| `slot_size` | bytes per slot (≤ 8192 effective) | env `DPUMESH_SLOT_SIZE` → **8192** |
+| `max_descriptors` | descriptor ring capacity | env `DPUMESH_MAX_DESCRIPTORS` → **2048** |
+| `poll_rx` | `1` = `dequeue` spin-polls (lean server) | `0` |
+| `async_client` | `1` = `poll_response` model | `0` |
 
-### Flag constants (`dpumesh_common.h`)
-| Constant | Value | Meaning |
-|---|---|---|
-| `OP_REQUEST` | `0x00` | Request direction (OR into `flags`) |
-| `OP_RESPONSE` | `0x10` | Response direction |
-| `CASE_EXTERNAL` | `1` | Client-originated traffic |
-| `CASE_INGRESS` | `2` | DPU-injected ingress |
+Precedence: explicit field (`> 0`) → env var → default. Invariant: `num_slots × slot_size == 32 MB` (`DPU_BUFFER_SIZE`).
 
-Compose: request = `OP_REQUEST | CASE_EXTERNAL`; reply = `(req.flags & ~OP_REQUEST) | OP_RESPONSE`.
+### `sw_descriptor_t` (fill for `dpumesh_enqueue`)
+`header_buf_slot=-1`, `header_len=0`, `body_buf_slot` (TX/RX slot), `body_len`
+(≤ slot_size), `req_id`, `dst_pod_id`, `src_pod_id` (= `dpumesh_get_pod_id`),
+`flags` = `OpFlag|CaseFlag`, `valid=1`.
 
-### Limits / defaults
-| Constant | Value |
-|---|---|
-| `DPUMESH_SLOT_SIZE_DEFAULT` | `8192` (8 KB; also the per-`dma_copy` HW max) |
-| `DPUMESH_NUM_SLOTS_DEFAULT` | `4096` |
-| `DPUMESH_MAX_DESCRIPTORS_DEFAULT` | `2048` |
-| `MAX_PODS` | `8` (pod_id wire range `[0,127]`) |
-| `DPU_BUFFER_SIZE` | `32 MB` (= `4096 × 8192`; the `num_slots × slot_size` invariant) |
+Flags: `OP_REQUEST=0x00`, `OP_RESPONSE=0x10`, `CASE_EXTERNAL=1`, `CASE_INGRESS=2`.
+Reply flags = `(req.flags & ~OP_REQUEST) | OP_RESPONSE`.
 
 ---
 
-## 3. Layer 1 — C API reference (`dpumesh.h`)
+## Appendix B — Environment variables (host)
 
-Opaque handle: `typedef struct dpumesh_ctx dpumesh_ctx_t;`. All `tx`/`rx`/`pending`
-calls are internally locked and thread-safe.
+Precedence `config field (>0) → env → default`:
 
-### Lifecycle
-**`int dpumesh_init(dpumesh_ctx_t **ctx, const char *app_name, int worker_id, const dpumesh_config_t *config)`**
-| Param | Dir | Meaning |
-|---|---|---|
-| `ctx` | out | Receives the allocated context pointer |
-| `app_name` | in | Service name (used in the worker-id string and pod registration) |
-| `worker_id` | in | Worker number; becomes this node's `pod_id` unless env `DPUMESH_POD_ID` overrides |
-| `config` | in | Configuration, or `NULL` for all defaults |
-| **Returns** | | `0` on success (`*ctx` set); non-zero on failure |
-
-**`void dpumesh_destroy(dpumesh_ctx_t *ctx)`** — Tear down the context and release all DOCA resources.
-
-### Query / info
-| Signature | Returns |
-|---|---|
-| `int dpumesh_get_slot_size(dpumesh_ctx_t *ctx)` | Configured `slot_size` (bytes) — the max body per message |
-| `int dpumesh_get_pod_id(dpumesh_ctx_t *ctx)` | This node's `pod_id` |
-| `const char *dpumesh_get_worker_id(dpumesh_ctx_t *ctx)` | Worker-id string `"<app_name>-worker-<n>"` (lifetime = `ctx`) |
-
-### Raw buffer / queue API
-**`int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc, int timeout_ms)`** — Receive one descriptor.
-| Param | Dir | Meaning |
-|---|---|---|
-| `desc` | out | Filled on success; `desc->body_buf_slot` is an **RX slot the caller must `rx_free`** after reading |
-| `timeout_ms` | in | `-1` = block forever, `0` = non-blocking, `>0` = milliseconds |
-| **Returns** | | `0` on success; `-1` on timeout/error |
-
-| Signature | Param / Returns |
-|---|---|
-| `uint8_t *dpumesh_rx_buf(dpumesh_ctx_t *ctx, int slot)` | Pointer to RX slot body (zero-copy read); `NULL` if invalid |
-| `void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot)` | Release an RX slot after reading |
-| `int dpumesh_tx_alloc(dpumesh_ctx_t *ctx)` | Allocate a TX slot → slot index `≥0`, or **`-1` = pool exhausted (backpressure, not an error)** |
-| `uint8_t *dpumesh_tx_buf(dpumesh_ctx_t *ctx, int slot)` | Pointer to TX slot body (zero-copy write up to `slot_size`) |
-| `void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot)` | Free a TX slot on the **error path** (before ownership is handed to `attach_tx`) |
-| `int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc)` | Submit a filled descriptor to TX → `0` success, `-1` failure |
-
-### Client / responder request-response API
-| Signature | Params / Returns |
-|---|---|
-| `uint32_t dpumesh_alloc_req_id(dpumesh_ctx_t *ctx)` | Atomic, thread-safe unique request id |
-| `int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id)` | Register a pending entry **before** `enqueue` → `0` / `-1` |
-| `void dpumesh_pending_attach_tx(dpumesh_ctx_t *ctx, uint32_t req_id, int tx_slot)` | Bind the TX slot to the pending entry **after a successful `enqueue`**; TX-slot lifetime now owned by the pending/`TX_ACK` path |
-| `void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id)` | Cancel a pending entry (error path); defers TX cleanup if the DPA may still be using the slot |
-
-**`int dpumesh_wait_response(dpumesh_ctx_t *ctx, uint32_t req_id, sw_descriptor_t *resp, int timeout_ms)`** — Blocking response wait (blocking-client model).
-| Param | Dir | Meaning |
-|---|---|---|
-| `resp` | out | Response descriptor on success; caller must `rx_free(resp->body_buf_slot)` |
-| `timeout_ms` | in | `-1` forever, `0` non-blocking, `>0` ms |
-| **Returns** | | `0` on success (`resp` filled); `-1` on timeout |
-
-**`int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint32_t req_id, sw_descriptor_t *resp)`** — Non-blocking poll (async-client model).
-| Returns | Meaning |
-|---|---|
-| `0` | Response arrived — `resp` filled, **TX already freed**, caller must `rx_free(resp->body_buf_slot)` |
-| `1` | Not ready — poll again later |
-| `-1` | Error / abandoned (no live pending for `req_id`) |
-
-> A client process must use **either** `wait_response` (set `async_client=0`) **or** `poll_response` (set `async_client=1`) consistently — never both.
-
-**`void dpumesh_pending_release_async(dpumesh_ctx_t *ctx, uint32_t req_id)`** — Responder-side fire-and-forget release after `enqueue`+`attach_tx` when **no response is expected** (e.g. a server sending `OP_RESPONSE`). Idempotent; safe to race with `TX_ACK`. Acts only on the unmodified state:
-- TX still attached → mark for release; `TX_ACK` frees the slot and clears the entry.
-- TX already freed by an earlier `TX_ACK` → clear immediately (slot reusable).
-- any other state → no-op.
-
----
-
-## 4. Ownership & lifecycle rules (correctness-critical)
-
-**Send (request or response):**
-```
-req_id = alloc_req_id(ctx)                 // client only; responder reuses req->req_id
-tx = tx_alloc(ctx)                         // -1 → backpressure, retry later
-write into tx_buf(ctx, tx)                 // ≤ slot_size bytes
-register_pending(ctx, req_id)              // BEFORE enqueue; -1 → tx_free + fail
-fill sw_descriptor_t (valid=1, slots/ids/flags)
-enqueue(ctx, &desc)                        // -1 → tx_free + cancel_pending + fail
-attach_tx(ctx, req_id, tx)                 // success → pending owns the TX slot
-   client : wait_response | poll_response  // frees TX on completion
-   responder: pending_release_async        // TX_ACK frees TX (fire-and-forget)
-```
-- After `attach_tx`, **never** call `tx_free` — `TX_ACK` (or `cancel_pending`'s deferred path) owns it.
-- `tx_free` is only for the error path **before** `attach_tx`.
-
-**Receive:** `dequeue` (or a response from `wait`/`poll`) yields `body_buf_slot`; read via `rx_buf`; **always** `rx_free` it.
-
----
-
-## 5. Layer 2 — Thrift C++ transports
-
-Drop-in for the Apache Thrift transport stack. All in `apache::thrift::transport`.
-
-### `TDpumeshServerTransport` — replaces `TServerSocket`
-```cpp
-TDpumeshServerTransport(const std::string& app_name, int worker_id);
-TDpumeshServerTransport(const std::string& app_name, int worker_id,
-                        const dpumesh_config_t& config);
-```
-| Param | Meaning |
-|---|---|
-| `app_name` | Service name (pod registration) |
-| `worker_id` | Worker number → pod id |
-| `config` | (2nd overload) sizing/mode; zero fields fall back to defaults. 1st overload uses `DPUMESH_CONFIG_DEFAULT`. |
-
-Methods (override `TServerTransport`): `listen()`, `close()`, `interrupt()`, `interruptChildren()`, `getPort()` → `0` (no TCP port), `acceptImpl()` → a `TDpumeshTransport` per dequeued request.
-
-### `TDpumeshClientTransport` — replaces `TSocket`
-```cpp
-TDpumeshClientTransport(dpumesh_ctx_t* ctx, int32_t dst_pod_id = 0,
-                        int timeout_ms = 30000);
-```
-| Param | Default | Meaning |
-|---|---|---|
-| `ctx` | — | Shared, already-initialized context |
-| `dst_pod_id` | `0` | Target service pod id |
-| `timeout_ms` | `30000` | Per-call response timeout (ms) |
-
-Methods: `read`, `write`, `flush`, `isOpen` (true while `ctx != nullptr`), `open` (no-op), `close`. **Wrap in `TFramedTransport`.**
-
-### `TDpumeshTransport` — per-connection server-side transport
-`TDpumeshTransport(dpumesh_ctx_t* ctx, const sw_descriptor_t& desc)` — constructed by `acceptImpl()` from a freshly dequeued request; one runner thread serves many requests (loops back into `read()` to fetch the next). `static constexpr int IDLE_TIMEOUT_MS = 30000;` — after this idle gap `read()` returns 0 so the processor loop exits cleanly.
-
----
-
-## 6. Environment variables
-
-**Host library** (`dpumesh_init`), precedence `config field (>0) → env → default`:
 | Variable | Effect | Default |
 |---|---|---|
 | `DPUMESH_PCI_ADDR` | DOCA device PCI address | `94:00.0` |
-| `DPUMESH_POD_ID` | Override pod id (else = `worker_id`) | `worker_id` |
+| `DPUMESH_POD_ID` | Override this node's pod id | = `worker_id` arg |
 | `DPUMESH_NUM_SLOTS` | Slots per pool | `4096` |
 | `DPUMESH_SLOT_SIZE` | Bytes per slot | `8192` |
 | `DPUMESH_MAX_DESCRIPTORS` | Descriptor ring capacity | `2048` |
-| `DPUMESH_RINGS_PER_POD` | `K` = EU-sharding rings/pod; **must match the DPU process** | `1` (clamped ≤ 8) |
-| `DPUMESH_HOST_EPOLL` | `1` = host PE-progress thread sleeps on epoll; `0` = busy-poll | `0` (test-bench sets `1`) |
-
-**DPU process** (set when launching `dpumesh_dpu`, not the host app): `DPUMESH_DPA_THREADS` (EU count, default 1; test-bench 4), `DPUMESH_RINGS_PER_POD` (K, must match host), `DPUMESH_EVENT_LOOP` (1 = epoll-at-idle ARM loop, default).
-
----
-
-## 7. Examples
-
-### 7a. Client — async (poll) model
-```c
-dpumesh_config_t cfg = DPUMESH_CONFIG_DEFAULT;
-cfg.async_client = 1;                        // use poll_response, not wait_response
-dpumesh_ctx_t *ctx;
-if (dpumesh_init(&ctx, "bench", /*worker_id*/10, &cfg) != 0) return 1;
-int my_pod = dpumesh_get_pod_id(ctx);
-
-// --- send ---
-uint32_t req_id = dpumesh_alloc_req_id(ctx);
-int tx = dpumesh_tx_alloc(ctx);              // -1 => backpressure, retry later
-if (tx < 0) { /* retry */ }
-uint8_t *buf = dpumesh_tx_buf(ctx, tx);
-memcpy(buf, payload, payload_len);           // <= slot_size
-
-if (dpumesh_register_pending(ctx, req_id) < 0) { dpumesh_tx_free(ctx, tx); /* fail */ }
-
-sw_descriptor_t d; memset(&d, 0, sizeof d);
-d.header_buf_slot = -1;
-d.body_buf_slot   = tx;
-d.body_len        = payload_len;
-d.req_id          = req_id;
-d.dst_pod_id      = 11;                       // target service
-d.src_pod_id      = my_pod;
-d.flags           = OP_REQUEST | CASE_EXTERNAL;
-d.valid           = 1;
-if (dpumesh_enqueue(ctx, &d) < 0) { dpumesh_tx_free(ctx, tx); dpumesh_cancel_pending(ctx, req_id); /* fail */ }
-dpumesh_pending_attach_tx(ctx, req_id, tx);   // pending now owns the TX slot
-
-// --- harvest (non-blocking) ---
-sw_descriptor_t resp;
-for (;;) {
-    int r = dpumesh_poll_response(ctx, req_id, &resp);
-    if (r == 1) { /* not ready: do other work, or time out */ continue; }
-    if (r == 0) {
-        const uint8_t *rb = dpumesh_rx_buf(ctx, resp.body_buf_slot);
-        /* use rb[0..resp.body_len-1] */
-        dpumesh_rx_free(ctx, resp.body_buf_slot);   // TX already freed by the lib
-    } else { /* r == -1: abandoned */ dpumesh_cancel_pending(ctx, req_id); }
-    break;
-}
-```
-*(Blocking model: set `cfg.async_client = 0` and replace the harvest loop with
-`dpumesh_wait_response(ctx, req_id, &resp, /*timeout_ms*/30000)` → `0`/`-1`,
-then `rx_free(resp.body_buf_slot)`.)*
-
-### 7b. Server / echo — recv → reply
-```c
-dpumesh_config_t cfg = DPUMESH_CONFIG_DEFAULT;
-cfg.poll_rx = 1;                              // lean RX: spin-poll, no per-req cond
-dpumesh_ctx_t *ctx;
-dpumesh_init(&ctx, "echo", /*worker_id*/11, &cfg);
-
-for (;;) {
-    sw_descriptor_t req;
-    if (dpumesh_dequeue(ctx, &req, -1) < 0 || !req.valid) continue;
-
-    const uint8_t *in = dpumesh_rx_buf(ctx, req.body_buf_slot);
-    int tx = dpumesh_tx_alloc(ctx);
-    if (tx < 0) { dpumesh_rx_free(ctx, req.body_buf_slot); continue; }
-    uint8_t *out = dpumesh_tx_buf(ctx, tx);
-    memcpy(out, in, req.body_len);            // produce the response body
-    dpumesh_rx_free(ctx, req.body_buf_slot);  // done with RX
-
-    if (dpumesh_register_pending(ctx, req.req_id) < 0) { dpumesh_tx_free(ctx, tx); continue; }
-    dpumesh_pending_attach_tx(ctx, req.req_id, tx);
-
-    sw_descriptor_t resp; memset(&resp, 0, sizeof resp);
-    resp.header_buf_slot = -1;
-    resp.body_buf_slot   = tx;
-    resp.body_len        = req.body_len;
-    resp.req_id          = req.req_id;
-    resp.dst_pod_id      = req.src_pod_id;                       // back to sender
-    resp.src_pod_id      = dpumesh_get_pod_id(ctx);
-    resp.flags           = (req.flags & ~OP_REQUEST) | OP_RESPONSE;
-    resp.valid           = 1;
-    if (dpumesh_enqueue(ctx, &resp) < 0) { dpumesh_cancel_pending(ctx, req.req_id); continue; }
-    dpumesh_pending_release_async(ctx, req.req_id);             // TX_ACK frees the slot
-}
-```
-
-### 7c. Thrift server (replaces `TServerSocket`)
-```cpp
-auto transport = std::make_shared<TDpumeshServerTransport>("unique-id-service", /*worker_id*/11);
-auto tf = std::make_shared<TFramedTransportFactory>();
-auto pf = std::make_shared<TBinaryProtocolFactory>();
-TThreadedServer server(processor, transport, tf, pf);   // handler/processor unchanged
-server.serve();
-```
-
-### 7d. Thrift client (replaces `TSocket`)
-```cpp
-auto dpumesh = std::make_shared<TDpumeshClientTransport>(ctx, /*dst_pod_id*/11, /*timeout_ms*/30000);
-auto framed  = std::make_shared<TFramedTransport>(dpumesh);
-auto proto   = std::make_shared<TBinaryProtocol>(framed);
-MyServiceClient client(proto);
-framed->open();
-client.someRpc(...);                          // routed over DPUmesh to pod 11
-```
-
----
-
-## 8. Notes & invariants
-- **Sizing invariant:** `num_slots × slot_size == DPU_BUFFER_SIZE` (32 MB). The defaults (4096 × 8 KB) satisfy it; change both together.
-- **Body cap:** `body_len ≤ slot_size`; the Thrift base layer throws `TTransportException` if a write exceeds it.
-- **`K` must match:** host `DPUMESH_RINGS_PER_POD` and the DPU process value must be equal (host TX rings pair 1:1 with DPU per-pod rings).
-- **No host→host:** the body always traverses host → DPU → host (the DPU is the routing rendezvous); the DPU routes on `dst_pod_id` and never reads the body.
-- **Thread-safety:** `tx`/`rx`/`pending` calls are internally locked; many worker threads may share one `ctx`.
+| `DPUMESH_RINGS_PER_POD` | EU-sharding rings/pod `K` (must match the DPU process) | `1` |
+| `DPUMESH_HOST_EPOLL` | `1` = host PE-progress thread sleeps on epoll; `0` = busy-poll | `0` |

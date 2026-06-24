@@ -60,6 +60,13 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx);
 /* ====== Query configured values ====== */
 int dpumesh_get_slot_size(dpumesh_ctx_t *ctx);
 
+/* Enable + return a readiness eventfd: a real fd that becomes readable whenever an
+ * inbound request/response is delivered. Wait on it with a VANILLA epoll/poll/select
+ * (no busy-poll); on wakeup, drain it with one read() of a uint64_t, then collect
+ * work via dpumesh_dequeue(0) / dpumesh_poll_response(). Returns -1 on failure.
+ * Idempotent; the PE thread (DPUMESH_HOST_EPOLL=1) drives it notification-style. */
+int dpumesh_get_event_fd(dpumesh_ctx_t *ctx);
+
 /* ====== Info ====== */
 int         dpumesh_get_pod_id(dpumesh_ctx_t *ctx);
 const char *dpumesh_get_worker_id(dpumesh_ctx_t *ctx);
@@ -79,7 +86,9 @@ uint8_t *dpumesh_rx_buf(dpumesh_ctx_t *ctx, int slot);
 /* Free an RX buffer slot after reading. */
 void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot);
 
-/* Allocate a TX buffer slot. Returns slot index or -1. */
+/* Allocate a TX buffer slot. Returns a slot index (>=0). Under backpressure
+ * (free-list empty) it BUSY-SPINS with capped backoff until a slot frees — it
+ * does not fail/return -1. */
 int dpumesh_tx_alloc(dpumesh_ctx_t *ctx);
 
 /* Get pointer to TX buffer data for a slot (zero-copy write). */

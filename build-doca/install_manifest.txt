@@ -66,6 +66,7 @@
 /usr/local/include/thrift/concurrency/Monitor.h
 /usr/local/include/thrift/transport/TDpumeshServerTransport.h
 /usr/local/include/thrift/transport/THttpTransport.h
+/usr/local/include/thrift/transport/dpumesh_sock.h
 /usr/local/include/thrift/transport/TFileTransport.h
 /usr/local/include/thrift/transport/TTransportUtils.h
 /usr/local/include/thrift/transport/doca/comch_msgq.h

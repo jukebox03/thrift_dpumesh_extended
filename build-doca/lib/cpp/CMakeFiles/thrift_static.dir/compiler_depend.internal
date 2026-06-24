@@ -21581,6 +21581,8 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o
  /usr/include/x86_64-linux-gnu/bits/unistd_ext.h
  /usr/include/x86_64-linux-gnu/sys/epoll.h
  /usr/include/x86_64-linux-gnu/bits/epoll.h
+ /usr/include/x86_64-linux-gnu/sys/eventfd.h
+ /usr/include/x86_64-linux-gnu/bits/eventfd.h
  /opt/mellanox/doca/include/doca_log.h
  /opt/mellanox/doca/include/doca_compat.h
  /opt/mellanox/doca/include/doca_config.h

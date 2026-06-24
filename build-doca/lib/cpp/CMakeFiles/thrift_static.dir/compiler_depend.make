@@ -21527,6 +21527,8 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: ../l
   /usr/include/x86_64-linux-gnu/bits/unistd_ext.h \
   /usr/include/x86_64-linux-gnu/sys/epoll.h \
   /usr/include/x86_64-linux-gnu/bits/epoll.h \
+  /usr/include/x86_64-linux-gnu/sys/eventfd.h \
+  /usr/include/x86_64-linux-gnu/bits/eventfd.h \
   /opt/mellanox/doca/include/doca_log.h \
   /opt/mellanox/doca/include/doca_compat.h \
   /opt/mellanox/doca/include/doca_config.h \
@@ -22759,6 +22761,8 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/dpumesh_doca.c.o: ../l
 /usr/include/boost/mpl/bool_fwd.hpp:
 
 /usr/include/c++/11/debug/assertions.h:
+
+/usr/include/x86_64-linux-gnu/sys/eventfd.h:
 
 /usr/include/x86_64-linux-gnu/bits/types/sigset_t.h:
 
@@ -24259,6 +24263,8 @@ thrift/config.h:
 /usr/include/boost/mpl/aux_/preprocessed/gcc/greater_equal.hpp:
 
 /usr/include/boost/mpl/at.hpp:
+
+/usr/include/x86_64-linux-gnu/bits/eventfd.h:
 
 /usr/include/boost/mpl/aux_/push_back_impl.hpp:
 

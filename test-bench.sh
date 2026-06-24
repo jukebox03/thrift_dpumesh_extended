@@ -162,12 +162,21 @@ build_bench_binaries() {
     if [ ! -e "$BUILD_DOCA/lib/libthriftd.so" ] && [ ! -e "$BUILD_DOCA/lib/libthriftd.a" ]; then
         THRIFT_LINK_LIB="-lthrift"
     fi
-    gcc -O2 -o "$BENCH_DIR/bench_dpumesh" "$BENCH_DIR/bench_dpumesh.c" \
+    # Client source: DEFAULT is the façade load-generator (dpumesh_sock.h). The
+    # raw low-level-API client is still available via BENCH_SRC=bench_dpumesh.c. Same binary name.
+    local bench_src="${BENCH_SRC:-bench_sock.c}"
+    info "Bench client source: $bench_src"
+    gcc -O2 -o "$BENCH_DIR/bench_dpumesh" "$BENCH_DIR/$bench_src" \
         -I"$PROJ_ROOT/lib/cpp/src" \
         -L"$BUILD_DOCA/lib" -L"$DOCA_LIB_DIR" \
         $THRIFT_LINK_LIB -lpthread -ldoca_common -ldoca_comch \
         -Wl,-rpath,/usr/local/lib -Wl,-rpath,"$DOCA_LIB_DIR"
-    gcc -O2 -o "$BENCH_DIR/echo_dpumesh" "$BENCH_DIR/echo_dpumesh.c" \
+    # Echo server source: DEFAULT is the native-epoll façade server (dpumesh_sock.h).
+    # The raw low-level-API echo is still available via ECHO_SRC=echo_dpumesh.c.
+    # Both compile to the same binary name so the image/k8s are unchanged.
+    local echo_src="${ECHO_SRC:-echo_sock.c}"
+    info "Echo server source: $echo_src"
+    gcc -O2 -o "$BENCH_DIR/echo_dpumesh" "$BENCH_DIR/$echo_src" \
         -I"$PROJ_ROOT/lib/cpp/src" \
         -L"$BUILD_DOCA/lib" -L"$DOCA_LIB_DIR" \
         $THRIFT_LINK_LIB -lpthread -ldoca_common -ldoca_comch \

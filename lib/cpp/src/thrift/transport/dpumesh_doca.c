@@ -16,6 +16,7 @@
 #include <stdatomic.h>
 #include <unistd.h>        /* close() for the host epoll RX path */
 #include <sys/epoll.h>     /* event-driven host PE progress (DPUMESH_HOST_EPOLL) */
+#include <sys/eventfd.h>   /* readiness eventfd for native-epoll integration (dpumesh_get_event_fd) */
 
 #include <doca_log.h>
 #include <doca_mmap.h>
@@ -144,6 +145,15 @@ struct dpumesh_ctx {
      * instead of blocking in dpumesh_wait_response. Process-global: a process
      * in async mode must use poll_response, never wait_response. */
     int async_client;
+
+    /* Readiness eventfd for native-epoll integration. Lazily enabled by
+     * dpumesh_get_event_fd(): once enabled, rx_deliver_desc writes the eventfd on
+     * each user-visible delivery (request -> RX ring, or response -> pending) so a
+     * caller blocked in a vanilla epoll_wait() on this fd wakes up. The PE thread
+     * itself already sleeps on the DOCA PE notification fd (DPUMESH_HOST_EPOLL), so
+     * the whole chain is notification-driven, not busy-poll. -1 = not created. */
+    int notify_efd;
+    volatile int notify_enabled;
 
     /* Client-side pending response table */
     dpumesh_pending_t pending[MAX_PENDING];
@@ -281,6 +291,19 @@ static inline int rxq_try_pop(dpumesh_ctx_t *ctx, sw_descriptor_t *out)
  * Deliver a fully parsed descriptor to the pending table or RX queue.
  * Common path for both comch-based RX_DATA and DMA-based DMA_COMPLETION.
  */
+/* Wake a caller blocked in a vanilla epoll_wait() on the readiness eventfd.
+ * No-op until dpumesh_get_event_fd() enables it. Per-delivery write (no
+ * coalescing) → cannot lose a wakeup; the eventfd is a plain counter, drained by
+ * one read() per epoll wakeup. Safe to call from the PE thread. */
+static inline void dpumesh_notify(dpumesh_ctx_t *ctx)
+{
+    if (ctx->notify_enabled && ctx->notify_efd >= 0) {
+        uint64_t one = 1;
+        ssize_t w = write(ctx->notify_efd, &one, sizeof(one));
+        (void)w;
+    }
+}
+
 static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int slot)
 {
     if (desc->flags & OP_RESPONSE) {
@@ -300,6 +323,7 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
             /* Async clients poll p->state and need no wakeup. */
             if (!ctx->async_client)
                 pthread_cond_signal(&p->cond);
+            dpumesh_notify(ctx);   /* wake a native epoll_wait() on the eventfd */
         } else if (p->state == -2) {
             /* Cancelled request — DPA finished, now safe to free TX + RX */
             if (p->tx_slot >= 0) {
@@ -340,6 +364,7 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
             pthread_cond_signal(&ctx->rx_cond);
             pthread_mutex_unlock(&ctx->rx_lock);
         }
+        dpumesh_notify(ctx);   /* wake a native epoll_wait() on the eventfd */
     }
 }
 
@@ -663,6 +688,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
                  const dpumesh_config_t *config) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)calloc(1, sizeof(dpumesh_ctx_t));
     if (!ctx) return -1;
+    ctx->notify_efd = -1;   /* before any goto fail: cleanup must not close fd 0 */
 
     init_config(ctx, config, app_name, worker_num);
 
@@ -692,6 +718,11 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
 
     pthread_mutex_init(&ctx->rx_lock, NULL);
     pthread_cond_init(&ctx->rx_cond, NULL);
+
+    /* Readiness eventfd (non-blocking, close-on-exec). Non-fatal if it fails —
+     * dpumesh_get_event_fd() then returns -1 and the caller falls back to polling. */
+    ctx->notify_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    ctx->notify_enabled = 0;
 
     atomic_init(&ctx->next_req_id, 1);
     for (int i = 0; i < MAX_PENDING; i++) {
@@ -725,6 +756,8 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
         ctx->pe_running = 0;
         pthread_join(ctx->pe_tid, NULL);
     }
+    /* PE thread joined → no more dpumesh_notify() writers; safe to close. */
+    if (ctx->notify_efd >= 0) { close(ctx->notify_efd); ctx->notify_efd = -1; }
 
     /* Free resources BEFORE destroying locks they depend on. */
 
@@ -1002,6 +1035,19 @@ void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot) {
 
 int dpumesh_get_slot_size(dpumesh_ctx_t *ctx) {
     return ctx->slot_size;
+}
+
+/* Enable + return the readiness eventfd: a real fd that becomes readable
+ * whenever an inbound request/response is delivered, so a caller can wait on it
+ * with a VANILLA epoll/poll/select instead of busy-polling dequeue/poll_response.
+ * The PE thread (notification-driven under DPUMESH_HOST_EPOLL=1) writes it on each
+ * delivery. Drain it with a single read() of a uint64_t per wakeup, then collect
+ * ready work via dpumesh_dequeue(0)/dpumesh_poll_response(). Returns -1 if the
+ * eventfd could not be created. Idempotent; level-triggered-friendly. */
+int dpumesh_get_event_fd(dpumesh_ctx_t *ctx) {
+    if (!ctx || ctx->notify_efd < 0) return -1;
+    ctx->notify_enabled = 1;
+    return ctx->notify_efd;
 }
 
 int dpumesh_get_pod_id(dpumesh_ctx_t *ctx) {

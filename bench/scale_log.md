@@ -1693,3 +1693,49 @@ helps" for a single DPU; the old 4pod_scales gain was on a host/ARM-bound config
 
 → Bottom line: within one DPU you are AT the structural wall (~257K, ~220µs). Free latency win = load-adaptive
 flush. Real throughput gain needs either the host→host re-architecture (≈2×) or more DPUs (horizontal).
+
+---
+
+## 2026-06-24 — Façade validation: native-epoll server (echo_sock.c) over DPUmesh
+
+Goal: prove a vanilla non-blocking epoll server ports to DPUmesh by swapping ONLY the BSD calls for their
+`_dpumesh` twins, using NATIVE kernel epoll on `dpumesh_event_fd(s)` (no epoll_*_dpumesh wrappers). Server =
+bench/echo_sock.c (single-threaded reactor: epoll_create1/epoll_ctl/epoll_wait + accept/read/write/send/
+close_dpumesh). Client = unchanged bench_dpumesh (raw API). Library: added an eventfd the PE thread signals on
+each delivery (dpumesh_get_event_fd), so the user's epoll_wait sleeps on a real fd.
+
+| target | achieved | p50 (us) | p99 (us) | OK/Fail |
+|---:|---:|---:|---:|---|
+| 30K  | 29,819  | 171 | 541    | 300000/0 |
+| 60K  | 59,673  | 165 | 518    | 600000/0 |
+| 100K | 99,454  | 194 | 501    | 1000000/0 |
+| 150K | 149,169 | 223 | 447    | 1500000/0 |
+| 200K | 198,890 | 263 | 33,341 | 2000000/0 |
+| 240K | 238,685 | 588 | 1,467  | 2400000/0 |
+
+**Idle CPU:** echo_sock reactor core = **1.2%** (sleeps on native epoll → NOTIFICATION-driven, not busy-poll;
+the PE thread also sleeps on the DOCA notif fd under HOST_EPOLL=1).
+
+→ **PASS on all criteria:** (1) a normal epoll server runs with only `_dpumesh` suffixes on the data calls +
+native epoll on the event fd; (2) 0-fail 30K→240K; (3) throughput matches the raw 3-thread echo (~240K
+sustainable); (4) lower latency at low-mid load (165–263us, single reactor, no futex/thread contention);
+(5) idle 1.2% proves it's notification-driven. eventfd write is per-delivery (coalescing = future opt).
+
+### 2026-06-24 — FULL façade stack (bench_sock.c client + echo_sock.c server), both on the new API
+
+Client = bench/bench_sock.c (windowed async load-gen using ONLY connect/write/send/read/close_dpumesh — one
+single-shot dpmconn_t per in-flight request, malloc/free per request). Server = bench/echo_sock.c (native epoll
+on dpumesh_event_fd). No raw dpumesh.h calls in either. BENCH_SRC/ECHO_SRC toggles in test-bench.sh.
+
+| target | achieved | p50 (us) | p99 (us) | OK/Fail |
+|---:|---:|---:|---:|---|
+| 30K  | 29,838  | 170 | 501   | 300000/0 |
+| 100K | 99,451  | 200 | 493   | 1000000/0 |
+| 200K | 198,925 | 255 | 4,789 | 2000000/0 |
+| 240K | 238,699 | 541 | 4,577 | 2400000/0 |
+| recovery 30K | 29,838 | (below) | — | 300000/0 |
+
+→ **PASS:** the full client+server, written entirely with the `_dpumesh` façade, sustains 240K 0-fail — same
+ceiling as the raw-API stack. The client's per-request malloc/free (single-shot conns) did NOT cap throughput.
+Latency competitive (170–255µs low-mid). Confirms a normal async request/response CLIENT ports with just the
+`_dpumesh` suffix, exactly like the server. The benchmark now runs on the new API by default with these toggles.
