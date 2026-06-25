@@ -32,14 +32,14 @@
  *      a request/response is ready, wait on event_fd_dpm(s) with native
  *      epoll/poll/select — it is notification-driven (no busy-poll).
  *   3. SINGLE-SHOT conn. One dpmconn_t carries exactly one request/response; after
- *      send_dpm() it cannot be written/sent again — close_dpm() and make a
+ *      flush_dpm() it cannot be written/sent again — close_dpm() and make a
  *      new connect_dpm()/accept_dpm().
  *   4. ADDRESS = pod_id (a small integer), not an IP/port. A "connection" is one
  *      request/response conversation, not a persistent stream; reuse is per-call.
  *   5. write_dpm() BUFFERS into the TX slot; the message is transmitted
  *      AUTOMATICALLY by the next read_dpm() (client) or close_dpm()
  *      (server), so the write->read / write->close patterns need NO explicit send.
- *      send_dpm() remains available to flush explicitly (e.g. a pipelined
+ *      flush_dpm() remains available to flush explicitly (e.g. a pipelined
  *      async client that ships now and harvests the response later).
  *
  * Thread-safety: the underlying ctx is internally locked, so multiple threads may
@@ -144,7 +144,7 @@ static inline int event_fd_dpm(dpm_t *s) { return dpumesh_get_event_fd(s->ctx); 
 /* INTERNAL: build a server conn from a dequeued request descriptor. */
 static inline dpmconn_t *server_conn_dpm(dpm_t *s, const sw_descriptor_t *req) {
     dpmconn_t *c = (dpmconn_t *)calloc(1, sizeof(*c));
-    if (!c) { dpumesh_rx_free(s->ctx, req->body_buf_slot); return NULL; }
+    if (!c) { errno = ENOMEM; dpumesh_rx_free(s->ctx, req->body_buf_slot); return NULL; }
     c->ep        = s;
     c->is_server = 1;
     c->peer_pod  = req->src_pod_id;
@@ -161,7 +161,10 @@ static inline dpmconn_t *server_conn_dpm(dpm_t *s, const sw_descriptor_t *req) {
 
 /* accept(): NON-BLOCKING. Returns a new server connection holding the next
  * incoming request (body already available via read_dpm), or NULL with
- * errno=EAGAIN if no request is pending. */
+ * errno=EAGAIN if no request is pending. A NULL with errno!=EAGAIN (ENOMEM) is
+ * a rare conn-alloc failure: the dequeued request is dropped and its RX slot
+ * reclaimed (no leak). An accept-until-NULL loop treats it as "drained", which
+ * is safe — it just skips that one request. */
 static inline dpmconn_t *accept_dpm(dpm_t *s) {
     sw_descriptor_t req;
     if (dpumesh_dequeue(s->ctx, &req, 0) < 0 || !req.valid) {
@@ -175,7 +178,7 @@ static inline dpmconn_t *accept_dpm(dpm_t *s) {
  * only binds the target. Returns NULL on OOM. */
 static inline dpmconn_t *connect_dpm(dpm_t *s, int dst_pod_id) {
     dpmconn_t *c = (dpmconn_t *)calloc(1, sizeof(*c));
-    if (!c) return NULL;
+    if (!c) { errno = ENOMEM; return NULL; }
     c->ep       = s;
     c->is_server = 0;
     c->peer_pod = (int32_t)dst_pod_id;
@@ -211,26 +214,31 @@ static inline int client_poll_dpm(dpmconn_t *c) {
 
 /* ===== read / write / send ===== */
 
-/* send_dpm() is defined below; forward-declared here for autoflush_dpm(). */
-static inline int send_dpm(dpmconn_t *c);
+/* flush_dpm() is defined below; forward-declared here for autoflush_dpm(). */
+static inline int flush_dpm(dpmconn_t *c);
 
 /* INTERNAL: implicitly transmit a buffered-but-unsent outbound message. This is
  * what lets the socket-style write->read (client) and write->close patterns work
- * with NO explicit send_dpm() call. No-op if nothing is buffered (tx_slot<0)
- * or it was already sent. Returns send_dpm()'s result (0 ok; -1 errno=EAGAIN
+ * with NO explicit flush_dpm() call. No-op if nothing is buffered (tx_slot<0)
+ * or it was already sent. Returns flush_dpm()'s result (0 ok; -1 errno=EAGAIN
  * on a transient the caller's next read retries). */
 static inline int autoflush_dpm(dpmconn_t *c) {
     if (c->sent || c->tx_slot < 0) return 0;
-    return send_dpm(c);
+    return flush_dpm(c);
 }
 
 /* read(): copy inbound body bytes into buf (advancing the read cursor). On a
  * client conn it first auto-flushes any buffered request (implicit send), so
- * write_dpm()+read_dpm() needs no explicit send_dpm() call.
+ * write_dpm()+read_dpm() needs no explicit flush_dpm() call.
  *   >0 = bytes copied
  *    0 = end of message (whole body consumed)
  *   -1 = would-block (client: response not arrived; errno=EAGAIN) OR
- *        abandoned (errno=ECONNRESET). */
+ *        abandoned (errno=ECONNRESET).
+ * NB: on the client path ECONNRESET means this req_id's pending entry was
+ * reclaimed/aliased (a req_id-table collision) — it is NOT peer death. A dead
+ * or unregistered dst_pod_id is never detected: its response simply never
+ * arrives, so read_dpm stays EAGAIN forever (apply your own wall-clock
+ * timeout). */
 static inline ssize_t read_dpm(dpmconn_t *c, void *buf, size_t len) {
     if (!c->rx_ready) {
         if (!c->is_server && autoflush_dpm(c) < 0) return -1;   /* errno set by send */
@@ -257,14 +265,40 @@ static inline int tx_ensure_dpm(dpmconn_t *c) {
     return 0;
 }
 
-/* write(): BUFFER outbound body bytes (transmitted later by send_dpm()).
+/* INTERNAL: reset a CLIENT conn for a new request after its previous exchange
+ * completed (response delivered + read). Frees the prior response's RX slot and
+ * clears the per-exchange state; the peer binding is kept and the next flush takes
+ * a fresh req_id. This is what makes a conn REUSABLE — connect once, then loop
+ * write -> read -> write -> read ..., and close at the end. */
+static inline void conn_reset_exchange(dpmconn_t *c) {
+    if (c->rx_slot >= 0) dpumesh_rx_free(c->ep->ctx, c->rx_slot);
+    c->rx_slot = -1; c->rx_buf = NULL; c->rx_len = 0; c->rx_pos = 0; c->rx_ready = 0;
+    c->sent = 0; c->req_assigned = 0; c->pending = 0;
+    /* tx_slot is already -1 (handed off at flush); a fresh one is taken on write. */
+}
+
+/* INTERNAL: begin building a new outbound message. If the conn already sent its
+ * message, a CLIENT whose response has been delivered auto-resets for a new
+ * request (sequential reuse); otherwise reject with EINVAL — one conn carries one
+ * outstanding exchange at a time (a write before the response arrives, or a 2nd
+ * reply on a server conn). Then ensure a TX slot. 0 ok; -1 (EINVAL / EAGAIN). */
+static inline int conn_begin_tx(dpmconn_t *c) {
+    if (c->sent) {
+        if (!c->is_server && c->rx_ready) conn_reset_exchange(c);
+        else { errno = EINVAL; return -1; }
+    }
+    return tx_ensure_dpm(c);
+}
+
+/* write(): BUFFER outbound body bytes (transmitted later by flush_dpm()). On a
+ * client conn whose previous response was already read, the first write of the
+ * next message auto-starts a NEW request (reuse — see conn_begin_tx).
  *   >0 = bytes buffered (always == len on success)
- *   -1 = message would exceed slot_size (errno=EMSGSIZE), or the conn was already
- *        sent (errno=EINVAL — single-shot). Acquiring a TX slot busy-spins under
- *        saturation, it does not fail. */
+ *   -1 = message would exceed slot_size (errno=EMSGSIZE), or a write while a
+ *        request is still outstanding / on an already-sent server conn
+ *        (errno=EINVAL). Acquiring a TX slot busy-spins under saturation. */
 static inline ssize_t write_dpm(dpmconn_t *c, const void *buf, size_t len) {
-    if (c->sent) { errno = EINVAL; return -1; }
-    if (tx_ensure_dpm(c) < 0) return -1;
+    if (conn_begin_tx(c) < 0) return -1;
     int cap = c->ep->slot_size;
     if (c->tx_len + len > (uint32_t)cap) { errno = EMSGSIZE; return -1; }
     memcpy(c->tx_buf + c->tx_len, buf, len);
@@ -275,10 +309,9 @@ static inline ssize_t write_dpm(dpmconn_t *c, const void *buf, size_t len) {
 /* sendfile(): append up to `count` bytes from in_fd into the outbound body
  * (still capped at slot_size). If `offset` is non-NULL the file is read from
  * *offset and *offset is advanced. Returns bytes appended (0 at EOF), -1 on
- * error/backpressure. Ship with send_dpm() afterwards. */
+ * error/backpressure. Ship with flush_dpm() afterwards. */
 static inline ssize_t sendfile_dpm(dpmconn_t *c, int in_fd, off_t *offset, size_t count) {
-    if (c->sent) { errno = EINVAL; return -1; }
-    if (tx_ensure_dpm(c) < 0) return -1;
+    if (conn_begin_tx(c) < 0) return -1;
     int cap = c->ep->slot_size;
     size_t room = (size_t)cap - c->tx_len;
     if (count > room) count = room;
@@ -301,15 +334,20 @@ static inline ssize_t sendfile_dpm(dpmconn_t *c, int in_fd, off_t *offset, size_
  * so it can't be retried). Also use it to flush early (e.g. a pipelined async
  * client that sends now and reads the response later). After send, a client conn awaits
  * its response (read_dpm, optionally via native epoll on event_fd_dpm);
- * a server conn is complete.
- * Single-shot: a conn may be sent at most once.
+ * a server conn is complete. A CLIENT conn is REUSABLE after its response is read
+ * (the next write starts a new request); a conn carries one outstanding exchange
+ * at a time.
  *   0  = sent
- *  -1  = conn already sent (errno=EINVAL); OR a req_id pending-table collision
- *        (errno=EAGAIN — a ~2s hard timeout from register_pending, NOT retry-soon
- *        backpressure; rare); OR a descriptor validation error from enqueue. The
- *        TX-slot / DMA-ring acquisition busy-spins, it does not fail. On -1 the
- *        buffered body is retained for a retry. */
-static inline int send_dpm(dpmconn_t *c) {
+ *  -1, errno=EINVAL  = conn already sent (single-shot) — NOT retryable.
+ *  -1, errno=EAGAIN  = req_id pending-table collision. RETRYABLE (body kept),
+ *        but this errno is returned only AFTER a ~2s hard wait inside
+ *        register_pending — it is NOT retry-soon backpressure, and a retry with
+ *        the same req_id may block another ~2s until the colliding slot frees.
+ *        Rare (only when in-flight ≥ MAX_PENDING).
+ *  -1, errno=EBADMSG = permanent descriptor-validation fault from enqueue —
+ *        NOT retryable; close the conn. Unreachable via the façade.
+ * The TX-slot / DMA-ring acquisition busy-spins, it never fails with -1. */
+static inline int flush_dpm(dpmconn_t *c) {
     dpumesh_ctx_t *ctx = c->ep->ctx;
     if (c->sent) { errno = EINVAL; return -1; }
     if (tx_ensure_dpm(c) < 0) return -1;          /* allow zero-length messages */
@@ -338,9 +376,14 @@ static inline int send_dpm(dpmconn_t *c) {
     d.valid           = 1;
 
     if (dpumesh_enqueue(ctx, &d) < 0) {
+        /* enqueue only fails on a PERMANENT descriptor-validation fault (null
+         * desc / slot out of range / body_len > slot_size); ring saturation
+         * busy-spins instead. So this is NOT retryable — report EBADMSG, not
+         * EAGAIN. (Unreachable via the façade: write_dpm caps the body at
+         * slot_size and tx_alloc always yields a valid slot.) */
         dpumesh_cancel_pending(ctx, c->req_id);
         c->pending = 0;
-        errno = EAGAIN;
+        errno = EBADMSG;
         return -1;
     }
     dpumesh_pending_attach_tx(ctx, c->req_id, c->tx_slot);
@@ -361,10 +404,14 @@ static inline int send_dpm(dpmconn_t *c) {
 /* close(): ship any buffered-but-unsent message (e.g. a server response built
  * with write_dpm()), then release the conn's slots/pending and free it. Safe on
  * NULL.
+ *
+ * ONE-WAY (fire-and-forget): a CLIENT that does write -> close WITHOUT a read
+ * sends the request and does not wait for a response — the TX slot is freed by
+ * the DPU's TX_ACK (no leak) and any reply the peer sends is silently dropped.
  *   0  = ok (message shipped, or nothing was buffered)
  *  -1  = the buffered message FAILED to ship (rare — e.g. a req_id collision).
  *        The conn is freed EITHER WAY, so -1 means "not delivered and NOT
- *        retryable on this conn." For guaranteed delivery, call send_dpm()
+ *        retryable on this conn." For guaranteed delivery, call flush_dpm()
  *        explicitly (and retry on EAGAIN) BEFORE close_dpm(). */
 static inline int close_dpm(dpmconn_t *c) {
     if (!c) return 0;

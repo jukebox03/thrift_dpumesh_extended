@@ -57,6 +57,7 @@ int main(void)
             pod_id_dpm(s), dfd);
 
     struct epoll_event events[MAX_EVENTS];
+    unsigned long recv_total = 0;   /* received-request counter (delivery cross-check) */
     for (;;) {
         int nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);   /* sleeps until activity */
         if (nfds < 0) {
@@ -87,6 +88,8 @@ int main(void)
                     write_dpm(c, buf, (size_t)off);
 
                 close_dpm(c);
+                if ((++recv_total % 200000) == 0)
+                    fprintf(stderr, "[echo_sock] recv_total=%lu\n", recv_total);
             }
         }
     }

@@ -703,9 +703,13 @@ run_bench() {
     local app="bench-${mode}"
 
     local cmd="RUN $rps $dur $size"
-    [ "$conns" != "0" ] && cmd="$cmd $conns"
+    if [ "${RUN_ONEWAY:-0}" = "1" ]; then
+        cmd="RUN $rps $dur $size ${conns} 1"      # mode=1 (one-way); conns must precede mode
+    elif [ "$conns" != "0" ]; then
+        cmd="$cmd $conns"
+    fi
 
-    step "=== $mode bench: rps=$rps dur=${dur}s size=${size}B conns=${conns} ==="
+    step "=== $mode bench: rps=$rps dur=${dur}s size=${size}B conns=${conns} oneway=${RUN_ONEWAY:-0} ==="
     local timeout_sec=$((dur + 30))
     local pod_ip
     pod_ip=$(kubectl get pod -n "$NS" -l "app=$app" --field-selector=status.phase=Running -o jsonpath='{.items[0].status.podIP}')
@@ -814,6 +818,11 @@ case "$CMD" in
         # 안전함 — re-pin 비용은 한 번 작은 taskset 호출들이라 무시 가능.
         pin_pods fair >/dev/null
         run_bench "dpumesh" "${@:2}"
+        ;;
+    dpumesh-oneway)
+        # One-way (fire-and-forget) load: client does write->close, no read.
+        pin_pods fair >/dev/null
+        RUN_ONEWAY=1 run_bench "dpumesh" "${@:2}"
         ;;
     dpumesh-hw)
         # HW limit chase: dpumesh 측만 multi-core. echo-dpumesh "1,5", bench

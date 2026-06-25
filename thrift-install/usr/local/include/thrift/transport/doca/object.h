@@ -298,7 +298,7 @@ struct objects {
     struct doca_task *deferred_recv[MAX_DEFERRED_RECV];
     int num_deferred_recv;
 
-    /* Deferred TX_ACK sends (DPU only). When server_send_tx_ack_to returns
+    /* Deferred TX_ACK sends (DPU only). When a batched TX_ACK send returns
      * AGAIN (comch send pool full), we stash the ACK here and the main
      * loop retries each iteration after pe_progress drains completions.
      * The DPU is the only authority that can free a host's TX slot, so we

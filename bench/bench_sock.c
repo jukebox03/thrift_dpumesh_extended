@@ -8,10 +8,10 @@
  *     read()           ->  read_dpm()   (implicit send + the response; EAGAIN until it arrives)
  *     close()          ->  close_dpm()
  *
- * Each in-flight request is one dpmconn_t (single-shot). A worker keeps a window
- * of W conns: it connect/write/send to launch, and read_dpm (non-blocking) to
- * harvest. The control daemon / pacing / latency stats are identical to the
- * raw-API bench — only the per-request data path uses the façade.
+ * A worker keeps a window of W REUSABLE conns: connect once per slot, then loop
+ * write -> read (harvest) -> write ... reusing the conn across requests (close
+ * only on error or at the end). The control daemon / pacing / latency stats are
+ * identical to the raw-API bench — only the per-request data path uses the façade.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -89,20 +89,25 @@ static void *worker_fn_async(void *arg) {
         if (atomic_load(w->stop)) break;
         int did_work = 0;
 
-        /* ---- 1. Launch due requests into free window slots ---- */
+        /* ---- 1. Launch due requests into free window slots (REUSING the conn) ---- */
         for (int s = 0; s < W && next_j < w->budget; s++) {
             if (fl[s].active) continue;
             double scheduled = w->start_at + (double)next_j * w->interval_sec;
             if (now_sec() < scheduled) break;          /* paced */
 
-            dpmconn_t *c = connect_dpm(g_s, g_dst_pod_id);     /* connect() */
-            if (!c) break;                              /* transient OOM: retry next sweep */
-
+            if (!fl[s].c) {                             /* connect ONCE; reuse after */
+                fl[s].c = connect_dpm(g_s, g_dst_pod_id);
+                if (!fl[s].c) break;                    /* transient OOM: retry next sweep */
+            }
             uint8_t p = (uint8_t)('A' + (next_j & 0xf));
             body[0] = p; body[w->msg_size / 2] = p; body[w->msg_size - 1] = p;
-            write_dpm(c, body, (size_t)w->msg_size);  /* write() buffers; the */
-            /* harvest read_dpm() below ships it (implicit send) — no send(). */
-            fl[s].c = c; fl[s].scheduled = scheduled; fl[s].launched = now_sec();
+            /* write() auto-starts a NEW request on the reused conn (its prior
+             * response was already read); the harvest read_dpm() below ships it. */
+            if (write_dpm(fl[s].c, body, (size_t)w->msg_size) < 0) {
+                close_dpm(fl[s].c); fl[s].c = NULL;     /* drop a wedged conn, reconnect next */
+                break;
+            }
+            fl[s].scheduled = scheduled; fl[s].launched = now_sec();
             fl[s].j = next_j; fl[s].active = 1;
             next_j++; did_work = 1;
         }
@@ -113,7 +118,7 @@ static void *worker_fn_async(void *arg) {
             ssize_t n = read_dpm(fl[s].c, rb, (size_t)w->msg_size);   /* read() */
             if (n < 0 && errno == EAGAIN) {            /* response not in yet */
                 if (now_sec() - fl[s].launched > timeout_s) {
-                    close_dpm(fl[s].c);
+                    close_dpm(fl[s].c); fl[s].c = NULL;   /* stuck → drop + reconnect */
                     atomic_fetch_add(w->fail, 1);
                     fl[s].active = 0; completed++; did_work = 1;
                 }
@@ -127,13 +132,14 @@ static void *worker_fn_async(void *arg) {
                 bad = (n != (ssize_t)w->msg_size) ||
                       (n > 0 && (rb[0] != expect || rb[n / 2] != expect || rb[n - 1] != expect));
             }
-            close_dpm(fl[s].c);                     /* close() */
             if (bad) {
+                close_dpm(fl[s].c); fl[s].c = NULL;     /* error → drop + reconnect */
                 atomic_fetch_add(w->fail, 1);
             } else {
                 double lat_us = (now_sec() - fl[s].scheduled) * 1e6;
                 if (w->n_samples < w->cap) w->samples[w->n_samples++] = lat_us;
                 atomic_fetch_add(w->ok, 1);
+                /* keep fl[s].c for REUSE — the next launch write()s a new request */
             }
             fl[s].active = 0; completed++; did_work = 1;
         }
@@ -145,11 +151,52 @@ static void *worker_fn_async(void *arg) {
         }
     }
 
-    /* Drain slots still active at stop/deadline — close_dpm cancels the
-     * pending entry + reclaims the TX slot (no leak across back-to-back runs). */
+    /* Close every conn we still hold (active or idle-reusable) — close_dpm frees
+     * the held RX/TX slots + pending (no leak across back-to-back runs). */
     for (int s = 0; s < W; s++)
-        if (fl[s].active) close_dpm(fl[s].c);
+        if (fl[s].c) close_dpm(fl[s].c);
     free(fl); free(body); free(rb);
+    return NULL;
+}
+
+/* One-way (fire-and-forget) generator: connect -> write -> close, NO read. The
+ * TX slot is freed by the DPU's TX_ACK (no response is awaited); any reply the
+ * echo peer sends is silently dropped at the transport. "ok" = the send was
+ * handed off (close returned 0); there is no round-trip, so the recorded latency
+ * is just the send-call time (coordinated-omission t0 = scheduled). Delivery is
+ * cross-checked against the echo's recv_total counter. */
+static void *worker_fn_oneway(void *arg) {
+    worker_t *w = (worker_t *)arg;
+    uint8_t *body = malloc((size_t)w->msg_size);
+    if (!body) { atomic_store(w->stop, 1); return NULL; }
+    memset(body, 0, (size_t)w->msg_size);
+
+    long next_j = 0;
+    while (next_j < w->budget) {
+        if (atomic_load(w->stop)) break;
+        double scheduled = w->start_at + (double)next_j * w->interval_sec;
+        double now = now_sec();
+        if (now < scheduled) {                      /* ahead of schedule → pace */
+            struct timespec ts = {0, 5000};         /* 5 us */
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        dpmconn_t *c = connect_dpm(g_s, g_dst_pod_id);
+        if (!c) { atomic_fetch_add(w->fail, 1); next_j++; continue; }
+        uint8_t p = (uint8_t)('A' + (next_j & 0xf));
+        body[0] = p; body[w->msg_size / 2] = p; body[w->msg_size - 1] = p;
+        write_dpm(c, body, (size_t)w->msg_size);
+        int r = close_dpm(c);                       /* fire-and-forget: ship + ACK frees */
+        if (r < 0) {
+            atomic_fetch_add(w->fail, 1);
+        } else {
+            double lat_us = (now_sec() - scheduled) * 1e6;
+            if (w->n_samples < w->cap) w->samples[w->n_samples++] = lat_us;
+            atomic_fetch_add(w->ok, 1);
+        }
+        next_j++;
+    }
+    free(body);
     return NULL;
 }
 
@@ -185,7 +232,7 @@ static double pct(double *sorted, size_t n, double p) {
 }
 
 /* ------------------------------------------------------------ run command */
-static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns) {
+static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns, int mode) {
     char reply[256];
 
     if (rps < 1 || dur < 1 || msg_size < 1) {
@@ -213,9 +260,11 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns) {
     long remainder    = total_budget % n_workers;
     double interval_sec = (double)n_workers / (double)rps;
 
-    fprintf(stderr, "[bench_sock] RUN rps=%d dur=%d size=%d conns=%d "
+    void *(*worker_fn)(void *) = mode ? worker_fn_oneway : worker_fn_async;
+    fprintf(stderr, "[bench_sock] RUN rps=%d dur=%d size=%d conns=%d mode=%s "
                     "(workers=%d inflight=%d interval=%.3fus per worker)\n",
-            rps, dur, msg_size, conns, n_workers, inflight, interval_sec * 1e6);
+            rps, dur, msg_size, conns, mode ? "oneway" : "rpc",
+            n_workers, inflight, interval_sec * 1e6);
 
     pthread_t  *tids   = calloc((size_t)n_workers, sizeof(pthread_t));
     worker_t   *wargs  = calloc((size_t)n_workers, sizeof(worker_t));
@@ -247,7 +296,7 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns) {
         wargs[i].samples      = calloc(wargs[i].cap ? wargs[i].cap : 1, sizeof(double));
         wargs[i].n_samples    = 0;
         if (!wargs[i].samples) atomic_store(&stop, 1);
-        if (pthread_create(&tids[i], &worker_attr, worker_fn_async, &wargs[i]) != 0) {
+        if (pthread_create(&tids[i], &worker_attr, worker_fn, &wargs[i]) != 0) {
             atomic_store(&stop, 1);
             tids[i] = 0;
         }
@@ -297,10 +346,10 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns) {
 }
 
 /* ------------------------------------------------------------ control TCP */
-static int parse_run_line(const char *line, int *rps, int *dur, int *size, int *conns) {
+static int parse_run_line(const char *line, int *rps, int *dur, int *size, int *conns, int *mode) {
     char cmd[16] = {0};
-    *conns = 0;
-    int n = sscanf(line, "%15s %d %d %d %d", cmd, rps, dur, size, conns);
+    *conns = 0; *mode = 0;
+    int n = sscanf(line, "%15s %d %d %d %d %d", cmd, rps, dur, size, conns, mode);
     if (n < 4) return -1;
     if (strcmp(cmd, "RUN") != 0) return -1;
     return 0;
@@ -320,14 +369,14 @@ static void handle_ctrl(int conn_fd) {
         close(conn_fd);
         return;
     }
-    int rps, dur, size, conns;
-    if (parse_run_line(buf, &rps, &dur, &size, &conns) < 0) {
-        const char *e = "ERR bad command (use: RUN <rps> <dur> <size> [<conns>])\n";
+    int rps, dur, size, conns, mode;
+    if (parse_run_line(buf, &rps, &dur, &size, &conns, &mode) < 0) {
+        const char *e = "ERR bad command (use: RUN <rps> <dur> <size> [<conns> [<mode>]])\n";
         write(conn_fd, e, strlen(e));
         close(conn_fd);
         return;
     }
-    run_test(conn_fd, rps, dur, size, conns);
+    run_test(conn_fd, rps, dur, size, conns, mode);
     close(conn_fd);
 }
 

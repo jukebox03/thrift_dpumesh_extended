@@ -296,27 +296,18 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
         if (p->state == 0) {
             p->desc = *desc;
             p->state = 1;
-            /* Response arrival implies the request round-tripped, so its TX slot
-             * is logically free now — release it here. No-op if a TX_ACK already
-             * freed it (tx_slot==-1). */
-            if (p->tx_slot >= 0) {
-                dpumesh_tx_free(ctx, p->tx_slot);
-                p->tx_slot = -1;
-            }
-            /* Response delivered. Clients harvest via dpumesh_poll_response (a
-             * lock-free state load); wake a native epoll_wait() on the eventfd. */
+            /* Response delivered. The request's TX slot is freed solely by its
+             * TX_ACK (ack = sole authority) — not here. Clients harvest via
+             * dpumesh_poll_response; wake a native epoll_wait() on the eventfd. */
             dpumesh_notify(ctx);
         } else if (p->state == -2) {
-            /* Cancelled request — DPA finished, now safe to free TX + RX */
-            if (p->tx_slot >= 0) {
-                dpumesh_tx_free(ctx, p->tx_slot);
-                p->tx_slot = -1;
-            }
+            /* Cancelled/one-way request, unwanted late response: reclaim only the
+             * RX landing. The TX slot stays for its TX_ACK to free + clear -2→-1. */
             rx_reclaim(ctx, slot);
-            p->state = -1;
-            pthread_cond_broadcast(&p->cond);
         } else {
-            DOCA_LOG_ERR("RX deliver: OP_RESPONSE for req_id=%u but no waiter (state=%d)",
+            /* No live waiter: a one-way sender already released the entry (its
+             * reply is unwanted), or a duplicate/late response. Drop it quietly. */
+            DOCA_LOG_DBG("RX deliver: OP_RESPONSE for req_id=%u, no waiter (state=%d) — dropped",
                          desc->req_id, p->state);
             rx_reclaim(ctx, slot);
         }
@@ -394,46 +385,10 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
      * byte read is sufficient. */
     uint8_t mtype = data[0];
 
-    if (mtype == DMESH_MSG_FWD_ACK) {
-        /* === TX_ACK: per-request notification that DPU has consumed the
-         * forward DMA tied to req_id — host's TX slot for this request can
-         * now be released. Pure event signal; no flow-control piggyback. */
-        struct dmesh_tx_ack_msg ack;
-        if (len < sizeof(ack)) {
-            DOCA_LOG_ERR("TX_ACK: too short (len=%u need=%zu)", len, sizeof(ack));
-            return;
-        }
-        memcpy(&ack, data, sizeof(ack));
-
-        uint32_t idx = ack.req_id % MAX_PENDING;
-        dpumesh_pending_t *p = &ctx->pending[idx];
-        pthread_mutex_lock(&p->lock);
-        /* owner_req_id guard: every MAX_PENDING requests reuse this idx, so a
-         * late/duplicate ACK for an old req_id could otherwise free the TX slot
-         * of the live request now occupying the slot. Only free if THIS req_id
-         * still owns it. */
-        if ((p->state == 0 || p->state == -2) && p->tx_slot >= 0 &&
-            p->owner_req_id == ack.req_id) {
-            /* state 0: request still waiting — free TX slot early.
-             * state -2: wait_response gave up on timeout but deferred the TX
-             *           free until DPA finished the forward DMA; this ACK
-             *           confirms that, so we can release the slot now. */
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
-            if (p->state == -2) {
-                p->state = -1;
-                pthread_cond_broadcast(&p->cond);
-            }
-        }
-        pthread_mutex_unlock(&p->lock);
-
-        DOCA_LOG_DBG("TX_ACK: freed TX slot for req_id=%u", ack.req_id);
-        return;
-    }
 
     if (mtype == DMESH_MSG_BATCH_FWD_ACK) {
-        /* Batched TX_ACK: free the TX slot of each req_id (identical per-request
-         * logic + owner guard as DMESH_MSG_FWD_ACK). One message → K frees. */
+        /* Batched TX_ACK: free the TX slot of each req_id (owner-guarded).
+         * One message → K frees. */
         if (len < 4) {
             DOCA_LOG_ERR("BATCH_TX_ACK: too short (len=%u)", len);
             return;
@@ -450,11 +405,14 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
             uint32_t idx = rid % MAX_PENDING;
             dpumesh_pending_t *p = &ctx->pending[idx];
             pthread_mutex_lock(&p->lock);
-            if ((p->state == 0 || p->state == -2) && p->tx_slot >= 0 &&
-                p->owner_req_id == rid) {
+            if (p->tx_slot >= 0 && p->owner_req_id == rid) {
+                /* ack = sole free authority for a SENT slot. Free regardless of
+                 * state (0=in flight, 1=response landed, -2=closed, -3=harvested);
+                 * for the terminal-awaiting-ack states (-2/-3) the slot was the
+                 * last thing holding the entry, so clear it to -1 (reusable). */
                 dpumesh_tx_free(ctx, p->tx_slot);
                 p->tx_slot = -1;
-                if (p->state == -2) {
+                if (p->state == -2 || p->state == -3) {
                     p->state = -1;
                     pthread_cond_broadcast(&p->cond);
                 }
@@ -464,44 +422,10 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
         return;
     }
 
-    if (mtype == DMESH_MSG_REV_DONE) {
-        /* === Reverse DMA notification (DPU→CPU) ===
-         * DPU ARM forwards this after DPA completes DMA from DPU TX buffer
-         * to Host RX buffer. Data (body only) is already at rx_dma_buffer[pos].
-         * Per-request metadata (req_id, src/dst pod, flags, length) comes
-         * from comp itself — not from the DMA payload. */
-        struct dmesh_dma_completion_msg comp;
-        if (len < sizeof(comp)) {
-            DOCA_LOG_ERR("DMA_COMPLETION: too short (len=%u need=%zu)", len, sizeof(comp));
-            return;
-        }
-        memcpy(&comp, data, sizeof(comp));
-
-        uint32_t pos = comp.pos;
-        uint32_t dma_len = comp.length;
-
-        if (!ctx->rx_dma_buffer || (size_t)pos + dma_len > ctx->rx_dma_buf_size) {
-            DOCA_LOG_ERR("DMA_COMPLETION: invalid pos=%u len=%u buf_size=%zu",
-                         pos, dma_len, ctx->rx_dma_buf_size);
-            return;
-        }
-
-        /* Process the entry. End-node slot-based admission keeps in-flight
-         * bytes ≤ buf_size, so DPU never laps. We trust DMA_COMPLETION
-         * delivery (no gap-recovery scan). */
-        if (process_rx_dma_entry(ctx, pos, dma_len,
-                                 comp.req_id, comp.src_pod_id,
-                                 comp.dst_pod_id, comp.flags) != 0) {
-            DOCA_LOG_WARN("DMA_COMPLETION: process_rx_dma_entry failed at pos=%u len=%u",
-                          pos, dma_len);
-        }
-        return;
-    }
 
     if (mtype == DMESH_MSG_BATCH_REV_DONE) {
-        /* Batched reverse-DMA notification: deliver each entry (identical per-entry
-         * logic as DMESH_MSG_REV_DONE). One reaped comch msg → K deliveries, so the
-         * single PE thread reaps 1/K — the 2-pod throughput lever. */
+        /* Batched reverse-DMA notification: deliver each entry. One reaped comch
+         * msg → K deliveries, so the single PE thread reaps 1/K — the 2-pod lever. */
         if (len < 4) {
             DOCA_LOG_ERR("BATCH_REV_DONE: too short (len=%u)", len);
             return;
@@ -1006,13 +930,17 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
                  * effectively dead. Reclaim the slot to keep the pending
                  * table from wedging the whole gateway; the late TX_ACK
                  * (if ever) will find state=-1 and no-op. */
-                if (p->state == -2) {
+                if (p->state == -2 || p->state == -3) {
+                    /* Terminal-awaiting-ack: the TX_ACK never arrived (dead link /
+                     * deferred-queue drop). Force-free so the table doesn't wedge;
+                     * a late ack finds state cleared and no-ops. Safe after 2s —
+                     * the DPA finished the forward DMA long ago. */
                     if (p->tx_slot >= 0) {
                         dpumesh_tx_free(ctx, p->tx_slot);
                         p->tx_slot = -1;
                     }
-                    DOCA_LOG_WARN("Pending slot %u reclaimed after -2 timeout (req_id=%u)",
-                                  idx, req_id);
+                    DOCA_LOG_WARN("Pending slot %u reclaimed after ack timeout (req_id=%u, state=%d)",
+                                  idx, req_id, p->state);
                     break;  /* fall through to claim the slot */
                 }
                 pthread_mutex_unlock(&p->lock);
@@ -1061,15 +989,18 @@ int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint32_t req_id,
     }
     if (st == 1) {
         *resp = p->desc;
-        /* Response arrived = DPA finished reading the TX buffer; return it now. */
+        /* Harvest the response. The TX slot is freed solely by its TX_ACK; if the
+         * ack hasn't landed yet (tx_slot>=0) park at -3 so register_pending can't
+         * reuse this idx until the ack frees the slot + clears -3→-1. If the ack
+         * already freed it, the entry is done now (-1). */
         if (p->tx_slot >= 0) {
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
+            p->state = -3;
+        } else {
+            p->state = -1;
+            /* Wake a register_pending() colliding on this idx (rare: in-flight ≥
+             * MAX_PENDING). Not a per-request hot path. */
+            pthread_cond_broadcast(&p->cond);
         }
-        p->state = -1;
-        /* Wake a register_pending() that may be colliding on this idx (rare:
-         * only when in-flight ≥ MAX_PENDING). Not a per-request hot path. */
-        pthread_cond_broadcast(&p->cond);
         pthread_mutex_unlock(&p->lock);
         return 0;
     }
@@ -1085,41 +1016,20 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
     dpumesh_pending_t *p = &ctx->pending[idx];
 
     pthread_mutex_lock(&p->lock);
-    if (p->state == 1) {
-        /* Response arrived but was never consumed — reclaim RX landing + TX */
-        if (p->desc.body_buf_slot >= 0)
-            rx_credit_return(ctx, p->desc.body_buf_slot);
+    /* Close path. A SENT TX slot (tx_slot>=0) may still be in the DPA's hands, so
+     * it is NEVER freed here — the TX_ACK is the sole authority (it frees + clears
+     * -2→-1). Park at -2 to await it; only when there is no sent slot to free
+     * (tx_slot<0: enqueue failed, or the ack already freed it) clear to -1 now.
+     * An undelivered response's RX landing is always reclaimed. */
+    if (p->state == 1 && p->desc.body_buf_slot >= 0)
+        rx_credit_return(ctx, p->desc.body_buf_slot);
+    if (p->state != -1) {
         if (p->tx_slot >= 0) {
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
+            p->state = -2;                 /* await TX_ACK to free + clear */
+        } else {
+            p->state = -1;                 /* nothing held — reusable now */
+            pthread_cond_broadcast(&p->cond);
         }
-        p->state = -1;
-        pthread_cond_broadcast(&p->cond);
-    } else if (p->state == 0) {
-        /* In-flight, no timeout yet — caller gave up; free TX now.
-         * (No DPA-in-progress risk because 0 means DPA hasn't had a chance
-         * to signal completion, i.e. request was cancelled pre-enqueue
-         * path or immediately after enqueue failure.) */
-        if (p->tx_slot >= 0) {
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
-        }
-        p->state = -1;
-        pthread_cond_broadcast(&p->cond);
-    } else if (p->state == -2) {
-        /* Timeout path: wait_response already returned -1 and left state=-2
-         * pending a late TX_ACK. By the time we reach this branch the DPA is
-         * guaranteed not to be reading the slot, so it is safe to force-free. */
-        if (p->tx_slot >= 0) {
-            dpumesh_tx_free(ctx, p->tx_slot);
-            p->tx_slot = -1;
-        }
-        p->state = -1;
-        pthread_cond_broadcast(&p->cond);
-        pthread_mutex_unlock(&p->lock);
-        return;
-    } else {
-        /* state == -1, already clean — nothing to do. */
     }
     pthread_mutex_unlock(&p->lock);
 }

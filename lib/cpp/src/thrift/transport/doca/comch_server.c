@@ -483,19 +483,6 @@ server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn
 	return DOCA_SUCCESS;
 }
 
-doca_error_t
-server_send_tx_ack_to(struct objects *objs,
-                      struct doca_comch_connection *conn,
-                      uint32_t req_id,
-                      int32_t dst_pod_id)
-{
-	struct dmesh_tx_ack_msg ack;
-	ack.type = DMESH_MSG_FWD_ACK;
-	ack._pad[0] = ack._pad[1] = ack._pad[2] = 0;
-	ack.req_id = req_id;
-	(void)dst_pod_id;   /* not on the wire; kept in signature for callers */
-	return server_send_msg_to_conn(objs, conn, (const char *)&ack, sizeof(ack));
-}
 
 /* Send a batched TX_ACK (n req_ids, 1..BATCH_TXACK_MAX) as one message. Only
  * the first 4 + 4*n bytes are transmitted (the unused tail of req_ids[] is not

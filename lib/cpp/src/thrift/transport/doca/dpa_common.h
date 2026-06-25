@@ -70,7 +70,7 @@ struct dpa_thread_arg {
  *   Forward path (Host→DPU): payload = body
  *   Reverse path (DPU→Host): payload = body
  * Per-request metadata (req_id / src_pod_id / dst_pod_id / flags / length)
- * is carried via dmesh_dma_completion_msg (and dma_desc on-DPU), keeping
+ * is carried via comch_dma_comp_msg (and dma_desc on-DPU), keeping
  * reverse per-entry size = forward per-entry size = slot_size. That is
  * what makes num_slots × slot_size ≤ DPU_BUFFER_SIZE actually bound the
  * reverse buffer occupancy.

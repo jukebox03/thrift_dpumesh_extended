@@ -38,7 +38,7 @@ send_or_defer_tx_ack(struct objects *objs, struct pod_state *src_pod,
     if (!src_pod || !src_pod->connection)
         return;
 
-    doca_error_t r = server_send_tx_ack_to(objs, src_pod->connection, req_id, dst_pod_id);
+    doca_error_t r = server_send_batch_tx_ack_to(objs, src_pod->connection, &req_id, 1);
     if (r == DOCA_SUCCESS)
         return;
 
@@ -254,13 +254,11 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
         return -1;
     }
 
-    int echo_mode = (dst_pod_id == -1 || dst_pod_id == src_pod_id);
-    struct pod_state *target_pod = echo_mode ? src_pod
-                                             : find_pod_by_id(objs, dst_pod_id);
+    struct pod_state *target_pod = find_pod_by_id(objs, dst_pod_id);
 
     if (!target_pod || !pod_data_ready(target_pod) || !target_pod->tx_rings[0]) {
         DOCA_LOG_ERR("DMA completed: target_pod=%d not found or TX ring not ready",
-                     echo_mode ? src_pod_id : dst_pod_id);
+                     dst_pod_id);
         send_or_defer_tx_ack(objs, src_pod, req_id, dst_pod_id);
         return -1;
     }
@@ -270,8 +268,7 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
     int kr = target_pod->k_rings > 0 ? target_pod->k_rings : 1;
     int ring_k = (int)(target_pod->rev_rr++ % (uint32_t)kr);
 
-    int8_t fwd_flags = echo_mode ? OP_RESPONSE
-                                 : ((entry->flags & OP_RESPONSE) | CASE_INGRESS);
+    int8_t fwd_flags = (entry->flags & OP_RESPONSE) | CASE_INGRESS;
     doca_error_t fwd_result = dpu_enqueue_reverse_dma(
         objs, fwd_buf_pod, target_pod, ring_k, req_id, dst_pod_id, src_pod_id, fwd_flags,
         entry->buf_offset, payload_len);
@@ -280,8 +277,7 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
         return 0;  /* TX descriptor ring full — preserve entry, retry next iter */
     }
     if (fwd_result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("%s failed for req_id=%u dst_pod=%d: %s",
-                     echo_mode ? "Echo" : "Forward",
+        DOCA_LOG_ERR("Forward failed for req_id=%u dst_pod=%d: %s",
                      req_id, dst_pod_id, doca_error_get_descr(fwd_result));
         /* Reverse will not fire — release src host's TX slot now so the
          * caller doesn't stall on 2s reclaim. */
@@ -311,8 +307,7 @@ drain_deferred_tx_acks(struct objects *objs)
     int total = objs->num_deferred_tx_acks;
     for (int i = 0; i < total; i++) {
         deferred_tx_ack_t *d = &objs->deferred_tx_acks[i];
-        doca_error_t rc = server_send_tx_ack_to(objs, d->conn, d->req_id,
-                                                 d->dst_pod_id);
+        doca_error_t rc = server_send_batch_tx_ack_to(objs, d->conn, &d->req_id, 1);
         if (rc == DOCA_SUCCESS) {
             sent++;
             continue;
@@ -350,9 +345,7 @@ drain_deferred_tx_acks(struct objects *objs)
 static int
 process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
 {
-    /* Determine destination pod — for echo (dst=-1 or dst==src), send to source */
-    int echo_mode = (entry->dst_pod_id == -1 || entry->dst_pod_id == entry->src_pod_id);
-    int32_t target_id = echo_mode ? entry->src_pod_id : entry->dst_pod_id;
+    int32_t target_id = entry->dst_pod_id;
     struct pod_state *target_pod = find_pod_by_id(objs, target_id);
 
     if (!target_pod || !target_pod->connection) {
@@ -365,48 +358,21 @@ process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
         return -1;
     }
 
-    /* Deliver REV_DONE to the destination host. Cross-pod (the common case incl.
-     * the bench): BATCH it so the host PE reaps 1 comch msg per K responses — the
-     * 2-pod cap. Echo (target == src below, same conn): send UN-batched so REV_DONE
-     * strictly precedes the same-conn TX_ACK (load-bearing ordering). */
-    if (echo_mode) {
-        struct dmesh_dma_completion_msg comp_msg;
-        comp_msg.type = DMESH_MSG_REV_DONE;
-        comp_msg.pos = entry->buf_offset;
-        comp_msg.length = entry->length;
-        comp_msg.req_id = entry->req_id;
-        comp_msg.src_pod_id = entry->src_pod_id;
-        comp_msg.dst_pod_id = entry->dst_pod_id;
-        comp_msg.flags = entry->flags;
-        doca_error_t result = server_send_msg_to_conn(objs, target_pod->connection,
-                                                       (const char *)&comp_msg, sizeof(comp_msg));
-        if (result == DOCA_ERROR_AGAIN) {
-            return 0;  /* retain entry → ingest backpressure */
-        }
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("REV_NOTIFY: send DMA_COMPLETION to pod %d failed: %s",
-                         target_id, doca_error_get_descr(result));
-            struct pod_state *src_pod = find_pod_by_id(objs, entry->src_pod_id);
-            send_or_defer_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id);
-            return -1;
-        }
-    } else {
-        if (batch_or_send_rev_done(objs, target_pod, entry->req_id, entry->src_pod_id,
-                                   entry->dst_pod_id, entry->buf_offset, entry->length,
-                                   entry->flags) == 0)
-            return 0;  /* batch full + send pool busy → retain entry (backpressure) */
-    }
+    /* Deliver REV_DONE to the destination host, BATCHED so the host PE reaps 1
+     * comch msg per K responses (the per-RTT PE reap is the 2-pod cap). */
+    if (batch_or_send_rev_done(objs, target_pod, entry->req_id, entry->src_pod_id,
+                               entry->dst_pod_id, entry->buf_offset, entry->length,
+                               entry->flags) == 0)
+        return 0;  /* batch full + send pool busy → retain entry (backpressure) */
 
-    /* DMA_COMPLETION sent; now release src's TX slot — the only place it is
-     * released on the success path. For echo src==dst this goes to the same pod
-     * as the DMA_COMPLETION above; comch handles the second send (or defers). */
-    struct pod_state *src_pod = echo_mode ? target_pod
-                                          : find_pod_by_id(objs, entry->src_pod_id);
-    /* Request forwards skip TX_ACK — the client frees its TX slot on response
-     * arrival (REV_DONE). Response forwards (OP_RESPONSE) get no reply, so they
-     * still ACK their src to free its slot; echo (src==dst) keeps the ACK too. */
-    if (echo_mode || (entry->flags & OP_RESPONSE))
-        batch_or_send_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id);
+    /* REV_DONE batched; now release src's TX slot — the only place it is released
+     * on the success path. */
+    struct pod_state *src_pod = find_pod_by_id(objs, entry->src_pod_id);
+    /* Always ACK — both requests and responses get a (batched) TX_ACK. The host's
+     * TX_ACK handler is the SOLE authority that frees a sent TX slot (Stage-2 C3:
+     * the request's REV_DONE self-free was removed). Uniform: no request/response
+     * gate, no flag. */
+    batch_or_send_tx_ack(objs, src_pod, entry->req_id, entry->dst_pod_id);
 
     return 1;
 }

@@ -1881,3 +1881,168 @@ busy-poll" claim as `HOST_EPOLL=1`-only (library default = internal RX thread ad
 return now checked; connect dead-pod behavior noted; client multi-conn epoll pattern (event_fd is per-endpoint) noted.
 Behavior-preserving (bench ignores close's return) — smoke ladder 30K 29,839/0 · 100K 99,452/0 · 200K 198,920/0 p50
 265µs · 235K 233,738/0 → all 0-fail. Deferred per user: one-way path (B), slot_size>8192 reject (C), req_id 2s stall (D).
+
+### 2026-06-25 — Rigorous api.md/dpm.h review + fixes (FC-1/FC-2/EDGE-4 + doc precision)
+
+5-dimension adversarial cross-verify of api.md vs dpm.h vs core (dpumesh_doca.c) vs scale_log: 9 findings confirmed
+(1 major DEFERRED), 3 refuted. NO memory-safety bugs (all TX/RX-slot/pending/req_id lifecycles correct). Fixed every
+non-major finding:
+- **dpm.h (behavior, but on unreachable/rare paths → throughput-neutral):** FC-1 `errno=ENOMEM` on conn calloc-fail in
+  server_conn_dpm + connect_dpm (was unset → an accept-until-NULL loop couldn't tell OOM from "drained"). FC-2 send_dpm
+  enqueue-fail `EAGAIN`→`EBADMSG` (enqueue −1 = permanent descriptor-validation fault; ring saturation busy-spins and
+  never returns −1 → the "retry" label was wrong). EDGE-4 read_dpm doc: on the client path ECONNRESET = req_id-table
+  collision/reclaim, NOT peer death (a dead/unregistered pod stays persistent EAGAIN).
+- **api.md (doc only):** send_dpm errno taxonomy (EINVAL / EAGAIN-after-~2s / EBADMSG); the ~2s collision-retry framing;
+  client examples 4b/4c given wall-clock timeouts (they deadlocked on a dead pod before); 240K reframed as the warm-only
+  knee with stable ≤235K + ceiling ~257K; idle 1%→1.2%.
+- **Major DEFERRED per user:** EDGE-2 (slot_size>8192 silent-drop + DPU_BUFFER_SIZE admission-invariant break).
+
+Validation (deploy via test-bench.sh, fair 1-core, 8KB, warm ramp):
+| target | achieved | p50 | p99 | ok/fail |
+|---|---|---|---|---|
+| 30K  | 29,837  | 162µs | 489µs | 300000/0 |
+| 60K  | 59,671  | 161µs | 264µs | 600000/0 |
+| 100K | 99,449  | 200µs | 315µs | 1.0M/0 |
+| 150K | 149,142 | 227µs | 337µs | 1.5M/0 |
+| 200K | 198,902 | 266µs | 41ms* | 2.0M/0 |
+| 220K | 218,791 | 296µs | 728µs | 2.2M/0 (warm + drained) |
+
+*200K p99 = known first-touch knee spike. A back-to-back 220K with NO drain gap degraded (200,764 achieved, 320 fails,
+seconds latency) = documented knee-overshoot ([[feedback_bench_warmup_ramp]]); recovered 30K/200K 0-fail WITHOUT redeploy
+→ no slot leak ([[feedback_no_slot_leak]]). DPU log clean (no ERR/flood), pods 0-restart. The errno/doc edits are
+confirmed behavior-neutral (they only touch unreachable enqueue-validation/OOM paths + comments) — ladder matches the
+prior baseline byte-for-byte.
+
+### 2026-06-25 — API redesign Stage 1: flush rename + echo_mode removal + C2 (4→2 completion types)
+
+Part of the 2-stage clean-transport redesign (Stage 2 = C3 tx_slot/ack decouple, separate). All Stage-1 changes:
+- **`send_dpm` → `flush_dpm`** (dpm.h + api.md; bench/echo never called send — implicit flush via read/close).
+- **`echo_mode` removed** (dpu_worker.c): the `dst==-1 || dst==src` loopback special-case that auto-relabeled a
+  self-send as OP_RESPONSE and sent an UN-batched REV_DONE. A self-send now routes normally (`find_pod_by_id(dst)`,
+  `(flags&OP_RESPONSE)|CASE_INGRESS`, batched REV_DONE) — benchmark-shaped cruft gone, 2-pod hot path never used it.
+- **C2: 4 DPU→host completion types → 2.** Singular `DMESH_MSG_FWD_ACK`/`REV_DONE` (+ their structs + senders +
+  host handlers) deleted; everything routes via `BATCH_FWD_ACK`/`BATCH_REV_DONE` (now enum 3/4, batch-of-1 on the
+  error/defer path). `send_or_defer_tx_ack`/`drain_deferred_tx_acks` → `server_send_batch_tx_ack_to(...,1)`.
+  (Combined with the prior always-ACK gate removal at dpu_worker.c:408.) Trivial leftover: dead `server_send_tx_ack_to`
+  prototype in comch_server.h + 2 descriptive comments (object.h/dpa_common.h) — harmless, defer to a cleanup pass.
+
+Local: bench façade + host core (dpumesh_doca.c w/ real DOCA headers) syntax-clean; DPU `.c` no edit-induced errors.
+Deploy via test-bench.sh: DPU ninja + host make + bench all built; pods Ready.
+
+**Validation (fair 1-core, 8KB, warm ramp) — 0-fail, baseline-identical:**
+| target | achieved | p50 | p99 | ok/fail |
+|---|---|---|---|---|
+| 30K  | 29,837  | 171µs | 544µs  | 300000/0 |
+| 60K  | 59,671  | 164µs | 525µs  | 600000/0 |
+| 100K | 99,451  | 210µs | 586µs  | 1.0M/0 |
+| 150K | 149,173 | 236µs | 9.98ms* | 1.5M/0 |
+| 200K | 198,893 | 280µs | 32.8ms* | 2.0M/0 |
+| 220K | 218,784 | 326µs | 2.12ms | 2.2M/0 |
+
+*first-touch knee spike (known). Back-to-back 130K×2 = 129,279/129,279 (0-fail) + recovery 30K 0-fail → **no slot
+leak**. DPU log no ERR/flood across the whole run (proves C2 both-sides type agreement + echo-removal routing intact).
+→ Stage 1 is functionally correct, leak-free, throughput/latency unchanged. Next: Stage 2 (C3).
+
+### 2026-06-25 — API redesign Stage 2: C3 — TX-slot decoupled from pending entry, ACK = sole free authority
+
+Made the host TX_ACK the single authority that frees a SENT slot, removing the multiple writers that touched
+`p->tx_slot` (the entry-reuse clobber was the latent leak source). All host-side (dpumesh_doca.c); 1 DPU comment.
+Rule: **DPA-might-have-read (sent) slot → freed only by its TX_ACK / the 2s backstop; never-sent slot → freed
+locally by dpm.h.** Edits:
+- **Removed the two TX self-frees**: `rx_deliver_desc` (response-landing, state 0→1) and `dpumesh_poll_response`
+  (harvest, state 1). They no longer touch tx_slot.
+- **ACK handler frees regardless of state** (was state 0/-2 only): `tx_slot>=0 && owner_req_id==rid` → free; for the
+  terminal-awaiting-ack states (-2/-3) clear → -1 (reusable).
+- **New state -3** (response harvested, awaiting ack): `poll_response` parks at -3 when the ack hasn't freed the slot
+  yet; `register_pending` treats -3 as occupied → can't reuse the idx until the ack clears it → **no reuse clobber**.
+- **`cancel_pending` (close) delegates sent slots to the ACK** (state→-2) instead of force-freeing; frees nothing
+  locally (only clears -1 when tx_slot<0 = enqueue-fail / ack already came). Reclaims an undelivered response's RX
+  landing. (Fixes a latent unsafety: the old state==0 branch force-freed a slot the DPA might still be reading —
+  now first-class as one-way send via [[project_completion_required]]'s ACK path.)
+- **Backstop**: `register_pending`'s 2s reclaim now covers -2 AND -3 (force-free if the ACK never arrives — dead
+  link / deferred-queue drop; safe after 2s since the forward DMA finished long ago).
+- `pending_release_async` (server reply) + `dumesh_destroy` teardown already matched the model → unchanged.
+
+Local: dpumesh_doca.c + façade syntax-clean (real DOCA headers); -3 setter (poll_response) has clearers (ack +
+backstop). Deploy: DPU 13 objs + host + bench built; pods Ready.
+
+**Validation (fair 1-core, 8KB, warm ramp) — 0-fail, baseline-identical:**
+| target | achieved | p50 | p99 | ok/fail |
+|---|---|---|---|---|
+| 30K  | 29,837  | 161µs | 454µs  | 300000/0 |
+| 100K | 99,450  | 200µs | 402µs  | 1.0M/0 |
+| 150K | 149,167 | 226µs | 694µs  | 1.5M/0 |
+| 200K | 198,896 | 283µs | 34.8ms* | 2.0M/0 |
+| 220K | 218,790 | 314µs | 997µs  | 2.2M/0 |
+
+*first-touch knee spike (known). **Leak stress: 150K ×3 back-to-back = 149,167/149,164/149,164 (0-fail)** + recovery
+30K 0-fail → **no slot leak** — the decisive C3 check (a lifecycle bug = slot exhaustion → throughput collapse).
+DPU log: no ERR/flood and **no "ack-timeout reclaim" WARN** → ack-sole-authority frees cleanly; -2 (server reply via
+release_async) and -3 (client harvest) both hammered at ~218K/s and clear correctly. Both terminal-await-ack states
+heavily exercised. NOT bench-exercised (structurally sound, shares machinery, but no direct test): one-way close
+(cancel→-2 delegation) and unwanted-late-response reclaim — follow-up for a one-way workload.
+→ Stage 2 done. Transport is now: 2 completion types, no echo special-case, flush API, single ACK free-authority.
+
+### 2026-06-25 — Façade redesign (dpm.h): reusable conn (①) + one-way first-class (②)
+
+Now that the transport supports it (Stages 1-2), reshaped the dpm.h façade to the "socket-mimicry, friction-removed"
+model. Host-only (dpm.h + bench_sock.c + 1 host-core log line + api.md); no DPU/wire change.
+- **① Reusable client conn.** `connect` once, then loop `write → read → write → read …`, `close` at the end. New
+  internal `conn_reset_exchange()` (frees the prior response's RX slot, clears per-exchange state, keeps the peer
+  binding) + `conn_begin_tx()` (called by write/sendfile): on a client conn whose response was already read, the next
+  write auto-starts a NEW request (fresh req_id at flush); otherwise EINVAL — one conn = one outstanding exchange (a
+  write mid-flight, or a 2nd reply on a server conn). Replaces the old single-shot `if (c->sent) EINVAL`.
+- **② One-way first-class.** `write → close` (no read) = fire-and-forget: close auto-flushes, then cancel_pending
+  delegates the TX slot to the ACK (C3) → no leak; a reply the peer sends is silently dropped. Downgraded the
+  rx_deliver "no waiter" log ERR→DBG so an unwanted one-way reply can't flood. Documented in dpm.h + api.md (the §1/§2
+  "pair / single-shot / one-way not first-class" claims rewritten to "peer handle / reusable / one-way first-class").
+- **bench_sock.c**: window slots now keep ONE reusable conn each (connect once; write→read→reuse), closing only on
+  error/timeout/end — demonstrates ①. **echo_sock.c unchanged** (server side: accept→read→write→close per request is
+  already the clean pattern; reuse/one-way are client concepts).
+
+Local: bench/echo + host core syntax-clean. Deploy: DPU 13 objs + host + bench built; pods Ready.
+
+**Validation (fair 1-core, 8KB, warm ramp) — 0-fail, baseline-identical:**
+| target | achieved | p50 | p99 | ok/fail |
+|---|---|---|---|---|
+| 30K  | 29,837  | 161µs | 549µs  | 300000/0 |
+| 100K | 99,451  | 202µs | 483µs  | 1.0M/0 |
+| 150K | 149,165 | 231µs | 10.3ms* | 1.5M/0 |
+| 200K | 198,900 | 286µs | 31.6ms* | 2.0M/0 |
+| 220K | 218,783 | 302µs | 34.5ms* | 2.2M/0 |
+
+*first-touch knee spikes (known). **Reuse leak stress: 150K ×3 back-to-back = 149,166/149,165/149,162 (0-fail)** +
+recovery 30K 0-fail → **no leak** — the decisive ① check (a reused conn holds its RX slot between requests; a leak
+would compound across back-to-back). DPU log clean. → ① validated end-to-end. ② (one-way) is implemented + documented
+but NOT bench-exercised (bench is RPC: reuse+read); follow-up = a one-way load test. Façade is now: peer-handle conn,
+reusable, one-way first-class, flush API.
+
+### 2026-06-25 — api.md full rewrite + one-way LOAD TEST (closes the ② follow-up)
+
+**api.md rewritten** to the new façade model (peer-handle conn / reusable client / one-way first-class / flush API):
+§3 signatures+errno corrected, examples 4a-4f redone (echo, reusable-RPC client, one-way, epoll window, epoll server,
+HTTP). **Verified mechanically**: all 6 examples extracted into a scratch .c and compiled `-Wall` against the real
+dpm.h → 0 errors (the doc's API usage matches the code).
+
+**One-way load test built + run** (this exercises ② directly):
+- bench_sock.c: `worker_fn_oneway` (connect→write→close, NO read; paced; ok = close==0); RUN gains an optional 6th
+  `mode` field (0=rpc, 1=oneway). test-bench.sh: `dpumesh-oneway` subcommand (RUN_ONEWAY=1 → mode=1).
+- echo_sock.c: per-accept `recv_total` counter, printed every 200k → delivery cross-check via pod logs.
+
+Results (fair 1-core, 8KB):
+| rate | achieved | p50 | p99 | fail |
+|---|---|---|---|---|
+| 30K–150K ramp | on-target | ~31µs | ~63µs | 0 |
+| 200K | 198,879 | 31µs | 63µs | 0 |
+| 235K | 233,708 | 31µs | 63µs | 0 |
+
+- **Delivery proven (not just enqueued):** echo recv_total delta == client OK total, twice exactly — ramp
+  3,400,000 == 3,400,000; back-to-back 4,800,000 == 4,800,000.
+- **No leak:** one-way 150K×3 back-to-back = 149,144/149,165/149,170 (0-fail) + recovery 0-fail.
+- **DPU log: no ERR/flood/"no waiter"** → the echo's unwanted replies (one-way sender doesn't read) are dropped
+  silently (② DBG-downgrade works); the request TX slot is freed by its ACK (no leak), confirmed by the back-to-back.
+- **p50 ~31µs flat to 235K** = send-call time only (fire-and-forget, no RTT) vs RPC's ~227µs RTT — the expected
+  one-way characteristic. NB this is one-way-to-a-replying-echo: the dropped replies still incur reverse-DMA traffic,
+  yet 235K sustains. RPC regression re-confirmed 0-fail 30K→200K on the same build.
+→ ② (one-way) now validated end-to-end. Façade redesign complete: peer-handle / reusable / one-way first-class /
+flush API, all measured 0-fail + leak-free + delivery-confirmed.

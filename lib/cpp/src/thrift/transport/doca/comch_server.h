@@ -27,13 +27,6 @@ doca_error_t
 server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn,
                         const char *msg, size_t len);
 
-/* Send TX ACK to a specific host connection: per-request notification that
- * forward DMA finished. */
-doca_error_t
-server_send_tx_ack_to(struct objects *objs,
-					  struct doca_comch_connection *conn,
-					  uint32_t req_id,
-					  int32_t dst_pod_id);
 
 /* Batched TX_ACK: coalesce n req_ids into one message. */
 doca_error_t

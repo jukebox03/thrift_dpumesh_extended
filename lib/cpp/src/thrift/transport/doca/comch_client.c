@@ -102,18 +102,6 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 			return;
 		}
 		break;
-	case DMESH_MSG_FWD_ACK:
-		/* Forward DMA consumed by DPU — sender can free TX buffer slot */
-		if (objs->rx_data_hook)
-			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
-		break;
-
-	case DMESH_MSG_REV_DONE:
-		/* Reverse DMA (DPU→CPU) completion: data is already in Host RX DMA
-		 * buffer; notification carries pos/length/req_id/src/dst/flags. */
-		if (objs->rx_data_hook)
-			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
-		break;
 
 	case DMESH_MSG_BATCH_FWD_ACK:
 		/* Batched TX_ACK — coalesced free of K req_ids. */

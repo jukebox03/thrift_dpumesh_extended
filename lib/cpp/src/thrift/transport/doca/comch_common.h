@@ -24,10 +24,8 @@ enum dmesh_msg_type {
     DMESH_MSG_INVALID      = 0, /* reserved: zeroed buffer is never a live type */
     DMESH_MSG_POD_REGISTER = 1, /* Host→DPU: register this connection's pod_id */
     DMESH_MSG_MMAP_EXPORT  = 2, /* Host→DPU: export an mmap region (ring / TX buf / RX buf) */
-    DMESH_MSG_FWD_ACK      = 3, /* DPU→Host: forward DMA (CPU→DPU) consumed — free TX slot */
-    DMESH_MSG_REV_DONE     = 4, /* DPU→Host: reverse DMA (DPU→CPU) done — data in Host RX buf */
-    DMESH_MSG_BATCH_FWD_ACK= 5, /* DPU→Host: batch of req_ids whose forward DMA is done — free all */
-    DMESH_MSG_BATCH_REV_DONE=6, /* DPU→Host: batch of reverse-DMA completions — deliver all */
+    DMESH_MSG_BATCH_FWD_ACK= 3, /* DPU→Host: batch of req_ids whose forward DMA is done — free all */
+    DMESH_MSG_BATCH_REV_DONE=4, /* DPU→Host: batch of reverse-DMA completions — deliver all */
 };
 
 /* DPU→Host: batched TX_ACK. Coalesces up to BATCH_TXACK_MAX per-request
@@ -46,7 +44,7 @@ _Static_assert(sizeof(struct dmesh_batch_tx_ack_msg) == 4 + 4 * BATCH_TXACK_MAX,
 /* DPU→Host: batched REV_DONE. Coalesces up to BATCH_REVDONE_MAX per-response
  * reverse-DMA completions into one comch message so the host PE thread reaps 1
  * message per K responses instead of K — the per-RTT PE reap is the 2-pod cap.
- * Each entry mirrors the dmesh_dma_completion_msg payload minus the type byte. */
+ * Each entry mirrors the comch_dma_comp_msg payload minus the type byte. */
 #define BATCH_REVDONE_MAX 16
 struct dmesh_rev_done_entry {
     int8_t   flags;
@@ -93,36 +91,6 @@ struct dmesh_register_msg {
     int32_t pod_id;
     char app_name[64];
 };
-
-/* DPU→Host: per-request notification that forward DMA (CPU→DPU) is done —
- * sender can release the TX slot tied to req_id. Pure event signal. 1-byte
- * type (host dispatches by reading a single byte). The slot is freed by
- * req_id alone. */
-struct dmesh_tx_ack_msg {
-    uint8_t  type;       /* = DMESH_MSG_FWD_ACK */
-    uint8_t  _pad[3];    /* align req_id to its natural 4B boundary */
-    uint32_t req_id;
-};
-_Static_assert(sizeof(struct dmesh_tx_ack_msg) == 8,
-               "dmesh_tx_ack_msg must pack to 8B");
-
-/* DPU→Host: reverse DMA (DPU→CPU) completion — data landed in Host RX buffer.
- * Byte-identical to struct comch_dma_comp_msg (dpa_common.h): the DPA emits
- * that 16B packed struct to the DPU and the DPU relays the SAME content up to
- * the host, rewriting only the type byte (DPA_MSG_REV_DONE → DMESH_MSG_REV_DONE)
- * on relay. type is 1 byte (not the 4-byte enum) so the layout matches the DPA
- * struct exactly; the host dispatches by reading type as a single byte. */
-struct dmesh_dma_completion_msg {
-    uint8_t  type;        /* = DMESH_MSG_REV_DONE */
-    int8_t   flags;       /* OP_REQUEST/OP_RESPONSE + CASE_* */
-    int8_t   src_pod_id;
-    int8_t   dst_pod_id;
-    uint32_t pos;         /* offset in Host RX DMA buffer */
-    uint32_t length;      /* DMA'd body length */
-    uint32_t req_id;
-};
-_Static_assert(sizeof(struct dmesh_dma_completion_msg) == 16,
-               "dmesh_dma_completion_msg must pack to 16B (mirrors comch_dma_comp_msg)");
 
 
 
