@@ -2046,3 +2046,24 @@ Results (fair 1-core, 8KB):
   yet 235K sustains. RPC regression re-confirmed 0-fail 30K→200K on the same build.
 → ② (one-way) now validated end-to-end. Façade redesign complete: peer-handle / reusable / one-way first-class /
 flush API, all measured 0-fail + leak-free + delivery-confirmed.
+
+### 2026-06-25 — Façade naming flipped `*_dpm` suffix → `dpm_*` prefix (reverts the 06-24 "unify to suffix")
+
+Reverses the earlier "Façade naming unified to `*_dpm` suffix" decision: all façade identifiers now carry the `dpm_`
+PREFIX. Generic mechanical transform `\b(<ident>)_dpm\b → dpm_\1` over the only 4 files that use the suffix:
+`lib/cpp/src/thrift/transport/dpm.h`, `bench/echo_sock.c`, `bench/bench_sock.c`, `api.md`.
+- **16 public funcs:** `socket_dpm`→`dpm_socket`, `destroy_dpm`→`dpm_destroy`, `pod_id_dpm`→`dpm_pod_id`,
+  `msg_max_dpm`→`dpm_msg_max`, `event_fd_dpm`→`dpm_event_fd`, `accept_dpm`→`dpm_accept`, `connect_dpm`→`dpm_connect`,
+  `set_data_dpm`→`dpm_set_data`, `get_data_dpm`→`dpm_get_data`, `is_server_dpm`→`dpm_is_server`, `peer_dpm`→`dpm_peer`,
+  `read_dpm`→`dpm_read`, `write_dpm`→`dpm_write`, `sendfile_dpm`→`dpm_sendfile`, `flush_dpm`→`dpm_flush`,
+  `close_dpm`→`dpm_close`.
+- **4 internal static helpers** (same file, for uniformity): `server_conn_dpm`→`dpm_server_conn`,
+  `client_poll_dpm`→`dpm_client_poll`, `autoflush_dpm`→`dpm_autoflush`, `tx_ensure_dpm`→`dpm_tx_ensure`.
+- **Untouched:** types `dpm_t`/`dpmconn_t` (already prefix-style); the low-level C core API (`dpumesh.h`/`dpumesh_doca.c`:
+  `dpumesh_init`/`dpumesh_get_event_fd`/…); env vars `DPUMESH_*`; the header filename `dpm.h`. Prose mentions of the
+  convention updated by hand (`_dpm` twin/suffix → `dpm_` prefix; `epoll_*_dpm` → `dpm_epoll_*`).
+- **scale_log history left intact** (the 06-24 entries above still record the suffix era — not rewritten).
+
+Behavior-preserving, name-only. Verified host-side: `gcc -fsyntax-only -I lib/cpp/src bench/{echo,bench}_sock.c` → 0
+errors; repo-wide grep confirms 0 remaining `_dpm` tokens in code/doc. Deploy smoke-ladder via test-bench.sh pending
+(mechanical rename — no codepath change).

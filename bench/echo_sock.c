@@ -1,19 +1,19 @@
 /*
  * echo_sock.c — a plain non-blocking epoll echo server, ported to DPUmesh by
- * swapping the BSD-socket calls for their `_dpm` twins.
+ * swapping the BSD-socket calls for their `dpm_` twins.
  *
  * The ENTIRE port from an ordinary TCP epoll echo server is:
- *     socket()/bind()/listen()  ->  socket_dpm()
- *     <listen fd>               ->  event_fd_dpm()      (register in NATIVE epoll)
- *     accept()                  ->  accept_dpm()
- *     read()                    ->  read_dpm()
- *     write()                   ->  write_dpm()  (close_dpm ships it; no send)
- *     close()                   ->  close_dpm()
+ *     socket()/bind()/listen()  ->  dpm_socket()
+ *     <listen fd>               ->  dpm_event_fd()      (register in NATIVE epoll)
+ *     accept()                  ->  dpm_accept()
+ *     read()                    ->  dpm_read()
+ *     write()                   ->  dpm_write()  (dpm_close ships it; no send)
+ *     close()                   ->  dpm_close()
  *     epoll_create/_ctl/_wait   ->  UNCHANGED (native kernel epoll)
  *
  * Everything else — the epoll loop, the readiness dispatch, errno/EAGAIN — is
  * standard Linux I/O. This is the whole point: a normal epoll server runs over
- * the DPU transport with nothing but the `_dpm` suffix.
+ * the DPU transport with nothing but the `dpm_` prefix.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -38,11 +38,11 @@ int main(void)
         worker_id = atoi(getenv("BENCH_WORKER_ID"));
 
     /* socket() + bind() + listen() */
-    dpm_t *s = socket_dpm("echo-sock", worker_id);
-    if (!s) { fprintf(stderr, "[echo_sock] socket_dpm failed\n"); return 1; }
+    dpm_t *s = dpm_socket("echo-sock", worker_id);
+    if (!s) { fprintf(stderr, "[echo_sock] dpm_socket failed\n"); return 1; }
 
     /* The DPUmesh readiness fd plays the role of the listen socket. */
-    int dfd = event_fd_dpm(s);
+    int dfd = dpm_event_fd(s);
     if (dfd < 0) { fprintf(stderr, "[echo_sock] event_fd unavailable\n"); return 1; }
 
     /* ---- vanilla kernel epoll, unchanged ---- */
@@ -54,7 +54,7 @@ int main(void)
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, dfd, &ev) < 0) { perror("epoll_ctl"); return 1; }
 
     fprintf(stderr, "[echo_sock] ready: pod_id=%d event_fd=%d (native epoll)\n",
-            pod_id_dpm(s), dfd);
+            dpm_pod_id(s), dfd);
 
     struct epoll_event events[MAX_EVENTS];
     unsigned long recv_total = 0;   /* received-request counter (delivery cross-check) */
@@ -75,25 +75,25 @@ int main(void)
 
             /* accept() every queued request (non-blocking; NULL/EAGAIN = drained). */
             dpmconn_t *c;
-            while ((c = accept_dpm(s)) != NULL) {
+            while ((c = dpm_accept(s)) != NULL) {
                 /* read() the whole request (arrives atomically, <= 8 KB) */
                 char buf[8192];
                 ssize_t off = 0, r;
-                while ((r = read_dpm(c, buf + off, sizeof buf - (size_t)off)) > 0)
+                while ((r = dpm_read(c, buf + off, sizeof buf - (size_t)off)) > 0)
                     off += r;
 
                 /* write() it straight back; close() ships it (implicit send) — a
                  * normal read/write/close echo server, no explicit send call. */
                 if (off > 0)
-                    write_dpm(c, buf, (size_t)off);
+                    dpm_write(c, buf, (size_t)off);
 
-                close_dpm(c);
+                dpm_close(c);
                 if ((++recv_total % 200000) == 0)
                     fprintf(stderr, "[echo_sock] recv_total=%lu\n", recv_total);
             }
         }
     }
 
-    destroy_dpm(s);
+    dpm_destroy(s);
     return 0;
 }
