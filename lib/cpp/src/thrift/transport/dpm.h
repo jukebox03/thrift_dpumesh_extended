@@ -1,56 +1,34 @@
 /*
- * dpm.h — socket/epoll-style façade over the DPUmesh C API.
+ * dpm.h — socket/epoll-style façade over the DPUmesh C API (oriented endpoint
+ * tuple model — design-endpoint-tuple.md). Header-only.
  *
- * Header-only. Lets you port an ordinary non-blocking epoll server/client to
- * DPUmesh by swapping the BSD-socket calls for their `dpm_` equivalents:
+ *     socket()/bind()/listen()  ->  dmesh_create_channel()   (registers a service)
+ *     accept()                  ->  dmesh_accept()           (allocates a server port)
+ *     connect()                 ->  dmesh_connect(svc)       (allocates a client port)
+ *     read()                    ->  dmesh_read()
+ *     write()                   ->  dmesh_write()  (buffers; dmesh_flush ships)
+ *     sendfile()                ->  dmesh_sendfile()
+ *     close()                   ->  dmesh_close()
+ *     epoll_*()                 ->  UNCHANGED native epoll on dmesh_event_fd(s)
  *
- *     socket()/bind()/listen()  ->  dpm_socket()      (folded into one)
- *     accept()                  ->  dpm_accept()
- *     connect()                 ->  dpm_connect()
- *     read()                    ->  dpm_read()
- *     write()                   ->  dpm_write()  (read/close ships it; send optional)
- *     sendfile()                ->  dpm_sendfile()
- *     close()                   ->  dpm_close()
- *     epoll_create()/_ctl()/_wait() -> UNCHANGED — use native kernel epoll, and
- *         register dpm_event_fd(s) (a real fd) like a listen socket. When it
- *         is readable, drain it (one read() of a uint64_t) and dpm_accept()
- *         the pending request(s). No dpm_epoll_* wrappers exist.
+ * ADDRESSING (TCP-faithful, no direction flag):
+ *   - A message carries src=(pod,port) and dst=(service,pod,port) + a per-conn
+ *     seq. The receiver demuxes by dst_port: a CLIENT port → reply; a SERVER port
+ *     → established request; port 0 (BLANK) → a fresh connection request (accept
+ *     queue). Request vs response is implicit in WHICH local socket the tuple
+ *     resolves to — never signaled. Self-routing / loopback works (client and
+ *     server ports are distinct, even on one host).
+ *   - dmesh_connect(svc) binds a logical SERVICE; the DPU routes the FIRST request
+ *     (dst_pod=BLANK) to a backend pod (connection-level / sticky LB). The client
+ *     learns the backend (pod,port) from the first reply and talks to it directly
+ *     thereafter — so one accepted server conn carries MANY exchanges (persistent).
  *
- * SEMANTIC DIFFERENCES vs BSD sockets (by design — read these):
- *   1. MESSAGE-oriented, not a byte stream. One request maps to one response,
- *      each body <= slot_size (HARD CAP 8 KB — the DPA dma_copy limit). A whole
- *      message arrives ATOMICALLY: dpm_accept() already holds the full
- *      request body, so there is no partial-read state machine and no EPOLLOUT
- *      dance for the body.
- *   2. NON-BLOCKING RX. dpm_accept / dpm_read and epoll readiness never
- *      block; "not ready" returns the would-block sentinel with errno=EAGAIN.
- *      The TX side (write/sendfile/send) never blocks on the PEER, but it
- *      BUSY-SPINS (capped ~50µs backoff) while the LOCAL TX-slot pool or DMA ring
- *      is saturated (dpumesh_tx_alloc/enqueue self-throttle by spinning, they
- *      never fail with backpressure), and send's register_pending can block up to
- *      ~2s on a req_id collision. There is no cond-blocking mode. To SLEEP until
- *      a request/response is ready, wait on dpm_event_fd(s) with native
- *      epoll/poll/select — it is notification-driven (no busy-poll).
- *   3. SINGLE-SHOT conn. One dpmconn_t carries exactly one request/response; after
- *      dpm_flush() it cannot be written/sent again — dpm_close() and make a
- *      new dpm_connect()/dpm_accept().
- *   4. ADDRESS = pod_id (a small integer), not an IP/port. A "connection" is one
- *      request/response conversation, not a persistent stream; reuse is per-call.
- *   5. dpm_write() BUFFERS into the TX slot; the message is transmitted
- *      AUTOMATICALLY by the next dpm_read() (client) or dpm_close()
- *      (server), so the write->read / write->close patterns need NO explicit send.
- *      dpm_flush() remains available to flush explicitly (e.g. a pipelined
- *      async client that ships now and harvests the response later).
- *
- * Thread-safety: the underlying ctx is internally locked, so multiple threads may
- * each run their own accept/handle loop on one endpoint. A single dpmconn_t is NOT
- * thread-safe — use one per thread.
+ * SEMANTICS: message/RPC channel, not a byte stream. One whole <= slot_size (8 KB)
+ * body arrives atomically. NON-BLOCKING RX (EAGAIN). One conn carries one
+ * outstanding exchange at a time. SEND IS EXPLICIT: write buffers, flush ships.
  */
 #ifndef DPM_H
 #define DPM_H
-
-/* Requires POSIX (pread/read/sched_yield) — compile with the project's default
- * flags (gcc gnu11) or define _GNU_SOURCE; the rest of DPUmesh is POSIX/Linux. */
 
 #include <stdint.h>
 #include <stddef.h>
@@ -69,47 +47,46 @@ extern "C" {
 
 /* ===== Handles ===== */
 
-/* Endpoint — the bound, listening socket. One per process (wraps one DOCA
- * device context). */
-typedef struct dpm_endpoint {
+/* Endpoint — one per process. Wraps one DOCA device context + this node's
+ * registered service. */
+typedef struct dmesh_channel {
     dpumesh_ctx_t *ctx;
     int            pod_id;
-    int            slot_size;   /* cached max body size (avoids a per-write lib call) */
-} dpm_t;
+    int            slot_size;   /* cached max body size */
+} dmesh_channel_t;
 
-/* Connection — one request/response conversation (≈ an accepted/connected fd). */
-typedef struct dpm_conn {
-    dpm_t   *ep;
-    int      is_server;        /* 1 = accepted request, 0 = client request */
-    int32_t  peer_pod;         /* server: requester; client: target */
-    uint32_t req_id;
-    int      req_assigned;     /* client: req_id allocated yet? (0 is a valid id at wrap) */
-    int8_t   req_flags;        /* server: inbound flags (mirrored onto the reply) */
+/* Connection — one peer conversation (oriented tuple). */
+typedef struct dmesh_conn {
+    dmesh_channel_t *ep;
+    int       role;            /* DMESH_ROLE_CLIENT (connect) | DMESH_ROLE_SERVER (accept) */
 
-    /* Inbound body (server: request, client: response). */
-    int            rx_slot;    /* -1 = none */
+    /* addressing tuple */
+    uint16_t  local_port;      /* my port: pc (client) or ps (server) */
+    int16_t   dst_service;     /* peer service: callee (client) / caller (server) */
+    int16_t   remote_pod;      /* peer pod; DMESH_POD_BLANK on a client pre-establish */
+    uint16_t  remote_port;     /* peer port; 0 on a client pre-establish */
+    uint8_t   established;      /* learned the peer (pod,port)? */
+    uint16_t  seq;             /* current exchange seq (match key with local_port) */
+
+    /* inbound body (SERVER: the request; CLIENT: the reply) */
+    int            rx_slot;    /* landing byte-offset in host RX buffer; -1 = none */
     const uint8_t *rx_buf;
     uint32_t       rx_len;
     uint32_t       rx_pos;
-    int            rx_ready;   /* body available to read? */
+    int            rx_ready;
 
-    /* Outbound body (server: response, client: request) — buffered until send. */
-    int       tx_slot;         /* -1 = not yet allocated */
+    /* outbound body (buffered until flush) */
+    int       tx_slot;         /* -1 = not allocated */
     uint8_t  *tx_buf;
     uint32_t  tx_len;
-    int       sent;            /* enqueued? */
-    int       pending;         /* register_pending outstanding? */
+    int       sent;
+    int       pending;         /* registered in pending[(local_port,seq)] ? */
+} dmesh_conn_t;
 
-    void     *user_data;       /* like epoll_event.data.ptr — yours to use */
-} dpmconn_t;
+/* ===== Endpoint lifecycle ===== */
 
-/* ===== Endpoint lifecycle (socket + bind + listen, folded) ===== */
-
-/* Create an endpoint bound to `pod_id` with identity `app_name`. RX is
- * non-blocking poll-only (the transport has no cond-blocking path). Returns NULL
- * on failure (errno set by init). `pod_id` is overridden by env DPUMESH_POD_ID. */
-static inline dpm_t *dpm_socket(const char *app_name, int pod_id) {
-    dpm_t *s = (dpm_t *)calloc(1, sizeof(*s));
+static inline dmesh_channel_t *dmesh_create_channel(const char *app_name, int pod_id) {
+    dmesh_channel_t *s = (dmesh_channel_t *)calloc(1, sizeof(*s));
     if (!s) return NULL;
     dpumesh_config_t cfg = DPUMESH_CONFIG_DEFAULT;
     if (dpumesh_init(&s->ctx, app_name, pod_id, &cfg) != 0 || !s->ctx) {
@@ -121,87 +98,101 @@ static inline dpm_t *dpm_socket(const char *app_name, int pod_id) {
     return s;
 }
 
-/* Destroy the endpoint and release all DOCA resources. */
-static inline void dpm_destroy(dpm_t *s) {
+static inline void dmesh_destroy_channel(dmesh_channel_t *s) {
     if (!s) return;
     if (s->ctx) dpumesh_destroy(s->ctx);
     free(s);
 }
 
-/* This endpoint's pod_id, and the configured max body size (slot_size). */
-static inline int dpm_pod_id(dpm_t *s)    { return s->pod_id; }
-static inline int dpm_msg_max(dpm_t *s)   { return s->slot_size; }
+static inline int dmesh_pod_id(dmesh_channel_t *s)  { return s->pod_id; }
+static inline int dmesh_msg_max(dmesh_channel_t *s) { return s->slot_size; }
+static inline int dmesh_event_fd(dmesh_channel_t *s) { return dpumesh_get_event_fd(s->ctx); }
 
-/* Readiness fd for NATIVE epoll/poll/select: becomes readable when an inbound
- * request/response is delivered. Register it like a listen socket; on wakeup,
- * drain it (one read() of a uint64_t) and dpm_accept()/dpm_read() the
- * ready work. Returns -1 if unavailable (fall back to polling dpm_accept).
- * Notification-driven — no busy-poll. */
-static inline int dpm_event_fd(dpm_t *s) { return dpumesh_get_event_fd(s->ctx); }
+/* ===== internal helpers ===== */
+
+/* Return any held RX-landing credit and clear the inbound view. */
+static inline void conn_free_rx(dmesh_conn_t *c) {
+    if (c->rx_slot >= 0) dpumesh_rx_free(c->ep->ctx, c->rx_slot);
+    c->rx_slot = -1; c->rx_buf = NULL; c->rx_len = 0; c->rx_pos = 0; c->rx_ready = 0;
+}
 
 /* ===== Connection setup ===== */
 
-/* INTERNAL: build a server conn from a dequeued request descriptor. */
-static inline dpmconn_t *dpm_server_conn(dpm_t *s, const sw_descriptor_t *req) {
-    dpmconn_t *c = (dpmconn_t *)calloc(1, sizeof(*c));
-    if (!c) { errno = ENOMEM; dpumesh_rx_free(s->ctx, req->body_buf_slot); return NULL; }
-    c->ep        = s;
-    c->is_server = 1;
-    c->peer_pod  = req->src_pod_id;
-    c->req_id    = req->req_id;
-    c->req_flags = req->flags;
-    c->rx_slot   = req->body_buf_slot;
-    c->rx_buf    = dpumesh_rx_buf(s->ctx, req->body_buf_slot);
-    c->rx_len    = req->body_len;
-    c->rx_pos    = 0;
-    c->rx_ready  = 1;          /* request body is already here (atomic) */
-    c->tx_slot   = -1;
-    return c;
-}
-
-/* accept(): NON-BLOCKING. Returns a new server connection holding the next
- * incoming request (body already available via dpm_read), or NULL with
- * errno=EAGAIN if no request is pending. A NULL with errno!=EAGAIN (ENOMEM) is
- * a rare conn-alloc failure: the dequeued request is dropped and its RX slot
- * reclaimed (no leak). An accept-until-NULL loop treats it as "drained", which
- * is safe — it just skips that one request. */
-static inline dpmconn_t *dpm_accept(dpm_t *s) {
+/* accept(): NON-BLOCKING. Pops the next fresh connection request from the accept
+ * queue, allocates a SERVER port (the persistent conn endpoint), and returns a
+ * conn already holding the request body. NULL+EAGAIN if none pending; NULL+ENOMEM
+ * on alloc failure (the request is dropped, its RX slot reclaimed). */
+static inline dmesh_conn_t *dmesh_accept(dmesh_channel_t *s) {
     sw_descriptor_t req;
     if (dpumesh_dequeue(s->ctx, &req, 0) < 0 || !req.valid) {
         errno = EAGAIN;
         return NULL;
     }
-    return dpm_server_conn(s, &req);
-}
+    dmesh_conn_t *c = (dmesh_conn_t *)calloc(1, sizeof(*c));
+    if (!c) { errno = ENOMEM; dpumesh_rx_free(s->ctx, req.body_buf_slot); return NULL; }
+    uint16_t ps = dpumesh_alloc_port(s->ctx, DMESH_ROLE_SERVER);
+    if (ps == 0) { dpumesh_rx_free(s->ctx, req.body_buf_slot); free(c); errno = ENOMEM; return NULL; }
 
-/* connect(): create a client connection to `dst_pod_id`. No round-trip — this
- * only binds the target. Returns NULL on OOM. */
-static inline dpmconn_t *dpm_connect(dpm_t *s, int dst_pod_id) {
-    dpmconn_t *c = (dpmconn_t *)calloc(1, sizeof(*c));
-    if (!c) { errno = ENOMEM; return NULL; }
-    c->ep       = s;
-    c->is_server = 0;
-    c->peer_pod = (int32_t)dst_pod_id;
-    c->rx_slot  = -1;
-    c->tx_slot  = -1;
+    c->ep          = s;
+    c->role        = DMESH_ROLE_SERVER;
+    c->local_port  = ps;
+    c->remote_pod  = req.src_pod;        /* the client (for replies) */
+    c->remote_port = req.src_port;
+    c->dst_service = req.src_service;     /* caller's service (for the reply mirror) */
+    c->established = 1;
+    c->seq         = req.seq;            /* echo on the reply */
+    c->rx_slot     = req.body_buf_slot;
+    c->rx_buf      = dpumesh_rx_buf(s->ctx, req.body_buf_slot);
+    c->rx_len      = req.body_len;
+    c->rx_pos      = 0;
+    c->rx_ready    = 1;                  /* request body already here */
+    c->tx_slot     = -1;
     return c;
 }
 
-/* ===== Per-connection user data (mirrors epoll_event.data.ptr) ===== */
-static inline void  dpm_set_data(dpmconn_t *c, void *p) { c->user_data = p; }
-static inline void *dpm_get_data(dpmconn_t *c)          { return c->user_data; }
-static inline int   dpm_is_server(dpmconn_t *c)         { return c->is_server; }
-static inline int32_t dpm_peer(dpmconn_t *c)            { return c->peer_pod; }
+/* connect(): bind a CLIENT conn to a logical SERVICE. Allocates a client port; no
+ * round-trip. The DPU resolves the service → backend on the first request; the
+ * conn learns the backend (pod,port) from the first reply. NULL+ENOMEM on OOM. */
+static inline dmesh_conn_t *dmesh_connect(dmesh_channel_t *s, int dst_service) {
+    dmesh_conn_t *c = (dmesh_conn_t *)calloc(1, sizeof(*c));
+    if (!c) { errno = ENOMEM; return NULL; }
+    uint16_t pc = dpumesh_alloc_port(s->ctx, DMESH_ROLE_CLIENT);
+    if (pc == 0) { free(c); errno = ENOMEM; return NULL; }
+    c->ep          = s;
+    c->role        = DMESH_ROLE_CLIENT;
+    c->local_port  = pc;
+    c->dst_service = (int16_t)dst_service;
+    c->remote_pod  = DMESH_POD_BLANK;
+    c->remote_port = DMESH_PORT_BLANK;
+    c->established = 0;
+    c->seq         = 0;
+    c->rx_slot     = -1;
+    c->tx_slot     = -1;
+    return c;
+}
 
-/* INTERNAL: poll a client conn for its response. 1=ready (rx populated),
- * 0=not yet, -1=abandoned. */
-static inline int dpm_client_poll(dpmconn_t *c) {
+/* The peer of this exchange: the resolved peer pod once established, else the
+ * service connected to. */
+static inline int32_t dmesh_peer(dmesh_conn_t *c) {
+    return (c->remote_pod != DMESH_POD_BLANK) ? c->remote_pod : c->dst_service;
+}
+
+/* INTERNAL: poll a CLIENT conn for its reply. 1=ready, 0=not yet, -1=abandoned. */
+static inline int dmesh_poll_reply(dmesh_conn_t *c) {
     if (c->rx_ready) return 1;
-    if (!c->sent)    return 0;          /* nothing requested yet */
+    if (!c->sent)    return 0;
     sw_descriptor_t resp;
-    int r = dpumesh_poll_response(c->ep->ctx, c->req_id, &resp);
+    int r = dpumesh_poll_response(c->ep->ctx, c->local_port, c->seq, &resp);
     if (r == 1) return 0;
     if (r < 0)  return -1;
+    /* Reply arrived. On the FIRST exchange, learn the resolved backend POD so
+     * subsequent requests go direct to it (connection-level sticky). M3: the
+     * client does NOT pin to a server port — established requests keep
+     * dst_port=0 (→ the backend's accept queue), so remote_port stays 0. */
+    if (!c->established) {
+        c->remote_pod  = resp.src_pod;
+        c->established = 1;
+    }
     c->rx_slot  = resp.body_buf_slot;
     c->rx_buf   = dpumesh_rx_buf(c->ep->ctx, resp.body_buf_slot);
     c->rx_len   = resp.body_len;
@@ -212,37 +203,33 @@ static inline int dpm_client_poll(dpmconn_t *c) {
     return 1;
 }
 
-/* ===== read / write / send ===== */
-
-/* dpm_flush() is defined below; forward-declared here for dpm_autoflush(). */
-static inline int dpm_flush(dpmconn_t *c);
-
-/* INTERNAL: implicitly transmit a buffered-but-unsent outbound message. This is
- * what lets the socket-style write->read (client) and write->close patterns work
- * with NO explicit dpm_flush() call. No-op if nothing is buffered (tx_slot<0)
- * or it was already sent. Returns dpm_flush()'s result (0 ok; -1 errno=EAGAIN
- * on a transient the caller's next read retries). */
-static inline int dpm_autoflush(dpmconn_t *c) {
-    if (c->sent || c->tx_slot < 0) return 0;
-    return dpm_flush(c);
+/* INTERNAL: poll a SERVER conn for the next established request (single inbox). */
+static inline int dmesh_poll_request_conn(dmesh_conn_t *c) {
+    if (c->rx_ready) return 1;
+    sw_descriptor_t req;
+    if (!dpumesh_poll_request(c->ep->ctx, c->local_port, &req)) return 0;
+    c->seq         = req.seq;
+    c->remote_pod  = req.src_pod;
+    c->remote_port = req.src_port;
+    c->dst_service = req.src_service;
+    c->rx_slot     = req.body_buf_slot;
+    c->rx_buf      = dpumesh_rx_buf(c->ep->ctx, req.body_buf_slot);
+    c->rx_len      = req.body_len;
+    c->rx_pos      = 0;
+    c->rx_ready    = 1;
+    return 1;
 }
 
-/* read(): copy inbound body bytes into buf (advancing the read cursor). On a
- * client conn it first auto-flushes any buffered request (implicit send), so
- * dpm_write()+dpm_read() needs no explicit dpm_flush() call.
- *   >0 = bytes copied
- *    0 = end of message (whole body consumed)
- *   -1 = would-block (client: response not arrived; errno=EAGAIN) OR
- *        abandoned (errno=ECONNRESET).
- * NB: on the client path ECONNRESET means this req_id's pending entry was
- * reclaimed/aliased (a req_id-table collision) — it is NOT peer death. A dead
- * or unregistered dst_pod_id is never detected: its response simply never
- * arrives, so dpm_read stays EAGAIN forever (apply your own wall-clock
- * timeout). */
-static inline ssize_t dpm_read(dpmconn_t *c, void *buf, size_t len) {
+/* ===== read / write / send ===== */
+
+/* read(): copy inbound body bytes. CLIENT: polls for the reply (flush the request
+ * first). SERVER: returns the accepted request, then (after a reply) polls the
+ * inbox for the next established request on this conn.
+ *   >0 bytes, 0 = end of message, -1 = would-block (EAGAIN) / abandoned (ECONNRESET). */
+static inline ssize_t dmesh_read(dmesh_conn_t *c, void *buf, size_t len) {
     if (!c->rx_ready) {
-        if (!c->is_server && dpm_autoflush(c) < 0) return -1;   /* errno set by send */
-        int r = dpm_client_poll(c);
+        int r = (c->role == DMESH_ROLE_CLIENT) ? dmesh_poll_reply(c)
+                                               : dmesh_poll_request_conn(c);
         if (r == 0) { errno = EAGAIN;     return -1; }
         if (r < 0)  { errno = ECONNRESET; return -1; }
     }
@@ -254,50 +241,38 @@ static inline ssize_t dpm_read(dpmconn_t *c, void *buf, size_t len) {
     return (ssize_t)n;
 }
 
-/* INTERNAL: ensure a TX slot is allocated. 0 ok, -1 backpressure (errno=EAGAIN). */
-static inline int dpm_tx_ensure(dpmconn_t *c) {
+/* INTERNAL: ensure a TX slot is allocated. 0 ok, -1 backpressure (EAGAIN). */
+static inline int dmesh_tx_ensure(dmesh_conn_t *c) {
     if (c->tx_slot >= 0) return 0;
     int slot = dpumesh_tx_alloc(c->ep->ctx);
-    if (slot < 0) { errno = EAGAIN; return -1; }   /* TX pool exhausted */
+    if (slot < 0) { errno = EAGAIN; return -1; }
     c->tx_slot = slot;
     c->tx_buf  = dpumesh_tx_buf(c->ep->ctx, slot);
     c->tx_len  = 0;
     return 0;
 }
 
-/* INTERNAL: reset a CLIENT conn for a new request after its previous exchange
- * completed (response delivered + read). Frees the prior response's RX slot and
- * clears the per-exchange state; the peer binding is kept and the next flush takes
- * a fresh req_id. This is what makes a conn REUSABLE — connect once, then loop
- * write -> read -> write -> read ..., and close at the end. */
-static inline void conn_reset_exchange(dpmconn_t *c) {
-    if (c->rx_slot >= 0) dpumesh_rx_free(c->ep->ctx, c->rx_slot);
-    c->rx_slot = -1; c->rx_buf = NULL; c->rx_len = 0; c->rx_pos = 0; c->rx_ready = 0;
-    c->sent = 0; c->req_assigned = 0; c->pending = 0;
-    /* tx_slot is already -1 (handed off at flush); a fresh one is taken on write. */
+/* INTERNAL: reset a CLIENT conn for a new request after its reply was read. Frees
+ * the prior reply's RX landing; keeps the conn binding + seq counter. */
+static inline void conn_reset_exchange(dmesh_conn_t *c) {
+    conn_free_rx(c);
+    c->sent = 0; c->pending = 0;
+    /* tx_slot already -1 (handed off at flush); a fresh one is taken on write. */
 }
 
-/* INTERNAL: begin building a new outbound message. If the conn already sent its
- * message, a CLIENT whose response has been delivered auto-resets for a new
- * request (sequential reuse); otherwise reject with EINVAL — one conn carries one
- * outstanding exchange at a time (a write before the response arrives, or a 2nd
- * reply on a server conn). Then ensure a TX slot. 0 ok; -1 (EINVAL / EAGAIN). */
-static inline int conn_begin_tx(dpmconn_t *c) {
+/* INTERNAL: begin a new outbound message. A CLIENT conn whose reply was read
+ * auto-resets for the next request; otherwise a 2nd write while outstanding is
+ * EINVAL. Then ensure a TX slot. */
+static inline int conn_begin_tx(dmesh_conn_t *c) {
     if (c->sent) {
-        if (!c->is_server && c->rx_ready) conn_reset_exchange(c);
+        if (c->role == DMESH_ROLE_CLIENT && c->rx_ready) conn_reset_exchange(c);
         else { errno = EINVAL; return -1; }
     }
-    return dpm_tx_ensure(c);
+    return dmesh_tx_ensure(c);
 }
 
-/* write(): BUFFER outbound body bytes (transmitted later by dpm_flush()). On a
- * client conn whose previous response was already read, the first write of the
- * next message auto-starts a NEW request (reuse — see conn_begin_tx).
- *   >0 = bytes buffered (always == len on success)
- *   -1 = message would exceed slot_size (errno=EMSGSIZE), or a write while a
- *        request is still outstanding / on an already-sent server conn
- *        (errno=EINVAL). Acquiring a TX slot busy-spins under saturation. */
-static inline ssize_t dpm_write(dpmconn_t *c, const void *buf, size_t len) {
+/* write(): BUFFER outbound body bytes (shipped by dmesh_flush). */
+static inline ssize_t dmesh_write(dmesh_conn_t *c, const void *buf, size_t len) {
     if (conn_begin_tx(c) < 0) return -1;
     int cap = c->ep->slot_size;
     if (c->tx_len + len > (uint32_t)cap) { errno = EMSGSIZE; return -1; }
@@ -306,11 +281,8 @@ static inline ssize_t dpm_write(dpmconn_t *c, const void *buf, size_t len) {
     return (ssize_t)len;
 }
 
-/* sendfile(): append up to `count` bytes from in_fd into the outbound body
- * (still capped at slot_size). If `offset` is non-NULL the file is read from
- * *offset and *offset is advanced. Returns bytes appended (0 at EOF), -1 on
- * error/backpressure. Ship with dpm_flush() afterwards. */
-static inline ssize_t dpm_sendfile(dpmconn_t *c, int in_fd, off_t *offset, size_t count) {
+/* sendfile(): append up to count bytes from in_fd (capped at slot_size). */
+static inline ssize_t dmesh_sendfile(dmesh_conn_t *c, int in_fd, off_t *offset, size_t count) {
     if (conn_begin_tx(c) < 0) return -1;
     int cap = c->ep->slot_size;
     size_t room = (size_t)cap - c->tx_len;
@@ -325,119 +297,80 @@ static inline ssize_t dpm_sendfile(dpmconn_t *c, int in_fd, off_t *offset, size_
     return n;
 }
 
-/* send(): transmit the buffered outbound message (client: request; server:
- * response, matched to the inbound req_id). USUALLY OPTIONAL for the happy path —
- * dpm_read() (client) and dpm_close() (server) auto-flush. Call it explicitly
- * when you need to CONFIRM or RETRY delivery: it returns the send status (0/-1)
- * and a transient -1 (EAGAIN) can be retried with the body still buffered —
- * whereas dpm_close()'s auto-flush can only REPORT a failure (the conn is freed,
- * so it can't be retried). Also use it to flush early (e.g. a pipelined async
- * client that sends now and reads the response later). After send, a client conn awaits
- * its response (dpm_read, optionally via native epoll on dpm_event_fd);
- * a server conn is complete. A CLIENT conn is REUSABLE after its response is read
- * (the next write starts a new request); a conn carries one outstanding exchange
- * at a time.
- *   0  = sent
- *  -1, errno=EINVAL  = conn already sent (single-shot) — NOT retryable.
- *  -1, errno=EAGAIN  = req_id pending-table collision. RETRYABLE (body kept),
- *        but this errno is returned only AFTER a ~2s hard wait inside
- *        register_pending — it is NOT retry-soon backpressure, and a retry with
- *        the same req_id may block another ~2s until the colliding slot frees.
- *        Rare (only when in-flight ≥ MAX_PENDING).
- *  -1, errno=EBADMSG = permanent descriptor-validation fault from enqueue —
- *        NOT retryable; close the conn. Unreachable via the façade.
- * The TX-slot / DMA-ring acquisition busy-spins, it never fails with -1. */
-static inline int dpm_flush(dpmconn_t *c) {
+/* flush(): ship the buffered message. CLIENT: a request (first → routed by
+ * service with dst_pod=BLANK; established → direct to the learned backend).
+ * SERVER: a reply, mirrored back to the caller; the conn is then ready for the
+ * next request. REQUIRED to send.
+ *   0 sent; -1 EINVAL (already sent) / EAGAIN (pending collision) / EBADMSG (desc fault). */
+static inline int dmesh_flush(dmesh_conn_t *c) {
     dpumesh_ctx_t *ctx = c->ep->ctx;
     if (c->sent) { errno = EINVAL; return -1; }
-    if (dpm_tx_ensure(c) < 0) return -1;          /* allow zero-length messages */
+    if (dmesh_tx_ensure(c) < 0) return -1;          /* allow zero-length messages */
 
-    if (!c->is_server && !c->req_assigned) {
-        c->req_id = dpumesh_alloc_req_id(ctx);
-        c->req_assigned = 1;
-    }
+    if (c->role == DMESH_ROLE_CLIENT)
+        c->seq++;                                   /* new per-conn seq for this request */
 
     if (!c->pending) {
-        if (dpumesh_register_pending(ctx, c->req_id) < 0) { errno = EAGAIN; return -1; }
+        if (dpumesh_register_pending(ctx, c->local_port, c->seq) < 0) { errno = EAGAIN; return -1; }
         c->pending = 1;
     }
 
     sw_descriptor_t d;
     memset(&d, 0, sizeof(d));
-    d.header_buf_slot = -1;
-    d.header_len      = 0;
-    d.body_buf_slot   = c->tx_slot;
-    d.body_len        = c->tx_len;
-    d.req_id          = c->req_id;
-    d.dst_pod_id      = c->peer_pod;
-    d.src_pod_id      = c->ep->pod_id;
-    d.flags           = c->is_server ? (int8_t)((c->req_flags & ~OP_REQUEST) | OP_RESPONSE)
-                                     : (int8_t)(OP_REQUEST | CASE_EXTERNAL);
-    d.valid           = 1;
+    d.body_buf_slot = c->tx_slot;
+    d.body_len      = c->tx_len;
+    d.src_port      = c->local_port;
+    d.seq           = c->seq;
+    d.dst_service   = c->dst_service;
+    if (c->role == DMESH_ROLE_CLIENT && !c->established) {
+        d.dst_pod  = DMESH_POD_BLANK;     /* first request → DPU resolves dst_service */
+        d.dst_port = DMESH_PORT_BLANK;
+    } else {
+        d.dst_pod  = c->remote_pod;       /* direct: established client / server reply */
+        d.dst_port = c->remote_port;
+    }
+    d.valid = 1;
 
     if (dpumesh_enqueue(ctx, &d) < 0) {
-        /* enqueue only fails on a PERMANENT descriptor-validation fault (null
-         * desc / slot out of range / body_len > slot_size); ring saturation
-         * busy-spins instead. So this is NOT retryable — report EBADMSG, not
-         * EAGAIN. (Unreachable via the façade: dpm_write caps the body at
-         * slot_size and tx_alloc always yields a valid slot.) */
-        dpumesh_cancel_pending(ctx, c->req_id);
+        dpumesh_cancel_pending(ctx, c->local_port, c->seq);
         c->pending = 0;
         errno = EBADMSG;
         return -1;
     }
-    dpumesh_pending_attach_tx(ctx, c->req_id, c->tx_slot);
+    dpumesh_pending_attach_tx(ctx, c->local_port, c->seq, c->tx_slot);
 
-    if (c->is_server) {
-        /* fire-and-forget: TX_ACK frees the TX slot, no response expected */
-        dpumesh_pending_release_async(ctx, c->req_id);
-        c->pending = 0;
-    }
-    /* TX ownership handed to the pending/TX_ACK path. */
     c->tx_slot = -1;
     c->tx_buf  = NULL;
     c->tx_len  = 0;
-    c->sent    = 1;
+
+    if (c->role == DMESH_ROLE_SERVER) {
+        /* Reply shipped: no response expected on (ps,seq); the TX_ACK frees the
+         * TX slot. M3: one reply per accepted request — the app closes this conn
+         * next (which frees ps + the request's RX credit). No conn reuse. */
+        dpumesh_pending_release_async(ctx, c->local_port, c->seq);
+        c->pending = 0;
+        c->sent = 1;
+    } else {
+        c->sent = 1;                                /* await the reply (dmesh_read) */
+    }
     return 0;
 }
 
-/* close(): ship any buffered-but-unsent message (e.g. a server response built
- * with dpm_write()), then release the conn's slots/pending and free it. Safe on
- * NULL.
- *
- * ONE-WAY (fire-and-forget): a CLIENT that does write -> close WITHOUT a read
- * sends the request and does not wait for a response — the TX slot is freed by
- * the DPU's TX_ACK (no leak) and any reply the peer sends is silently dropped.
- *   0  = ok (message shipped, or nothing was buffered)
- *  -1  = the buffered message FAILED to ship (rare — e.g. a req_id collision).
- *        The conn is freed EITHER WAY, so -1 means "not delivered and NOT
- *        retryable on this conn." For guaranteed delivery, call dpm_flush()
- *        explicitly (and retry on EAGAIN) BEFORE dpm_close(). */
-static inline int dpm_close(dpmconn_t *c) {
+/* close(): free the conn's port/slots/pending. Does NOT send (flush first). */
+static inline int dmesh_close(dmesh_conn_t *c) {
     if (!c) return 0;
-    int flushed = dpm_autoflush(c);   /* 0 = shipped / nothing buffered; -1 = ship failed */
     dpumesh_ctx_t *ctx = c->ep->ctx;
-    if (c->rx_slot >= 0)            dpumesh_rx_free(ctx, c->rx_slot);
-    if (c->tx_slot >= 0 && !c->sent) dpumesh_tx_free(ctx, c->tx_slot);   /* unsent */
-    if (c->pending)                 dpumesh_cancel_pending(ctx, c->req_id);
+    conn_free_rx(c);                                     /* return held RX credit */
+    if (c->tx_slot >= 0 && !c->sent) dpumesh_tx_free(ctx, c->tx_slot);  /* buffered, never flushed */
+    if (c->pending)                  dpumesh_cancel_pending(ctx, c->local_port, c->seq);
+    if (c->local_port)               dpumesh_free_port(ctx, c->local_port);
     free(c);
-    return flushed;
+    return 0;
 }
 
 /* ===== Event-loop integration =====
- * There are NO dpm_epoll_* wrappers. Use NATIVE kernel epoll/poll/select and
- * register dpm_event_fd(s) like a listen socket:
- *
- *   int dfd = dpm_event_fd(s);                 // -1 if unavailable
- *   epoll_ctl(epfd, EPOLL_CTL_ADD, dfd, &ev);      // ev.events = EPOLLIN
- *   ... epoll_wait(epfd, events, n, timeout) ...   // sleeps until inbound activity
- *   // on a dfd event: drain it, then accept the pending request(s):
- *   uint64_t cnt; while (read(dfd, &cnt, sizeof cnt) > 0) {}   // drain (EAGAIN when empty)
- *   dpmconn_t *c; while ((c = dpm_accept(s)) != NULL) { handle(c); }
- *
- * The fd is raised per delivery and drained by the read(); a level-triggered
- * EPOLLIN plus the accept-until-EAGAIN loop processes every queued request. dfd
- * mixes freely with real sockets in the same epoll set. */
+ * No dmesh_epoll_* wrappers. Register dmesh_event_fd(s) in native epoll like a
+ * listen socket; on EPOLLIN drain it (read() a uint64_t) and accept()/read(). */
 
 #ifdef __cplusplus
 }

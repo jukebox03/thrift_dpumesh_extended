@@ -220,11 +220,15 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
 
         comp.type = DPA_MSG_FWD_DONE;
         comp.pos = ring->region_off + thread_arg->pos[r];  /* absolute (EU-sharding) */
-        comp.length = desc->size;
-        comp.req_id = (uint32_t)desc->idx;
-        comp.src_pod_id = ring->pod_id;
-        comp.dst_pod_id = desc->dst_pod_id;
-        comp.flags = desc->flags;
+        comp.length = (uint16_t)desc->size;
+        /* Endpoint tuple — opaque passthrough from the host-posted desc. src_service
+         * is NOT carried (16B budget); the DPU derives it from src_pod. */
+        comp.seq = desc->seq;
+        comp.src_port = desc->src_port;
+        comp.dst_port = desc->dst_port;
+        comp.dst_service = desc->dst_service;
+        comp.src_pod_id = ring->pod_id;          /* forward: sender = this ring's pod */
+        comp.dst_pod_id = desc->dst_pod_id;      /* may be DMESH_POD_BLANK → DPU resolves */
 
         doca_dpa_dev_comch_producer_dma_copy(producer,
                                     dpu_consumer_id,
@@ -335,11 +339,15 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
          * identity must come from the descriptor. */
         comp.type = DPA_MSG_REV_DONE;
         comp.pos = ring->region_off + thread_arg->rev_pos[r];  /* absolute (EU-sharding) */
-        comp.length = desc->size;
-        comp.req_id = (uint32_t)desc->idx;
-        comp.src_pod_id = desc->src_pod_id;
-        comp.dst_pod_id = desc->dst_pod_id;
-        comp.flags = desc->flags;
+        comp.length = (uint16_t)desc->size;
+        /* Endpoint tuple — opaque passthrough from the DPU-posted reverse desc.
+         * src_service is NOT carried (16B); the DPU derives it from src_pod. */
+        comp.seq = desc->seq;
+        comp.src_port = desc->src_port;
+        comp.dst_port = desc->dst_port;
+        comp.dst_service = desc->dst_service;
+        comp.src_pod_id = desc->src_pod_id;      /* reverse: original sender carried in desc */
+        comp.dst_pod_id = desc->dst_pod_id;      /* resolved target */
 
         doca_dpa_dev_comch_producer_dma_copy(producer,
                                     dpu_consumer_id,

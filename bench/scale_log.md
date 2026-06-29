@@ -2067,3 +2067,194 @@ PREFIX. Generic mechanical transform `\b(<ident>)_dpm\b → dpm_\1` over the onl
 Behavior-preserving, name-only. Verified host-side: `gcc -fsyntax-only -I lib/cpp/src bench/{echo,bench}_sock.c` → 0
 errors; repo-wide grep confirms 0 remaining `_dpm` tokens in code/doc. Deploy smoke-ladder via test-bench.sh pending
 (mechanical rename — no codepath change).
+
+### 2026-06-25 — Drop socket-cosplay in the echo example (atomic msg → single read)
+
+A message arrives ATOMICALLY (one whole ≤8KB body, contiguous in `rx_buf`), so the byte-stream accumulation loop
+`while ((r = dpm_read(c, buf+off, …)) > 0) off += r;` always did exactly [1 real read + 1 EOF read]. Replaced it with a
+single `dpm_read(c, buf, sizeof buf)` (buf sized to the slot max). Applied in `bench/echo_sock.c` + api.md examples 4a /
+4e / 4f. Also removed `signal(SIGPIPE, SIG_IGN)` + `<signal.h>` from echo_sock.c — vestigial socket boilerplate (the
+program has NO real sockets; `dpm_write` is a memcpy into a slot, so SIGPIPE can never fire). `bench_sock.c` keeps it
+(its control plane uses real TCP). Reframed the now-false "diff is only the `dpm_` prefix / nothing but the suffix"
+claims (echo_sock.c header, 4e note) to "simpler than a socket, not byte-for-byte identical" — the read-loop collapse
+*is* a divergence from socket code. Behavior-preserving; `gcc -fsyntax-only -Wall` clean. Transport API/semantics
+untouched (this is example/usage cleanup only).
+
+### 2026-06-25 — Façade prefix flipped `dmesh_` + handle types renamed (user-directed)
+
+Per user decision (keep incremental write → keep the per-exchange handle, just make names honest):
+- **Prefix `dpm_` → `dmesh_`** on all 16 public funcs + 4 internal static helpers (`dmesh_socket`, `dmesh_accept`,
+  `dmesh_read`, `dmesh_write`, `dmesh_flush`, `dmesh_close`, `dmesh_event_fd`, …). No collision with the existing core
+  `dmesh_*` family (those are all `_msg`/`_entry`/`doca_dpa_*` structs; verified).
+- **`dpm_t` → `dmesh_channel_t`** (struct tag `dpm_endpoint` → `dmesh_channel`).
+- **`dpmconn_t` → `dmesh_conn_t`** (prefix-only for now; the "conn" name is still socket-ish and may be revisited —
+  struct tag `dpm_conn` → `dmesh_conn`).
+- **Kept as-is (out of scope):** header filename `dpm.h` + include guard `DPM_H`; the C core (`dpumesh.h`/`dpumesh_*`,
+  `dpumesh_ctx_t`) which the real Thrift transport uses directly (façade is bench-only).
+- Scope: `dpm.h` + `bench/{echo,bench}_sock.c` + `api.md` (+ synced install copy). Ordered sed (types first, then
+  generic prefix) so `dpm_t` didn't get mangled into `dmesh_t`. `gcc -fsyntax-only -Wall` on both bench files → 0
+  errors; repo-wide grep → 0 `dpm_` identifiers (scale_log history intentionally left).
+
+STILL PENDING (user thinking): the semantic name redesign (e.g. `dmesh_conn_t` → exchange/ticket terms, `dmesh_socket`/
+`accept`/`connect`/`read`/`write` → RPC/message verbs). This entry is the prefix+type step only.
+
+### 2026-06-25 — Endpoint lifecycle verbs renamed (user-directed, partial semantic pass)
+
+- `dmesh_socket` → **`dmesh_create_channel`**, `dmesh_destroy` → **`dmesh_destroy_channel`** (match the `dmesh_channel_t`
+  type). Core `dpumesh_destroy(ctx)` inside is untouched.
+- **Deliberately kept** (user decision): `dmesh_accept` (NOT renamed — `next_request`/`take_request` was rejected as
+  assuming RPC, since one-way is first-class and an inbound isn't necessarily a "request"; `accept` is neutral),
+  `dmesh_connect`, and all of read/write/sendfile/flush/close/event_fd/pod_id/msg_max/is_server/peer/set_data/get_data.
+- Types `dmesh_channel_t`/`dmesh_conn_t` unchanged (conn rename still deferred).
+- Scope: `dpm.h` + `bench/{echo,bench}_sock.c` + `api.md` (+ synced install copy). `gcc -fsyntax-only -Wall` both bench
+  files → 0 errors.
+
+### 2026-06-25 — Role-neutrality pass: remove role-assuming API (user principle)
+
+User principle: the façade must exist **independently of server/client/topology role**. Audited the façade and removed/
+neutralized every role assumption (the C core `dpumesh_*` was already role-neutral — pod_id/worker_id based).
+- **Removed public accessors** (unused except the doc/4d example): `dmesh_is_server` (role-assuming), `dmesh_set_data`,
+  `dmesh_get_data` (+ the `user_data` field they backed). 4d epoll-window example rewritten to track conns by its own
+  `inflight[]` index (the `set_data`/`get_data` tag was redundant — the array index already is the request index).
+- **Kept** `dmesh_peer` (role-NEUTRAL — just "the other pod in this exchange"; the only way to learn a received
+  message's sender). Doc neutralized.
+- **Renamed role-named internals** → direction-based (a property of the *exchange*, not the node): field
+  `is_server`→`inbound`; helper `dmesh_server_conn`→`dmesh_inbound_conn`; helper `dmesh_client_poll`→`dmesh_poll_reply`.
+- **Neutralized all "server"/"client" in dpm.h comments** → "inbound exchange (received)" / "outbound exchange
+  (initiated)". Verified: `grep server|client dpm.h` = 0.
+- Behavior unchanged (the inbound/outbound distinction is intrinsic: a reply carries the received req_id + OP_RESPONSE;
+  a request allocates a new req_id). `gcc -fsyntax-only -Wall` both bench files → 0 errors; install copy synced.
+- Final public surface: `dmesh_create_channel`/`dmesh_destroy_channel`/`dmesh_event_fd`/`dmesh_pod_id`/`dmesh_msg_max` ·
+  `dmesh_accept`/`dmesh_connect` · `dmesh_read`/`dmesh_write`/`dmesh_sendfile`/`dmesh_flush`/`dmesh_close` · `dmesh_peer`
+  · types `dmesh_channel_t`/`dmesh_conn_t`.
+
+### 2026-06-25 — req_id originator-scoping + OP_ functionally removed + explicit flush (host-only; NOT YET DEPLOYED)
+
+Big design (agreed via wf_bf45a2f9 mapping). **Host-only change — DPU/DPA/Thrift/gateway untouched** so the cross-target
+build I can't verify stays green. NOT yet deploy-tested (deploy is the user's per [[feedback_no_background_deploy]]).
+- **req_id originator-scoped** (`dpumesh_doca.c` `dpumesh_alloc_req_id`): `req_id = (pod_id<<25) | (counter & 0x01FFFFFF)`
+  — top 7 bits = minting pod, low 25 = counter. Globally unique across pods. Constants `DMESH_REQID_POD_SHIFT/MASK/CTR_MASK`.
+- **OP_RESPONSE demux REPLACED** (`rx_deliver_desc`): was `if (flags & OP_RESPONSE)`; now `if (req_id>>25 == ctx->pod_id)`
+  → "did I mint this?" = reply→pending, else→accept ring. + added `owner_req_id == req_id` guard (hardens vs wrap-alias;
+  the deliver path lacked it). DPU/DPA still carry the now-unread OP bit — harmless dead bits (kept #defines to avoid
+  touching the unverifiable build). Façade `dmesh_flush` now sets `d.flags = 0`.
+- **Loopback (dst==self) REJECTED** at `dpumesh_enqueue` — a self-minted req_id arriving back can't be told request-leg
+  from reply-leg without a direction bit. Unused in practice (all traffic is cross-pod).
+- **autoflush REMOVED + explicit flush** (`dpm.h`): `dmesh_autoflush` deleted; `read`/`close` no longer auto-send.
+  `dmesh_close` is now pure teardown (discards an un-flushed buffer; cancels pending if flushed-not-read; returns 0).
+  Send is now ALWAYS explicit: `write → flush → read` (RPC) / `write → flush → close` (one-way). Updated bench
+  (echo_sock, bench_sock async+oneway) + api.md examples 4a–4f + §2/§3 tables/lifecycles.
+- KEPT: `inbound` field (req_id alloc-vs-reuse is intrinsic — a reply reuses the received req_id), release_async (server),
+  the flags byte (ABI), OP_/CASE_ #defines (now dead — physical deletion is the pending follow-up that touches Thrift/DPU).
+- **Verified host-side**: `gcc -fsyntax-only -Wall` echo_sock/bench_sock = 0 errors; `gcc -fsyntax-only` dumesh_doca.c =
+  0 errors (only pre-existing DOCA deprecation warnings). Install header synced.
+- **PENDING (user)**: `./test-bench.sh deploy` + warm ladder (30K→200K, expect 0-fail) — builds libthrift+DPU+DPA and
+  validates on real HW. Watch for: loopback-reject false positives (none expected), reply mis-demux (would show as
+  client EAGAIN-forever / wrong-body fails).
+
+**VALIDATED ON HW (2026-06-25, fair 1-core, 8KB)** — deployed via `test-bench.sh deploy` (exit 0, fresh pods,
+restart=0; DPU log clean, NO ERR/loopback-reject/drop floods — only benign DOCA startup WRNs). Warm ladder:
+
+| target | achieved | p50 | p99 | OK/Fail |
+|---|---|---|---|---|
+| 30K  | 29,838  | 166µs | 513µs | 300000/0 |
+| 100K | 99,450  | 200µs | 1.2ms | 1.0M/0 |
+| 150K | 149,168 | 227µs | 338µs | 1.5M/0 |
+| 200K (warm,drained) | **198,893** | 273µs | 28ms* | **2.0M/0** |
+
+→ **req_id-origin demux + explicit-flush redesign is CORRECT + PERFORMANCE-NEUTRAL** — 200K 0-fail at 198.9K matches the
+pre-change baseline (~198K). *The first 200K shot (cold 100K→200K jump, no drain) knee'd to 170K/9-fail/2s-p999 =
+documented [[feedback_bench_warmup_ramp]] knee-overshoot, NOT a regression; a 100K re-run recovered 0-fail (no leak
+[[feedback_no_slot_leak]]) and the warm/drained 200K retry was clean. 200K p99 28ms = the known first-touch tail spike.
+DPU `-l` stayed 40 (nothing to revert). OP_/CASE_ #defines still present (dead) — physical deletion still a follow-up.
+
+---
+
+# Endpoint-tuple redesign — deploy + test (2026-06-29)
+
+Redesign: `req_id` → oriented endpoint tuple `(src pod/port, dst service/pod/port, seq)`.
+Demux by `dst_port` (not req_id-origin / no direction flag); addressing = **service_id**
+(DPU `dpu_route` resolves service→pod, connection-level sticky); self-routing/loopback
+enabled; server model **M3** (each side closes independently, server accept→handle→close
+per request). Thrift transport excluded from build (unchanged). See git for code.
+
+## Bring-up bugs (host-side, found via pod stderr per diagnose-before-redeploy)
+1. **pending index collapsed to seq** → 2.1 RPS, p50 12s. `pending[key % MAX_PENDING]`
+   with `key=(port<<16)|seq` and `MAX_PENDING=2^16` → `key%65536 == seq`, so PORT was
+   dropped from the index → every conn's seq=N aliased one slot → `register_pending`
+   2s collision-wait per request.
+2. **Knuth-hash index** (fix attempt) → 3,753 RPS, p50 164µs but **p99 12s**. Hashing
+   (port,seq) birthday-collides at a few hundred conns; a collided slot stuck at
+   state=1 (response delivered, not yet harvested) blocked others → cascade.
+   Log: `Pending slot collision: req_id=0x500001 idx=42375 stuck state=1`.
+3. **FIX: index = port** (`dmesh_pidx(key) = key>>16`). Each live conn owns a unique
+   port and is single-outstanding (≤1 in-flight (port,seq)) → collision-free, like an
+   fd indexing its slot. `owner_key=(port<<16|seq)` still guards late/dup ACK. → healthy.
+
+## Ramp (8192B, 10s, fair 1-core/pod; DPA=4 K=2, baked config) — ALL 0-fail
+| target | achieved | p50 | p99 | p999 | ok/fail |
+|---|---|---|---|---|---|
+| 30000  | 29,837  | 171µs | 562µs  | 2.77ms | 300000/0 |
+| 100000 | 99,450  | 206µs | 8.21ms | 10.69ms| 1.0M/0 |
+| 150000 | 149,174 | 234µs | 5.89ms | 11.83ms| 1.5M/0 |
+| 200000 | 198,908 | 292µs | 27.69ms| 44.55ms| 2.0M/0 |
+| 220000 | 218,792 | 338µs | 3.95ms | 8.00ms | 2.2M/0 |
+
+**Verdict: perf-NEUTRAL vs pre-redesign ~220K baseline, 0-fail across the ramp.**
+p50 actually lower (171–338µs vs old ~14ms blocking / ~1–3ms async) — the bench async
+client + the leaner path. p99 noisy at 200K (27ms) but 0-fail; recovers at 220K.
+The path validated: service routing (dpu_route service11→pod11), dst_port demux,
+(port,seq) match, slot/credit mgmt, establish/sticky. (Standard bench is cross-pod
+pod10→service11→pod11; loopback/self-service is a separate setup, not yet run.)
+
+## comch_dma_comp_msg 20B (was 16B) — measured NOT a slowdown
+The 20B completion immediate (2nd WQE BB) is perf-neutral here (219K = baseline). The
+earlier slowness was bug #1/#2, not the immediate size. 16B is reachable only via
+pos byte-offset→slot-index (DPA change), expected ~0 gain — deferred.
+
+## comch_dma_comp_msg → 16B (done 2026-06-29) — measured perf-identical to 20B
+Earlier entry deferred 16B (said it needed pos→slot-index). Done a simpler way:
+**dropped `src_service` from the 16B wire** (the DPU derives the caller's service from
+src_pod's registration in the recv-cb — assumes one service per pod, true today since
+service_id=pod_id). Reordered: type0 src_pod1 dst_pod2 dst_svc3 src_port4 dst_port6 seq8
+length10 pos12 = exactly 16B (type@0 for the recv peek, pos@12 4-aligned, no padding).
+Files: dpa_common.h (struct+assert==16), dpa_kernel.c (fwd/rev comp fill), dpa.c
+(recv-cb derives src_service). dpu_worker/host/rev_done_entry unchanged.
+
+Re-ramp (8192B, 10s, fair) — ALL 0-fail, **= 20B within noise**:
+| target | 16B achieved | 20B achieved | p50(16B) |
+|---|---|---|---|
+| 30000  | 29,837  | 29,837  | 160µs |
+| 100000 | 99,451  | 99,450  | 200µs |
+| 200000 | 198,911 | 198,908 | 264µs |
+| 220000 | 218,814 | 218,792 | 318µs |
+
+**Verdict: comch immediate 16B vs 20B is NOT a throughput lever in the ≤220K host-bound
+range** (DPU/DPA hop is small; the immediate cost only matters near the DPA op-rate
+ceiling ~257K, not reached). User's "16B 넘으면 느려졌다" did not reproduce — the
+earlier slowness was the pending-index bug. 16B kept anyway (leaner, one WQE BB).
+
+## Loopback / self-routing validation (2026-06-29) — PASS
+New, isolated test (no transport code changed): `bench/loopback_sock.c` — ONE pod
+(pod_id=12, service_id=12) runs an echo thread AND a client loop over the SAME
+channel. The client connect(svc 12) -> DPU resolves svc 12 -> pod 12 (itself) ->
+own echo replies. Proves self-routing + the oriented-tuple demux on a single host
+(request lands dst_port=0 -> accept queue/server; reply lands dst_port=pc -> client
+pending; distinguished even though both legs are local — impossible in the old
+req_id-origin model, which foreclosed loopback). Wired into test-bench.sh:
+`./test-bench.sh loopback <N> <SIZE>` (new loopback-dpumesh deployment, pod 12,
+cores 4,5). (Also deleted the unused test-dpumesh.sh.)
+
+Result: **N=50000 → ok=50000 / fail=0, served(echo side)=50000 (cross-check), p50=120.6µs.**
+
+Cross-pod NOT regressed by the added 3rd pod — warm ramp (8192B):
+| target | achieved | ok/fail |
+|---|---|---|
+| 30000  | 29,837  | 300000/0 |
+| 100000 | 99,448  | 1.0M/0 |
+| 200000 | 198,888 | 2.0M/0 |
+| 220000 | 218,784 | 2.2M/0 |
+
+NB: a COLD-JUMP straight to 220K right after the loopback test gave 168K + 507 fail
+— the known cold-jump wedge artifact, NOT a regression; the warm ramp above is 0-fail
+(reconfirms "always ramp, never cold-jump").

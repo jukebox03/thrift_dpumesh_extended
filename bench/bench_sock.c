@@ -2,11 +2,11 @@
  * bench_sock.c — DPUmesh load-generator, written with ONLY the socket/epoll
  * façade (dpm.h). A port of an ordinary async request/response client:
  *
- *     socket()/bind()  ->  dpm_socket()
- *     connect()        ->  dpm_connect()
- *     write()          ->  dpm_write()  (buffers; the read below ships it)
- *     read()           ->  dpm_read()   (implicit send + the response; EAGAIN until it arrives)
- *     close()          ->  dpm_close()
+ *     socket()/bind()  ->  dmesh_create_channel()
+ *     connect()        ->  dmesh_connect()
+ *     write()          ->  dmesh_write()  (buffers; the read below ships it)
+ *     read()           ->  dmesh_read()   (implicit send + the response; EAGAIN until it arrives)
+ *     close()          ->  dmesh_close()
  *
  * A worker keeps a window of W REUSABLE conns: connect once per slot, then loop
  * write -> read (harvest) -> write ... reusing the conn across requests (close
@@ -36,7 +36,7 @@
 #define WAIT_TIMEOUT_MS    5000
 #define DRAIN_GRACE_SEC    5
 
-static dpm_t *g_s = NULL;            /* the façade endpoint (shared, thread-safe) */
+static dmesh_channel_t *g_s = NULL;            /* the façade endpoint (shared, thread-safe) */
 static int    g_dst_pod_id = 11;
 static int    g_async_threads = 4;
 
@@ -64,7 +64,7 @@ typedef struct {
 
 /* One in-flight request = one façade connection. */
 typedef struct {
-    dpmconn_t *c;
+    dmesh_conn_t *c;
     double     scheduled;   /* t0 for latency (coordinated-omission: scheduled time) */
     double     launched;    /* send time, for the wall-clock timeout */
     long       j;           /* logical request index (body pattern) */
@@ -96,15 +96,17 @@ static void *worker_fn_async(void *arg) {
             if (now_sec() < scheduled) break;          /* paced */
 
             if (!fl[s].c) {                             /* connect ONCE; reuse after */
-                fl[s].c = dpm_connect(g_s, g_dst_pod_id);
+                fl[s].c = dmesh_connect(g_s, g_dst_pod_id);
                 if (!fl[s].c) break;                    /* transient OOM: retry next sweep */
             }
             uint8_t p = (uint8_t)('A' + (next_j & 0xf));
             body[0] = p; body[w->msg_size / 2] = p; body[w->msg_size - 1] = p;
-            /* write() auto-starts a NEW request on the reused conn (its prior
-             * response was already read); the harvest dpm_read() below ships it. */
-            if (dpm_write(fl[s].c, body, (size_t)w->msg_size) < 0) {
-                dpm_close(fl[s].c); fl[s].c = NULL;     /* drop a wedged conn, reconnect next */
+            /* write() buffers + auto-starts a NEW request on the reused conn (its
+             * prior reply was already read); flush() ships it now (read no longer
+             * auto-sends). */
+            if (dmesh_write(fl[s].c, body, (size_t)w->msg_size) < 0 ||
+                dmesh_flush(fl[s].c) < 0) {
+                dmesh_close(fl[s].c); fl[s].c = NULL;     /* drop a wedged conn, reconnect next */
                 break;
             }
             fl[s].scheduled = scheduled; fl[s].launched = now_sec();
@@ -115,10 +117,10 @@ static void *worker_fn_async(void *arg) {
         /* ---- 2. Harvest completed (and time out stalled) slots ---- */
         for (int s = 0; s < W; s++) {
             if (!fl[s].active) continue;
-            ssize_t n = dpm_read(fl[s].c, rb, (size_t)w->msg_size);   /* read() */
+            ssize_t n = dmesh_read(fl[s].c, rb, (size_t)w->msg_size);   /* read() */
             if (n < 0 && errno == EAGAIN) {            /* response not in yet */
                 if (now_sec() - fl[s].launched > timeout_s) {
-                    dpm_close(fl[s].c); fl[s].c = NULL;   /* stuck → drop + reconnect */
+                    dmesh_close(fl[s].c); fl[s].c = NULL;   /* stuck → drop + reconnect */
                     atomic_fetch_add(w->fail, 1);
                     fl[s].active = 0; completed++; did_work = 1;
                 }
@@ -133,7 +135,7 @@ static void *worker_fn_async(void *arg) {
                       (n > 0 && (rb[0] != expect || rb[n / 2] != expect || rb[n - 1] != expect));
             }
             if (bad) {
-                dpm_close(fl[s].c); fl[s].c = NULL;     /* error → drop + reconnect */
+                dmesh_close(fl[s].c); fl[s].c = NULL;     /* error → drop + reconnect */
                 atomic_fetch_add(w->fail, 1);
             } else {
                 double lat_us = (now_sec() - fl[s].scheduled) * 1e6;
@@ -151,10 +153,10 @@ static void *worker_fn_async(void *arg) {
         }
     }
 
-    /* Close every conn we still hold (active or idle-reusable) — dpm_close frees
+    /* Close every conn we still hold (active or idle-reusable) — dmesh_close frees
      * the held RX/TX slots + pending (no leak across back-to-back runs). */
     for (int s = 0; s < W; s++)
-        if (fl[s].c) dpm_close(fl[s].c);
+        if (fl[s].c) dmesh_close(fl[s].c);
     free(fl); free(body); free(rb);
     return NULL;
 }
@@ -181,12 +183,13 @@ static void *worker_fn_oneway(void *arg) {
             nanosleep(&ts, NULL);
             continue;
         }
-        dpmconn_t *c = dpm_connect(g_s, g_dst_pod_id);
+        dmesh_conn_t *c = dmesh_connect(g_s, g_dst_pod_id);
         if (!c) { atomic_fetch_add(w->fail, 1); next_j++; continue; }
         uint8_t p = (uint8_t)('A' + (next_j & 0xf));
         body[0] = p; body[w->msg_size / 2] = p; body[w->msg_size - 1] = p;
-        dpm_write(c, body, (size_t)w->msg_size);
-        int r = dpm_close(c);                       /* fire-and-forget: ship + ACK frees */
+        dmesh_write(c, body, (size_t)w->msg_size);
+        int r = dmesh_flush(c);                       /* fire-and-forget: flush ships, TX_ACK frees */
+        dmesh_close(c);                               /* close cancels the pending wait, frees conn */
         if (r < 0) {
             atomic_fetch_add(w->fail, 1);
         } else {
@@ -240,9 +243,9 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns, int
         write(conn_fd, e, strlen(e));
         return;
     }
-    if (msg_size > dpm_msg_max(g_s)) {
+    if (msg_size > dmesh_msg_max(g_s)) {
         int n = snprintf(reply, sizeof(reply), "ERR size %d > slot_size %d\n",
-                         msg_size, dpm_msg_max(g_s));
+                         msg_size, dmesh_msg_max(g_s));
         write(conn_fd, reply, (size_t)n);
         return;
     }
@@ -404,10 +407,10 @@ int main(void) {
     if (getenv("BENCH_DST_POD_ID")) g_dst_pod_id   = atoi(getenv("BENCH_DST_POD_ID"));
     if (getenv("ASYNC_THREADS"))    g_async_threads = atoi(getenv("ASYNC_THREADS"));
 
-    g_s = dpm_socket("bench-sock", worker_id);     /* socket() + bind() */
-    if (!g_s) { fprintf(stderr, "[bench_sock] dpm_socket failed\n"); return 1; }
+    g_s = dmesh_create_channel("bench-sock", worker_id);     /* socket() + bind() */
+    if (!g_s) { fprintf(stderr, "[bench_sock] dmesh_create_channel failed\n"); return 1; }
     fprintf(stderr, "[bench_sock] ready: pod_id=%d dst_pod_id=%d (façade client)\n",
-            dpm_pod_id(g_s), g_dst_pod_id);
+            dmesh_pod_id(g_s), g_dst_pod_id);
 
     int srv = ctrl_listen(CTRL_PORT);
     if (srv < 0) return 1;

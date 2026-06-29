@@ -81,8 +81,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             }
             struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)raw;
             int32_t src_pod_id = comp_msg->src_pod_id;
-            int32_t dst_pod_id = comp_msg->dst_pod_id;
-            uint32_t req_id = comp_msg->req_id;
+            int32_t dst_pod_id = comp_msg->dst_pod_id;   /* may be DMESH_POD_BLANK → resolve */
+            uint16_t seq = comp_msg->seq;
 
             /* Find the source pod's local DMA buffer. pod_data_ready ACQUIRE-loads
              * dma_ready so the dma_buffer/handle reads below see the
@@ -105,9 +105,12 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             entry.entry_type = COMP_ENTRY_FORWARD;
             entry.src_pod_id = src_pod_id;
             entry.dst_pod_id = dst_pod_id;
-            entry.req_id = req_id;
+            entry.src_service = (int16_t)src_pod->service_id;  /* derived (not on 16B wire) */
+            entry.dst_service = comp_msg->dst_service;
+            entry.src_port = comp_msg->src_port;
+            entry.dst_port = comp_msg->dst_port;
+            entry.seq = seq;
             entry.length = payload_len;
-            entry.flags = comp_msg->flags;
 
             /* Zero-copy: record buffer offset instead of heap-copying.
              * End-node slot-based admission keeps in-flight bytes ≤ buf_size
@@ -118,8 +121,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             entry.pod_idx = (int)(src_pod - objs->pods);
 
             if (ingest_push(objs, &entry) != 0) {
-                DOCA_LOG_ERR("Completion queue full, dropping req_id=%u (src=%d, dst=%d)",
-                             req_id, src_pod_id, dst_pod_id);
+                DOCA_LOG_ERR("Completion queue full, dropping seq=%u (src=%d, dst=%d)",
+                             seq, src_pod_id, dst_pod_id);
                 /* zero-copy: no heap data to free */
             }
             break;
@@ -139,15 +142,19 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             rev_entry.entry_type = COMP_ENTRY_REV_NOTIFY;
             rev_entry.src_pod_id = rev_comp->src_pod_id;
             rev_entry.dst_pod_id = rev_comp->dst_pod_id;
-            rev_entry.req_id = rev_comp->req_id;
+            struct pod_state *rev_src = find_pod_by_id(objs, rev_comp->src_pod_id);
+            rev_entry.src_service = rev_src ? (int16_t)rev_src->service_id : (int16_t)DMESH_SVC_NONE;
+            rev_entry.dst_service = rev_comp->dst_service;
+            rev_entry.src_port = rev_comp->src_port;
+            rev_entry.dst_port = rev_comp->dst_port;
+            rev_entry.seq = rev_comp->seq;
             rev_entry.length = rev_comp->length;
-            rev_entry.flags = rev_comp->flags;
             rev_entry.buf_offset = rev_comp->pos;  /* position in Host RX buffer */
             rev_entry.pod_idx = -1;
 
             if (ingest_push(objs, &rev_entry) != 0) {
-                DOCA_LOG_ERR("Completion queue full, dropping REV_DMA req_id=%u",
-                             rev_comp->req_id);
+                DOCA_LOG_ERR("Completion queue full, dropping REV_DMA seq=%u",
+                             rev_comp->seq);
             }
             break;
         }

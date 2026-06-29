@@ -37,10 +37,13 @@ typedef uint32_t doca_dpa_dev_mmap_t;
 typedef struct {
     uint8_t  entry_type;   /* COMP_ENTRY_FORWARD or COMP_ENTRY_REV_NOTIFY */
     int32_t  src_pod_id;
-    int32_t  dst_pod_id;
-    uint32_t req_id;
+    int32_t  dst_pod_id;   /* FORWARD: DMESH_POD_BLANK -> resolve dst_service */
+    int16_t  src_service;  /* caller service (opaque passthrough) */
+    int16_t  dst_service;  /* callee service (routing input when dst_pod_id==BLANK) */
+    uint16_t src_port;     /* sender port (opaque passthrough) */
+    uint16_t dst_port;     /* dest port (opaque passthrough; PORT_BLANK -> accept queue on host) */
+    uint16_t seq;          /* per-conn sequence (opaque passthrough) */
     uint32_t length;
-    int8_t   flags;
     uint32_t buf_offset;   /* FORWARD: offset in pod's RX DMA buffer; REV_NOTIFY: pos in Host RX buf */
     int32_t  pod_idx;      /* FORWARD: index into pods[]; REV_NOTIFY: unused (-1) */
 } dpu_comp_entry_t;
@@ -105,8 +108,8 @@ CQ_INLINE uint32_t comp_queue_usage(const dpu_comp_queue_t *q) {
  * full. Stored verbatim so the main loop can retry without recomputing. */
 typedef struct {
     struct doca_comch_connection *conn;
-    uint32_t  req_id;
-    int32_t   dst_pod_id;
+    uint16_t  port;   /* source endpoint port of the acked leg (TX_ACK key with seq) */
+    uint16_t  seq;
 } deferred_tx_ack_t;
 
 /* ====== DOCA task pool capacity tracking (check-first model) ======
@@ -130,6 +133,7 @@ typedef struct {
 struct pod_state {
     struct doca_comch_connection *connection;
     int32_t pod_id;
+    int32_t service_id;     /* this pod's service id (DPU service_table[service_id]=pod_id); SVC_NONE if none */
     char app_name[64];
     int registered;         /* 1 = DMESH_MSG_POD_REGISTER received */
     int dma_ready;          /* 1 = both mmaps arrived, DPA ring added */
@@ -183,7 +187,7 @@ struct pod_state {
     /* Batched TX_ACK accumulator. Response-forward TX_ACKs destined to THIS pod
      * accumulate here; flushed as one dmesh_batch_tx_ack_msg when full or on the
      * periodic tail-flush. Single ARM thread owns this — no lock. */
-    uint32_t txack_batch[BATCH_TXACK_MAX];
+    struct dmesh_tx_ack_entry txack_batch[BATCH_TXACK_MAX];
     int      txack_batch_n;
 
     /* Batched REV_DONE accumulator (mirror of txack_batch). Reverse-DMA
@@ -287,6 +291,12 @@ struct objects {
      * an accelerator (the registered gate remains the authority).
      * Must be initialized to all -1 before the worker starts. */
     int pod_id_to_slot[POD_ID_SPACE];
+
+    /* service_id -> pod_id resolution (DPU routing seam — dpu_route mock).
+     * Populated from pods_register(service_id). -1 = unknown (dpu_route falls
+     * back to the request's src pod). Indexed by service_id [0,POD_ID_SPACE).
+     * The future L7 proxy replaces this lookup. Init to all -1 at startup. */
+    int service_table[POD_ID_SPACE];
 
     /* Deferred completion queue (DPU only) */
     dpu_comp_queue_t comp_queue;

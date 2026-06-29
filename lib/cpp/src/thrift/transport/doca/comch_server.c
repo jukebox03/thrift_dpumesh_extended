@@ -170,8 +170,9 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 			DOCA_LOG_ERR("Received invalid REGISTER message");
 			return;
 		}
-		pods_register(objs, comch_connection, reg->pod_id, reg->app_name);
-		DOCA_LOG_INFO("Pod registered: pod_id=%d, app=%s", reg->pod_id, reg->app_name);
+		pods_register(objs, comch_connection, reg->pod_id, reg->service_id, reg->app_name);
+		DOCA_LOG_INFO("Pod registered: pod_id=%d service_id=%d app=%s",
+		              reg->pod_id, reg->service_id, reg->app_name);
 		break;
 	}
 
@@ -484,13 +485,13 @@ server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn
 }
 
 
-/* Send a batched TX_ACK (n req_ids, 1..BATCH_TXACK_MAX) as one message. Only
- * the first 4 + 4*n bytes are transmitted (the unused tail of req_ids[] is not
- * sent). DOCA_ERROR_AGAIN if the send pool is full (caller retains the batch). */
+/* Send a batched TX_ACK (n (port,seq) entries, 1..BATCH_TXACK_MAX) as one
+ * message. Only the first 4 + 4*n bytes are transmitted. DOCA_ERROR_AGAIN if the
+ * send pool is full (caller retains the batch). */
 doca_error_t
 server_send_batch_tx_ack_to(struct objects *objs,
                             struct doca_comch_connection *conn,
-                            const uint32_t *req_ids, int n)
+                            const struct dmesh_tx_ack_entry *acks, int n)
 {
 	if (n <= 0)
 		return DOCA_SUCCESS;
@@ -499,7 +500,7 @@ server_send_batch_tx_ack_to(struct objects *objs,
 	m.count = (uint8_t)n;
 	m._pad[0] = m._pad[1] = 0;
 	for (int i = 0; i < n; i++)
-		m.req_ids[i] = req_ids[i];
+		m.acks[i] = acks[i];
 	size_t wire = 4 + 4u * (size_t)n;   /* header + only the valid entries */
 	return server_send_msg_to_conn(objs, conn, (const char *)&m, wire);
 }
@@ -632,7 +633,7 @@ pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn)
 
 int
 pods_register(struct objects *objs, struct doca_comch_connection *conn,
-              int32_t pod_id, const char *app_name)
+              int32_t pod_id, int32_t service_id, const char *app_name)
 {
 	int n = __atomic_load_n(&objs->num_pods, __ATOMIC_ACQUIRE);
 	for (int i = 0; i < n; i++) {
@@ -643,6 +644,7 @@ pods_register(struct objects *objs, struct doca_comch_connection *conn,
 		 * Readers that observe registered=1 (ACQUIRE load) are guaranteed
 		 * to see the prior pod_id/app_name writes. */
 		objs->pods[i].pod_id = pod_id;
+		objs->pods[i].service_id = service_id;
 		snprintf(objs->pods[i].app_name, sizeof(objs->pods[i].app_name),
 		         "%s", app_name);
 		__atomic_store_n(&objs->pods[i].registered, 1, __ATOMIC_RELEASE);
@@ -653,8 +655,14 @@ pods_register(struct objects *objs, struct doca_comch_connection *conn,
 		if (pod_id >= 0 && pod_id < POD_ID_SPACE)
 			__atomic_store_n(&objs->pod_id_to_slot[pod_id], i, __ATOMIC_RELEASE);
 
-		DOCA_LOG_INFO("pods_register: slot %d → pod_id=%d app=%s",
-		              i, pod_id, app_name);
+		/* service_id -> pod resolution for dpu_route (first request of a
+		 * connection). Multiple pods registering the same service_id are LB
+		 * candidates; this mock keeps the last writer (future L7 picks). */
+		if (service_id >= 0 && service_id < POD_ID_SPACE)
+			__atomic_store_n(&objs->service_table[service_id], pod_id, __ATOMIC_RELEASE);
+
+		DOCA_LOG_INFO("pods_register: slot %d → pod_id=%d service_id=%d app=%s",
+		              i, pod_id, service_id, app_name);
 		return 0;
 	}
 	DOCA_LOG_ERR("pods_register: connection not found for pod_id=%d", pod_id);

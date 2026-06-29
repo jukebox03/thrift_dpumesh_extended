@@ -1,26 +1,24 @@
 /*
- * echo_sock.c — a plain non-blocking epoll echo server, ported to DPUmesh by
- * swapping the BSD-socket calls for their `dpm_` twins.
- *
- * The ENTIRE port from an ordinary TCP epoll echo server is:
- *     socket()/bind()/listen()  ->  dpm_socket()
- *     <listen fd>               ->  dpm_event_fd()      (register in NATIVE epoll)
- *     accept()                  ->  dpm_accept()
- *     read()                    ->  dpm_read()
- *     write()                   ->  dpm_write()  (dpm_close ships it; no send)
- *     close()                   ->  dpm_close()
+ * echo_sock.c — a non-blocking epoll echo server over DPUmesh. The BSD-socket
+ * calls map to their `dmesh_` twins:
+ *     socket()/bind()/listen()  ->  dmesh_create_channel()
+ *     <listen fd>               ->  dmesh_event_fd()      (register in NATIVE epoll)
+ *     accept()                  ->  dmesh_accept()
+ *     read()                    ->  dmesh_read()
+ *     write()                   ->  dmesh_write()  (dmesh_close ships it; no send)
+ *     close()                   ->  dmesh_close()
  *     epoll_create/_ctl/_wait   ->  UNCHANGED (native kernel epoll)
  *
- * Everything else — the epoll loop, the readiness dispatch, errno/EAGAIN — is
- * standard Linux I/O. This is the whole point: a normal epoll server runs over
- * the DPU transport with nothing but the `dpm_` prefix.
+ * The epoll loop is standard Linux I/O, but this is NOT a byte-for-byte socket
+ * port — it is *simpler*. A request arrives ATOMICALLY (one whole <= 8 KB
+ * message), so the byte-stream read loop collapses to a single dmesh_read, with no
+ * partial-read accumulation and no EPOLLOUT send dance.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <errno.h>
-#include <signal.h>
 #include <unistd.h>
 #include <sched.h>
 #include <sys/epoll.h>
@@ -31,18 +29,16 @@
 
 int main(void)
 {
-    signal(SIGPIPE, SIG_IGN);
-
     int worker_id = 11;
     if (getenv("BENCH_WORKER_ID"))
         worker_id = atoi(getenv("BENCH_WORKER_ID"));
 
     /* socket() + bind() + listen() */
-    dpm_t *s = dpm_socket("echo-sock", worker_id);
-    if (!s) { fprintf(stderr, "[echo_sock] dpm_socket failed\n"); return 1; }
+    dmesh_channel_t *s = dmesh_create_channel("echo-sock", worker_id);
+    if (!s) { fprintf(stderr, "[echo_sock] dmesh_create_channel failed\n"); return 1; }
 
     /* The DPUmesh readiness fd plays the role of the listen socket. */
-    int dfd = dpm_event_fd(s);
+    int dfd = dmesh_event_fd(s);
     if (dfd < 0) { fprintf(stderr, "[echo_sock] event_fd unavailable\n"); return 1; }
 
     /* ---- vanilla kernel epoll, unchanged ---- */
@@ -54,7 +50,7 @@ int main(void)
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, dfd, &ev) < 0) { perror("epoll_ctl"); return 1; }
 
     fprintf(stderr, "[echo_sock] ready: pod_id=%d event_fd=%d (native epoll)\n",
-            dpm_pod_id(s), dfd);
+            dmesh_pod_id(s), dfd);
 
     struct epoll_event events[MAX_EVENTS];
     unsigned long recv_total = 0;   /* received-request counter (delivery cross-check) */
@@ -74,26 +70,27 @@ int main(void)
             while (read(dfd, &cnt, sizeof cnt) > 0) { /* drain */ }
 
             /* accept() every queued request (non-blocking; NULL/EAGAIN = drained). */
-            dpmconn_t *c;
-            while ((c = dpm_accept(s)) != NULL) {
-                /* read() the whole request (arrives atomically, <= 8 KB) */
+            dmesh_conn_t *c;
+            while ((c = dmesh_accept(s)) != NULL) {
+                /* The whole request body arrives atomically (<= 8 KB) and buf is
+                 * sized to the max, so ONE dmesh_read returns it in full — no
+                 * byte-stream accumulation loop. */
                 char buf[8192];
-                ssize_t off = 0, r;
-                while ((r = dpm_read(c, buf + off, sizeof buf - (size_t)off)) > 0)
-                    off += r;
+                ssize_t n = dmesh_read(c, buf, sizeof buf);
 
-                /* write() it straight back; close() ships it (implicit send) — a
-                 * normal read/write/close echo server, no explicit send call. */
-                if (off > 0)
-                    dpm_write(c, buf, (size_t)off);
+                /* echo it straight back; flush ships it (close no longer sends). */
+                if (n > 0) {
+                    dmesh_write(c, buf, (size_t)n);
+                    dmesh_flush(c);
+                }
 
-                dpm_close(c);
+                dmesh_close(c);
                 if ((++recv_total % 200000) == 0)
                     fprintf(stderr, "[echo_sock] recv_total=%lu\n", recv_total);
             }
         }
     }
 
-    dpm_destroy(s);
+    dmesh_destroy_channel(s);
     return 0;
 }

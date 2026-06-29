@@ -57,6 +57,7 @@ FLEXIO_LIB_DIR="/opt/mellanox/flexio/lib"
 
 IMG_BENCH_DPU="bench/bench-dpumesh:latest"
 IMG_ECHO_DPU="bench/echo-dpumesh:latest"
+IMG_LOOPBACK_DPU="bench/loopback-dpumesh:latest"   # self-routing validator (1 pod = client+server)
 IMG_BENCH_TCP="bench/bench-tcp:latest"
 IMG_ECHO_TCP="bench/echo-tcp:latest"
 IMG_ENVOY="envoyproxy/envoy:v1.30-latest"
@@ -175,7 +176,14 @@ build_bench_binaries() {
         -L"$BUILD_DOCA/lib" -L"$DOCA_LIB_DIR" \
         $THRIFT_LINK_LIB -lpthread -ldoca_common -ldoca_comch \
         -Wl,-rpath,/usr/local/lib -Wl,-rpath,"$DOCA_LIB_DIR"
-    info "C bench binaries built (façade: bench_sock.c + echo_sock.c)"
+    # loopback validator: one pod is BOTH client and server of its own service
+    # (self-routing / loopback proof for the oriented-tuple demux).
+    gcc -O2 -o "$BENCH_DIR/loopback_dpumesh" "$BENCH_DIR/loopback_sock.c" \
+        -I"$PROJ_ROOT/lib/cpp/src" \
+        -L"$BUILD_DOCA/lib" -L"$DOCA_LIB_DIR" \
+        $THRIFT_LINK_LIB -lpthread -ldoca_common -ldoca_comch \
+        -Wl,-rpath,/usr/local/lib -Wl,-rpath,"$DOCA_LIB_DIR"
+    info "C bench binaries built (façade: bench_sock.c + echo_sock.c + loopback_sock.c)"
 
     if ! command -v go >/dev/null 2>&1; then
         err "go not found in PATH"; exit 1
@@ -206,6 +214,10 @@ build_images() {
     cp -f "$BENCH_DIR/echo_dpumesh" "$PROJ_ROOT/"
     build_image "$BENCH_DIR/Dockerfile.echo_dpumesh" "$IMG_ECHO_DPU" "$PROJ_ROOT"
     rm -f "$PROJ_ROOT/echo_dpumesh"
+
+    cp -f "$BENCH_DIR/loopback_dpumesh" "$PROJ_ROOT/"
+    build_image "$BENCH_DIR/Dockerfile.loopback_dpumesh" "$IMG_LOOPBACK_DPU" "$PROJ_ROOT"
+    rm -f "$PROJ_ROOT/loopback_dpumesh"
 
     # tcp bench — slim, build from BENCH_DIR directly
     build_image "$BENCH_DIR/Dockerfile.bench_tcp" "$IMG_BENCH_TCP" "$BENCH_DIR"
@@ -334,10 +346,11 @@ get_pod_cores() {
             ;;
         fair|*)
             case "$app" in
-                bench-dpumesh) echo "0" ;;
-                echo-dpumesh)  echo "1" ;;
-                bench-tcp)     echo "2" ;;   # bench + sidecar1 share core 2
-                echo-tcp)      echo "3" ;;   # echo  + sidecar2 share core 3
+                bench-dpumesh)    echo "0" ;;
+                echo-dpumesh)     echo "1" ;;
+                bench-tcp)        echo "2" ;;   # bench + sidecar1 share core 2
+                echo-tcp)         echo "3" ;;   # echo  + sidecar2 share core 3
+                loopback-dpumesh) echo "4,5" ;; # client+echo+PE threads in one pod
                 *) echo "" ;;
             esac
             ;;
@@ -360,7 +373,7 @@ pin_pods() {
         warn "cpupower not found; skipping DVFS lock"
     fi
 
-    for app in bench-dpumesh echo-dpumesh bench-tcp echo-tcp; do
+    for app in bench-dpumesh echo-dpumesh loopback-dpumesh bench-tcp echo-tcp; do
         local cores pod_id
         cores=$(get_pod_cores "$app" "$profile")
         [ -z "$cores" ] && continue
@@ -492,6 +505,46 @@ spec:
       volumes:
       - { name: infiniband, hostPath: { path: /dev/infiniband } }
       - { name: libthrift-so, hostPath: { path: $BUILD_DOCA/lib, type: Directory } }
+---
+# loopback-dpumesh (pod_id=12, service_id=12): ONE pod that is both client and
+# server of its own service — proves self-routing (DPU resolves service 12 -> pod
+# 12 = itself) + the oriented-tuple demux on a single host.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loopback-dpumesh
+spec:
+  replicas: 0
+  selector: { matchLabels: { app: loopback-dpumesh } }
+  template:
+    metadata: { labels: { app: loopback-dpumesh } }
+    spec:
+      hostname: loopback-dpumesh
+      containers:
+      - name: loopback-dpumesh
+        image: docker.io/$IMG_LOOPBACK_DPU
+        imagePullPolicy: Never
+        ports: [{ containerPort: $CTRL_PORT }]
+        env:
+        - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
+        - { name: BENCH_WORKER_ID, value: "12" }
+        - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
+        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
+        - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
+        securityContext: { privileged: true }
+        volumeMounts:
+        - { mountPath: /dev/infiniband, name: infiniband }
+        - { mountPath: /usr/local/lib/libthrift.so.0.12.0, name: libthrift-so, subPath: libthrift.so.0.12.0 }
+      volumes:
+      - { name: infiniband, hostPath: { path: /dev/infiniband } }
+      - { name: libthrift-so, hostPath: { path: $BUILD_DOCA/lib, type: Directory } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: loopback-dpumesh }
+spec:
+  selector: { app: loopback-dpumesh }
+  ports: [{ port: $CTRL_PORT, targetPort: $CTRL_PORT }]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -669,9 +722,10 @@ scale_up_with_wait() {
 
 start_pods() {
     step "=== Starting pods (innermost first) ==="
-    # DPUmesh: echo first (so bench finds dst), then bench
-    scale_up_with_wait "echo-dpumesh"  "pods: 1"
-    scale_up_with_wait "bench-dpumesh" "pods: 2"
+    # DPUmesh: echo first (so bench finds dst), then bench, then loopback (self-svc)
+    scale_up_with_wait "echo-dpumesh"     "pods: 1"
+    scale_up_with_wait "bench-dpumesh"    "pods: 2"
+    scale_up_with_wait "loopback-dpumesh" "pods: 3"
     # TCP: echo-tcp pod (echo + sidecar2) first, then bench-tcp pod
     # (bench + sidecar1). Sidecars are containers in these pods, not
     # standalone deployments. STRICT_DNS lazy resolution makes order
@@ -745,12 +799,41 @@ run_bench() {
     echo "============================================================"
 }
 
+run_loopback() {
+    # $1 = N round-trips, $2 = msg size. The loopback-dpumesh pod (pod_id=12) is
+    # BOTH client and server of its OWN service (12): connect(svc 12) -> DPU
+    # resolves svc 12 -> pod 12 (itself) -> own echo replies. Proves self-routing
+    # + the oriented-tuple demux on a single host (request dst_port=0 -> accept,
+    # reply dst_port=pc -> client, distinguished even though both legs are local).
+    local N="${1:-50000}" size="${2:-8192}"
+    local pod_ip
+    pod_ip=$(kubectl get pod -n "$NS" -l app=loopback-dpumesh --field-selector=status.phase=Running -o jsonpath='{.items[0].status.podIP}')
+    if [ -z "$pod_ip" ]; then
+        err "loopback-dpumesh pod not found — run '$0 deploy' first"; return 1
+    fi
+    step "=== loopback (self-service): pod12 → service12 → pod12, N=$N size=${size}B ==="
+    local resp
+    resp=$(printf 'RUN %s %s\n' "$N" "$size" | timeout 120s nc "$pod_ip" "$CTRL_PORT" || true)
+    if [ -z "$resp" ]; then err "no response (timeout or pod down)"; return 1; fi
+    if [[ "$resp" == ERR* ]]; then err "loopback replied: $resp"; return 1; fi
+    # Parse: OK <ok> <fail> <served> <p50us>
+    read -r tag ok fail served p50 <<<"$resp"
+    echo
+    echo "============================================================"
+    echo "  loopback (self-routing) result"
+    echo "============================================================"
+    printf "  OK / Fail:       %s / %s\n" "$ok" "$fail"
+    printf "  Served (echo):   %s\n" "$served"
+    printf "  p50 latency:     %s us\n" "$p50"
+    echo "============================================================"
+}
+
 ### ---------------------------------------------------------- utility ###
 
 show_logs() {
     # bench-tcp/echo-tcp pods now have 2 containers each (app + sidecar);
     # --all-containers prefixes each line with the container name.
-    for app in bench-dpumesh echo-dpumesh bench-tcp echo-tcp; do
+    for app in bench-dpumesh echo-dpumesh loopback-dpumesh bench-tcp echo-tcp; do
         echo "=== $app ==="
         kubectl logs -n "$NS" -l "app=$app" --all-containers=true --prefix=true --tail=20 2>/dev/null || true
         echo
@@ -823,6 +906,11 @@ case "$CMD" in
         # One-way (fire-and-forget) load: client does write->close, no read.
         pin_pods fair >/dev/null
         RUN_ONEWAY=1 run_bench "dpumesh" "${@:2}"
+        ;;
+    loopback)
+        # Self-routing / loopback: pod 12 is client+server of its own service 12.
+        pin_pods fair >/dev/null
+        run_loopback "${2:-50000}" "${3:-8192}"
         ;;
     dpumesh-hw)
         # HW limit chase: dpumesh 측만 multi-core. echo-dpumesh "1,5", bench

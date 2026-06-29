@@ -91,28 +91,32 @@ enum dpa_msg_type {
 	DPA_MSG_REV_DONE     = 5, /* DPA→DPU: reverse DMA completed (DPU→CPU) */
 };
 
-/* Packed to exactly 16 bytes (one WQE BB) to minimize PCIe immediate-data cost
- * on dma_copy. Field widths chosen to preserve semantics:
- *   type        : 1B  — only 2 values used (DPA_MSG_FWD_DONE, DPA_MSG_REV_DONE)
- *   flags       : 1B  — OP_REQUEST/OP_RESPONSE + CASE_* (bit-flag set)
- *   src/dst_pod : 1B  — MAX_PODS=8 + -1 sentinel fits in int8
- *   pos         : 4B  — buffer offset (DPU buf / Host RX buf)
- *   length      : 4B  — DMA'd body length (≤ DPUMESH_SLOT_SIZE_DEFAULT)
- *   req_id      : 4B  — Thrift stream/request ID (wraparound counter)
- * All 4B fields land on their natural alignment so no __attribute__((packed)) is
- * needed and DPA accesses stay aligned. */
+/* DPA->DPU completion immediate — packed to EXACTLY 16 bytes (one WQE BB) to
+ * minimize PCIe immediate-data cost on dma_copy. `type` MUST stay at offset 0 (the
+ * recv callback peeks raw[0] to dispatch). Carries the endpoint tuple so the DPU
+ * can route (dst_pod==BLANK -> resolve dst_service) and the host can demux by
+ * dst_port; port/seq are OPAQUE passthrough.
+ *   src_service is NOT on the wire (16B budget): the DPU derives the caller's
+ *   service from src_pod's registration (assumes ONE service per pod — widen the
+ *   wire if a pod ever hosts multiple services).
+ * Layout is naturally aligned (uint16 on even offsets, pos@12) — no padding:
+ *   type0 src_pod1 dst_pod2 dst_svc3 src_port4 dst_port6 seq8 length10 pos12 = 16B. */
 struct comch_dma_comp_msg {
-	uint8_t  type;        /* one of: DPA_MSG_FWD_DONE, DPA_MSG_REV_DONE */
-	int8_t   flags;       /* OP_REQUEST / OP_RESPONSE + CASE_* */
-	int8_t   src_pod_id;  /* originating pod */
-	int8_t   dst_pod_id;  /* destination pod */
+	uint8_t  type;        /* DPA_MSG_FWD_DONE / DPA_MSG_REV_DONE (offset 0 — peeked) */
+	int8_t   src_pod_id;  /* originating pod (always concrete) */
+	int8_t   dst_pod_id;  /* dest pod; DMESH_POD_BLANK -> DPU resolves dst_service */
+	int8_t   dst_service; /* callee service id (routing input when dst_pod==BLANK) */
+	uint16_t src_port;    /* sender port */
+	uint16_t dst_port;    /* dest port; PORT_BLANK -> accept queue */
+	uint16_t seq;         /* per-conn sequence (match key with port) */
+	uint16_t length;      /* payload length (<= DPUMESH_SLOT_SIZE) */
 	uint32_t pos;         /* buffer offset (forward: DPU dpu_buf; reverse: Host RX) */
-	uint32_t length;      /* payload length */
-	uint32_t req_id;      /* Thrift stream/request ID */
 };
-/* Sent as immediate data via doca_dpa_dev_comch_producer_dma_copy() — HW max 32 bytes */
+/* Sent as immediate via doca_dpa_dev_comch_producer_dma_copy() — HW max 32 bytes. */
 _Static_assert(sizeof(struct comch_dma_comp_msg) == 16,
-               "comch_dma_comp_msg must pack to exactly 16 bytes (one WQE BB)");
+               "comch_dma_comp_msg must be exactly 16 bytes (one WQE BB)");
+_Static_assert(offsetof(struct comch_dma_comp_msg, type) == 0,
+               "comch_dma_comp_msg.type must be at offset 0 (recv-cb peeks raw[0])");
 /* src/dst_pod_id travel as int8 on the wire (dst==-1 is the echo sentinel), so
  * pod_id must fit in int8. Fail-fast if MAX_PODS ever outgrows that. */
 _Static_assert(MAX_PODS <= 127,
@@ -167,9 +171,15 @@ struct dma_desc {
 	doca_dpa_dev_mmap_t mmap;      /* 4B */
 	uint64_t addr;                 /* 8B */
 	uint32_t size;                 /* 4B (fixed width for Host/DPA ABI stability) */
-	uint64_t idx;                  /* 8B (req_id) */
-	int32_t dst_pod_id;            /* 4B (routing target) */
-	int8_t flags;                  /* 1B (OP_REQUEST/OP_RESPONSE + CASE_*) */
+	/* 8B of endpoint-tuple metadata (replaces the old 8B `idx`/req_id, offset 16).
+	 * DPA copies these verbatim into the completion (opaque passthrough). */
+	uint16_t seq;                  /* 2B per-conn sequence (was req_id) */
+	uint16_t src_port;             /* 2B sender port */
+	uint16_t dst_port;             /* 2B dest port (PORT_BLANK=0 -> accept queue) */
+	int8_t   src_service;          /* 1B caller service (SVC_NONE if none) */
+	int8_t   dst_service;          /* 1B callee service (routing input when dst_pod==BLANK) */
+	int32_t dst_pod_id;            /* 4B routing target; DMESH_POD_BLANK(-1) -> DPU resolves dst_service */
+	int8_t flags;                  /* 1B (reserved/unused — was OP_/CASE_; kept for offset stability) */
 	uint8_t pad0[3];               /* 3B alignment for src_pod_id */
 	int32_t src_pod_id;            /* 4B (original forward sender; on reverse rings,
 	                                * ring->pod_id is the receiver, so the source
@@ -188,7 +198,7 @@ struct dma_desc {
 _Static_assert(sizeof(struct dma_desc) == 64, "dma_desc must be 64 bytes");
 _Static_assert(offsetof(struct dma_desc, addr) == 4, "dma_desc.addr offset mismatch");
 _Static_assert(offsetof(struct dma_desc, size) == 12, "dma_desc.size offset mismatch");
-_Static_assert(offsetof(struct dma_desc, idx) == 16, "dma_desc.idx offset mismatch");
+_Static_assert(offsetof(struct dma_desc, seq) == 16, "dma_desc.seq offset mismatch");
 _Static_assert(offsetof(struct dma_desc, dst_pod_id) == 24, "dma_desc.dst_pod_id offset mismatch");
 _Static_assert(offsetof(struct dma_desc, flags) == 28, "dma_desc.flags offset mismatch");
 _Static_assert(offsetof(struct dma_desc, src_pod_id) == 32, "dma_desc.src_pod_id offset mismatch");

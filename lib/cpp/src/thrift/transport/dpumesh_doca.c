@@ -56,16 +56,53 @@ static void cleanup_ctx(struct dpumesh_ctx *ctx);
  * to avoid hash collisions. */
 #define MAX_PENDING 65536
 
+/* Originator-scoped req_id layout: top 7 bits = the minting pod's id, low 25 =
+ * a per-pod counter. Makes req_id globally unique across pods so the receiving
+ * host demuxes reply-vs-request by "did I mint this?" (req_id>>SHIFT == my pod)
+ * with NO wire direction flag. Pod sits ABOVE the low-16 pending index so the
+ * hash (req_id % MAX_PENDING) stays a pure counter. */
+#define DMESH_REQID_POD_SHIFT 25
+#define DMESH_REQID_POD_MASK  0x7Fu          /* pod_id range [0,127] = 7 bits */
+#define DMESH_REQID_CTR_MASK  0x01FFFFFFu     /* low 25 bits = per-pod counter */
+
 typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     sw_descriptor_t desc;
-    volatile int state;   /* -1=unused, -2=abandoned/timed-out, 0=waiting, 1=arrived */
+    volatile int state;   /* -1=unused, -2=abandoned, -3=harvested-awaiting-ack, 0=waiting, 1=arrived */
     int tx_slot;          /* TX buffer slot owned by this request, -1 if none */
-    uint32_t owner_req_id; /* req_id currently occupying this idx; guards the
-                            * TX_ACK handler against a late/duplicate ACK after
-                            * req_id reuses this idx */
+    uint32_t owner_key;   /* (port<<16|seq) currently occupying this idx; guards the
+                           * TX_ACK handler against a late/duplicate ACK after the
+                           * key reuses this idx */
 } dpumesh_pending_t;
+
+/* Endpoint port table (oriented-tuple demux, design-endpoint-tuple.md). Index =
+ * port [1,65535]; port 0 = BLANK (fresh connection request → accept queue). Each
+ * allocated port is a "socket": CLIENT (replies → pending[(port,seq)]) or SERVER
+ * (established requests → this slot's single-outstanding inbox). Allocated from
+ * one host-unique pool so client and server ports never collide (loopback-safe). */
+#define DMESH_PORT_SPACE  65536
+#define DMESH_ROLE_FREE   0
+#define DMESH_ROLE_CLIENT 1
+#define DMESH_ROLE_SERVER 2
+struct dmesh_port_slot {
+    uint8_t          role;
+    sw_descriptor_t  inbox;       /* SERVER: next established request (single-outstanding) */
+    atomic_int       inbox_ready; /* SERVER: 1 = inbox holds an unread request */
+};
+/* (port,seq) → 32-bit pending-table key (owner-guard value). */
+static inline uint32_t dmesh_key(uint16_t port, uint16_t seq) {
+    return ((uint32_t)port << 16) | (uint32_t)seq;
+}
+/* key → pending-table INDEX = the PORT (key's high 16 bits). Each live conn owns a
+ * UNIQUE port and is single-outstanding (≤1 in-flight (port,seq) at a time), so
+ * indexing by port is collision-FREE across conns — like a file descriptor indexing
+ * its per-fd slot. Hashing (port,seq) instead birthday-collides even at a few
+ * hundred conns, making register_pending block 2s and cascade (throughput death).
+ * owner_key=(port<<16|seq) still guards a late/duplicate ACK from an old seq. */
+static inline uint32_t dmesh_pidx(uint32_t key) {
+    return (key >> 16) & (MAX_PENDING - 1);
+}
 
 /* One cell of the lock-free bounded SPMC RX ring (Vyukov's bounded-MPMC cell/seq
  * design, producer side specialized to a single producer). `seq` carries the
@@ -140,9 +177,14 @@ struct dpumesh_ctx {
     int notify_efd;
     volatile int notify_enabled;
 
-    /* Client-side pending response table */
+    /* Client-side pending response table (keyed by (port,seq) via dmesh_key). */
     dpumesh_pending_t pending[MAX_PENDING];
-    atomic_uint_fast32_t next_req_id;
+
+    /* Endpoint port table + allocator (oriented-tuple demux). */
+    struct dmesh_port_slot *ports;     /* [DMESH_PORT_SPACE] */
+    pthread_mutex_t port_lock;
+    uint32_t next_port;                /* bump cursor, wraps within [1,65535] */
+    int32_t service_id;                /* this node's service id (SVC_NONE if client-only) */
 };
 
 /* ====================================================================
@@ -285,53 +327,71 @@ static inline void dpumesh_notify(dpumesh_ctx_t *ctx)
     }
 }
 
-/* Deliver a fully parsed descriptor: OP_RESPONSE -> client pending table,
- * otherwise -> the SPMC RX ring for server workers. */
+/* Deliver a fully parsed descriptor. Demux WITHOUT a wire flag: a req_id this
+ * host MINTED carries this pod's id in its top bits (see dpumesh_alloc_req_id),
+ * so it is the reply to one of our outstanding requests -> client pending table;
+ * any other req_id is a fresh inbound message -> SPMC RX ring for server workers.
+ * (Loopback dst==self is rejected at dpumesh_enqueue, so a self-minted req_id can
+ * only arrive here as a reply, never as a fresh request.) */
 static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int slot)
 {
-    if (desc->flags & OP_RESPONSE) {
-        uint32_t idx = desc->req_id % MAX_PENDING;
-        dpumesh_pending_t *p = &ctx->pending[idx];
-        pthread_mutex_lock(&p->lock);
-        if (p->state == 0) {
-            p->desc = *desc;
-            p->state = 1;
-            /* Response delivered. The request's TX slot is freed solely by its
-             * TX_ACK (ack = sole authority) — not here. Clients harvest via
-             * dpumesh_poll_response; wake a native epoll_wait() on the eventfd. */
-            dpumesh_notify(ctx);
-        } else if (p->state == -2) {
-            /* Cancelled/one-way request, unwanted late response: reclaim only the
-             * RX landing. The TX slot stays for its TX_ACK to free + clear -2→-1. */
-            rx_reclaim(ctx, slot);
-        } else {
-            /* No live waiter: a one-way sender already released the entry (its
-             * reply is unwanted), or a duplicate/late response. Drop it quietly. */
-            DOCA_LOG_DBG("RX deliver: OP_RESPONSE for req_id=%u, no waiter (state=%d) — dropped",
-                         desc->req_id, p->state);
-            rx_reclaim(ctx, slot);
-        }
-        pthread_mutex_unlock(&p->lock);
-    } else {
-        /* Lock-free Vyukov single-producer enqueue (PE thread is the only
-         * producer). No blocking in the PE callback path: if the ring is full,
-         * drop immediately so we don't stall the PE. Slot-based admission (DPA
-         * reverse credit + sender's tx_alloc) keeps in-flight bounded. */
+    uint16_t dport = desc->dst_port;
+
+    /* (1) BLANK dst_port → fresh connection request → accept queue (SPMC ring). */
+    if (dport == DMESH_PORT_BLANK) {
         uint_fast32_t pos = atomic_load_explicit(&ctx->rx_enq, memory_order_relaxed);
         struct rxq_cell *c = &ctx->rx_ring[pos & (RX_QUEUE_SIZE - 1)];
-        uint_fast32_t seq = atomic_load_explicit(&c->seq, memory_order_acquire);
-        if ((int_fast32_t)(seq - pos) != 0) {
-            DOCA_LOG_ERR("RX deliver: queue full, dropping req_id=%u", desc->req_id);
+        uint_fast32_t cseq = atomic_load_explicit(&c->seq, memory_order_acquire);
+        if ((int_fast32_t)(cseq - pos) != 0) {
+            DOCA_LOG_ERR("RX deliver: accept queue full, dropping seq=%u", desc->seq);
             rx_reclaim(ctx, slot);
             return;
         }
         c->desc = *desc;
         atomic_store_explicit(&c->seq, pos + 1, memory_order_release);
         atomic_store_explicit(&ctx->rx_enq, pos + 1, memory_order_relaxed);
-        /* Consumers spin-poll the ring (dpumesh_dequeue); wake a native
-         * epoll_wait() on the eventfd. No cond wakeup. */
         dpumesh_notify(ctx);
+        return;
     }
+
+    struct dmesh_port_slot *psl = &ctx->ports[dport];
+    uint8_t role = __atomic_load_n(&psl->role, __ATOMIC_ACQUIRE);
+
+    /* (2) CLIENT port → this is the reply to one of our requests → pending. */
+    if (role == DMESH_ROLE_CLIENT) {
+        uint32_t key = dmesh_key(dport, desc->seq);
+        dpumesh_pending_t *p = &ctx->pending[dmesh_pidx(key)];
+        pthread_mutex_lock(&p->lock);
+        if (p->owner_key != key) {
+            rx_reclaim(ctx, slot);                 /* aliased/freed — no live waiter */
+        } else if (p->state == 0) {
+            p->desc = *desc;
+            p->state = 1;                          /* TX slot freed solely by its TX_ACK */
+            dpumesh_notify(ctx);
+        } else {
+            rx_reclaim(ctx, slot);                 /* cancelled/harvested/dup — drop landing */
+        }
+        pthread_mutex_unlock(&p->lock);
+        return;
+    }
+
+    /* (3) SERVER port → an established request on an accepted conn → its inbox. */
+    if (role == DMESH_ROLE_SERVER) {
+        if (atomic_load_explicit(&psl->inbox_ready, memory_order_acquire)) {
+            /* Single-outstanding per conn → should never be occupied. Drop safely. */
+            DOCA_LOG_ERR("RX deliver: server inbox busy port=%u, dropping seq=%u",
+                         dport, desc->seq);
+            rx_reclaim(ctx, slot);
+            return;
+        }
+        psl->inbox = *desc;
+        atomic_store_explicit(&psl->inbox_ready, 1, memory_order_release);
+        dpumesh_notify(ctx);
+        return;
+    }
+
+    /* (4) free/unknown port → stale (conn closed) — reclaim the landing. */
+    rx_reclaim(ctx, slot);
 }
 
 /*
@@ -341,9 +401,8 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
  * payload. The DMA payload is the body itself (no in-band header).
  * Returns 0 on success, -1 on malformed/undeliverable.
  */
-static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_len,
-                                uint32_t req_id, int32_t src_pod_id,
-                                int32_t dst_pod_id, int8_t flags) {
+static int process_rx_dma_entry(dpumesh_ctx_t *ctx, const struct dmesh_rev_done_entry *e) {
+    uint32_t pos = e->pos, dma_len = e->length;
     if (!ctx->rx_dma_buffer || (size_t)pos + dma_len > ctx->rx_dma_buf_size) {
         DOCA_LOG_ERR("process_rx_dma_entry: bounds fail pos=%u len=%u buf=%zu",
                      pos, dma_len, ctx->rx_dma_buf_size);
@@ -352,11 +411,10 @@ static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_l
     /* Body must fit one slot; the DPA caps each reverse DMA at DPA_DMA_COPY_MAX
      * (= default slot_size), but guard so a non-default slot_size can't overrun. */
     if (dma_len > (uint32_t)ctx->slot_size) {
-        DOCA_LOG_ERR("process_rx_dma_entry: len=%u exceeds slot_size=%d (req_id=%u)",
-                     dma_len, ctx->slot_size, req_id);
+        DOCA_LOG_ERR("process_rx_dma_entry: len=%u exceeds slot_size=%d (seq=%u)",
+                     dma_len, ctx->slot_size, e->seq);
         return -1;
     }
-    uint32_t body_len = dma_len;
 
     /* Zero-copy: deliver the landing byte-offset `pos`; the consumer reads
      * rx_dma_buffer[pos] directly and returns the credit at rx_free. */
@@ -364,13 +422,16 @@ static int process_rx_dma_entry(dpumesh_ctx_t *ctx, uint32_t pos, uint32_t dma_l
 
     sw_descriptor_t desc;
     memset(&desc, 0, sizeof(desc));
-    desc.req_id        = req_id;
-    desc.src_pod_id    = src_pod_id;
-    desc.dst_pod_id    = dst_pod_id;
-    desc.flags         = flags;
-    desc.header_buf_slot = -1;
     desc.body_buf_slot = slot;
-    desc.body_len      = body_len;
+    desc.body_len      = dma_len;
+    /* oriented tuple from the DPU completion (peer = src; dst is me) */
+    desc.src_pod       = e->src_pod_id;
+    desc.src_service   = e->src_service;
+    desc.dst_service   = e->dst_service;
+    desc.src_port      = e->src_port;
+    desc.dst_port      = e->dst_port;
+    desc.seq           = e->seq;
+    desc.dst_pod       = (int16_t)ctx->pod_id;   /* delivered here → I am the dst pod */
     desc.valid         = 1;
 
     rx_deliver_desc(ctx, &desc, slot);
@@ -401,11 +462,11 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
             return;
         }
         for (uint32_t i = 0; i < n; i++) {
-            uint32_t rid = b->req_ids[i];
-            uint32_t idx = rid % MAX_PENDING;
+            uint32_t key = dmesh_key(b->acks[i].port, b->acks[i].seq);
+            uint32_t idx = dmesh_pidx(key);
             dpumesh_pending_t *p = &ctx->pending[idx];
             pthread_mutex_lock(&p->lock);
-            if (p->tx_slot >= 0 && p->owner_req_id == rid) {
+            if (p->tx_slot >= 0 && p->owner_key == key) {
                 /* ack = sole free authority for a SENT slot. Free regardless of
                  * state (0=in flight, 1=response landed, -2=closed, -3=harvested);
                  * for the terminal-awaiting-ack states (-2/-3) the slot was the
@@ -444,8 +505,7 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
                              e->pos, e->length, ctx->rx_dma_buf_size);
                 continue;
             }
-            if (process_rx_dma_entry(ctx, e->pos, e->length, e->req_id,
-                                     e->src_pod_id, e->dst_pod_id, e->flags) != 0)
+            if (process_rx_dma_entry(ctx, e) != 0)
                 DOCA_LOG_WARN("BATCH_REV_DONE: process_rx_dma_entry failed pos=%u len=%u",
                               e->pos, e->length);
         }
@@ -487,6 +547,13 @@ static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, cons
     else
         ctx->pod_id = worker_num;
 
+    /* This node's service id (DPU service_table[service_id]=pod_id). Default =
+     * pod_id, so a client connecting to dst_service=N reaches the pod hosting
+     * service N. Override with DPUMESH_SERVICE_ID. */
+    if ((env_val = getenv("DPUMESH_SERVICE_ID")) != NULL)
+        ctx->service_id = atoi(env_val);
+    else
+        ctx->service_id = ctx->pod_id;
 }
 
 static doca_error_t init_doca_device(dpumesh_ctx_t *ctx) {
@@ -507,6 +574,7 @@ static doca_error_t init_control_path(dpumesh_ctx_t *ctx) {
 
     ctx->reg_msg.type = DMESH_MSG_POD_REGISTER;
     ctx->reg_msg.pod_id = ctx->pod_id;
+    ctx->reg_msg.service_id = ctx->service_id;   /* DPU: service_table[service_id]=pod_id */
     snprintf(ctx->reg_msg.app_name, sizeof(ctx->reg_msg.app_name), "%s", ctx->app_name);
 
     result = client_send_msg(&ctx->doca_objs, (const char *)&ctx->reg_msg, sizeof(ctx->reg_msg));
@@ -611,13 +679,19 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     ctx->notify_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     ctx->notify_enabled = 0;
 
-    atomic_init(&ctx->next_req_id, 1);
     for (int i = 0; i < MAX_PENDING; i++) {
         pthread_mutex_init(&ctx->pending[i].lock, NULL);
         pthread_cond_init(&ctx->pending[i].cond, NULL);
         ctx->pending[i].state = -1;
         ctx->pending[i].tx_slot = -1;
     }
+
+    /* Endpoint port table + allocator (oriented-tuple demux). calloc → every slot
+     * role=FREE, inbox_ready=0. Ports allocated from 1 (0 = BLANK sentinel). */
+    ctx->ports = (struct dmesh_port_slot *)calloc(DMESH_PORT_SPACE, sizeof(struct dmesh_port_slot));
+    if (!ctx->ports) goto fail;
+    pthread_mutex_init(&ctx->port_lock, NULL);
+    ctx->next_port = 1;
 
     ctx->doca_objs.rx_data_hook = rx_data_hook;
     ctx->doca_objs.rx_hook_ctx = ctx;
@@ -680,6 +754,7 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
         pthread_mutex_destroy(&ctx->ring_locks[j]);
     if (ctx->slot_next) free(ctx->slot_next);
     if (ctx->rx_ring) free(ctx->rx_ring);
+    if (ctx->ports) { free(ctx->ports); ctx->ports = NULL; pthread_mutex_destroy(&ctx->port_lock); }
 
     free(ctx);
 }
@@ -747,6 +822,11 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
         return -1;
     }
 
+    /* Loopback (dst == self) is NOW supported: demux is by dst_port (client vs
+     * server socket), not by req_id origin, so a self-routed request and its reply
+     * are distinguished even on the same host. The DPU may also route a service to
+     * the sender's own pod. No reject here. */
+
     if (desc->body_buf_slot < 0 || desc->body_buf_slot >= ctx->num_slots) {
         DOCA_LOG_ERR("ENQUEUE rejected: invalid body_buf_slot=%d (num_slots=%d)",
                      desc->body_buf_slot, ctx->num_slots);
@@ -802,15 +882,21 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     dma->addr = (uint64_t)ctx->dma_buffer +
                 ((size_t)desc->body_buf_slot * ctx->slot_size);
     dma->size = desc->body_len;
-    dma->idx  = desc->req_id;
-    dma->dst_pod_id = desc->dst_pod_id;
-    dma->flags = desc->flags;
+    /* oriented endpoint tuple → DPA passthrough → DPU routes (dst_pod==BLANK).
+     * src identity is stamped from the ctx (this node), not the caller's desc. */
+    dma->seq         = desc->seq;
+    dma->src_port    = desc->src_port;
+    dma->dst_port    = desc->dst_port;
+    dma->src_service = (int8_t)ctx->service_id;
+    dma->dst_service = (int8_t)desc->dst_service;
+    dma->dst_pod_id  = desc->dst_pod;
+    dma->src_pod_id  = ctx->pod_id;
 
     __sync_synchronize();
     dma->valid = 1;
 
-    DOCA_LOG_DBG("ENQUEUE: req_id=%u ring=%d slot=%u len=%u",
-                 desc->req_id, ridx, ring_slot, desc->body_len);
+    DOCA_LOG_DBG("ENQUEUE: seq=%u dst_svc=%d dst_pod=%d ring=%d slot=%u len=%u",
+                 desc->seq, desc->dst_service, desc->dst_pod, ridx, ring_slot, desc->body_len);
 
     pthread_mutex_unlock(rlock);
 
@@ -905,12 +991,50 @@ const char *dpumesh_get_worker_id(dpumesh_ctx_t *ctx) {
  * Client-side API
  * ==================================================================== */
 
-uint32_t dpumesh_alloc_req_id(dpumesh_ctx_t *ctx) {
-    return atomic_fetch_add(&ctx->next_req_id, 1);
+/* Allocate a host-unique port (>=1) and register it as a CLIENT or SERVER
+ * socket. The role is published with RELEASE so the PE thread's ACQUIRE-load in
+ * rx_deliver_desc sees a fully-initialized slot. Returns 0 on exhaustion. */
+uint16_t dpumesh_alloc_port(dpumesh_ctx_t *ctx, int role) {
+    pthread_mutex_lock(&ctx->port_lock);
+    for (uint32_t scanned = 0; scanned < DMESH_PORT_SPACE - 1; scanned++) {
+        uint32_t p = ctx->next_port;
+        ctx->next_port = (p + 1 >= DMESH_PORT_SPACE) ? 1 : p + 1;  /* wrap, skip 0 */
+        if (p == 0) continue;
+        if (ctx->ports[p].role == DMESH_ROLE_FREE) {
+            atomic_store_explicit(&ctx->ports[p].inbox_ready, 0, memory_order_relaxed);
+            __atomic_store_n(&ctx->ports[p].role, (uint8_t)role, __ATOMIC_RELEASE);
+            pthread_mutex_unlock(&ctx->port_lock);
+            return (uint16_t)p;
+        }
+    }
+    pthread_mutex_unlock(&ctx->port_lock);
+    DOCA_LOG_ERR("dpumesh_alloc_port: no free ports");
+    return 0;
 }
 
-int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
-    uint32_t idx = req_id % MAX_PENDING;
+/* Release a port. role=FREE (RELEASE) → the PE thread drops any further landing
+ * for it as stale. Any unread inbox content is abandoned (owner is closing). */
+void dpumesh_free_port(dpumesh_ctx_t *ctx, uint16_t port) {
+    if (port == 0 || port >= DMESH_PORT_SPACE) return;
+    atomic_store_explicit(&ctx->ports[port].inbox_ready, 0, memory_order_relaxed);
+    __atomic_store_n(&ctx->ports[port].role, DMESH_ROLE_FREE, __ATOMIC_RELEASE);
+}
+
+/* SERVER conn: poll this port's single-outstanding inbox for the next
+ * established request. Returns 1 + fills *out, or 0 if none pending. */
+int dpumesh_poll_request(dpumesh_ctx_t *ctx, uint16_t port, sw_descriptor_t *out) {
+    if (port == 0 || port >= DMESH_PORT_SPACE) return 0;
+    struct dmesh_port_slot *psl = &ctx->ports[port];
+    if (!atomic_load_explicit(&psl->inbox_ready, memory_order_acquire))
+        return 0;
+    *out = psl->inbox;
+    atomic_store_explicit(&psl->inbox_ready, 0, memory_order_release);
+    return 1;
+}
+
+int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq) {
+    uint32_t req_id = dmesh_key(port, seq);   /* (port,seq) table key */
+    uint32_t idx = dmesh_pidx(req_id);
     dpumesh_pending_t *p = &ctx->pending[idx];
 
     pthread_mutex_lock(&p->lock);
@@ -953,15 +1077,15 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
 
     p->state = 0;
     p->tx_slot = -1;
-    p->owner_req_id = req_id;   /* claim this idx; TX_ACK frees only for this req_id */
+    p->owner_key = req_id;   /* claim this idx; TX_ACK frees only for this (port,seq) */
     /* p->desc is fully overwritten by rx_deliver_desc before state=1, and only
      * read at state==1 — no need to pre-zero it. */
     pthread_mutex_unlock(&p->lock);
     return 0;
 }
 
-void dpumesh_pending_attach_tx(dpumesh_ctx_t *ctx, uint32_t req_id, int tx_slot) {
-    uint32_t idx = req_id % MAX_PENDING;
+void dpumesh_pending_attach_tx(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq, int tx_slot) {
+    uint32_t idx = dmesh_pidx(dmesh_key(port, seq));
     dpumesh_pending_t *p = &ctx->pending[idx];
 
     pthread_mutex_lock(&p->lock);
@@ -969,9 +1093,9 @@ void dpumesh_pending_attach_tx(dpumesh_ctx_t *ctx, uint32_t req_id, int tx_slot)
     pthread_mutex_unlock(&p->lock);
 }
 
-int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint32_t req_id,
+int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq,
                           sw_descriptor_t *resp) {
-    dpumesh_pending_t *p = &ctx->pending[req_id % MAX_PENDING];
+    dpumesh_pending_t *p = &ctx->pending[dmesh_pidx(dmesh_key(port, seq))];
 
     /* Lock-free fast path: while still waiting, a single acquire-load of the
      * volatile state avoids the mutex entirely. A racy 0 just polls again; any
@@ -1011,8 +1135,8 @@ int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint32_t req_id,
     return -1;
 }
 
-void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
-    uint32_t idx = req_id % MAX_PENDING;
+void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq) {
+    uint32_t idx = dmesh_pidx(dmesh_key(port, seq));
     dpumesh_pending_t *p = &ctx->pending[idx];
 
     pthread_mutex_lock(&p->lock);
@@ -1047,8 +1171,8 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id) {
  * Only acts on state == 0; other states are left alone since they're
  * already owned by another path (response arrived, cancelled, or unused).
  */
-void dpumesh_pending_release_async(dpumesh_ctx_t *ctx, uint32_t req_id) {
-    uint32_t idx = req_id % MAX_PENDING;
+void dpumesh_pending_release_async(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq) {
+    uint32_t idx = dmesh_pidx(dmesh_key(port, seq));
     dpumesh_pending_t *p = &ctx->pending[idx];
 
     pthread_mutex_lock(&p->lock);

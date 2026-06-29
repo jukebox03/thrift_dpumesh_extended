@@ -40,4 +40,16 @@
  * credit counter at index DMA_RING_SIZE. */
 #define DMA_RING_SIZE       4096
 
+/* ====== Endpoint addressing — oriented-tuple model (design-endpoint-tuple.md) ======
+ * A message carries src=(pod,port[,service]) and dst=(service,pod,port). The DPU
+ * routes ONLY when dst_pod is BLANK (first request of a connection): it resolves
+ * dst_service -> pod (dpu_route mock, future L7). Once a connection is established
+ * the client sends dst_pod filled -> DPU delivers direct (no re-routing).
+ *   service_id : own int8 space [0,127]   (registered via app_name)
+ *   pod_id     : own int8 space [0,127]
+ * service_id and pod_id are SEPARATE fields (not a shared/partitioned namespace). */
+#define DMESH_POD_BLANK     (-1)   /* dst_pod == -1 -> DPU must resolve dst_service */
+#define DMESH_PORT_BLANK     0     /* dst_port == 0 -> service listener / accept queue */
+#define DMESH_SVC_NONE      (-1)   /* no service id */
+
 #endif /* DPUMESH_COMMON_H */

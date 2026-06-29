@@ -28,11 +28,11 @@ server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn
                         const char *msg, size_t len);
 
 
-/* Batched TX_ACK: coalesce n req_ids into one message. */
+/* Batched TX_ACK: coalesce n (port,seq) entries into one message. */
 doca_error_t
 server_send_batch_tx_ack_to(struct objects *objs,
 							struct doca_comch_connection *conn,
-							const uint32_t *req_ids, int n);
+							const struct dmesh_tx_ack_entry *acks, int n);
 
 /* Batched REV_DONE: coalesce n reverse-DMA completions into one message. */
 doca_error_t
@@ -64,6 +64,6 @@ pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn)
 /* Register pod_id for an existing connection. Returns 0 on success. */
 int
 pods_register(struct objects *objs, struct doca_comch_connection *conn,
-              int32_t pod_id, const char *app_name);
+              int32_t pod_id, int32_t service_id, const char *app_name);
 
 #endif // COMCH_SERVER_H

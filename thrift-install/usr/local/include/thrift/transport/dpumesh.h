@@ -36,16 +36,22 @@ typedef struct {
 #define DPUMESH_CONFIG_DEFAULT { 0, 0 }
 
 /* ====== SwDescriptor (host-internal RX/TX descriptor, packed) ====== */
-typedef struct __attribute__((packed)) {
-    int32_t  header_buf_slot;       /* i  (always -1 for Thrift) */
-    uint32_t header_len;            /* I  (always 0 for Thrift)  */
-    int32_t  body_buf_slot;         /* i */
-    uint32_t body_len;              /* I */
-    uint32_t req_id;                /* I  (stream_id) */
-    int32_t  dst_pod_id;            /* i */
-    int32_t  src_pod_id;            /* i */
-    int8_t   flags;                 /* b */
-    int8_t   valid;                 /* b */
+/* Host-internal descriptor (NOT a wire layout): the façade builds it for
+ * dpumesh_enqueue (translated to dma_desc) and dpumesh_dequeue fills it from a
+ * delivered completion. Carries the oriented endpoint tuple — see
+ * design-endpoint-tuple.md §12.2. */
+typedef struct {
+    int32_t  body_buf_slot;         /* TX slot (send) | RX landing byte-offset (recv) */
+    uint32_t body_len;
+    /* ---- oriented endpoint tuple ---- */
+    int16_t  src_pod;               /* sender pod (always concrete) */
+    uint16_t src_port;              /* sender port */
+    int16_t  src_service;           /* sender's own service (= ep service_id); SVC_NONE if none */
+    int16_t  dst_service;           /* peer service (routing input when dst_pod==BLANK) */
+    int16_t  dst_pod;               /* dest pod; DMESH_POD_BLANK(-1) -> DPU resolves dst_service */
+    uint16_t dst_port;              /* dest port; DMESH_PORT_BLANK(0) -> accept queue */
+    uint16_t seq;                   /* per-conn sequence (match key with port) */
+    int8_t   valid;
 } sw_descriptor_t;
 
 /* ====== Opaque context ====== */
@@ -101,12 +107,23 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc);
 
 /* ====== Client-side API (request/response matching) ====== */
 
-/* Allocate a unique request ID (atomic, thread-safe). */
-uint32_t dpumesh_alloc_req_id(dpumesh_ctx_t *ctx);
+/* Endpoint roles for dpumesh_alloc_port (oriented-tuple demux). */
+#define DMESH_ROLE_FREE   0
+#define DMESH_ROLE_CLIENT 1
+#define DMESH_ROLE_SERVER 2
 
-/* Register a pending entry for req_id (must call before enqueue).
+/* Allocate a host-unique endpoint port (>=1), registered as DMESH_ROLE_CLIENT or
+ * DMESH_ROLE_SERVER; returns 0 on exhaustion. Release with dpumesh_free_port. */
+uint16_t dpumesh_alloc_port(dpumesh_ctx_t *ctx, int role);
+void     dpumesh_free_port(dpumesh_ctx_t *ctx, uint16_t port);
+
+/* SERVER conn: poll the port's single-outstanding inbox for the next established
+ * request. Returns 1 + fills *out, or 0 if none pending. */
+int dpumesh_poll_request(dpumesh_ctx_t *ctx, uint16_t port, sw_descriptor_t *out);
+
+/* Register a pending entry for (port,seq) (must call before enqueue).
  * Returns 0 on success, -1 on failure. */
-int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
+int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq);
 
 /* Non-blocking poll for a response matching req_id.
  * Returns:
@@ -117,17 +134,17 @@ int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
  * Polling is the only completion model (there is no blocking wait); the PE
  * thread delivers responses into the pending table + raises the readiness
  * eventfd (dpumesh_get_event_fd) for a native epoll_wait(). */
-int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint32_t req_id,
+int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq,
                           sw_descriptor_t *resp);
 
-/* Associate a TX slot with a pending request (call after successful enqueue).
+/* Associate a TX slot with a pending (port,seq) (call after successful enqueue).
  * On timeout, the TX slot is deferred until DPA finishes processing. */
-void dpumesh_pending_attach_tx(dpumesh_ctx_t *ctx, uint32_t req_id, int tx_slot);
+void dpumesh_pending_attach_tx(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq, int tx_slot);
 
 /* Cancel a pending entry (e.g. on error path).
  * If TX is attached and DPA may still be using it, defers cleanup
  * until the response arrives (state -2 → rx_data_hook frees TX). */
-void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
+void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq);
 
 /* Asynchronously release a pending entry registered via dpumesh_register_pending.
  * Intended for responder-side use (e.g. server sending OP_RESPONSE) after
@@ -142,7 +159,7 @@ void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint32_t req_id);
  *   - any other state: no-op (already managed by another path).
  *
  * Idempotent. Safe to call concurrently with TX_ACK arrival. */
-void dpumesh_pending_release_async(dpumesh_ctx_t *ctx, uint32_t req_id);
+void dpumesh_pending_release_async(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq);
 
 #ifdef __cplusplus
 }
