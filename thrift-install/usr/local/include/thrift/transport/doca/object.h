@@ -186,13 +186,13 @@ struct pod_state {
 
     /* Batched TX_ACK accumulator. Response-forward TX_ACKs destined to THIS pod
      * accumulate here; flushed as one dmesh_batch_tx_ack_msg when full or on the
-     * periodic tail-flush. Single ARM thread owns this — no lock. */
+     * idle (drain-empty, proc==0) flush. Single ARM thread owns this — no lock. */
     struct dmesh_tx_ack_entry txack_batch[BATCH_TXACK_MAX];
     int      txack_batch_n;
 
     /* Batched REV_DONE accumulator (mirror of txack_batch). Reverse-DMA
      * completions destined to THIS pod accumulate here; flushed as one
-     * dmesh_batch_rev_done_msg when full, on drain-empty, or the periodic tail
+     * dmesh_batch_rev_done_msg when full or on the idle (drain-empty, proc==0)
      * flush. Single ARM thread owns this — no lock. */
     struct dmesh_rev_done_entry rev_done_batch[BATCH_REVDONE_MAX];
     int      rev_done_batch_n;
@@ -234,7 +234,7 @@ struct objects {
      * num_dpa_threads (= N, clamp [1, MAX_DPA_RINGS]) EU threads share ONE
      * doca_dpa device (`dpa`). Each EU k owns its own dpa_threads[k]
      * (doca_dpa_thread + arg) and its own 1c/1p comch channel dpa_comches[k].
-     * A pod's rings are assigned to EU (pod_id % num_dpa_threads). The DPU side
+     * A pod's K forward rings map to EUs (pod_id*K + j) % num_dpa_threads (ring j). The DPU side
      * stays single-threaded: all N recv-msgq consumers connect to the one
      * consumer_pe, so one pe_progress drains every channel into the single
      * comp_queue — no lock, tx_ring stays single-producer.
@@ -293,8 +293,9 @@ struct objects {
     int pod_id_to_slot[POD_ID_SPACE];
 
     /* service_id -> pod_id resolution (DPU routing seam — dpu_route mock).
-     * Populated from pods_register(service_id). -1 = unknown (dpu_route falls
-     * back to the request's src pod). Indexed by service_id [0,POD_ID_SPACE).
+     * Populated from pods_register(service_id). -1 = unknown (dpu_route returns
+     * -1 → the forward entry is DROPPED + the sender TX_ACK'd; NO src-pod fallback).
+     * Indexed by service_id [0,POD_ID_SPACE).
      * The future L7 proxy replaces this lookup. Init to all -1 at startup. */
     int service_table[POD_ID_SPACE];
 

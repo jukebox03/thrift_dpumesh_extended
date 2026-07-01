@@ -39,6 +39,14 @@
 static dmesh_channel_t *g_s = NULL;            /* the façade endpoint (shared, thread-safe) */
 static int    g_dst_pod_id = 11;
 static int    g_async_threads = 4;
+static int    g_pipeline_depth = 8;            /* mode=2: messages in flight PER conn (BENCH_PIPELINE) */
+
+/* Observability (reset per RUN): connection reuse + fail breakdown. Printed to
+ * stderr in the DONE line (NOT in the OK reply, which test-bench.sh parses). */
+static atomic_long g_connects     = 0;         /* total dmesh_connect() calls (reuse: << ok) */
+static atomic_long g_fail_timeout = 0;         /* no reply within WAIT_TIMEOUT_MS */
+static atomic_long g_fail_reset   = 0;         /* read returned <0 (abandoned) or 0 (EOF) */
+static atomic_long g_fail_bad     = 0;         /* reply wrong size / corrupt content */
 
 /* ------------------------------------------------------------ time helpers */
 static double now_sec(void) {
@@ -98,6 +106,7 @@ static void *worker_fn_async(void *arg) {
             if (!fl[s].c) {                             /* connect ONCE; reuse after */
                 fl[s].c = dmesh_connect(g_s, g_dst_pod_id);
                 if (!fl[s].c) break;                    /* transient OOM: retry next sweep */
+                atomic_fetch_add(&g_connects, 1);       /* count connects (reuse: connects << ok) */
             }
             uint8_t p = (uint8_t)('A' + (next_j & 0xf));
             body[0] = p; body[w->msg_size / 2] = p; body[w->msg_size - 1] = p;
@@ -122,17 +131,20 @@ static void *worker_fn_async(void *arg) {
                 if (now_sec() - fl[s].launched > timeout_s) {
                     dmesh_close(fl[s].c); fl[s].c = NULL;   /* stuck → drop + reconnect */
                     atomic_fetch_add(w->fail, 1);
+                    atomic_fetch_add(&g_fail_timeout, 1);   /* breakdown: timeout */
                     fl[s].active = 0; completed++; did_work = 1;
                 }
                 continue;
             }
             int bad;
-            if (n < 0) {                                /* ECONNRESET / abandoned */
+            if (n <= 0) {                               /* <0 abandoned / 0 EOF (peer closed) */
                 bad = 1;
+                atomic_fetch_add(&g_fail_reset, 1);
             } else {
                 uint8_t expect = (uint8_t)('A' + (fl[s].j & 0xf));
                 bad = (n != (ssize_t)w->msg_size) ||
-                      (n > 0 && (rb[0] != expect || rb[n / 2] != expect || rb[n - 1] != expect));
+                      (rb[0] != expect || rb[n / 2] != expect || rb[n - 1] != expect);
+                if (bad) atomic_fetch_add(&g_fail_bad, 1);  /* breakdown: corrupt/short */
             }
             if (bad) {
                 dmesh_close(fl[s].c); fl[s].c = NULL;     /* error → drop + reconnect */
@@ -185,6 +197,7 @@ static void *worker_fn_oneway(void *arg) {
         }
         dmesh_conn_t *c = dmesh_connect(g_s, g_dst_pod_id);
         if (!c) { atomic_fetch_add(w->fail, 1); next_j++; continue; }
+        atomic_fetch_add(&g_connects, 1);             /* one-way: a fresh conn per message */
         uint8_t p = (uint8_t)('A' + (next_j & 0xf));
         body[0] = p; body[w->msg_size / 2] = p; body[w->msg_size - 1] = p;
         dmesh_write(c, body, (size_t)w->msg_size);
@@ -200,6 +213,100 @@ static void *worker_fn_oneway(void *arg) {
         next_j++;
     }
     free(body);
+    return NULL;
+}
+
+/* Pipelined generator (mode=2): each conn carries up to P (=g_pipeline_depth)
+ * OUTSTANDING messages, so one harvest sweep drains a BATCH of replies from one
+ * conn's inbox — exercising the "multiple slots read at once" path on both sides
+ * (the echo accumulates a burst per conn; this client drains them in one loop).
+ * In-order per-conn delivery lets a small per-conn FIFO match each reply to its
+ * send and verify content + ordering. */
+typedef struct {
+    dmesh_conn_t *c;
+    double  sched[64];      /* scheduled time (coordinated-omission latency) */
+    double  sent [64];      /* send time (timeout) */
+    uint8_t expect[64];     /* expected content byte (in-order match) */
+    int     head, tail;     /* outstanding = tail-head; ring index = % P */
+} pipe_conn_t;
+
+static void *worker_fn_pipeline(void *arg) {
+    worker_t *w = (worker_t *)arg;
+    int W = w->inflight > 0 ? w->inflight : 1;
+    int P = g_pipeline_depth; if (P < 1) P = 1; if (P > 64) P = 64;
+
+    pipe_conn_t *pc = calloc((size_t)W, sizeof(pipe_conn_t));
+    uint8_t *body = malloc((size_t)w->msg_size);
+    uint8_t *rb   = malloc((size_t)w->msg_size);
+    if (!pc || !body || !rb) { free(pc); free(body); free(rb); atomic_store(w->stop, 1); return NULL; }
+    memset(body, 0, (size_t)w->msg_size);
+
+    long next_j = 0, completed = 0;
+    const double timeout_s = (double)WAIT_TIMEOUT_MS / 1000.0;
+
+    while (completed < w->budget) {
+        if (atomic_load(w->stop)) break;
+        int did_work = 0;
+        for (int s = 0; s < W; s++) {
+            pipe_conn_t *q = &pc[s];
+            if (!q->c) {
+                q->c = dmesh_connect(g_s, g_dst_pod_id);
+                if (!q->c) continue;
+                atomic_fetch_add(&g_connects, 1);
+                q->head = q->tail = 0;
+            }
+            /* ---- fill: up to P outstanding on THIS conn (paced) ---- */
+            /* MUST establish (1 RTT) before pipelining: an unestablished client conn
+             * ships every message with dst_pod=BLANK, so each would land as a NEW
+             * accept on the server (accept-queue flood + orphan conns). Hold depth at
+             * 1 until the first reply is read (c->established), then ramp to P. */
+            int depth = q->c->established ? P : 1;
+            while ((q->tail - q->head) < depth && next_j < w->budget) {
+                double scheduled = w->start_at + (double)next_j * w->interval_sec;
+                if (now_sec() < scheduled) break;
+                uint8_t p = (uint8_t)('A' + (next_j & 0xf));
+                body[0] = p; body[w->msg_size / 2] = p; body[w->msg_size - 1] = p;
+                if (dmesh_write(q->c, body, (size_t)w->msg_size) < 0 || dmesh_flush(q->c) < 0) {
+                    dmesh_close(q->c); q->c = NULL; break;
+                }
+                int i = q->tail % P;
+                q->sched[i] = scheduled; q->sent[i] = now_sec(); q->expect[i] = p;
+                q->tail++; next_j++; did_work = 1;
+            }
+            if (!q->c) continue;
+            /* ---- harvest: drain ALL ready replies in one sweep (multi-slot read) ---- */
+            ssize_t n = -1;
+            while ((q->tail - q->head) > 0 && (n = dmesh_read(q->c, rb, (size_t)w->msg_size)) > 0) {
+                int i = q->head % P;
+                uint8_t expect = q->expect[i];
+                int bad = (n != (ssize_t)w->msg_size) ||
+                          (rb[0] != expect || rb[n / 2] != expect || rb[n - 1] != expect);
+                double scheduled = q->sched[i];
+                q->head++;
+                if (bad) { atomic_fetch_add(w->fail, 1); atomic_fetch_add(&g_fail_bad, 1); }
+                else {
+                    double lat_us = (now_sec() - scheduled) * 1e6;
+                    if (w->n_samples < w->cap) w->samples[w->n_samples++] = lat_us;
+                    atomic_fetch_add(w->ok, 1);
+                }
+                completed++; did_work = 1;
+            }
+            /* ---- EOF / timeout on the remaining outstanding ---- */
+            if (q->c && (q->tail - q->head) > 0) {
+                int out = q->tail - q->head;
+                if (n == 0) {                                  /* peer FIN mid-stream */
+                    atomic_fetch_add(w->fail, out); atomic_fetch_add(&g_fail_reset, out);
+                    completed += out; dmesh_close(q->c); q->c = NULL; did_work = 1;
+                } else if (now_sec() - q->sent[q->head % P] > timeout_s) {
+                    atomic_fetch_add(w->fail, out); atomic_fetch_add(&g_fail_timeout, out);
+                    completed += out; dmesh_close(q->c); q->c = NULL; did_work = 1;
+                }
+            }
+        }
+        if (!did_work) { struct timespec ts = {0, 5000}; nanosleep(&ts, NULL); }
+    }
+    for (int s = 0; s < W; s++) if (pc[s].c) dmesh_close(pc[s].c);
+    free(pc); free(body); free(rb);
     return NULL;
 }
 
@@ -263,11 +370,18 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns, int
     long remainder    = total_budget % n_workers;
     double interval_sec = (double)n_workers / (double)rps;
 
-    void *(*worker_fn)(void *) = mode ? worker_fn_oneway : worker_fn_async;
+    void *(*worker_fn)(void *) =
+        (mode == 1) ? worker_fn_oneway :
+        (mode == 2) ? worker_fn_pipeline : worker_fn_async;
+    const char *mode_name = (mode == 1) ? "oneway" : (mode == 2) ? "pipeline" : "rpc";
+    /* reset per-RUN observability counters */
+    atomic_store(&g_connects, 0); atomic_store(&g_fail_timeout, 0);
+    atomic_store(&g_fail_reset, 0); atomic_store(&g_fail_bad, 0);
     fprintf(stderr, "[bench_sock] RUN rps=%d dur=%d size=%d conns=%d mode=%s "
                     "(workers=%d inflight=%d interval=%.3fus per worker)\n",
-            rps, dur, msg_size, conns, mode ? "oneway" : "rpc",
+            rps, dur, msg_size, conns, mode_name,
             n_workers, inflight, interval_sec * 1e6);
+    if (mode == 2) fprintf(stderr, "[bench_sock]   pipeline_depth=%d (per conn)\n", g_pipeline_depth);
 
     pthread_t  *tids   = calloc((size_t)n_workers, sizeof(pthread_t));
     worker_t   *wargs  = calloc((size_t)n_workers, sizeof(worker_t));
@@ -346,6 +460,12 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns, int
                      rps_ach, p50, p99, p999, ok_n, fail_n, mb_s);
     write(conn_fd, reply, (size_t)n);
     fprintf(stderr, "[bench_sock] DONE %s", reply);
+    /* Observability (stderr only — keeps the OK reply parseable): connection reuse
+     * (connects vs ok) + WHY fails happened (timeout vs reset/EOF vs corrupt). */
+    fprintf(stderr, "[bench_sock]   connects=%ld (ok=%ld → reuse=%.1fx)  fails: timeout=%ld reset/eof=%ld bad=%ld\n",
+            atomic_load(&g_connects), ok_n,
+            atomic_load(&g_connects) > 0 ? (double)ok_n / (double)atomic_load(&g_connects) : 0.0,
+            atomic_load(&g_fail_timeout), atomic_load(&g_fail_reset), atomic_load(&g_fail_bad));
 }
 
 /* ------------------------------------------------------------ control TCP */
@@ -406,6 +526,7 @@ int main(void) {
     if (getenv("BENCH_WORKER_ID"))  worker_id      = atoi(getenv("BENCH_WORKER_ID"));
     if (getenv("BENCH_DST_POD_ID")) g_dst_pod_id   = atoi(getenv("BENCH_DST_POD_ID"));
     if (getenv("ASYNC_THREADS"))    g_async_threads = atoi(getenv("ASYNC_THREADS"));
+    if (getenv("BENCH_PIPELINE"))   g_pipeline_depth = atoi(getenv("BENCH_PIPELINE"));
 
     g_s = dmesh_create_channel("bench-sock", worker_id);     /* socket() + bind() */
     if (!g_s) { fprintf(stderr, "[bench_sock] dmesh_create_channel failed\n"); return 1; }

@@ -104,7 +104,7 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 		break;
 
 	case DMESH_MSG_BATCH_FWD_ACK:
-		/* Batched TX_ACK — coalesced free of K req_ids. */
+		/* Batched TX_ACK — coalesced free of K (port,seq) TX slots. */
 		if (objs->rx_data_hook)
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
@@ -269,7 +269,7 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 
 	{
 		uint32_t desired_rq = max_rq_size;
-		if (desired_rq < CC_RECV_QUEUE_SIZE) desired_rq = CC_RECV_QUEUE_SIZE;
+		if (desired_rq < CC_CLIENT_RECV_QUEUE_SIZE) desired_rq = CC_CLIENT_RECV_QUEUE_SIZE;
 		result = doca_comch_client_set_recv_queue_size(objs->cc_client, desired_rq);
 		if (result == DOCA_SUCCESS) {
 			DOCA_LOG_INFO("CC client recv queue size set to %u (cap=%u)", desired_rq, max_rq_size);

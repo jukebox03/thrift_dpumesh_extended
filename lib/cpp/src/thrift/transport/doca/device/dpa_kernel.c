@@ -213,8 +213,12 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
             break;
         }
 
-        /* dma_copy requires 128B-aligned size; DPU buffer pos advances by it. */
+        /* dma_copy requires 128B-aligned size; DPU buffer pos advances by it.
+         * A FIN carries desc->size==0 (comp.length stays 0 → receiver reads EOF);
+         * still issue one min 128B transfer so the DMA engine never sees a
+         * zero-length descriptor (the copied bytes are ignored at length 0). */
         uint32_t chunk = ALIGN_UP_128(desc->size);
+        if (chunk == 0) chunk = DMA_COPY_SIZE_ALIGN;
         if (thread_arg->pos[r] + chunk > ring->dpu_buf_size)
             thread_arg->pos[r] = 0;
 
@@ -330,7 +334,10 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
             break;
         }
 
+        /* FIN (desc->size==0): min 128B transfer so the engine never sees a
+         * zero-length reverse descriptor; comp.length stays 0 → host reads EOF. */
         uint32_t chunk = ALIGN_UP_128(desc->size);
+        if (chunk == 0) chunk = DMA_COPY_SIZE_ALIGN;
         if (thread_arg->rev_pos[r] + chunk > ring->host_buf_size)
             thread_arg->rev_pos[r] = 0;
 

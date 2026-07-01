@@ -51,18 +51,25 @@ static int cmp_d(const void *a, const void *b) {
 /* ---- server side: drain this pod's accept queue, echo every request ---- */
 static void *echo_fn(void *arg) {
     (void)arg;
+    static dmesh_conn_t *cl[4096];
+    int ncl = 0;
+    char b[8192];
     while (!atomic_load(&g_stop)) {
-        dmesh_conn_t *c; int did = 0;
-        while ((c = dmesh_accept(g_s)) != NULL) {
-            char b[8192];
-            ssize_t n = dmesh_read(c, b, sizeof b);
-            if (n > 0) { dmesh_write(c, b, (size_t)n); dmesh_flush(c); }
-            dmesh_close(c);
-            atomic_fetch_add(&g_served, 1);
-            did = 1;
+        int did = 0;
+        dmesh_conn_t *c;
+        while (ncl < 4096 && (c = dmesh_accept(g_s)) != NULL) { cl[ncl++] = c; did = 1; }
+        for (int i = 0; i < ncl; ) {
+            ssize_t n;
+            while ((n = dmesh_read(cl[i], b, sizeof b)) > 0) {      /* drain to EAGAIN, echo each */
+                dmesh_write(cl[i], b, (size_t)n); dmesh_flush(cl[i]);
+                atomic_fetch_add(&g_served, 1); did = 1;
+            }
+            if (n == 0) { dmesh_close(cl[i]); cl[i] = cl[--ncl]; }  /* EOF (client FIN) → drop */
+            else i++;
         }
         if (!did) { struct timespec t = {0, 2000}; nanosleep(&t, NULL); }  /* 2us idle */
     }
+    for (int i = 0; i < ncl; i++) dmesh_close(cl[i]);
     return NULL;
 }
 

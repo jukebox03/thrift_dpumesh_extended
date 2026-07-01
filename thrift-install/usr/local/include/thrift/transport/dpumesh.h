@@ -105,61 +105,41 @@ void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot);
 /* Enqueue a descriptor to TX SQ. Returns 0 on success, -1 on failure. */
 int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc);
 
-/* ====== Client-side API (request/response matching) ====== */
+/* ====== Connection API (connection-oriented, full-duplex — no RPC matching) ======
+ *
+ * A "port" IS a connection (like a socket fd): it owns a peer, an inbound message
+ * queue, and an optional per-conn readiness eventfd. Inbound is routed by dst_port
+ * to the conn's inbox; there is NO request↔response matching. */
 
-/* Endpoint roles for dpumesh_alloc_port (oriented-tuple demux). */
+/* Endpoint roles for dpumesh_alloc_port. */
 #define DMESH_ROLE_FREE   0
 #define DMESH_ROLE_CLIENT 1
 #define DMESH_ROLE_SERVER 2
 
-/* Allocate a host-unique endpoint port (>=1), registered as DMESH_ROLE_CLIENT or
- * DMESH_ROLE_SERVER; returns 0 on exhaustion. Release with dpumesh_free_port. */
-uint16_t dpumesh_alloc_port(dpumesh_ctx_t *ctx, int role);
+/* Allocate a host-unique conn port (>=1) as CLIENT or SERVER (allocates its inbound
+ * ring); 0 on exhaustion. `user` is the app's conn handle, returned later by
+ * dpumesh_next_ready (stored before the port goes live so a ready-list entry never
+ * dereferences NULL). Release with dpumesh_free_port (reclaims undelivered inbound
+ * credits). */
+uint16_t dpumesh_alloc_port(dpumesh_ctx_t *ctx, int role, void *user);
 void     dpumesh_free_port(dpumesh_ctx_t *ctx, uint16_t port);
 
-/* SERVER conn: poll the port's single-outstanding inbox for the next established
- * request. Returns 1 + fills *out, or 0 if none pending. */
-int dpumesh_poll_request(dpumesh_ctx_t *ctx, uint16_t port, sw_descriptor_t *out);
+/* Pop the next inbound message descriptor for a conn (CLIENT or SERVER — one path).
+ * Returns 1 + fills *out (body at *out->body_buf_slot in the shared RX mmap; free
+ * via dpumesh_rx_free after reading), or 0 if the conn inbox is empty. */
+int dpumesh_conn_recv(dpumesh_ctx_t *ctx, uint16_t port, sw_descriptor_t *out);
 
-/* Register a pending entry for (port,seq) (must call before enqueue).
- * Returns 0 on success, -1 on failure. */
-int dpumesh_register_pending(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq);
+/* Pop the next READY conn (one whose inbox went empty→non-empty since you last
+ * drained it) and return the `user` handle registered at alloc; NULL when drained.
+ * The single endpoint fd (dpumesh_get_event_fd) wakes you; this names the conns to
+ * service WITHOUT scanning every conn or holding a per-conn fd. Drain each returned
+ * conn to EAGAIN (edge-triggered re-arm). Single-consumer (the event-loop thread). */
+void *dpumesh_next_ready(dpumesh_ctx_t *ctx);
 
-/* Non-blocking poll for a response matching req_id.
- * Returns:
- *    0 = response arrived (resp filled; TX already freed; caller must free the
- *        body via dpumesh_rx_free(resp->body_buf_slot)),
- *    1 = not ready yet — caller should poll again later,
- *   -1 = error/abandoned (no live pending for this req_id).
- * Polling is the only completion model (there is no blocking wait); the PE
- * thread delivers responses into the pending table + raises the readiness
- * eventfd (dpumesh_get_event_fd) for a native epoll_wait(). */
-int dpumesh_poll_response(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq,
-                          sw_descriptor_t *resp);
-
-/* Associate a TX slot with a pending (port,seq) (call after successful enqueue).
- * On timeout, the TX slot is deferred until DPA finishes processing. */
-void dpumesh_pending_attach_tx(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq, int tx_slot);
-
-/* Cancel a pending entry (e.g. on error path).
- * If TX is attached and DPA may still be using it, defers cleanup
- * until the response arrives (state -2 → rx_data_hook frees TX). */
-void dpumesh_cancel_pending(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq);
-
-/* Asynchronously release a pending entry registered via dpumesh_register_pending.
- * Intended for responder-side use (e.g. server sending OP_RESPONSE) after
- * enqueue + attach_tx, when no response is expected on this req_id (so the
- * pending entry is released without polling for a response).
- *
- * Behavior (only acts on state == 0):
- *   - tx_slot still attached: transition to state -2; TX_ACK handler will
- *     free the TX slot and clear the entry (state -2 → -1).
- *   - tx_slot already released by an earlier TX_ACK: clear immediately
- *     (state 0 → -1) so the slot is reusable for future register_pending.
- *   - any other state: no-op (already managed by another path).
- *
- * Idempotent. Safe to call concurrently with TX_ACK arrival. */
-void dpumesh_pending_release_async(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq);
+/* Record a SENT TX slot for (port,seq) so its DPU TX_ACK frees it (the BATCH_FWD_ACK
+ * handler reclaims it). Call after a successful dpumesh_enqueue. A conn may have many
+ * un-ACKed slots in flight (full-duplex / pipelined); never blocks. */
+void dpumesh_tx_track(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq, int tx_slot);
 
 #ifdef __cplusplus
 }

@@ -1,17 +1,10 @@
 #ifndef DPUMESH_COMMON_H
 #define DPUMESH_COMMON_H
 
-/* ====== Common Flags (shared by Host, DPU ARM, and DPA) ====== */
-
-/* CaseFlag — case classification (wire protocol shared by Host, DPU ARM, DPA). */
-#define CASE_EXTERNAL  1
-#define CASE_INGRESS   2
-
-/* OpFlag — request/response direction bit (OR'd into the descriptor flags byte) */
-#define OP_REQUEST     0x00
-#define OP_RESPONSE    0x10
-
-/* ====== DOCA / DPA limits ====== */
+/* ====== DOCA / DPA limits ======
+ * (The old OP_/CASE_ flag bytes were removed with the oriented-tuple redesign:
+ * request-vs-response is no longer a wire flag — it falls out of which local
+ * socket the dst_port resolves to. dma_desc.flags is now reserved/unused.) */
 #define MAX_DPA_RINGS       8   /* per-EU ring capacity (forward + reverse each) */
 #define MAX_PODS            8
 

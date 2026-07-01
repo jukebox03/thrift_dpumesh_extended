@@ -756,9 +756,12 @@ run_bench() {
     local rps="${1:-10000}" dur="${2:-10}" size="${3:-8192}" conns="${4:-0}"
     local app="bench-${mode}"
 
+    # mode: 0=rpc(reuse) 1=one-way 2=pipeline. RUN_ONEWAY=1 kept for back-compat.
+    local rmode="${RUN_MODE:-0}"
+    [ "${RUN_ONEWAY:-0}" = "1" ] && rmode=1
     local cmd="RUN $rps $dur $size"
-    if [ "${RUN_ONEWAY:-0}" = "1" ]; then
-        cmd="RUN $rps $dur $size ${conns} 1"      # mode=1 (one-way); conns must precede mode
+    if [ "$rmode" != "0" ]; then
+        cmd="RUN $rps $dur $size ${conns} $rmode"   # conns must precede mode
     elif [ "$conns" != "0" ]; then
         cmd="$cmd $conns"
     fi
@@ -906,6 +909,12 @@ case "$CMD" in
         # One-way (fire-and-forget) load: client does write->close, no read.
         pin_pods fair >/dev/null
         RUN_ONEWAY=1 run_bench "dpumesh" "${@:2}"
+        ;;
+    dpumesh-pipeline)
+        # Pipelined load: each conn carries BENCH_PIPELINE (default 8) outstanding
+        # messages → one harvest drains a BATCH (multi-slot read). conn-reuse path.
+        pin_pods fair >/dev/null
+        RUN_MODE=2 run_bench "dpumesh" "${@:2}"
         ;;
     loopback)
         # Self-routing / loopback: pod 12 is client+server of its own service 12.

@@ -387,7 +387,7 @@ init_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool 
 
     {
         uint32_t desired_rq = max_rq_size;
-        if (desired_rq < CC_RECV_QUEUE_SIZE) desired_rq = CC_RECV_QUEUE_SIZE;
+        if (desired_rq < CC_SERVER_RECV_QUEUE_SIZE) desired_rq = CC_SERVER_RECV_QUEUE_SIZE;
         result = doca_comch_server_set_recv_queue_size(objs->cc_server, desired_rq);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to set recv queue size (%u) with error = %s",

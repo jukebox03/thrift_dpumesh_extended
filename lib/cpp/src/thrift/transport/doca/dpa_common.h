@@ -69,7 +69,7 @@ struct dpa_thread_arg {
  * The DMA payload is the body itself — no in-band header.
  *   Forward path (Host→DPU): payload = body
  *   Reverse path (DPU→Host): payload = body
- * Per-request metadata (req_id / src_pod_id / dst_pod_id / flags / length)
+ * Per-request metadata (the oriented endpoint tuple: src/dst pod, port, service, seq + length)
  * is carried via comch_dma_comp_msg (and dma_desc on-DPU), keeping
  * reverse per-entry size = forward per-entry size = slot_size. That is
  * what makes num_slots × slot_size ≤ DPU_BUFFER_SIZE actually bound the
@@ -117,8 +117,9 @@ _Static_assert(sizeof(struct comch_dma_comp_msg) == 16,
                "comch_dma_comp_msg must be exactly 16 bytes (one WQE BB)");
 _Static_assert(offsetof(struct comch_dma_comp_msg, type) == 0,
                "comch_dma_comp_msg.type must be at offset 0 (recv-cb peeks raw[0])");
-/* src/dst_pod_id travel as int8 on the wire (dst==-1 is the echo sentinel), so
- * pod_id must fit in int8. Fail-fast if MAX_PODS ever outgrows that. */
+/* src/dst_pod_id travel as int8 on the wire (dst==-1 = DMESH_POD_BLANK, the
+ * unresolved-destination sentinel), so pod_id must fit in int8. Fail-fast if
+ * MAX_PODS ever outgrows that. */
 _Static_assert(MAX_PODS <= 127,
                "pod_id wire format is int8 in comch_dma_comp_msg; MAX_PODS must be <= 127");
 
@@ -188,7 +189,7 @@ struct dma_desc {
 	                                * and ignores this field. Reverse path: DPU sets
 	                                * it in dpu_enqueue_reverse_dma; DPA copies into
 	                                * comp.src_pod_id so the receiving host can
-	                                * route OP_REQUEST/RESPONSE correctly without
+	                                * capture the peer (src) and demux by dst_port without
 	                                * an in-payload sw_descriptor. */
 	uint8_t reserved[27];          /* 27B */
 	volatile uint8_t valid;        /* 1B */

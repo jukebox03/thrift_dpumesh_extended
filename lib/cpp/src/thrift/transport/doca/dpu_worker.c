@@ -64,7 +64,7 @@ send_or_defer_tx_ack(struct objects *objs, struct pod_state *src_pod,
 /* ====== Batched TX_ACK ====== */
 
 /* Flush a pod's accumulated TX_ACK batch as one message. On AGAIN the batch is
- * retained (retried by the next flush, including the 1 kHz tail flush). */
+ * retained (retried by the next flush, including the idle proc==0 flush). */
 static void
 flush_txack_batch(struct objects *objs, struct pod_state *pod)
 {
@@ -90,7 +90,7 @@ batch_or_send_tx_ack(struct objects *objs, struct pod_state *src_pod,
     }
     if (src_pod->txack_batch_n >= BATCH_TXACK_MAX) {
         /* Batch full and not yet drained (send pool busy) — single-send this one
-         * so no ack is lost; the full batch is retried by the tail flush. */
+         * so no ack is lost; the full batch is retried by the idle proc==0 flush. */
         send_or_defer_tx_ack(objs, src_pod, port, seq);
         return;
     }
@@ -106,7 +106,7 @@ batch_or_send_tx_ack(struct objects *objs, struct pod_state *src_pod,
  * 2-pod cap; coalescing K responses into one msg cuts the PE reap rate K-fold. */
 
 /* Flush a pod's accumulated REV_DONE batch as one message. On AGAIN the batch is
- * retained (retried by the next flush, including the proc==0 + 1 kHz tail flush). */
+ * retained (retried by the next flush, including the idle proc==0 flush). */
 static void
 flush_rev_done_batch(struct objects *objs, struct pod_state *pod)
 {
@@ -280,10 +280,13 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
         return -1;
     }
 
-    /* EU-sharding: round-robin the reverse DMA across target_pod's K rings so it
-     * is issued by K different EUs. Single ARM writer → rev_rr needs no lock. */
+    /* conn-sharding (reverse): shard by the DESTINATION conn's port so a conn's
+     * inbound stays FIFO on ONE EU (matches the forward src_port sharding → per-conn
+     * delivery order preserved). Different dst conns still spread across the K EUs.
+     * Single ARM writer → no lock. (dst_port==BLANK for a not-yet-established peer
+     * maps to ring 0; established traffic carries a real dst_port and spreads.) */
     int kr = target_pod->k_rings > 0 ? target_pod->k_rings : 1;
-    int ring_k = (int)(target_pod->rev_rr++ % (uint32_t)kr);
+    int ring_k = (int)((uint32_t)entry->dst_port % (uint32_t)kr);
 
     /* Reverse carries the full tuple (with the resolved dst_pod) so the dst host
      * demuxes by dst_port and captures the peer from src_*. No direction flag. */

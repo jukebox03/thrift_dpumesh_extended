@@ -2258,3 +2258,374 @@ Cross-pod NOT regressed by the added 3rd pod — warm ramp (8192B):
 NB: a COLD-JUMP straight to 220K right after the loopback test gave 168K + 507 fail
 — the known cold-jump wedge artifact, NOT a regression; the warm ramp above is 0-fail
 (reconfirms "always ramp, never cold-jump").
+
+---
+
+# 2026-06-30 — FIX: the ~2s p99/p999 spike (deferred item "D" register_pending 2s stall) — DONE
+
+## Symptom (user-reported, confirmed in this log)
+At/over the knee, p50 stays fine but **p99/p999 occasionally spikes to ~2 s** (still 0-fail).
+Documented here at: §1817 "first knee touch ~2 s p99", §2166 "first 200K shot … 2s-p999",
+§1772 "façade load-gen does not shed load gracefully under sustained overload
+(register_pending 2s collision-wait + enqueue busy-spin)", §1883 deferred "req_id 2s stall (D)".
+This is DISTINCT from the ~28-47ms saturation-knee queueing tail (that one is fine / ρ→1 physics).
+
+## Root cause (code-verified)
+`pending` is indexed by PORT alone (`dmesh_pidx = key>>16`). A conn/port's NEXT request
+(`register_pending`) cannot claim `pending[port]` until the PRIOR exchange clears to state -1,
+which requires that request's **TX_ACK (BATCH_FWD_ACK)** to free the held TX slot
+(state -3 harvested-awaiting-ack / -2 closed-awaiting-ack → -1). Under overload the TX_ACK is
+delayed (ARM send-pool deferral / batch-not-flushed / response REV_DONE overtakes the ack), so
+`register_pending` blocks on `pthread_cond_timedwait` up to its **2 s budget** (`dpumesh_doca.c:1039`).
+Stage-2 C3 (§1946) made the slot lifecycle leak-free but KEPT the 2 s as a backstop — i.e. the
+TX-slot custody and the entry-reuse were still coupled. THAT coupling is the spike.
+
+## Fix — decouple TX-slot custody from pending-entry reuse (host-only, dpumesh_doca.c)
+On response-harvest (`poll_response`), conn-close (`cancel_pending`), or server-reply-release
+(`pending_release_async`): if the request's TX_ACK has not freed its slot yet (tx_slot≥0), PARK the
+still-held slot in a small per-entry `drain[PENDING_DRAIN_MAX=16]` list (keyed by owner_key) and drop
+the entry to state -1 (reusable) IMMEDIATELY. The next request on that port no longer waits for the
+prior ack. The TX_ACK handler (`rx_data_hook` BATCH_FWD_ACK) now frees the slot from `drain[]` by
+owner_key match (swap-remove) when it is not the current exchange. Drain-list full (deep overload) →
+fall back to the old -2/-3 backstop (correctness preserved). `register_pending`'s 2 s dead-link reclaim
+and `cleanup_ctx` also free any parked `drain[]` slots. 7 edits, all in `dpumesh_doca.c`; ABI/DPU/DPA
+unchanged. Pure host-side; syntax-clean (real DOCA headers).
+
+## Measured (2026-06-30, fair 1-core/pod, 8192B, 10s, DPA=4 K=2, baked config) — ALL the 2 s gone
+Warm ramp (single shots):
+| target | achieved | p50 | p99 | p999 | ok/fail |
+|---|---|---|---|---|---|
+| 30K  | 29,837  | 163µs | 479µs  | 3.83ms | 300000/0 |
+| 100K | 99,447  | 209µs | 9.26ms*| 13.1ms | 1.0M/0 | (*warming transient; rechecked 100K×2 → p99 391/371µs) |
+| 150K | 149,175 | 234µs | 336µs  | 10.7ms | 1.5M/0 |
+| 200K | 198,912 | 292µs | 5.43ms | 17.2ms | 2.0M/0 |
+| 220K | 218,790 | 312µs | 4.27ms | 9.86ms | 2.2M/0 |
+
+200K ×5 (scale_log's exact "2s-p999" condition — warm, near-knee):
+p50 = 275/284/292/292/278µs (rock-stable); **p99 = 30.2/32.5/20.8/14.6/23.6ms; p999 = 44.5/46.8/35.5/33.5/43.1ms; all 0-fail.**
+→ mean p99 ~24ms = the SAME knee-queueing tail as the pre-fix 5-run (§1296: 0.6–36ms) — but with **NO 2 s outlier**.
+
+Over-knee 2s-catch — 220K ×5: p999 = 2.14/11.77/10.20/6.05/2.58ms (all 0-fail). 230K ×3 (past sustainable, was the 2s-stall zone): 0-fail, p999 ≤ 10.4ms.
+
+Overload shed: **250K → 248,590 achieved, p99 28.6ms, p999 49.5ms, 534/2.5M fail (0.02%)** — graceful
+(bounded ms tail + tiny timeout shed), vs the pre-fix collapse pattern (seconds-scale tails). 
+
+Leak: 150K ×3 back-to-back = 149,163/149,164/149,165 (0-fail, p99 improves as it warms) + 30K recovery
+0-fail; AND 30K/150K recovery AFTER the 250K overload (exercises the fail→cancel→drain[] path) = 0-fail
+→ **no slot leak** (incl. the fail path). Loopback (self-routing) 50000/50000 0-fail, p50 117µs → demux intact.
+
+## Verdict
+Across ~30 runs (30K→250K incl. heavy overload), **MAX p999 anywhere = 49.5ms (250K deep overload); ZERO
+runs hit the 2 s spike.** Deferred item "D" (register_pending 2 s stall) is RESOLVED. p50/throughput/leak-
+safety all unchanged; the residual p99/p999 at the knee is the (acceptable) ρ→1 queueing tail. The TX_ACK
+batching is NOT itself removed — the decouple makes its delay irrelevant to conn-reuse latency (keeps the
+batch's core-efficiency). A global drain pool (vs per-entry cap 16) is a possible follow-up only if a future
+workload overflows `drain[]` under extreme skew (then it degrades to the old -3 backstop, not a hang).
+
+---
+
+# 2026-06-30 — "out-of-nowhere / non-monotonic" p99/p999 tail diagnosis (NOT the 2s; NOT a bug)
+
+## Question
+Warm-ramp single shots showed a NON-monotonic tail: 100K p99=9.26ms but 150K p99=336µs (lower!),
+200K p99=5.43ms. Why does the tail jump "out of nowhere", not tracking load? (p50 is always ~200µs —
+this is purely a TAIL phenomenon.) Diagnosed by DIRECT experiment, not elimination.
+
+## H1 — the big p99 spike = per-run COLD-START (each 10s burst starts from idle/parked EUs)
+@100K, short (dur=10) ×5 vs long (dur=60) ×3 (fair 1-core, 8192B):
+| run | dur=10 p99 | dur=10 p999 | dur=60 p99 | dur=60 p999 |
+|---|---|---|---|---|
+| 1 | 269.6µs | 1972µs | 322.5µs | 4886µs |
+| 2 | 271.7µs | 9894µs | 279.7µs | 3450µs |
+| 3 | 264.2µs | 538µs  | 311.4µs | 9813µs |
+| 4 | 265.3µs | 2163µs | — | — |
+| 5 | **9300µs** | 10205µs | — | — |
+p50 ~208µs, all 0-fail. → the 9ms p99 hits ~1-in-5 SHORT runs and is GONE in long runs (60s p99 ~300µs):
+the first ~1s of each burst pays park-wake (~1ms keepalive) + pipeline-fill, coordinated-omission-amplified.
+**Cold-start is a measurement artifact of bursty 10s-from-idle sampling; in sustained load it happens once.**
+
+## H2 — the persistent p999 ms-tail = HOST single-core scheduling contention (DECISIVE)
+p999 stays ms-scale even in 60s runs (3.5-9.8ms) → not just cold-start; a recurring ~0.1% micro-stall.
+Core-count sweep (dur=30), p999 monotonically collapses with more host cores while p50 is unaffected:
+| load | fair (1 core) | hw (2 cores) | hw6 (6 cores) |
+|---|---|---|---|
+| 100K p999 | 8.9 / 9.97 ms | 2.06 / 3.00 ms | **1.03 / 1.25 ms** |
+| 100K p50  | 207 / 209µs | 193 / 196µs | 194 / 194µs |
+| 150K p999 | **14.6 / 34.1 ms** | 1.63 / 2.80 ms | — |
+| 150K p50  | 233 / 232µs | 232 / 224µs | — |
+→ In fair mode the transport's **host PE-progress thread (delivers DPU completions) shares core 0 with the
+4 async generators**; sporadic OS preemption of the PE thread delays a batch of in-flight completions →
+coordinated-omission renders it as a p99/p999 cluster. Random preemption timing → p999 swings 0.5–34ms
+run-to-run = the "out-of-nowhere / non-monotonic" tail. More cores remove the contention (9→2.5→1.1ms). p50 never moves.
+
+## Floor + the non-monotonicity explained
+hw6 floors at p999 ~1.1ms ≈ the **1ms keepalive period** (sporadic reverse-pickup wait; matches E5
+"988µs@50K ≈ 1 keepalive") — fundamental, small. The original table's "100K(9ms) > 150K(336µs)" was just
+run-to-run luck: 150K fair actually has a LARGER tail (15-34ms) than 100K — that single 150K shot drew a
+low sample. Each single 10s run draws a random tail from a wide contention+cold-start distribution.
+
+## Verdict — tail decomposition (NOT a transport bug)
+p50 ~200µs always (contention-immune) + cold-start (short-run p99 spike; 1-time under sustained load) +
+**HOST 1-core scheduling contention (dominant p999 1-34ms, gone with more cores)** + ~1ms keepalive floor +
+ρ→1 knee queueing (200K+ only). fair 1-core is the deliberate Istio-apples-to-apples setup; a real deployment
+with spare cores tails at ~1-2ms (hw-like). Levers (1-core): PE-thread sched priority/isolation (SCHED_FIFO /
+dedicated core), lighter PE per-completion work, sustained/long measurement, higher keepalive freq (≈1ms floor
+only). NB the decouple's per-harvest cond_broadcast (app-thread, no waiter in correct use) is a removable minor
+leanness item — not the cause. NOT re-attributable to the 2026-06-30 pending-decouple fix (the core sweep is
+mechanism-independent of the pending table).
+
+---
+
+# 2026-06-30 — Connection FIN (graceful close) — implementation + reliability test
+
+## What & why
+The connection model had NO teardown signal: `dmesh_close` freed only the LOCAL slot, so a
+server's accepted conn slot (+ per-conn eventfd) was never reclaimed → slots/eventfds accumulated
+**across runs** (latent port-space exhaustion + epoll bloat). Added a FIN so `dmesh_close` tells the
+peer to reclaim its slot. Goal of this test: prove reclaim works + stays perf-neutral.
+
+## Design (chosen: option (i) — FIN rides the data path, metadata-only)
+- **FIN = a zero-length message** (`body_len==0`) addressed to the established peer. A user 0-length
+  send is now a no-op, so `0` on the wire is unambiguously the FIN.
+- **Rides the same conn-shard ring as data** (`src_port % K`) → arrives AFTER all prior data (FIFO).
+- **No body DMA needed**: the host "arrival" signal is already the DPU ARM's REV_DONE *comch* message
+  (decoupled from the body DMA), so a FIN propagates as REV_DONE(length=0) — zero bytes moved. The DPU
+  stays **FIN-agnostic** (length 0 flows through `process_forward_entry` unchanged).
+- **Device change (only one):** `dpa_kernel.c` fwd+rev — `if (chunk==0) chunk=128` so a size-0 transfer
+  issues one safe min-128B DMA (the copied bytes are ignored at length 0) instead of a 0-byte descriptor
+  the DMA engine might reject. `comp.length` still 0 → receiver reads EOF.
+- **Delivery (BSD-faithful):** server PE inbox_push'es the 0-length desc → `dmesh_read` returns 0 (EOF,
+  sticky) → app `dmesh_close`s → slot freed, eventfd recycled, conn fd removed from epoll.
+- **Concurrent / stale FIN = silent drop, no extra logic:** a FIN landing on an already-freed slot hits
+  the existing `role==FREE → rx_reclaim` path. Port allocation round-robins the full 64K space, so a
+  freed port isn't reused for ~65K allocs → no peer-identity check needed (kept maximally simple).
+- Touch: `dpa_kernel.c` (2 lines, device), `dpm.h` (close sends FIN, read=EOF, empty-flush no-op),
+  `echo_sock.c` (EOF → epoll DEL + close). `dpu_worker.c` unchanged. bench client already closes conns.
+
+## RESULT 1 — reclaim works (DECISIVE, direct probe)
+Probe = count of per-conn eventfds held by the echo process (`/proc/1/fd`, in-container). With reclaim
+the freed eventfds return to the pool and the NEXT run REUSES them (count flat = high-water-mark of
+concurrent conns); WITHOUT reclaim each run allocates fresh fds (count grows by ~conns/run).
+
+| sequence (no redeploy) | conns/run | echo eventfds after each run | fail |
+|---|---|---|---|
+| 30K × 3 back-to-back  | 300  | 303 → 303 → 303 (FLAT)        | 0/0/0 |
+| 100K × 3 back-to-back | 1000 | 1003 → 1003 → 1003 (FLAT)     | 0/0/0 |
+| 100K / 60s sustained  | 1000 | 1003 (flat, 6M msgs)          | 0 / 6,000,000 |
+
+Flat across runs ⇒ every run's conns are reclaimed by FIN. (Pre-FIN this would be 303→606→909 …)
+
+## RESULT 2 — perf-neutral (warm ramp, fair 1-core, 8192B)
+| RPS  | achieved | p50 | p99 | fail | note |
+|---|---|---|---|---|---|
+| 30K  | 29.9K | 165µs | — | 0 / 450K | |
+| 60K  | 59.8K | 166µs | 481µs | 0 / 1.2M | |
+| 100K | 99.9K | **207µs** | 530µs | **0 / 6.0M** (60s) | = baseline p50 (perf-neutral) |
+p50 ~207µs at 100K is identical to the pre-FIN baseline → the FIN is free on the steady-state data path
+(it only fires at close). p999 ~10ms @100K is the documented 1-core PE-contention tail (see 06-30 entry),
+not FIN.
+
+## RESULT 3 — host CPU at 100K (1 core = 100%); the per-conn-fd tax, MEASURED
+35s sample mid-run, sustained 100K, ~1000 conns:
+| proc  | %usr | %sys | total | reading |
+|---|---|---|---|---|
+| echo  | ~10% | **~30%** | ~40% | **sys 3× usr** — one eventfd read per message (per-conn-fd) |
+| bench | ~20% | ~10% | ~30% | gen-bound |
+The echo is **syscall-dominated** (30% sys of 40% total) — confirms the per-conn-fd readiness model
+costs ~1 `read(eventfd)` per message under single-outstanding load. This is the headroom a single-
+channel-eventfd + ready-list would reclaim (1 syscall per *batch*, not per message). → next work item.
+
+## RESULT 4 — per-conn-fd CEILING (the known limit, independent of FIN)
+| RPS  | achieved | fail | state |
+|---|---|---|---|
+| 100K | 99.9K | 0 | clean |
+| 120K | 102K  | 190  (0.011%) | marginal, recovers |
+| 130K | 129K  | 290  (0.015%) | marginal, recovers |
+| 150K | 135K  | 1470 (0.05%)  | marginal, recovers |
+| 200K | —     | — | **bench daemon WEDGES** (no DONE; needs redeploy) |
+Clean (true 0-fail) ceiling ≈ **100K** on the per-conn-fd connection model vs the RPC-façade baseline's
+200K — roughly half, the cost being the echo's per-message eventfd syscalls (Result 3). At 200K (2000
+conns) the 1-core echo cannot service the per-conn-fd syscall rate → conns stall → bench workers block →
+hard wedge. NOT a FIN regression (pre-existing; reproduced the summary's "collapse at 100K+"). This is
+exactly the per-conn-fd → ready-list redesign queued as the next item.
+
+## DPU usage
+Config (baked, from deploy): DPA EU threads=4, rings_per_pod=2 (K=2), event_loop=1. Live DPU-ARM CPU
+sampling needs `dpu_sudo` ssh (out of the sanctioned host path); prior measurement has the ARM control
+plane at ~2.8% of RTT (not the bottleneck — the bottleneck here is the host echo's per-conn-fd syscalls).
+
+## Verdict
+FIN is **correct, reclaim-proven, and perf-neutral** at the connection model's clean operating point
+(≤100K, 0-fail, p50 207µs). It removes the cross-run slot/eventfd leak with ~one device line + host-only
+logic; concurrent close is handled by the existing free-slot drop. The per-conn-fd throughput ceiling
+(~100K clean, 200K wedge) is a SEPARATE, pre-existing limit — the motivation for the per-conn-fd →
+single-eventfd + ready-list review (Result 3 gives the CPU evidence: echo is 75% sys at 100K).
+
+---
+
+# 2026-06-30 — Single channel-eventfd + PE-published READY LIST (replaces per-conn fd)
+
+## What & why
+The per-conn-fd readiness model (one eventfd per conn) cost ~1 `read(eventfd)` syscall
+PER MESSAGE under the single-outstanding bench → echo was syscall-bound (30% %sys @100K)
+and **collapsed above ~100K** (150K 0.05% fail, 200K hard-wedged the bench daemon). Moved
+to the OLD façade's shape — **ONE channel eventfd** — but solved its "which conn is ready?"
+scan problem with a **PE-published ready list**: the PE already knows which conn it
+delivered to, so it pushes that conn's port to a lock-free SPSC ring the instant the conn's
+inbox goes empty→non-empty; the app drains the ring via `dmesh_next_ready()` (no scan, no
+per-conn fd). Re-arm is the inbox 0→1 edge + the app draining each ready conn to EAGAIN
+(EPOLLET contract) — no `in_ready` flag needed. `dmesh_next_ready` returns the SAME conn
+handle (slot stores a `user` back-pointer set before role is published); the app attaches
+its own context via `conn->user_data` (epoll `data.ptr` analog). Host-only change
+(dpumesh_doca.c + dpumesh.h + dpm.h + echo_sock.c); DPU/DPA untouched.
+
+## RESULT 1 — the per-conn-fd CEILING COLLAPSE is GONE (decisive)
+fair 1-core, 8192B, warm ramp:
+| RPS  | per-conn-fd (prev) | ready-list (now) |
+|---|---|---|
+| 100K | 0 fail | 0 fail, p50 207µs |
+| 130K | 290 fail (0.011%) | **0 fail**, p50 222µs |
+| 150K | 1470 fail (0.05%) | **0 fail**, p50 232µs (60s: 0/9,000,000) |
+| 200K | **HARD WEDGE** (no DONE; redeploy) | **0 fail, 199.4K**, p50 288µs, p99 30.9ms |
+| 250K | (n/a) | 249.3K, 669 fail (0.018% — ρ→1 overload knee), NO wedge |
+Clean (0-fail) ceiling: **~100K → ~200K (2×)**; reaches ~249K at the op-rate wall (~257K)
+with only overload-knee fails. The 200K wedge is eliminated. 200K p50=288µs / p99=30.9ms is
+the near-ceiling queueing tail, not a failure (achieved = target).
+
+## RESULT 2 — echo is LEANER (per-message syscall removed), same load
+| load | model | echo %usr | echo %sys | echo total |
+|---|---|---|---|---|
+| 100K | per-conn-fd | 10% | **30%** | 40% |
+| 100K | ready-list  | 10% | **20%** | **30%** |
+| 150K | ready-list  | 20% | 20% | 40% |
+At 100K the ready-list cuts echo %sys 30→20 and total 40→30: one `read(eventfd)` per epoll
+WAKE (amortized over all ready conns) instead of per message. At 150K — a load per-conn-fd
+could not sustain at all — the ready-list echo still fits in 40% of one core. (CPU sampled
+from /proc ticks over 30-35s; ~10% granularity, so read these as directional.)
+
+## RESULT 3 — cross-run stability (no leak/degradation)
+150K × 3 back-to-back, no redeploy: 149.41K / 149.41K / 149.41K, all 0 / 2,250,000. Flat
+throughput, zero fails → FIN reclaim + ready-list both stable across runs. (Per-conn eventfds
+are gone, so the prior eventfd-count leak probe no longer applies; FIN slot-reclaim is
+mechanically unchanged from its proven version — free_port still releases the slot.)
+
+## Mechanics that make it correct
+- **No lost wakeup without an in_ready flag:** a conn is enqueued only on its inbox 0→1 edge;
+  the app drains each ready conn to EAGAIN (inbox→0), so the next arrival is again a 0→1 edge
+  → re-enqueued. A push the app's final read misses (arrives after inbox hit 0) is a fresh
+  0→1 → enqueued. Each live conn sits in the ring at most once between drains → ring sized to
+  the port space never overflows.
+- **`dmesh_next_ready` returns your conn, not a new one:** the slot's `user` back-pointer is
+  set BEFORE role is published, so the PE never enqueues a port whose handle is NULL; a
+  ready-list entry for a since-closed conn (role==FREE) is skipped (round-robin port reuse
+  makes a realloc-collision astronomically distant).
+- **Busy-poll clients unaffected:** ready-list maintenance is gated on `notify_enabled` (set
+  by `dmesh_event_fd`); the bench busy-polls its own conns[] (notify off) → no ready-list work.
+
+## Verdict
+The ready list recovers the single-eventfd efficiency (≈ the old façade's 240K-class numbers)
+WITHOUT the per-conn scan and WITHOUT per-conn fds — clean ceiling doubles to ~200K, the 200K
+wedge is gone, and echo drops a syscall per message. This is the resolution of the per-conn-fd
+limit flagged in the FIN entry above.
+
+---
+
+# 2026-06-30 — Bench scenario coverage (reuse / one-way / loopback / pipeline) + high-load fail analysis
+
+Added per-RUN observability to bench_sock.c (stderr DONE line): `connects` (vs ok → reuse
+factor) and a fail breakdown (`timeout` / `reset-eof` / `bad`). Added a pipelined mode
+(mode=2, `dpumesh-pipeline`, `BENCH_PIPELINE` depth). fair 1-core, 8192B.
+
+## Scenario results
+| scenario | command | result | connects→reuse | note |
+|---|---|---|---|---|
+| **conn reuse** (default rpc) | `dpumesh 100K/15` | 0 / 1,500,000, p50 199.8µs | 1000 → **1500×** | conns ARE reused (one per slot, ~1500 req each) |
+| **one-way** (fire-and-forget) | `dpumesh-oneway 6K/15` | 0 / 90,000, p50 34.4µs | 90000 → **1.0×** | a fresh conn per message (by design); capacity ~6-8K (connect-churn bound) |
+| **loopback** (self-service) | `loopback 50000` | **0 / 50,000** (was 25000/25000) | — | fixed: persistent busy-poll echo |
+| **pipeline** depth=8 (multi-slot read) | `dpumesh-pipeline 100K/15` | 0 / 1,500,000, p50 **189.9µs** | 1000 → 1500× | content+ordering verified; p50 < single-outstanding (pipelining hides latency) |
+
+## Two bugs found + fixed by this coverage
+1. **Loopback was 50% fail.** `loopback_sock.c` echo closed the server conn after EACH request
+   (old style). With the new FIN, the client (which REUSES one conn) got the echo's FIN as EOF
+   on its next read → counted as a bad reply → fail+reconnect → exactly half failed. **Fix:**
+   persistent echo that keeps its accepted conns and busy-polls them (drain to EAGAIN, echo
+   every message, close only on the client's EOF). NB it busy-polls (no dmesh_next_ready):
+   this process is both client and server on ONE channel, and the ready list is single-consumer
+   — using next_ready in the echo thread would pop the CLIENT thread's reply conns and steal
+   their replies. (Design rule: a both-client-and-server process needs ONE event loop, or
+   busy-poll disjoint conn sets per thread, which is what the bench workers already do.)
+2. **Pipelining before establishment floods the accept queue (wedge).** First version of the
+   pipelined worker sent P messages before reading any — but a client conn only learns its peer
+   (establishes) when it READS the first reply, so all P shipped with `dst_pod=BLANK`, each
+   landing as a NEW accept on the server → accept-queue flood + orphan conns → the whole system
+   wedged (all subsequent runs 0-ok/all-timeout until redeploy). **Fix:** hold pipeline depth at
+   1 until `c->established`, then ramp to P. **General constraint: establish (1 RTT) before
+   pipelining.** (Now documented in api.md.)
+
+## High-load fails — WHY (point 3): offered > op-rate ceiling, NOT a buffer shortage
+| offered | achieved | p50 | fails (breakdown) |
+|---|---|---|---|
+| 200K | 199.4K | 288µs | **0** |
+| 250K | 249.1K | 1.8ms | 0 (knee; run-to-run 0–0.02%) |
+| 300K | **257.7K** | **1.27 s** | 1034 = **bad/drops** (timeout 0, reset 0) |
+- The **achieved RPS caps at ~257K regardless of offered** (300K offered → 257.7K served) = the
+  DPA op-rate wall, NOT a buffer limit. Below it (≤200K) = 0 fail.
+- Above it the offered-minus-served backlog queues unboundedly → **p50 explodes to seconds**
+  (coordinated omission) and, at heavy overload, the host RX ring / per-conn inbox overflows →
+  messages **dropped** → the client reads a later reply → **content-mismatch ("bad")** fail
+  (then it reconnects and resyncs, so drops are isolated, not a cascade). At the milder knee
+  (250K) the symptom is instead occasional 5 s **timeouts**.
+- **Would a bigger buffer fix it? NO.** (a) Host NUM_SLOTS is already at the max compatible with
+  the 32 MB DPU buffer (4096 × 8 KB; raising it breaks the admission invariant). (b) More
+  fundamentally, a deeper buffer cannot raise the 257K ceiling — at sustained offered > capacity
+  the queue is unbounded (Little's law), so a bigger buffer only TRADES drop-fails for worse
+  latency / eventual timeout-fails. The real fixes are **more throughput** (more EUs/DPUs/host
+  cores to lift the ~257K wall) or **admission control** (don't offer > ~250K per pair).
+
+## All raw per-run measurements (this session, fair 1-core, 8192B unless noted)
+Every run, in order, including the diagnostic / broken / recovery runs. Format from the bench
+OK reply (`achieved p50 p99 p999 ok fail mb_s`) + the stderr breakdown (`connects → reuse;
+timeout/reset/bad`). "—" = counter not present yet (measured before the observability deploy).
+
+**conn reuse (default async / rpc, mode=0):**
+| run | achieved | p50 | p99 | p999 | ok / fail | connects → reuse | breakdown |
+|---|---|---|---|---|---|---|---|
+| 100K/15 | 99599.6 | 199.8µs | 9368µs | 13754µs | 1,500,000 / 0 | 1000 → **1500×** | t0 r0 b0 |
+
+**one-way (mode=1, connect→write→close per message):**
+| run | achieved | p50 | ok / fail | connects → reuse | note |
+|---|---|---|---|---|---|
+| 60K/15 (over-offered) | 7920.8 | 1,304,446µs (1.3s) | 158,106 / 0 | — | offered 60K ≫ capacity → backlog; 0-fail |
+| 6K/15 (≈capacity) | 5822.8 | 34.4µs | 90,000 / 0 | 90000 → **1.0×** | per-message connect; real latency, t0 r0 b0 |
+
+**loopback (self-service pod12, N round-trips, RUN N size):**
+| run | ok / fail | served | p50 | note |
+|---|---|---|---|---|
+| 50000 (BEFORE fix) | 25,000 / 25,000 | 25,000 | 114.9µs | echo closed per-request + client reuse + FIN → every 2nd read = EOF → 50% fail |
+| 50000 (AFTER fix) | **50,000 / 0** | 50,000 | 115.3µs | persistent busy-poll echo |
+
+**pipeline depth=8 (mode=2, multi-slot read):**
+| run | achieved | p50 | ok / fail | connects → reuse | breakdown | note |
+|---|---|---|---|---|---|---|
+| 100K/15 (BROKEN, pre-fix) | 0.0 | — | 0 / 24,000 | 4000 → 0× | **timeout=24000** | sent 8 BLANK before establish → accept-queue flood |
+| → collateral 30K async | 0.0 | — | 0 / 600 | 900 → 0× | timeout=600 | system WEDGED (orphan conns); needed redeploy |
+| → collateral 250K async | 0.0 | — | 0 / 7,500 | 10000 → 0× | timeout=7500 | also wedged |
+| 100K/15 (FIXED, post depth-gate) | 99620.8 | **189.9µs** | **1,500,000 / 0** | 1000 → 1500× | t0 r0 b0 | p50 < single-outstanding (199.8µs); content+order verified |
+
+**high-load async (mode=0), the op-rate ceiling:**
+| run | achieved | p50 | p99 | ok / fail | connects → reuse | breakdown |
+|---|---|---|---|---|---|---|
+| 200K/20 | 199,400 | 288µs | 30,856µs | 4,000,000 / 0 | — | (ready-list section) |
+| 250K/15 | 249,052 | 1,829µs | — | 3,750,000 / 0 | 2500 → 1500× | t0 r0 b0 (knee; an earlier 250K run drew 669 fail — run-to-run) |
+| 300K/15 | **257,675** | **1,267,037µs (1.27s)** | 2,363,858µs | 4,498,966 / 1,034 | 4034 → 1115× | **bad=1034** (drops), timeout 0, reset 0 |
+
+**recovery confirmations (system left clean):**
+| after | run | achieved | ok / fail | connects → reuse |
+|---|---|---|---|---|
+| pipeline-wedge → redeploy + warm | 30K/8 | 29799.6 | 240,000 / 0 | — |
+| 300K overload | 30K/8 | 29798.3 | 240,000 / 0 | 279 → 860× |
+
+Reading the breakdown: reuse ≫ 1 ⇒ conns reused (rpc/pipeline ~1500×); reuse = 1 ⇒ per-message
+connect (one-way). fail kind: **timeout** = no reply in 5 s (knee / wedge); **bad** = drop →
+content-mismatch (overload ring overflow); **reset/eof** = peer closed mid-stream. Achieved RPS
+flat at ~257K across 250–300K offered = the DPA op-rate wall.

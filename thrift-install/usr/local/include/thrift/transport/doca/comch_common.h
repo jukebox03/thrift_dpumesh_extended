@@ -24,13 +24,13 @@ enum dmesh_msg_type {
     DMESH_MSG_INVALID      = 0, /* reserved: zeroed buffer is never a live type */
     DMESH_MSG_POD_REGISTER = 1, /* Host→DPU: register this connection's pod_id */
     DMESH_MSG_MMAP_EXPORT  = 2, /* Host→DPU: export an mmap region (ring / TX buf / RX buf) */
-    DMESH_MSG_BATCH_FWD_ACK= 3, /* DPU→Host: batch of req_ids whose forward DMA is done — free all */
+    DMESH_MSG_BATCH_FWD_ACK= 3, /* DPU→Host: batch of (port,seq) keys whose forward DMA is done — free all */
     DMESH_MSG_BATCH_REV_DONE=4, /* DPU→Host: batch of reverse-DMA completions — deliver all */
 };
 
 /* DPU→Host: batched TX_ACK. Coalesces up to BATCH_TXACK_MAX per-request
  * FWD_ACKs into one comch message so the host PE thread processes 1 message
- * instead of K. Flushed when full or on a periodic tail-flush. */
+ * instead of K. Flushed when full or on the idle (drain-empty) flush. */
 #define BATCH_TXACK_MAX 14
 /* DPU->Host TX_ACK frees the SENDER's TX slot. Keyed by the SOURCE endpoint
  * (port,seq) of the acked forward leg. The port's range (client-ephemeral vs
