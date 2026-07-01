@@ -25,6 +25,8 @@ int setup_dma_ring(struct objects *objs, size_t size, struct dma_ring **out_ring
     ring->size = size;          /* logical ring size (host wraps at this) */
     ring->head = 0;
     ring->descs = NULL;
+    ring->busy_head = 0xFFFFFFFFu;
+    ring->busy_probes = 0;
 
     /* Allocate one EXTRA slot. Slots 0..size-1 are normal dma_desc entries;
      * slot `size` holds the RX credit counter. Host atomically bumps its first
@@ -72,6 +74,8 @@ int setup_dpu_tx_ring(struct doca_dev *dev, size_t size,
     ring->size = size;
     ring->head = 0;
     ring->descs = NULL;
+    ring->busy_head = 0xFFFFFFFFu;
+    ring->busy_probes = 0;
 
     result = alloc_buffer_and_set_mmap(&ring->mmap, dev,
                            (void **)&ring->descs,
@@ -97,17 +101,15 @@ struct dma_desc *get_next_dma_desc(struct dma_ring *ring)
 
     if (desc->valid) {
         /* Reset the probe counter whenever head moves, so a climbing count
-         * tracks a single stuck head. */
-        static uint32_t busy_head = 0xFFFFFFFFu;
-        static uint64_t busy_probes = 0;
-        if (ring->head != busy_head) {
-            busy_head = ring->head;
-            busy_probes = 0;
+         * tracks a single stuck head. Per-ring state (see struct dma_ring). */
+        if (ring->head != ring->busy_head) {
+            ring->busy_head = ring->head;
+            ring->busy_probes = 0;
         }
-        if ((busy_probes++ & (RING_BUSY_LOG_EVERY - 1)) == 0)
+        if ((ring->busy_probes++ & (RING_BUSY_LOG_EVERY - 1)) == 0)
             DOCA_LOG_WARN("DMA ring busy at head=%u (size=%u) [stuck x%llu]",
                           ring->head, ring->size,
-                          (unsigned long long)busy_probes);
+                          (unsigned long long)ring->busy_probes);
         return NULL;
     }
 

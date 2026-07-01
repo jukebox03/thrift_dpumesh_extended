@@ -208,6 +208,127 @@ static inline int pod_data_ready(const struct pod_state *pod) {
     return __atomic_load_n(&pod->dma_ready, __ATOMIC_ACQUIRE);
 }
 
+/* ===================================================================
+ * DPU connection tracking (model B: the DPU owns every connection)
+ * ===================================================================
+ * A client addresses a SERVICE (dst_pod=BLANK); the DPU picks a backend per
+ * message and owns the "upstream" connection to it. Each upstream gets a
+ * DPU-assigned id `up_port` from [DMESH_UPORT_BASE, 65535]; host client conns
+ * use [1, DMESH_UPORT_BASE), so a host that is BOTH client and backend
+ * (loopback) never collides in its own ports[] table.
+ *
+ * Toward the backend the DPU rewrites the tuple to src=(client_pod, up_port),
+ * dst_port=up_port, so the backend sees the DPU id (not the real client) and
+ * replies to it. The reply returns to the DPU (which forwards everything), maps
+ * up_port -> (client_pod, client_port) and rewrites dst_port back to the client's
+ * real port. The client's TX_ACK is likewise translated up_port -> client_port
+ * so the client frees the right slot. (DMESH_UPORT_BASE is defined in the shared
+ * dpumesh_common.h so the host side sees the same split.) */
+
+struct dpu_upstream {
+    int      in_use;
+    int32_t  client_pod;
+    uint16_t client_port;   /* the downstream client's REAL port */
+    int32_t  backend_pod;
+};
+
+/* Reuse lookup: (client_pod, client_port, backend_pod) -> up_port, so a
+ * downstream reuses one upstream to a backend instead of creating a new one
+ * (and a fresh backend accept) per message. Open-addressed, linear probe. */
+#define DPU_CONN_HT_SIZE 131072u   /* power of two, >> max concurrent upstreams */
+struct dpu_conn_ht_entry {
+    int      in_use;
+    int32_t  client_pod;
+    uint16_t client_port;
+    int32_t  backend_pod;
+    uint16_t up_port;
+};
+
+struct dpu_conntrack {
+    struct dpu_upstream      upstream[65536];      /* by up_port (only [BASE,65535) live) */
+    struct dpu_conn_ht_entry ht[DPU_CONN_HT_SIZE]; /* reuse lookup */
+    uint32_t next_uport;                           /* round-robin cursor */
+};
+
+static inline uint32_t dpu_ct_hash(int32_t cp, uint16_t cport, int32_t bpod) {
+    uint32_t h = (uint32_t)cp * 2654435761u;
+    h ^= (uint32_t)cport * 40503u;
+    h ^= (uint32_t)bpod * 2246822519u;
+    return h & (DPU_CONN_HT_SIZE - 1u);
+}
+
+/* Return an existing up_port for (cp,cport,bpod), or 0 if none. */
+static inline uint16_t dpu_upstream_find(struct dpu_conntrack *ct, int32_t cp,
+                                         uint16_t cport, int32_t bpod) {
+    uint32_t mask = DPU_CONN_HT_SIZE - 1u, i = dpu_ct_hash(cp, cport, bpod);
+    for (uint32_t n = 0; n < DPU_CONN_HT_SIZE; n++) {
+        struct dpu_conn_ht_entry *e = &ct->ht[(i + n) & mask];
+        if (!e->in_use) return 0;
+        if (e->client_pod == cp && e->client_port == cport && e->backend_pod == bpod)
+            return e->up_port;
+    }
+    return 0;
+}
+
+/* Allocate a new up_port for (cp,cport,bpod) and index it. Returns 0 if the
+ * upstream id space [BASE,65535) is exhausted. */
+static inline uint16_t dpu_upstream_create(struct dpu_conntrack *ct, int32_t cp,
+                                           uint16_t cport, int32_t bpod) {
+    uint32_t span = 65536u - DMESH_UPORT_BASE;
+    uint16_t uP = 0;
+    for (uint32_t k = 0; k < span; k++) {
+        uint32_t p = DMESH_UPORT_BASE + ((ct->next_uport - DMESH_UPORT_BASE + k) % span);
+        if (!ct->upstream[p].in_use) { uP = (uint16_t)p; break; }
+    }
+    if (uP == 0) return 0;
+    ct->next_uport = (uP + 1u >= 65536u) ? DMESH_UPORT_BASE : (uint32_t)(uP + 1u);
+    ct->upstream[uP].in_use      = 1;
+    ct->upstream[uP].client_pod  = cp;
+    ct->upstream[uP].client_port = cport;
+    ct->upstream[uP].backend_pod = bpod;
+    uint32_t mask = DPU_CONN_HT_SIZE - 1u, i = dpu_ct_hash(cp, cport, bpod);
+    for (uint32_t n = 0; n < DPU_CONN_HT_SIZE; n++) {
+        struct dpu_conn_ht_entry *e = &ct->ht[(i + n) & mask];
+        if (!e->in_use) {
+            e->in_use = 1; e->client_pod = cp; e->client_port = cport;
+            e->backend_pod = bpod; e->up_port = uP;
+            break;
+        }
+    }
+    return uP;
+}
+
+/* Free an upstream (on close/FIN): clear the slot + remove its reuse entry
+ * (backward-shift so the linear-probe chain stays intact — no tombstones). */
+static inline void dpu_upstream_free(struct dpu_conntrack *ct, uint16_t uP) {
+    if (uP < DMESH_UPORT_BASE || !ct->upstream[uP].in_use) return;
+    int32_t  cp    = ct->upstream[uP].client_pod;
+    uint16_t cport = ct->upstream[uP].client_port;
+    int32_t  bpod  = ct->upstream[uP].backend_pod;
+    ct->upstream[uP].in_use = 0;
+
+    uint32_t mask = DPU_CONN_HT_SIZE - 1u, i = dpu_ct_hash(cp, cport, bpod);
+    uint32_t idx = UINT32_MAX;
+    for (uint32_t n = 0; n < DPU_CONN_HT_SIZE; n++) {
+        uint32_t p = (i + n) & mask;
+        if (!ct->ht[p].in_use) break;
+        if (ct->ht[p].client_pod == cp && ct->ht[p].client_port == cport &&
+            ct->ht[p].backend_pod == bpod) { idx = p; break; }
+    }
+    if (idx == UINT32_MAX) return;
+    uint32_t hole = idx, p = (idx + 1u) & mask;
+    while (ct->ht[p].in_use) {
+        uint32_t home = dpu_ct_hash(ct->ht[p].client_pod, ct->ht[p].client_port,
+                                    ct->ht[p].backend_pod);
+        if (((p - home) & mask) >= ((p - hole) & mask)) {
+            ct->ht[hole] = ct->ht[p];
+            hole = p;
+        }
+        p = (p + 1u) & mask;
+    }
+    ct->ht[hole].in_use = 0;
+}
+
 struct objects {
     struct doca_dev *dev;
     struct doca_dev_rep *rep_dev;
@@ -246,6 +367,10 @@ struct objects {
     struct dmesh_doca_dpa_comch  *dpa_comches[MAX_DPA_RINGS];
     int num_dpa_threads;                                    /* N */
     int k_rings;                            /* K = rings per pod, spread across K EUs (1 = legacy) */
+    int dpu_ready;   /* 0 until DPA + msgq init done. Gates setup_pod_dma so a fast
+                      * host whose mmaps arrive DURING init (before the DPA msgq is
+                      * up) doesn't setup too early; those pods run in a deferred
+                      * pass in run_dpu_worker once this is published. */
     int dpa_thread_running[MAX_DPA_RINGS];  /* per-EU: 1 = thread k started */
     int dpa_thread_running_any;             /* 1 = at least one EU started (keepalive guard) */
 
@@ -298,6 +423,10 @@ struct objects {
      * Indexed by service_id [0,POD_ID_SPACE).
      * The future L7 proxy replaces this lookup. Init to all -1 at startup. */
     int service_table[POD_ID_SPACE];
+
+    /* DPU-owned connection tracking (model B). Heap-allocated (large) in
+     * run_dpu_worker; single-threaded (control PE thread) so no lock. */
+    struct dpu_conntrack *conntrack;
 
     /* Deferred completion queue (DPU only) */
     dpu_comp_queue_t comp_queue;

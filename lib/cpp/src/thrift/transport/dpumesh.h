@@ -112,9 +112,14 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc);
  * to the conn's inbox; there is NO request↔response matching. */
 
 /* Endpoint roles for dpumesh_alloc_port. */
-#define DMESH_ROLE_FREE   0
-#define DMESH_ROLE_CLIENT 1
-#define DMESH_ROLE_SERVER 2
+#define DMESH_ROLE_FREE          0
+#define DMESH_ROLE_CLIENT        1
+#define DMESH_ROLE_SERVER        2
+/* Model B: a new server conn the PE created at message-1 delivery but the app has
+ * not accepted yet. Inbound coalesces to its inbox (so pipelined messages 2..P
+ * don't re-hit the accept queue); next_ready skips it; dmesh_accept promotes it
+ * to DMESH_ROLE_SERVER. */
+#define DMESH_ROLE_SERVER_PENDING 3
 
 /* Allocate a host-unique conn port (>=1) as CLIENT or SERVER (allocates its inbound
  * ring); 0 on exhaustion. `user` is the app's conn handle, returned later by
@@ -122,6 +127,14 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc);
  * dereferences NULL). Release with dpumesh_free_port (reclaims undelivered inbound
  * credits). */
 uint16_t dpumesh_alloc_port(dpumesh_ctx_t *ctx, int role, void *user);
+/* Allocate a SPECIFIC port slot (model B accept): bind exactly the DPU-assigned
+ * upstream id `port` (a uP in [DMESH_UPORT_BASE, 65535)). Returns `port` on
+ * success, 0 if the slot is already live. */
+uint16_t dpumesh_alloc_port_specific(dpumesh_ctx_t *ctx, uint16_t port, int role, void *user);
+/* Promote a PE-created DMESH_ROLE_SERVER_PENDING slot to a live SERVER conn:
+ * attach the app's conn handle `user`. Returns `port` on success, 0 if the slot
+ * is not pending (already accepted / freed / race). Used by dmesh_accept. */
+uint16_t dpumesh_accept_port(dpumesh_ctx_t *ctx, uint16_t port, void *user);
 void     dpumesh_free_port(dpumesh_ctx_t *ctx, uint16_t port);
 
 /* Pop the next inbound message descriptor for a conn (CLIENT or SERVER — one path).

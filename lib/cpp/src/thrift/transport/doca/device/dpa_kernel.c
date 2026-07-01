@@ -86,6 +86,14 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
             for (uint32_t ri = 0; ri < thread_arg->num_rev_rings; ri++) {
                 if (thread_arg->rev_rings[ri].pod_id == add_msg->ring.pod_id) {
                     thread_arg->rev_rings[ri] = add_msg->ring;
+                    /* Re-add = the host reconnected with a FRESH credit block
+                     * (freed_cumulative restarts at 0). Reset this EU/ring's
+                     * reverse-admission accounting so the stale (high) sent_count
+                     * vs new (0) freed can't make inflight >= rq_depth forever and
+                     * wedge every reverse DMA. During first-time setup no reverse
+                     * DMA has issued yet, so both are already 0 → this is a no-op. */
+                    dpa_cached_freed[thread_arg->eu_index][ri] = 0;
+                    dpa_sent_count[thread_arg->eu_index][ri] = 0;
                     DOCA_DPA_DEV_LOG_INFO("ADD_REV_RING updated: pod_id=%d host_mmap=0x%lx\n",
                                          add_msg->ring.pod_id, add_msg->ring.host_mmap);
                     found = 1;

@@ -16,6 +16,11 @@ struct dma_ring {
     uint32_t head;
     uint32_t size;
     struct dma_desc *descs;
+    /* "ring busy" WARN rate-limit state, PER RING (get_next_dma_desc is called
+     * under this ring's own lock, so these must NOT be function-static shared
+     * across the K rings — that races + defeats the throttle when >1 ring stalls). */
+    uint32_t busy_head;
+    uint64_t busy_probes;
 };
 
 /* Create + export one host→DPU forward descriptor ring (with the +1 credit

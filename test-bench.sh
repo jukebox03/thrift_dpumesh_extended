@@ -351,6 +351,8 @@ get_pod_cores() {
                 bench-tcp)        echo "2" ;;   # bench + sidecar1 share core 2
                 echo-tcp)         echo "3" ;;   # echo  + sidecar2 share core 3
                 loopback-dpumesh) echo "4,5" ;; # client+echo+PE threads in one pod
+                echo-dpumesh-13)  echo "6" ;;   # test-7 extra backend
+                echo-dpumesh-14)  echo "7" ;;   # test-7 extra backend
                 *) echo "" ;;
             esac
             ;;
@@ -373,7 +375,7 @@ pin_pods() {
         warn "cpupower not found; skipping DVFS lock"
     fi
 
-    for app in bench-dpumesh echo-dpumesh loopback-dpumesh bench-tcp echo-tcp; do
+    for app in bench-dpumesh echo-dpumesh echo-dpumesh-13 echo-dpumesh-14 loopback-dpumesh bench-tcp echo-tcp; do
         local cores pod_id
         cores=$(get_pod_cores "$app" "$profile")
         [ -z "$cores" ] && continue
@@ -459,6 +461,9 @@ spec:
         - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
         - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
         - { name: ASYNC_THREADS, value: "${ASYNC_THREADS:-4}" }
+        # Pipeline depth (mode=2 / dpumesh-pipeline): outstanding msgs PER conn.
+        # Default 8 (unchanged); set >16 to exercise deep-pipeline TX-slot custody.
+        - { name: BENCH_PIPELINE, value: "${BENCH_PIPELINE:-8}" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리 (CFS quota 미사용).
         volumeMounts:
@@ -499,6 +504,68 @@ spec:
         - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리.
+        volumeMounts:
+        - { mountPath: /dev/infiniband, name: infiniband }
+        - { mountPath: /usr/local/lib/libthrift.so.0.12.0, name: libthrift-so, subPath: libthrift.so.0.12.0 }
+      volumes:
+      - { name: infiniband, hostPath: { path: /dev/infiniband } }
+      - { name: libthrift-so, hostPath: { path: $BUILD_DOCA/lib, type: Directory } }
+---
+# echo-dpumesh-13 / -14 (pod_id=13,14): extra backends for the test-7 weighted-LB
+# demo (DPU LBs service 11 across pods 11,13,14). Same echo image, different id.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-dpumesh-13
+spec:
+  replicas: 0
+  selector: { matchLabels: { app: echo-dpumesh-13 } }
+  template:
+    metadata: { labels: { app: echo-dpumesh-13 } }
+    spec:
+      hostname: echo-dpumesh-13
+      containers:
+      - name: echo-dpumesh-13
+        image: docker.io/$IMG_ECHO_DPU
+        imagePullPolicy: Never
+        env:
+        - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
+        - { name: BENCH_WORKER_ID, value: "13" }
+        - { name: ECHO_THREADS, value: "${ECHO_THREADS:-3}" }
+        - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
+        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
+        - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
+        securityContext: { privileged: true }
+        volumeMounts:
+        - { mountPath: /dev/infiniband, name: infiniband }
+        - { mountPath: /usr/local/lib/libthrift.so.0.12.0, name: libthrift-so, subPath: libthrift.so.0.12.0 }
+      volumes:
+      - { name: infiniband, hostPath: { path: /dev/infiniband } }
+      - { name: libthrift-so, hostPath: { path: $BUILD_DOCA/lib, type: Directory } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-dpumesh-14
+spec:
+  replicas: 0
+  selector: { matchLabels: { app: echo-dpumesh-14 } }
+  template:
+    metadata: { labels: { app: echo-dpumesh-14 } }
+    spec:
+      hostname: echo-dpumesh-14
+      containers:
+      - name: echo-dpumesh-14
+        image: docker.io/$IMG_ECHO_DPU
+        imagePullPolicy: Never
+        env:
+        - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
+        - { name: BENCH_WORKER_ID, value: "14" }
+        - { name: ECHO_THREADS, value: "${ECHO_THREADS:-3}" }
+        - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
+        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
+        - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
+        securityContext: { privileged: true }
         volumeMounts:
         - { mountPath: /dev/infiniband, name: infiniband }
         - { mountPath: /usr/local/lib/libthrift.so.0.12.0, name: libthrift-so, subPath: libthrift.so.0.12.0 }
@@ -724,6 +791,8 @@ start_pods() {
     step "=== Starting pods (innermost first) ==="
     # DPUmesh: echo first (so bench finds dst), then bench, then loopback (self-svc)
     scale_up_with_wait "echo-dpumesh"     "pods: 1"
+    scale_up_with_wait "echo-dpumesh-13"  ""   # extra backends for test-7 weighted LB
+    scale_up_with_wait "echo-dpumesh-14"  ""
     scale_up_with_wait "bench-dpumesh"    "pods: 2"
     scale_up_with_wait "loopback-dpumesh" "pods: 3"
     # TCP: echo-tcp pod (echo + sidecar2) first, then bench-tcp pod
@@ -836,7 +905,7 @@ run_loopback() {
 show_logs() {
     # bench-tcp/echo-tcp pods now have 2 containers each (app + sidecar);
     # --all-containers prefixes each line with the container name.
-    for app in bench-dpumesh echo-dpumesh loopback-dpumesh bench-tcp echo-tcp; do
+    for app in bench-dpumesh echo-dpumesh echo-dpumesh-13 echo-dpumesh-14 loopback-dpumesh bench-tcp echo-tcp; do
         echo "=== $app ==="
         kubectl logs -n "$NS" -l "app=$app" --all-containers=true --prefix=true --tail=20 2>/dev/null || true
         echo

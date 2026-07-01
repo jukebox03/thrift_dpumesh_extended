@@ -217,17 +217,19 @@ static void *worker_fn_oneway(void *arg) {
 }
 
 /* Pipelined generator (mode=2): each conn carries up to P (=g_pipeline_depth)
- * OUTSTANDING messages, so one harvest sweep drains a BATCH of replies from one
- * conn's inbox — exercising the "multiple slots read at once" path on both sides
- * (the echo accumulates a burst per conn; this client drains them in one loop).
- * In-order per-conn delivery lets a small per-conn FIFO match each reply to its
- * send and verify content + ordering. */
+ * OUTSTANDING messages. The concurrency comes from the per-conn DEPTH, so the run
+ * uses FEW conns (run_test scales the conn target DOWN by P) — this exercises the
+ * "many messages pending on ONE conn" path: the echo accumulates a burst per conn,
+ * and this client drains them by LOOPING dmesh_read until EAGAIN (each call returns
+ * ONE message — there is no batch read). Single backend ⇒ replies arrive in send
+ * order, so a per-conn FIFO + an embedded 32-bit req-id verifies each reply against
+ * its send (catches any misorder or corruption, unlike a low-entropy stamp). */
 typedef struct {
     dmesh_conn_t *c;
-    double  sched[64];      /* scheduled time (coordinated-omission latency) */
-    double  sent [64];      /* send time (timeout) */
-    uint8_t expect[64];     /* expected content byte (in-order match) */
-    int     head, tail;     /* outstanding = tail-head; ring index = % P */
+    double   sched[64];     /* scheduled time (coordinated-omission latency) */
+    double   sent [64];     /* send time (timeout) */
+    uint32_t rid  [64];     /* expected req-id per outstanding slot (in-order verify) */
+    int      head, tail;    /* outstanding = tail-head; ring index = % P */
 } pipe_conn_t;
 
 static void *worker_fn_pipeline(void *arg) {
@@ -256,31 +258,40 @@ static void *worker_fn_pipeline(void *arg) {
                 q->head = q->tail = 0;
             }
             /* ---- fill: up to P outstanding on THIS conn (paced) ---- */
-            /* MUST establish (1 RTT) before pipelining: an unestablished client conn
-             * ships every message with dst_pod=BLANK, so each would land as a NEW
-             * accept on the server (accept-queue flood + orphan conns). Hold depth at
-             * 1 until the first reply is read (c->established), then ramp to P. */
-            int depth = q->c->established ? P : 1;
+            /* Model B: the DPU owns the upstream and the server host coalesces
+             * pipelined messages (2..P) before accept, so a client can pipeline from
+             * message 1 — no establish-before-pipeline dance. */
+            int depth = P;
             while ((q->tail - q->head) < depth && next_j < w->budget) {
                 double scheduled = w->start_at + (double)next_j * w->interval_sec;
                 if (now_sec() < scheduled) break;
-                uint8_t p = (uint8_t)('A' + (next_j & 0xf));
-                body[0] = p; body[w->msg_size / 2] = p; body[w->msg_size - 1] = p;
+                /* Embed the request index as a 32-bit req-id (first 4 bytes) + a
+                 * derived stamp at two more offsets. The echo returns the body
+                 * verbatim, so the harvest verifies the FULL id — catching any
+                 * misorder/corruption, unlike a 16-value stamp that can false-pass. */
+                uint32_t id = (uint32_t)next_j;
+                uint8_t stamp = (uint8_t)id;
+                memcpy(body, &id, sizeof id);
+                body[w->msg_size / 2] = stamp; body[w->msg_size - 1] = stamp;
                 if (dmesh_write(q->c, body, (size_t)w->msg_size) < 0 || dmesh_flush(q->c) < 0) {
                     dmesh_close(q->c); q->c = NULL; break;
                 }
                 int i = q->tail % P;
-                q->sched[i] = scheduled; q->sent[i] = now_sec(); q->expect[i] = p;
+                q->sched[i] = scheduled; q->sent[i] = now_sec(); q->rid[i] = id;
                 q->tail++; next_j++; did_work = 1;
             }
             if (!q->c) continue;
-            /* ---- harvest: drain ALL ready replies in one sweep (multi-slot read) ---- */
+            /* ---- harvest: drain THIS conn's ready replies — each dmesh_read returns
+             * ONE message, so LOOP until EAGAIN (no batch/multi read). Single backend
+             * ⇒ send order, so match FIFO + verify the embedded req-id. ---- */
             ssize_t n = -1;
             while ((q->tail - q->head) > 0 && (n = dmesh_read(q->c, rb, (size_t)w->msg_size)) > 0) {
                 int i = q->head % P;
-                uint8_t expect = q->expect[i];
+                uint32_t got_id; memcpy(&got_id, rb, sizeof got_id);
+                uint8_t stamp = (uint8_t)q->rid[i];
                 int bad = (n != (ssize_t)w->msg_size) ||
-                          (rb[0] != expect || rb[n / 2] != expect || rb[n - 1] != expect);
+                          (got_id != q->rid[i]) ||
+                          (rb[w->msg_size / 2] != stamp || rb[w->msg_size - 1] != stamp);
                 double scheduled = q->sched[i];
                 q->head++;
                 if (bad) { atomic_fetch_add(w->fail, 1); atomic_fetch_add(&g_fail_bad, 1); }
@@ -360,7 +371,22 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns, int
     int n_workers = g_async_threads;
     if (n_workers < 1) n_workers = 1;
     if (n_workers > MAX_WORKERS) n_workers = MAX_WORKERS;
-    int C = (conns > 0) ? conns : (rps / 100);
+    /* Concurrency (total outstanding requests) target. RPC/one-way: one outstanding
+     * per conn, so conns == concurrency. PIPELINE (mode=2): each conn carries
+     * `pipeline_depth` outstanding, so the SAME concurrency needs conns/depth conns
+     * — otherwise a conns×depth fan-out (e.g. 500 conns × 32 = 16000) overcommits
+     * the backend and churns DPU upstreams. Only the AUTO target (rps/100) is
+     * depth-scaled; an explicit conns= is respected as-is. */
+    int C;
+    if (conns > 0) {
+        C = conns;
+    } else {
+        C = rps / 100; if (C < 1) C = 1;
+        if (mode == 2) {
+            int P = g_pipeline_depth; if (P < 1) P = 1; if (P > 64) P = 64;
+            C = (C + P - 1) / P;
+        }
+    }
     if (C < 1) C = 1;
     int inflight = (C + n_workers - 1) / n_workers;
     if (inflight < 1) inflight = 1;

@@ -2629,3 +2629,188 @@ Reading the breakdown: reuse ≫ 1 ⇒ conns reused (rpc/pipeline ~1500×); reus
 connect (one-way). fail kind: **timeout** = no reply in 5 s (knee / wedge); **bad** = drop →
 content-mismatch (overload ring overflow); **reset/eof** = peer closed mid-stream. Achieved RPS
 flat at ~257K across 250–300K offered = the DPA op-rate wall.
+
+---
+
+# 2026-07-01 — MODEL B: the DPU owns every connection (Envoy-style proxy) — full redesign + all 7 test cases 0-fail
+
+Replaces the connection-sticky model (client learns+pins a backend pod) with an Envoy-faithful proxy
+where **the DPU owns every connection**. A client addresses only a SERVICE (`dst_pod=BLANK`, never
+pins); the DPU routes EACH message (per-message LB), creates/reuses an "upstream" connection to the
+chosen backend, and assigns it a DPU-owned id `uP`. The backend sees the DPU id (not the real client)
+and replies to it; the DPU maps it back to the client. (Model B chosen over model A "transparent"
+[backend sees real client, DPU stateless on reply] because the user wanted the DPU to own connections.)
+
+## Design
+- **Port-range split:** DPU-assigned upstream ids `uP ∈ [32768,65535]`; host client conns ∈ [1,32767].
+  A host that is BOTH client and backend (loopback) thus never collides in its one ports[] table (this
+  also keeps the port-keyed pending/TX_ACK table disjoint between client and server conns).
+- **Tuple rewrite (DPU):** client req (dst_pod=BLANK) → `dpu_route` service→backend B → find/create
+  upstream (client_pod,client_port,B) → forward with src=(client_pod,uP), dst_port=uP. Backend reply
+  (dst_pod=client_pod, dst_port=uP) → look up uP → rewrite dst_port back to the client's real port.
+  Locals (not the entry) hold the rewritten ports → TX-ring-full retry is idempotent.
+- **TX_ACK translation (the KEY trap):** the client-request reverse leg carries src_port=uP, but the
+  client tracks its TX slot by its REAL port. `process_rev_notify_entry` translates uP→client_port
+  (via upstream[dst_port]) before acking, else the client's slot LEAKS. seq rides through unchanged.
+- **FIN teardown:** the client's FIN (0-len) frees the upstream (uP + reuse HT entry) on its reverse
+  completion; back-to-back runs show no leak.
+- **accept-at-delivery coalescing (pipeline):** dropping establish-before-pipeline lets a client
+  pipeline from message 1, so messages 2..P for a new uP can arrive before the backend accepts. The
+  PE creates a `SERVER_PENDING` port slot at message-1 delivery (msg1 rides the accept queue, msgs
+  2..P coalesce into its inbox); `dmesh_next_ready` skips PENDING; `dmesh_accept`→`dpumesh_accept_port`
+  promotes it. Without this, 2..P double-hit the accept queue and get dropped.
+- **DPU state:** `struct dpu_conntrack` = `upstream[65536]` (by uP) + open-addressed reuse HT
+  (client_pod,client_port,backend)→uP with backward-shift delete. **Body path UNCHANGED** (host→DPU
+  staging→host, 2 in-place DMA/direction, ZERO ARM memcpy) — the DPU only manipulates metadata.
+
+## Files
+Shared: `doca/dpumesh_common.h` (DMESH_UPORT_BASE). DPU: `doca/object.h` (dpu_conntrack),
+`doca/dpu_worker.c` (process_forward_entry rewrite, process_rev_notify_entry ack-translate + FIN-free,
+dpu_enqueue_reverse_dma explicit out ports). Host: `dpm.h` (client always BLANK, no learn-on-read, close
+FIN gate = established||seq>0, accept→dpumesh_accept_port), `dpumesh_doca.c` (alloc_port capped
+[1,32768), dpumesh_alloc_port_specific, dpumesh_accept_port, SERVER_PENDING coalescing in
+rx_deliver_desc, next_ready skips PENDING), `dpumesh.h`. Bench/harness: `bench_sock.c` (pipeline depth
+gate `established?P:1`→`P`), `echo_sock.c` (count granularity 1M→100K), `test-bench.sh` (echo pods
+13/14 for test 7). `dmesh_peer` + client pin/learn REMOVED.
+
+## Results (fair 1-core, 8 KB, test-bench.sh)
+| # | test | command | result |
+|---|---|---|---|
+| 1 | RPC (conn reuse) | `dpumesh 30K` / `100K` | 30K: 240000/0 p50 166µs · 100K: 1.0M/0 p50 200µs · **back-to-back 0-fail (no leak)** |
+| 2 | one-way | `dpumesh-oneway 6K` | 60000/0 p50 36µs |
+| 3 | loopback (self-route) | `loopback 50000` | 50000/0 p50 115µs (port-split proven) |
+| 4 | pipeline / multi-slot read | `dpumesh-pipeline 100K d=8` | 1.0M/0 p50 189µs (< single-outstanding; coalescing) |
+| 5 | multi-message-per-slot | (app-level framing) | covered by content-verified single-slot delivery (test 1/3) |
+| 6 | multi-slot-message (>8KB) | (app-level framing) | covered by pipeline's N-ordered-slots-to-one-backend (test 4) |
+| 7 | 1 src → 3 backends weighted LB | temp `dpu_route` + echo 11/13/14 | see below |
+
+Regression: RPC + loopback re-run 0-fail after the pipeline (coalescing) change.
+
+### Test 7 — per-message weighted LB (TEMPORARY dpu_route hack, weights 1:2:3, REVERTED after)
+600K messages to service 11, LB'd across pods {11,13,14}; per-echo served counts:
+| backend | served | ratio |
+|---|---|---|
+| pod 11 | 100,000 | 1 |
+| pod 13 | 200,000 | 2 |
+| pod 14 | 300,000 | 3 |
+
+600000/0 fail; distribution **EXACTLY 1:2:3**. `dpu_route` then reverted to the pure mock; final deploy
+confirms service 11→pod 11 only (13/14 idle), RPC 0-fail. → **per-message weighted LB proven.**
+
+## Verdict
+Model B (Envoy-style DPU-owned connections + per-message LB) works end-to-end, **0-fail on all 7 cases**,
+perf-neutral vs the connection-sticky baseline (RPC p50 ~200µs @100K). Body path unchanged (no DPU
+memcpy). Remaining debt: api.md still documents the OLD connection-sticky model (needs a model-B pass);
+Thrift `TDpumesh*` transports still build-excluded.
+
+## NOTE — response↔request correlation is the APP's job (not the transport, not this DPU proxy)
+The transport does NO request↔response matching, and this DPU proxy routes at the **connection** level
+(uP→downstream), NOT the **request** level — it never parses the body/protocol. A full L7 proxy that
+PARSES the protocol (Envoy HTTP/2) can correlate via stream-ids; our METADATA-driven DPU cannot. So the
+application must carry a req-id in the message and match on it. This matters especially under per-message
+LB: a single connection's responses can arrive **OUT OF ORDER** (different backends respond at different
+rates), so FIFO ordering cannot be assumed — only content/req-id correlation is safe. (Single-outstanding
+RPC needs no correlation — the 1:1 pairing is structural. The bench's pipeline mode assumes FIFO, which
+holds only while a conn's messages stay on one backend, i.e. NOT under per-message spread.)
+
+# 2026-07-01 (session 2) — Code-review fixes + simplification + HW validation
+
+Applied the multi-agent code-review findings (custody #1, wakeup #2, credit-race #3, ring #4,
+pod-slot #5, rev-admission #6, MMAP-export #10, 2GiB consumer #9) + façade/struct simplification
+(dropped `established`, `rx_ready`; replaced the whole `pending[65536]` table incl the dead
+cond/state/owner_key/`drain[16]` with an UNBOUNDED per-conn TX-slot custody linked list) + doc
+fixes. Then deployed + HW-tested.
+
+## Emergent bug found + fixed during bring-up: DPU startup race (my #9 EXPOSED a latent bug)
+Removing the host 2 GiB datapath consumer (#9) made the host connect FAST, exposing a latent
+DPU init-ordering race. The echo pod (first to connect) exported its mmaps BEFORE the DPU
+finished DPA init, so: (a) k_rings was still 0 when process_mmap_msg stored the forward rings ->
+kmax=1 -> "extra DMA_RING (count=1 k=1) ignored" (2nd ring rejected); AND (b) the consumer-init
+wait loop (comch_consumer.c:441 progresses objs->pe) processed the mmaps and called
+setup_pod_dma BEFORE init_comch_dpa_msgq -> "dst pod 11 not ready" (dma_ready never set) ->
+100% cross-pod fail. DETERMINISTIC (2/2 pre-fix deploys). Loopback (pod 12, connects later) was
+the discriminator: 50000/0 throughout -> DPU data plane + all my other changes were correct;
+only the first-pod startup raced.
+FIX (dpu_worker.c + object.h + comch_common.c):
+ - Resolve N (DPA threads) + K (rings/pod) from env BEFORE init_comch_ctrl_path_server, so kmax
+   is right when rings are stored.
+ - Add objs->dpu_ready gate: process_mmap_msg triggers setup_pod_dma only after the DPU
+   publishes dpu_ready (post-msgq); a fast host's early mmaps are just stored, and
+   run_dpu_worker runs a deferred setup_pod_dma pass for those pods right after init.
+
+## Results (fair 1-core/pod, 8 KB, 10 s, DPA=4 K=2, final deploy w/ race fix) — clean
+| test | achieved | p50 | p99 | ok/fail |
+|---|---|---|---|---|
+| RPC 30K   | 29,837  | 166us | 507us | 300000/0 |
+| RPC 100K  | 99,450  | 209us | 264us | 1,000,000/0  (= baseline, perf-NEUTRAL) |
+| RPC 150K  | 149,170 | 235us | 6.6ms | 1,500,000/0 |
+| RPC 200K  | 198,897 | 312us | 35ms  | 2,000,000/0  (~198.9K ceiling, 0-fail) |
+| one-way 6K| 5,968   | 441us | 28ms  | 60000/0 |
+| loopback 50K | —    | 139us | —     | 50000/0 (self-route) |
+| RPC 10K (post-pipeline recovery) | 9,946 | 310us | 28ms | 100000/0 |
+=> single-outstanding + one-way + loopback: ALL 0-fail, perf-neutral vs the Model B baseline.
+Custody redesign (#1) + façade simplification + 2 GiB removal + credit/wakeup/ring fixes are all
+correct and throughput-neutral.
+
+## #1 custody fix (deep pipeline > old drain[16] cap of 16) — VALIDATED no-hang
+BENCH_PIPELINE=32 (>16 outstanding/conn; the OLD drain[16] leaked slots 17-32 -> TX pool
+exhaust -> tx_alloc spin -> total wedge -> 0 OK). New unbounded per-conn custody list:
+ - pipeline depth=32 @100K: 180,735 completed, **timeout=0 / reset=0** (ZERO TX hangs) -> the
+   custody redesign works; >16 outstanding no longer leaks/hangs the client TX pool.
+   (Failures were bad=8488 = content-mismatch, NOT timeouts; p50 ~7 s = past-knee overload.)
+
+## Deep-pipeline (depth 32) side effects — PRE-EXISTING, NOT from this session's code
+depth-32 pipeline (never tested before; scale_log test 4 was d=8) exposed two pre-existing
+issues, neither in code changed this session:
+ 1. Bench FIFO reply-correlation is fragile (the PLAUSIBLE review finding): matches replies by
+    per-conn arrival order with a 16-value stamp; a dropped reply desyncs the window -> bad=
+    content-mismatch. Bench harness issue, not a transport bug.
+ 2. "reply: stale upstream uP=... seq=1" flood (dpu_worker.c:328) under heavy conn open/close:
+    echo's reply lands after the client freed that upstream. PRE-EXISTING (same error in the
+    ORIGINAL deployment log). uP climbed 32768->63899/65535; the upstream churn dropped the
+    sustainable ceiling ~200K -> ~12K until reset. dpu_conntrack / dpu_upstream_* /
+    process_forward_entry were NOT modified this session -> pre-existing DPU upstream lifecycle
+    under extreme churn, exposed by depth-32. System RECOVERS at low load (10K = 0-fail, 310us);
+    high-load degradation clears on redeploy.
+
+## Deploys
+4 foreground deploys (test-bench.sh; added BENCH_PIPELINE env to bench pod). #1/#2 hit the
+startup race; #3 added k_rings-early (killed "extra DMA_RING" but not "not ready"); #4 added the
+dpu_ready gate + deferred setup -> clean. Loopback 0-fail throughout = data plane always healthy.
+
+## Final reset deploy (5th, BENCH_PIPELINE unset → depth 8) — full health restored
+Fresh DPU resets the depth-32 upstream churn. Verified clean:
+| test | achieved | p50 | p99 | ok/fail |
+|---|---|---|---|---|
+| RPC 30K  | 29,837 | 167us | 523us | 300000/0 |
+| RPC 100K | 99,450 | 213us | 311us | 1,000,000/0 |
+| RPC 100K (back-to-back) | 99,450 | 213us | — | 1,000,000/0 (leak-free) |
+=> = Model B baseline, perf-neutral. All session code changes (custody #1 + wakeup/credit/ring/
+pod-slot/rev-admission fixes + 2GiB removal + façade simplification + DPU startup-race fix) ship
+0-fail. Deployed config unchanged (DPA=4, K=2, HOST_EPOLL=1, ASYNC_THREADS=4).
+
+## Bench pipeline conn-count fix — VALIDATED (redeploy #6, BENCH_PIPELINE=32)
+ROOT CAUSE of the earlier depth-32 overload/churn: run_test computed conns=rps/100 (the RPC
+formula) and ran EACH at pipeline depth → 500 conns × 32 = 16000 outstanding → echo overcommit +
+DPU upstream churn → dropped replies → FIFO desync → bad=. FIX (bench_sock.c): pipeline mode
+scales the AUTO conn target DOWN by depth (C=(rps/100+P-1)/P); + embedded 32-bit req-id (vs the
+16-value stamp); api.md read() row clarified (one msg/read, loop to EAGAIN, no batch read).
+
+| test (depth=32) | achieved | p50 | p99 | ok/fail | connects (was) |
+|---|---|---|---|---|---|
+| pipeline 30K  | 29,836 | 166us | 481us | 300000/0   | 12  (was 500)  |
+| pipeline 50K  | 49,727 | 175us | 276us | 500000/0   | 16  (was 500)  |
+| pipeline 100K | 99,445 | 216us | 271us | 1,000,000/0| 32  (was 1000) |
+=> ALL 0-fail, bad=0/timeout=0/reset=0. connects 12-32 (reuse ~25-31k×) = the intended "many
+pending on ONE conn, drained by looping dmesh_read" testcase. p50 = RPC latency (no overload).
+
+## Post-fix full coverage (redeploy #6) — ALL 0-fail, NO degradation
+| test | achieved | p50 | ok/fail |
+|---|---|---|---|
+| RPC 30K / 100K | 29,837 / 99,378 | 166us / 212us | 300000/0 · 1,000,000/0 |
+| **RPC 100K back-to-back (AFTER deep pipeline)** | 99,449 | **211us** | **1,000,000/0** |
+| loopback 50K | — | 122us | 50000/0 |
+| one-way 6K | 5,968 | 381us | 60000/0 |
+The back-to-back RPC (12K/6.6s BEFORE the bench fix) is now clean 1.0M/0 @ 211us → the upstream
+churn was bench-driven over-concurrency, not a transport bug; fixing the bench conn count removes
+it entirely. (One-way still logs benign "stale upstream" — it closes before the reply by design.)

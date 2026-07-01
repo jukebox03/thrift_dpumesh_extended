@@ -96,13 +96,6 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 	/* Dispatch on the 1-byte type at offset 0. */
 	switch (recv_buffer[0])
 	{
-	case DMESH_MSG_MMAP_EXPORT:
-		if (msg_len <= sizeof(struct dmesh_mmap_msg)) {
-			DOCA_LOG_ERR("Received invalid MMAP message from server");
-			return;
-		}
-		break;
-
 	case DMESH_MSG_BATCH_FWD_ACK:
 		/* Batched TX_ACK — coalesced free of K (port,seq) TX slots. */
 		if (objs->rx_data_hook)

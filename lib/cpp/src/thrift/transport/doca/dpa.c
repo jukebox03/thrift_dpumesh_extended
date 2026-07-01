@@ -299,7 +299,11 @@ init_dpa_objects(struct objects *objs)
     /* Resolve N = number of DPA EU threads (multi-EU data plane),
      * clamped to [1, MAX_DPA_RINGS]. */
     if (objs->num_dpa_threads <= 0) {
-        int n = 1;
+        /* Default 4 = the measured production config (2-pod pair × K=2 rings = 4
+         * active EUs). test-bench.sh sets DPUMESH_DPA_THREADS explicitly, so this
+         * default only governs a direct (non-deploy) invocation — it just keeps
+         * that off the single-EU (~74K) floor. */
+        int n = 4;
         const char *env = getenv("DPUMESH_DPA_THREADS");
         if (env && *env) {
             n = atoi(env);
@@ -1050,12 +1054,10 @@ setup_pod_dma(struct objects *objs, struct pod_state *pod)
                      pod->pod_id, doca_error_get_descr(result));
         return result;
     }
-    result = export_mmap_to_remote(objs, pod->local_mmap, pod->dma_buffer,
-                                    DPU_BUFFER_SIZE, DMA_BUFFER, DPU_TO_HOST);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_WARN("setup_pod_dma: export to host failed: %s",
-                      doca_error_get_descr(result));
-    }
+    /* (The per-pod DPU staging buffer is NOT exported to the host: the host never
+     * reads it — its reverse path lands into its own rx_dma_buffer. The old
+     * DPU_TO_HOST export was dead, and misrouted to the first connection when
+     * >1 pod was registered; removed.) */
 
     /* 2. Forward rings: ring j -> EU k_j = (pod_id*K + j) % N. K consecutive EUs
      * per pod; consecutive pods land on disjoint EU sets. The FIRST ring on each

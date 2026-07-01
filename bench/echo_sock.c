@@ -88,7 +88,7 @@ int main(void)
         while ((c = dmesh_next_ready(s)) != NULL)          /* existing conns with inbound */
             if (echo_drain(c, &recv_total)) dmesh_close(c); /* EOF (peer FIN) → reclaim the conn */
 
-        if (recv_total && (recv_total % 1000000) < 64)
+        if (recv_total && (recv_total % 100000) < 64)
             fprintf(stderr, "[echo_sock] recv_total=%lu\n", recv_total);
     }
 

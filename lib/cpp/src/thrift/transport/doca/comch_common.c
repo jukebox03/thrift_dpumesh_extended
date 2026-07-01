@@ -132,8 +132,14 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 	/* Trigger per-pod DMA setup when both forward-direction mmaps have arrived.
 	 * setup_pod_dma / update_rev_ring_host_rx send ADD_RING/ADD_REV_RING to the
 	 * DPA. Rare (pod registration), off the steady path; runs on the single
-	 * worker thread that also drains consumer_pe, so no lock is needed. */
-	if (pod->ring_mmap_count >= kmax && pod->remote_mmap && !pod->dma_ready) {
+	 * worker thread that also drains consumer_pe, so no lock is needed.
+	 * GATED on objs->dpu_ready: a fast host can export its mmaps DURING DPU init
+	 * (before init_comch_dpa_msgq builds the DPA msgq), and this callback runs on
+	 * the control PE that init already progresses — so without the gate setup_pod_dma
+	 * would run before the msgq exists and the pod would never reach dma_ready.
+	 * Until dpu_ready, the mmaps are just stored; run_dpu_worker runs a deferred
+	 * setup pass for such pods right after init. */
+	if (objs->dpu_ready && pod->ring_mmap_count >= kmax && pod->remote_mmap && !pod->dma_ready) {
 		result = setup_pod_dma(objs, pod);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("setup_pod_dma failed for pod %d: %s",
@@ -151,36 +157,12 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		}
 	}
 #else
-	/* Host side: store the imported mmap in objs. The host holds only its
-	 * own ring/data buffers; the per-pod table lives on the DPU. */
-	(void)conn;
-	if (mmap_msg->mmap_type == DMA_BUFFER) {
-		mmap = &objs->remote_mmap;
-	} else if (mmap_msg->mmap_type == DMA_RING) {
-		mmap = &objs->ring_mmap;
-	} else {
-		DOCA_LOG_ERR("Invalid mmap type received: %d", mmap_msg->mmap_type);
-		return DOCA_ERROR_INVALID_VALUE;
-	}
-
-	result = doca_mmap_create_from_export(NULL, mmap_msg->export_desc,
-					      export_desc_len,
-					      objs->dev,
-					      mmap);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to create remote mmap from export desc: %s",
-			     doca_error_get_name(result));
-		return result;
-	}
-
-	if (remote_addr == NULL || buf_size == 0) {
-		DOCA_LOG_ERR("Invalid remote mmap metadata: remote_addr=%p buf_size=%zu",
-			     remote_addr, buf_size);
-		return DOCA_ERROR_INVALID_VALUE;
-	}
-
-	objs->remote_addr = remote_addr;
-	objs->remote_buf_size = buf_size;
+	/* Host side: the DPU→host MMAP_EXPORT import path is DEAD — the host reverse
+	 * path lands into its OWN ctx->rx_dma_buffer and never reads an imported DPU
+	 * mmap, so there is nothing to store. (The DPU no longer sends this either;
+	 * see setup_pod_dma in dpa.c.) */
+	(void)objs; (void)conn; (void)result; (void)mmap;
+	(void)remote_addr; (void)buf_size; (void)export_desc_len;
 #endif
 
 	return DOCA_SUCCESS;

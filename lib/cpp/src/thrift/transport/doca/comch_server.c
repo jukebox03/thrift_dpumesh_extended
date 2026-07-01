@@ -535,20 +535,39 @@ pods_add_connection(struct objects *objs, struct doca_comch_connection *conn)
 	/* See object.h pods[] concurrency model. Single writer (control PE
 	 * callback); registered=0 so readers skip the slot until pods_register
 	 * publishes it. The num_pods bump is the visibility gate for the slot's
-	 * existence; do it last. */
-	if (objs->num_pods >= MAX_PODS) {
-		DOCA_LOG_ERR("pods_add_connection: table full (%d)", MAX_PODS);
-		return -1;
+	 * existence; do it last.
+	 *
+	 * Prefer REUSING a slot freed by pods_remove_connection (connection==NULL,
+	 * registered==0) over always appending — otherwise the table exhausts after
+	 * MAX_PODS cumulative connect/disconnect cycles even though ≤MAX_PODS are ever
+	 * live. Slot indices stay stable; a freed slot is only reused on a later
+	 * connect, by which point the disconnected pod is long gone (reconnect latency
+	 * ≫ comp_queue drain), so no live comp_queue entry still references the index. */
+	int n = __atomic_load_n(&objs->num_pods, __ATOMIC_ACQUIRE);
+	int idx = -1;
+	for (int i = 0; i < n; i++) {
+		if (objs->pods[i].connection == NULL &&
+		    __atomic_load_n(&objs->pods[i].registered, __ATOMIC_ACQUIRE) == 0) {
+			idx = i;   /* recycle a freed slot */
+			break;
+		}
+	}
+	if (idx < 0) {
+		if (n >= MAX_PODS) {
+			DOCA_LOG_ERR("pods_add_connection: table full (%d)", MAX_PODS);
+			return -1;
+		}
+		idx = n;
 	}
 
-	int idx = objs->num_pods;
 	objs->pods[idx].connection = conn;
 	objs->pods[idx].pod_id = -1;  /* not yet registered */
 	objs->pods[idx].app_name[0] = '\0';
 	__atomic_store_n(&objs->pods[idx].registered, 0, __ATOMIC_RELEASE);
-	__atomic_store_n(&objs->num_pods, idx + 1, __ATOMIC_RELEASE);
+	if (idx == n)
+		__atomic_store_n(&objs->num_pods, idx + 1, __ATOMIC_RELEASE);
 
-	DOCA_LOG_INFO("pods_add_connection: slot %d", idx);
+	DOCA_LOG_INFO("pods_add_connection: slot %d%s", idx, (idx == n) ? "" : " (reused)");
 	return 0;
 }
 
