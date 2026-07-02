@@ -113,7 +113,6 @@ struct dma_desc *get_next_dma_desc(struct dma_ring *ring)
         return NULL;
     }
 
-    uint32_t next_head = (ring->head + 1) % ring->size;
-    ring->head = next_head;
+    ring->head = (ring->head + 1) % ring->size;
     return desc;
 }

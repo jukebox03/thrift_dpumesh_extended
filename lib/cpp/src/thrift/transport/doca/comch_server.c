@@ -5,18 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../dpumesh.h"
-
 #include "common.h"
 #include "object.h"
-#include "dpa.h"
-#include "dpa_common.h"
 #include "comch_common.h"
 #include "comch_consumer.h"
 
 #include <doca_pe.h>
 #include <doca_comch.h>
-#include <doca_comch_consumer.h>
 #include <doca_log.h>
 
 DOCA_LOG_REGISTER(COMCH_SERVER);
@@ -165,9 +160,19 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 			DOCA_LOG_ERR("Received invalid REGISTER message");
 			return;
 		}
-		pods_register(objs, comch_connection, reg->pod_id, reg->service_id, reg->app_name);
-		DOCA_LOG_INFO("Pod registered: pod_id=%d service_id=%d app=%s",
-		              reg->pod_id, reg->service_id, reg->app_name);
+		int assigned = pods_register(objs, comch_connection, reg->pod_id, reg->service_id);
+		if (assigned >= 0) {
+			/* Reply with the assigned pod_id so the host can address itself.
+			 * Non-blocking send (no PE re-entry from this callback). */
+			struct dmesh_pod_assigned_msg am = { .type = DMESH_MSG_POD_ASSIGNED };
+			am.pod_id = assigned;
+			doca_error_t sr = server_send_msg_to_conn(objs, comch_connection,
+			                                          (const char *)&am, sizeof(am));
+			if (sr != DOCA_SUCCESS)
+				DOCA_LOG_ERR("POD_ASSIGNED send failed (pod_id=%d): %s",
+				             assigned, doca_error_get_name(sr));
+		}
+		DOCA_LOG_INFO("Pod registered: pod_id=%d service_id=%d", assigned, reg->service_id);
 		break;
 	}
 
@@ -556,7 +561,6 @@ pods_add_connection(struct objects *objs, struct doca_comch_connection *conn)
 
 	objs->pods[idx].connection = conn;
 	objs->pods[idx].pod_id = -1;  /* not yet registered */
-	objs->pods[idx].app_name[0] = '\0';
 	__atomic_store_n(&objs->pods[idx].registered, 0, __ATOMIC_RELEASE);
 	if (idx == n)
 		__atomic_store_n(&objs->num_pods, idx + 1, __ATOMIC_RELEASE);
@@ -606,7 +610,6 @@ pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn)
 		objs->pods[i].dma_ready       = 0;
 		objs->pods[i].connection      = NULL;
 		objs->pods[i].pod_id          = -1;
-		objs->pods[i].app_name[0]     = '\0';
 		for (int j = 0; j < ring_mmap_count && j < MAX_EU_PER_POD; j++)
 			objs->pods[i].ring_mmaps[j] = NULL;
 		objs->pods[i].ring_mmap_count = 0;
@@ -646,20 +649,24 @@ pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn)
 
 int
 pods_register(struct objects *objs, struct doca_comch_connection *conn,
-              int32_t pod_id, int32_t service_id, const char *app_name)
+              int32_t pod_id, int32_t service_id)
 {
 	int n = __atomic_load_n(&objs->num_pods, __ATOMIC_ACQUIRE);
 	for (int i = 0; i < n; i++) {
 		if (objs->pods[i].connection != conn)
 			continue;
 
+		/* DPU-assigned pod_id: the host no longer picks its own address. A
+		 * register with pod_id < 0 gets the pods[] slot index — unique among
+		 * live pods and always in [0, MAX_PODS) ⊂ [0, POD_ID_SPACE). */
+		if (pod_id < 0)
+			pod_id = i;
+
 		/* Publication order: write all fields first, then the gate.
 		 * Readers that observe registered=1 (ACQUIRE load) are guaranteed
-		 * to see the prior pod_id/app_name writes. */
+		 * to see the prior pod_id write. */
 		objs->pods[i].pod_id = pod_id;
 		objs->pods[i].service_id = service_id;
-		snprintf(objs->pods[i].app_name, sizeof(objs->pods[i].app_name),
-		         "%s", app_name);
 		__atomic_store_n(&objs->pods[i].registered, 1, __ATOMIC_RELEASE);
 
 		/* Publish the O(1) pod_id->slot map AFTER registered=1, so a reader
@@ -674,11 +681,11 @@ pods_register(struct objects *objs, struct doca_comch_connection *conn,
 		if (service_id >= 0 && service_id < POD_ID_SPACE)
 			__atomic_store_n(&objs->service_table[service_id], pod_id, __ATOMIC_RELEASE);
 
-		DOCA_LOG_INFO("pods_register: slot %d → pod_id=%d service_id=%d app=%s",
-		              i, pod_id, service_id, app_name);
-		return 0;
+		DOCA_LOG_INFO("pods_register: slot %d → pod_id=%d service_id=%d",
+		              i, pod_id, service_id);
+		return pod_id;
 	}
-	DOCA_LOG_ERR("pods_register: connection not found for pod_id=%d", pod_id);
+	DOCA_LOG_ERR("pods_register: connection not found");
 	return -1;
 }
 

@@ -51,8 +51,8 @@ Header: `thrift/transport/dpm.h` (header-only, built on the C core `dpumesh.h`).
 
 ```c
 // Address a service, exchange freely, close at the end. No pod is ever named.
-dmesh_channel_t *s = dmesh_create_channel("myapp", /*pod_id*/10);
-dmesh_conn_t *c = dmesh_connect(s, /*service*/11);
+dmesh_channel_t *s = dmesh_create_channel(DMESH_SVC_NONE);   // pure client: advertises no service
+dmesh_conn_t *c = dmesh_connect(s, /*dst_service_id*/11);
 for (int i = 0; i < N; i++) {
     dmesh_write(c, msg, len);                    // buffer a message
     dmesh_flush(c);                              // ship it (read/close do NOT auto-send)
@@ -112,21 +112,24 @@ All calls are **non-blocking**. "would-block" = the listed sentinel **with `errn
 ### Channel (socket + bind + listen, folded)
 | Function | Returns / errno |
 |---|---|
-| `dmesh_channel_t *dmesh_create_channel(const char *app_name, int pod_id)` | Channel handle, or `NULL` on init failure. `app_name` = service identity (pod registration); `pod_id` = this node's address. |
+| `dmesh_channel_t *dmesh_create_channel(int service_id)` | Channel handle, or `NULL` on init failure. `service_id` = the service this node advertises (`DMESH_SVC_NONE` for a pure client). **The node's `pod_id` is assigned by the DPU at registration** — you never pick it; read it back with `dmesh_pod_id()`. Blocks briefly on the register round-trip. |
 | `void dmesh_destroy_channel(dmesh_channel_t *s)` | — (releases all DOCA resources; safe on `NULL`). |
 | `int dmesh_event_fd(dmesh_channel_t *s)` | The **one** readiness fd, for NATIVE epoll/poll/select. Readable when a new connection is pending **or** any connection has inbound. **Calling it enables readiness** — call once at startup; a purely busy-polling app that never calls it must poll its conns itself. `-1` if unavailable. |
 | `int dmesh_pod_id(dmesh_channel_t *s)` / `int dmesh_msg_max(dmesh_channel_t *s)` | This node's `pod_id` / the max body size (`slot_size`). |
 
-> **Env:** `DPUMESH_POD_ID` overrides `pod_id`; `DPUMESH_PCI_ADDR` selects the DOCA device;
-> `DPUMESH_SERVICE_ID` overrides the registered service (default = `pod_id`).
+> **Env:** `DPUMESH_PCI_ADDR` selects the DOCA device; `DPUMESH_SERVICE_ID` overrides the
+> `service_id` arg. (There is no `DPUMESH_POD_ID` — the DPU assigns `pod_id`.)
 > `DPUMESH_HOST_EPOLL=1` makes the RX (PE) thread **sleep** on the DOCA notification fd (idle CPU ~0).
+> `DPUMESH_ARENA_SLOTS=N` carves the top N TX slots into a contiguous zero-copy arena for
+> `dmesh_alloc(n>1)` (default 0 = no arena; single-slot `dmesh_alloc(1)` always works via the pool).
 
 ### Connect / accept / readiness
 | Function | Returns / errno |
 |---|---|
-| `dmesh_conn_t *dmesh_connect(dmesh_channel_t *s, int service_id)` | New **client** connection bound to a **`service_id`**. Local, no round-trip — every `write+flush` is routed by the DPU (per-message LB); no pod is chosen or learned here. A dead/unregistered service is **not** detected. `NULL`+`ENOMEM` on OOM. |
+| `dmesh_conn_t *dmesh_connect(dmesh_channel_t *s, int dst_service_id)` | New **client** connection bound to a **`dst_service_id`** (the same id the backend passed to `dmesh_create_channel`). Local, no round-trip — every `write+flush` is routed by the DPU (per-message LB); no pod is chosen or learned here. A dead/unregistered service is **not** detected. `NULL`+`ENOMEM` on OOM. |
 | `dmesh_conn_t *dmesh_accept(dmesh_channel_t *s)` | Next **inbound** connection the DPU created to your pod, holding its first message (body ready) with the peer learned; or `NULL`+`EAGAIN` if none pending. **Non-blocking.** (`NULL`+`ENOMEM` = rare alloc failure: the message is dropped, its RX credit reclaimed; an accept-until-NULL loop just skips it.) |
 | `dmesh_conn_t *dmesh_next_ready(dmesh_channel_t *s)` | Pop the next connection that **has inbound** (the DPU-facing poller named it) and return the **same** handle you created — or `NULL` when drained. **No scan, no per-conn fd.** After waking on `dmesh_event_fd`, loop this and `dmesh_read` each returned conn to EAGAIN. Single-consumer (your event loop). |
+| `void dmesh_pin_route(dmesh_conn_t *c)` | **Pin this conn to ONE backend** (connection-level LB, like a TCP proxy): every subsequent message (and the FIN) carries one route-affinity key, so the DPU routes them all to the backend picked for the **first** message — replies then arrive in **send order**. Call right after `dmesh_connect`, before any write; idempotent; no-op on a server conn. Forgoes per-message LB **by design** — use when the app assumes socket-style total order (the LD_PRELOAD shim pins every conn, §7). Keys share a global 255-id space: two pinned conns may share a backend (balance skew, never a correctness issue). |
 
 ### Read / write / sendfile / flush / close
 | Function | Returns / errno |
@@ -136,6 +139,20 @@ All calls are **non-blocking**. "would-block" = the listed sentinel **with `errn
 | `ssize_t dmesh_sendfile(dmesh_conn_t *c, int in_fd, off_t *offset, size_t count)` | Appends ≤`count` bytes from `in_fd` into the current message (**capped at `slot_size` → may be SHORT; check the return**); advances `*offset` if non-NULL. `0` = EOF on `in_fd`, `-1` on read error / no room (`EMSGSIZE`). |
 | `int dmesh_flush(dmesh_conn_t *c)` | **The explicit ship — REQUIRED to send.** `0` = sent (or nothing buffered → no-op; a zero-length message is reserved for the FIN). `-1` `EBADMSG` = descriptor fault (close the conn). (Acquiring the TX slot happened in `write` and busy-spins under saturation, so flush itself never returns `EAGAIN`.) |
 | `int dmesh_close(dmesh_conn_t *c)` | **Graceful close.** Sends a **FIN** (zero-length, behind all prior data) so the peer's `dmesh_read` returns `0` and the DPU frees the upstream; then frees local state. A buffered-but-unflushed message is discarded (flush first). Concurrent close is safe. Returns `0`. Safe on `NULL`. |
+
+### Zero-copy TX (optional) — `dmesh_alloc` / `dmesh_slot_register`
+Skip the `dmesh_write` memcpy by filling transport DMA memory directly.
+| Function | Returns / errno |
+|---|---|
+| `dmesh_buf_t dmesh_alloc(dmesh_channel_t *s, int n)` | A run of **n contiguous** TX slots to write into directly: `{uint8_t *ptr; int slot; int n;}`. `n==1` uses the lock-free pool; `n>1` needs a contiguous arena (`DPUMESH_ARENA_SLOTS>0`). `ptr==NULL` on failure (no/too-small arena, or `n<=0`). |
+| `int dmesh_slot_register(dmesh_conn_t *c, dmesh_buf_t b, uint32_t len)` | Adopt pre-filled `b` as this conn's outbound message — `dmesh_flush` then ships it with **no memcpy**. Any bytes already buffered are **flushed first**. `len` = valid bytes (`<= b.n*slot_size`); a `b.n>1` region ships as route-pinned chunks. Returns the conn's previous empty single slot to recycle, or `-1`. `-1`+`EINVAL` on a bad buffer. Call at a message boundary, then `dmesh_flush`. |
+| `void dmesh_free(dmesh_channel_t *s, dmesh_buf_t b)` | Release a `dmesh_alloc` buffer you did **not** ship (frees all `b.n` slots). |
+
+```c
+// zero-copy send: alloc → fill transport memory → register → flush (no memcpy)
+dmesh_buf_t b = dmesh_alloc(s, 1);
+if (b.ptr) { fill(b.ptr, len); dmesh_slot_register(c, b, len); dmesh_flush(c); }
+```
 
 ### Accessor
 - `void *c->user_data` — **app-owned** (like epoll's `data.ptr`): set it after `accept`/`connect`,
@@ -198,7 +215,7 @@ static int serve(dmesh_conn_t *c) {                 // drain to EAGAIN; reply to
 }
 
 int main(void) {
-    dmesh_channel_t *s = dmesh_create_channel("echo", /*pod_id*/11);
+    dmesh_channel_t *s = dmesh_create_channel(/*service_id*/11);   // this backend serves service 11
     int dfd = dmesh_event_fd(s);                     // the ONE channel fd
 
     int epfd = epoll_create1(0);                     // ── vanilla kernel epoll ──
@@ -223,8 +240,8 @@ int main(void) {
 Connect to a **service**, then `write → flush → read` one at a time. With **one** request
 outstanding, the reply that arrives IS this request's reply — **no correlation needed.**
 ```c
-dmesh_channel_t *s = dmesh_create_channel("client", /*pod_id*/10);
-dmesh_conn_t *c = dmesh_connect(s, /*service*/11);   // address a service, not a pod
+dmesh_channel_t *s = dmesh_create_channel(DMESH_SVC_NONE);   // pure client
+dmesh_conn_t *c = dmesh_connect(s, /*dst_service_id*/11);   // address a service, not a pod
 
 for (int i = 0; i < N; i++) {
     dmesh_write(c, req[i], req_len[i]); dmesh_flush(c);
@@ -252,7 +269,7 @@ request↔response matching.*
 ```c
 typedef struct { uint32_t req_id; uint8_t payload[BODY]; } msg_t;
 
-dmesh_conn_t *c = dmesh_connect(s, /*service*/11);
+dmesh_conn_t *c = dmesh_connect(s, /*dst_service_id*/11);
 
 for (uint32_t id = 0; id < N; id++) {                // fire N requests, no waiting
     msg_t m; m.req_id = id; /* fill m.payload ... */
@@ -390,3 +407,51 @@ backends and are matched by your **req-id**, not by order.
   DMA; only the descriptor and a 20 B completion ride the control path.
 - **uP** — the DPU-assigned upstream id: the backend's server-conn port, and the key the DPU maps
   ↔ `(client pod, client port, backend)` to route replies home.
+
+---
+
+## 7. Socket compatibility — `LD_PRELOAD` shim (`libdmesh_preload.so`)
+
+Run an **unmodified, dynamically-linked POSIX socket application** over DPUmesh — no
+recompile, no source change:
+
+```sh
+# backend: its listen(<port>) becomes a dmesh service listener
+LD_PRELOAD=libdmesh_preload.so DMESH_PRELOAD_LISTEN=9095 DMESH_PRELOAD_SVC=15  ./my_server 9095
+# client: connect()s to the mapped port are routed over DPUmesh
+LD_PRELOAD=libdmesh_preload.so DMESH_PRELOAD_MAP=9095=15                       ./my_client host 9095
+```
+
+| env | meaning |
+|---|---|
+| `DMESH_PRELOAD_LISTEN=<port>` | `listen()` on this TCP port becomes the dmesh service listener |
+| `DMESH_PRELOAD_SVC=<svc>` | the service this process advertises (required with `LISTEN`) |
+| `DMESH_PRELOAD_MAP=<port>=<svc>[,…]` | `connect()`s to these TCP ports go over dmesh |
+| `DMESH_PRELOAD_DEBUG=1` | per-connection diagnostics on stderr |
+
+**How it works.** When a socket becomes dmesh-backed, the shim `dup2()`s a private
+eventfd over the app's fd number — the fd stays a **real kernel fd**, so
+`epoll`/`poll`/`select`/`close`/`dup` work natively (kernel-TCP fds and dmesh fds mix
+freely in one epoll set). A dispatcher thread (the channel's single
+`dmesh_accept`/`dmesh_next_ready` consumer) asserts per-fd readability. Reads are
+byte-stream (short reads at message boundaries, exactly like TCP); each `send()`/
+`write()` ships one message (`write`+`flush`); any length auto-chunks (§3). Blocking
+sockets are emulated (`SO_RCVTIMEO` honored). Every client conn is
+`dmesh_pin_route()`d, so one connection's traffic stays on **one backend** and replies
+arrive **in order** — the socket contract; load is still balanced **across**
+connections.
+
+**Cost.** The shim deliberately re-buys the per-conn-fd readiness model the native API
+avoids (one eventfd signal per message): expect roughly **half** the native clean
+ceiling (measured ~100K vs ~200K class) — the price of transparency, paid only by
+preloaded apps. Native `dmesh_*` callers are unaffected.
+
+**Limits (v1).** AF_INET `SOCK_STREAM` only; most `SO_*` options are accepted no-ops;
+`shutdown(SHUT_WR)` sends the FIN (no true half-close — late replies are
+undeliverable); no fork-shared sockets (DOCA is not fork-safe); statically-linked or
+raw-syscall binaries (e.g. Go) bypass `LD_PRELOAD` entirely.
+
+**Validation.** `bench/tcp_echo.c` (vanilla epoll echo) + `bench/tcp_client.c`
+(vanilla blocking client) run the SAME binaries over kernel TCP and over DPUmesh
+(`./test-bench.sh preload <N> <SIZE> <CONNS>`): 0-fail across 1 KB–32 KB (32 KB =
+auto-chunk + pin + stream reassembly), p50 ~120–150 µs, back-to-back stable.

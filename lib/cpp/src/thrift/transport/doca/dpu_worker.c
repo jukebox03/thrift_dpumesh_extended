@@ -223,10 +223,13 @@ dpu_enqueue_reverse_dma(struct pod_state *src_pod,
 static inline int32_t
 lb_pick(struct objects *objs, int16_t svc)
 {
-    if (objs->lb_rr_count > 0) {   /* TEST: round-robin across the configured backends */
+    if (objs->lb_rr_count > 0) {   /* TEST: round-robin across the configured backend SERVICES */
         for (int i = 0; i < objs->lb_rr_count; i++) {
-            int32_t p = objs->lb_rr_pods[(objs->lb_rr_cursor++) % (uint32_t)objs->lb_rr_count];
-            if (find_pod_by_id(objs, p))
+            /* Entries are SERVICE ids (pod_ids are DPU-assigned, not knowable by
+             * the test harness); resolve each to its pod via the service table. */
+            int32_t s = objs->lb_rr_pods[(objs->lb_rr_cursor++) % (uint32_t)objs->lb_rr_count];
+            int32_t p = (s >= 0 && s < POD_ID_SPACE) ? objs->service_table[s] : -1;
+            if (p >= 0 && find_pod_by_id(objs, p))
                 return p;
         }
         return -1;

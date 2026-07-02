@@ -261,8 +261,7 @@ static void *worker_fn_pipeline(void *arg) {
             /* Model B: the DPU owns the upstream and the server host coalesces
              * pipelined messages (2..P) before accept, so a client can pipeline from
              * message 1 — no establish-before-pipeline dance. */
-            int depth = P;
-            while ((q->tail - q->head) < depth && next_j < w->budget) {
+            while ((q->tail - q->head) < P && next_j < w->budget) {
                 double scheduled = w->start_at + (double)next_j * w->interval_sec;
                 if (now_sec() < scheduled) break;
                 /* Embed the request index as a 32-bit req-id (first 4 bytes) + a
@@ -649,15 +648,14 @@ static int ctrl_listen(int port) {
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
-    int worker_id = 10;
-    if (getenv("BENCH_WORKER_ID"))  worker_id      = atoi(getenv("BENCH_WORKER_ID"));
-    if (getenv("BENCH_DST_POD_ID")) g_dst_pod_id   = atoi(getenv("BENCH_DST_POD_ID"));
+    if (getenv("BENCH_DST_POD_ID")) g_dst_pod_id   = atoi(getenv("BENCH_DST_POD_ID"));  /* dst SERVICE */
     if (getenv("ASYNC_THREADS"))    g_async_threads = atoi(getenv("ASYNC_THREADS"));
     if (getenv("BENCH_PIPELINE"))   g_pipeline_depth = atoi(getenv("BENCH_PIPELINE"));
 
-    g_s = dmesh_create_channel("bench-sock", worker_id);     /* socket() + bind() */
+    /* Pure client: advertises no service. The DPU assigns our pod_id. */
+    g_s = dmesh_create_channel(DMESH_SVC_NONE);              /* socket() + bind() */
     if (!g_s) { fprintf(stderr, "[bench_sock] dmesh_create_channel failed\n"); return 1; }
-    fprintf(stderr, "[bench_sock] ready: pod_id=%d dst_pod_id=%d (façade client)\n",
+    fprintf(stderr, "[bench_sock] ready: pod_id=%d dst_service=%d (façade client)\n",
             dmesh_pod_id(g_s), g_dst_pod_id);
 
     int srv = ctrl_listen(CTRL_PORT);

@@ -77,9 +77,9 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/object.c.o: \
  /opt/mellanox/doca/include/doca_common_defines.h \
  /opt/mellanox/doca/include/doca_pe.h \
  /opt/mellanox/doca/include/doca_comch.h \
- /opt/mellanox/doca/include/doca_ctx.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
+ /opt/mellanox/doca/include/doca_ctx.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_common.h \
  /opt/mellanox/doca/include/doca_mmap.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpumesh_common.h \

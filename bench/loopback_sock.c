@@ -35,7 +35,7 @@
 #define CTRL_PORT 9092
 
 static dmesh_channel_t *g_s   = NULL;
-static int              g_service = 0;     /* own service id (= own pod_id) */
+static int              g_service = 0;     /* own service id (declared at create_channel) */
 static atomic_int       g_stop  = 0;
 static atomic_long      g_served = 0;      /* requests the echo side replied to */
 
@@ -73,11 +73,16 @@ static void *echo_fn(void *arg) {
     return NULL;
 }
 
-/* ---- client side: N round-trips to our OWN service (reusable conn) ---- */
-static void run_loopback(int conn_fd, long N, int size) {
+/* ---- client side: N round-trips to our OWN service (reusable conn) ----
+ * zc != 0 → ZERO-COPY send: fill transport memory from dmesh_alloc directly and
+ * dmesh_slot_register it (no dmesh_write memcpy). size may exceed one slot (the
+ * region auto-chunks + route-pins); the reply is reassembled with a read loop. */
+static void run_loopback(int conn_fd, long N, int size, int zc) {
     char reply[160];
-    if (N < 1 || size < 1 || size > dmesh_msg_max(g_s)) {
-        int n = snprintf(reply, sizeof reply, "ERR bad args (size<=%d)\n", dmesh_msg_max(g_s));
+    int msgmax = dmesh_msg_max(g_s);
+    /* zero-copy may span slots (arena); plain path stays single-slot (<= msgmax). */
+    if (N < 1 || size < 1 || (!zc && size > msgmax)) {
+        int n = snprintf(reply, sizeof reply, "ERR bad args (size<=%d for non-zc)\n", msgmax);
         write(conn_fd, reply, (size_t)n); return;
     }
     uint8_t *body = malloc((size_t)size), *rb = malloc((size_t)size);
@@ -89,20 +94,33 @@ static void run_loopback(int conn_fd, long N, int size) {
     long ok = 0, fail = 0; size_t ns = 0;
     for (long i = 0; i < N && c && !atomic_load(&g_stop); i++) {
         uint8_t p = (uint8_t)('A' + (i & 0xf));
-        body[0] = p; body[size / 2] = p; body[size - 1] = p;
         double t0 = now_sec();
-        if (dmesh_write(c, body, (size_t)size) < 0 || dmesh_flush(c) < 0) {
-            fail++; dmesh_close(c); c = dmesh_connect(g_s, g_service); continue;
+        int sent;
+        if (zc) {
+            /* ZERO-COPY: alloc n contiguous slots, fill transport memory directly,
+             * register (adopt as the conn's outbound), flush ships it (no memcpy). */
+            int nslots = (size + msgmax - 1) / msgmax;
+            dmesh_buf_t bz = dmesh_alloc(g_s, nslots);
+            if (!bz.ptr) { fail++; dmesh_close(c); c = dmesh_connect(g_s, g_service); continue; }
+            bz.ptr[0] = p; bz.ptr[size / 2] = p; bz.ptr[size - 1] = p;
+            int old = dmesh_slot_register(c, bz, (uint32_t)size);
+            if (old >= 0) { dmesh_buf_t ob = { NULL, old, 1 }; dmesh_free(g_s, ob); }
+            sent = (dmesh_flush(c) >= 0);
+        } else {
+            body[0] = p; body[size / 2] = p; body[size - 1] = p;
+            sent = (dmesh_write(c, body, (size_t)size) >= 0 && dmesh_flush(c) >= 0);
         }
-        ssize_t n; double tw = now_sec();
-        for (;;) {
-            n = dmesh_read(c, rb, (size_t)size);
-            if (n >= 0) break;                       /* got reply */
-            if (errno != EAGAIN) break;              /* abandoned */
-            if (now_sec() - tw > 5.0) { n = -2; break; }  /* timeout */
-            sched_yield();
+        if (!sent) { fail++; dmesh_close(c); c = dmesh_connect(g_s, g_service); continue; }
+        /* read the reply — reassemble up to `size` bytes (large = multiple chunks). */
+        double tw = now_sec(); size_t got = 0; int timedout = 0;
+        while (got < (size_t)size) {
+            ssize_t n = dmesh_read(c, rb + got, (size_t)size - got);
+            if (n > 0) { got += (size_t)n; continue; }
+            if (n == 0) break;                            /* peer closed */
+            if (now_sec() - tw > 5.0) { timedout = 1; break; }  /* timeout */
+            sched_yield();                                /* EAGAIN */
         }
-        int bad = (n != (ssize_t)size) ||
+        int bad = timedout || got != (size_t)size ||
                   rb[0] != p || rb[size / 2] != p || rb[size - 1] != p;
         if (bad) { fail++; dmesh_close(c); c = dmesh_connect(g_s, g_service); }
         else     { ok++; lat[ns++] = (now_sec() - t0) * 1e6; }
@@ -125,22 +143,22 @@ static void handle_ctrl(int fd) {
     if (n <= 0) { close(fd); return; }
     buf[n] = '\0';
     char *nl = strchr(buf, '\n'); if (nl) *nl = '\0';
-    char cmd[16] = {0}; long N = 0; int size = 0;
-    if (sscanf(buf, "%15s %ld %d", cmd, &N, &size) >= 1 && strcmp(cmd, "RUN") == 0)
-        run_loopback(fd, N, size);
+    char cmd[16] = {0}; long N = 0; int size = 0, zc = 0;
+    if (sscanf(buf, "%15s %ld %d %d", cmd, &N, &size, &zc) >= 1 && strcmp(cmd, "RUN") == 0)
+        run_loopback(fd, N, size, zc);   /* 4th arg (optional) = zero-copy flag */
     else
-        write(fd, "ERR use: RUN <N> <SIZE>\n", 24);
+        write(fd, "ERR use: RUN <N> <SIZE> [ZC]\n", 29);
     close(fd);
 }
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
-    int pod = 12;
-    if (getenv("BENCH_WORKER_ID")) pod = atoi(getenv("BENCH_WORKER_ID"));
+    int service_id = 12;   /* this node advertises AND connects to its own service */
+    if (getenv("BENCH_WORKER_ID")) service_id = atoi(getenv("BENCH_WORKER_ID"));
 
-    g_s = dmesh_create_channel("loopback", pod);
+    g_s = dmesh_create_channel(service_id);
     if (!g_s) { fprintf(stderr, "[loopback] create_channel failed\n"); return 1; }
-    g_service = dmesh_pod_id(g_s);   /* own service id (service_id defaults to pod_id) */
+    g_service = service_id;   /* connect to OUR OWN service; DPU routes it back to us */
     fprintf(stderr, "[loopback] ready: pod_id=%d own_service=%d\n", dmesh_pod_id(g_s), g_service);
 
     pthread_t et; pthread_create(&et, NULL, echo_fn, NULL);

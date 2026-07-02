@@ -22,10 +22,11 @@ enum msg_direction {
  * (little-endian), so values must stay < 256. */
 enum dmesh_msg_type {
     DMESH_MSG_INVALID      = 0, /* reserved: zeroed buffer is never a live type */
-    DMESH_MSG_POD_REGISTER = 1, /* Host→DPU: register this connection's pod_id */
+    DMESH_MSG_POD_REGISTER = 1, /* Host→DPU: register (service_id; pod_id=-1 → DPU assigns) */
     DMESH_MSG_MMAP_EXPORT  = 2, /* Host→DPU: export an mmap region (ring / TX buf / RX buf) */
     DMESH_MSG_BATCH_FWD_ACK= 3, /* DPU→Host: batch of (port,seq) keys whose forward DMA is done — free all */
     DMESH_MSG_BATCH_REV_DONE=4, /* DPU→Host: batch of reverse-DMA completions — deliver all */
+    DMESH_MSG_POD_ASSIGNED = 5, /* DPU→Host: the pod_id the DPU allocated for this registration */
 };
 
 /* DPU→Host: batched TX_ACK. Coalesces up to BATCH_TXACK_MAX per-request
@@ -95,13 +96,21 @@ typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_comch_producer_t;
 typedef uint64_t doca_dpa_dev_comch_consumer_t;
 
-/* Host→DPU: register this connection's pod_id */
+/* Host→DPU: register this connection. pod_id == -1 asks the DPU to ALLOCATE a
+ * free pod_id and return it in a DMESH_MSG_POD_ASSIGNED reply. */
 struct dmesh_register_msg {
     enum dmesh_msg_type type;   /* = DMESH_MSG_POD_REGISTER */
-    int32_t pod_id;
+    int32_t pod_id;             /* -1 → DPU assigns (the host no longer picks its address) */
     int32_t service_id;         /* this node's service id; DPU sets service_table[service_id]=pod_id
                                  * (SVC_NONE = client-only, no service to advertise) */
-    char app_name[64];
+};
+
+/* DPU→Host: the pod_id the DPU allocated for a pod_id==-1 registration. Byte
+ * `type` at offset 0 (the host dispatches DPU→host messages by recv_buffer[0]). */
+struct dmesh_pod_assigned_msg {
+    uint8_t  type;              /* = DMESH_MSG_POD_ASSIGNED */
+    uint8_t  _pad[3];
+    int32_t  pod_id;            /* the assigned pod id (>= 0) */
 };
 
 

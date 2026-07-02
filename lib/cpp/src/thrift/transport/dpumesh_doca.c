@@ -133,9 +133,8 @@ struct rxq_cell {
 };
 
 struct dpumesh_ctx {
-    char app_name[64];
     char worker_id[128];
-    int  pod_id;
+    int  pod_id;             /* this node's address; -1 until the DPU assigns it at register */
     int  num_slots;
     int  slot_size;
     int  k_rings;              /* K = forward rings per pod (EU-sharding); 1 = legacy */
@@ -163,10 +162,19 @@ struct dpumesh_ctx {
     struct dmesh_register_msg reg_msg;
 
     /* TX slot management — lock-free Treiber free-list of slot indices.
-     * free_head packs (tag<<32 | head_index); head_index==num_slots = empty.
-     * The tag (bumped per op) defeats ABA. slot_next[i] links free slots. */
+     * free_head packs (tag<<32 | head_index); head_index==arena_base = empty.
+     * The tag (bumped per op) defeats ABA. slot_next[i] links free slots.
+     * The free-list covers ONLY the pool [0, arena_base); slots [arena_base,
+     * num_slots) are the contiguous zero-copy arena (dpumesh_arena_alloc). */
     atomic_uint_fast64_t free_head;
     uint32_t *slot_next;
+    /* Contiguous zero-copy arena: the top (num_slots - arena_base) slots serve
+     * dmesh_alloc(n>1). Bitmap first-fit under arena_lock (n>1 is the rare large
+     * path; single-slot alloc stays on the lock-free pool). arena_base==num_slots
+     * ⇒ no arena (default), pool = all slots, hot path bit-identical. */
+    int arena_base;
+    uint8_t *arena_used;       /* [num_slots - arena_base]; 1 = allocated. NULL if no arena */
+    pthread_mutex_t arena_lock;
 
     /* RX descriptor queue — lock-free bounded SPMC ring (1 producer = PE
      * thread, N consumers = server workers). dpumesh_dequeue spin-polls it
@@ -206,7 +214,7 @@ struct dpumesh_ctx {
     /* Endpoint port table + allocator (oriented-tuple demux). */
     struct dmesh_port_slot *ports;     /* [DMESH_PORT_SPACE] */
     pthread_mutex_t port_lock;
-    uint32_t next_port;                /* bump cursor, wraps within [1,65535] */
+    uint32_t next_port;                /* bump cursor, wraps within [1, DMESH_UPORT_BASE) */
     int32_t service_id;                /* this node's service id (SVC_NONE if client-only) */
 
     /* PE-published READY LIST (single channel-eventfd model). The PE pushes a
@@ -586,7 +594,7 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
     }
 }
 
-static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, const char *app_name, int worker_num) {
+static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, int service_id) {
     const char *env_val;
 
     if (config && config->num_slots > 0)
@@ -611,22 +619,27 @@ static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, cons
         ctx->k_rings = DPUMESH_RINGS_PER_POD_DEFAULT;
     if (ctx->k_rings > MAX_EU_PER_POD) ctx->k_rings = MAX_EU_PER_POD;
 
-    snprintf(ctx->app_name, sizeof(ctx->app_name), "%s", app_name);
-    snprintf(ctx->worker_id, sizeof(ctx->worker_id),
-             "%s-worker-%d", app_name, worker_num);
+    /* Contiguous zero-copy arena: the top DPUMESH_ARENA_SLOTS slots are carved out
+     * of the pool for dmesh_alloc(n>1). Default 0 → no arena, pool = all slots
+     * (hot path unchanged). Clamp so the pool keeps at least 1 slot. */
+    int arena_slots = 0;
+    if ((env_val = getenv("DPUMESH_ARENA_SLOTS")) != NULL && atoi(env_val) > 0)
+        arena_slots = atoi(env_val);
+    if (arena_slots > ctx->num_slots - 1) arena_slots = ctx->num_slots - 1;
+    ctx->arena_base = ctx->num_slots - arena_slots;   /* == num_slots when no arena */
 
-    if ((env_val = getenv("DPUMESH_POD_ID")) != NULL)
-        ctx->pod_id = atoi(env_val);
-    else
-        ctx->pod_id = worker_num;
-
-    /* This node's service id (DPU service_table[service_id]=pod_id). Default =
-     * pod_id, so a client connecting to dst_service=N reaches the pod hosting
-     * service N. Override with DPUMESH_SERVICE_ID. */
+    /* This node's service id (what it advertises; DPU sets service_table[service_id]
+     * = the assigned pod_id). SVC_NONE = client-only. Comes from the caller;
+     * DPUMESH_SERVICE_ID env overrides. The pod_id (this node's address) is NO
+     * LONGER host-chosen — the DPU assigns it at registration (see
+     * init_control_path). It stays -1 until DMESH_MSG_POD_ASSIGNED arrives. */
     if ((env_val = getenv("DPUMESH_SERVICE_ID")) != NULL)
         ctx->service_id = atoi(env_val);
     else
-        ctx->service_id = ctx->pod_id;
+        ctx->service_id = service_id;
+
+    ctx->pod_id = -1;   /* unassigned until the DPU replies */
+    snprintf(ctx->worker_id, sizeof(ctx->worker_id), "svc%d", ctx->service_id);
 }
 
 static doca_error_t init_doca_device(dpumesh_ctx_t *ctx) {
@@ -645,16 +658,35 @@ static doca_error_t init_control_path(dpumesh_ctx_t *ctx) {
     result = init_comch_ctrl_path_client("DPUMesh", &ctx->doca_objs, true);
     if (result != DOCA_SUCCESS) return result;
 
+    /* Register with pod_id = -1: the DPU allocates our pod_id and replies with
+     * DMESH_MSG_POD_ASSIGNED. Block until it arrives, progressing the PE by hand
+     * (the PE thread isn't started until the end of dpumesh_init). */
+    __atomic_store_n(&ctx->doca_objs.assigned_pod_id, -1, __ATOMIC_RELEASE);
     ctx->reg_msg.type = DMESH_MSG_POD_REGISTER;
-    ctx->reg_msg.pod_id = ctx->pod_id;
-    ctx->reg_msg.service_id = ctx->service_id;   /* DPU: service_table[service_id]=pod_id */
-    snprintf(ctx->reg_msg.app_name, sizeof(ctx->reg_msg.app_name), "%s", ctx->app_name);
+    ctx->reg_msg.pod_id = -1;                    /* DPU assigns this node's address */
+    ctx->reg_msg.service_id = ctx->service_id;   /* DPU: service_table[service_id]=assigned pod_id */
 
     result = client_send_msg(&ctx->doca_objs, (const char *)&ctx->reg_msg, sizeof(ctx->reg_msg));
-    if (result == DOCA_SUCCESS) {
-        DOCA_LOG_INFO("Sent REGISTER to DPU: pod_id=%d app=%s", ctx->pod_id, ctx->app_name);
+    if (result != DOCA_SUCCESS) return result;
+    DOCA_LOG_INFO("Sent REGISTER to DPU: service_id=%d (awaiting pod_id)", ctx->service_id);
+
+    /* Wait for the assignment. Bounded (~2 s) so a lost reply fails init instead
+     * of wedging forever. The reply normally lands in microseconds. */
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000 };   /* 10 us */
+    int32_t assigned = -1;
+    for (int i = 0; i < 200000; i++) {
+        assigned = __atomic_load_n(&ctx->doca_objs.assigned_pod_id, __ATOMIC_ACQUIRE);
+        if (assigned >= 0) break;
+        if (ctx->doca_objs.pe) doca_pe_progress(ctx->doca_objs.pe);
+        nanosleep(&ts, NULL);
     }
-    return result;
+    if (assigned < 0) {
+        DOCA_LOG_ERR("Timed out waiting for DPU pod_id assignment (service_id=%d)", ctx->service_id);
+        return DOCA_ERROR_TIME_OUT;
+    }
+    ctx->pod_id = assigned;
+    DOCA_LOG_INFO("DPU assigned pod_id=%d (service_id=%d)", ctx->pod_id, ctx->service_id);
+    return DOCA_SUCCESS;
 }
 
 static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
@@ -715,25 +747,33 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
     return DOCA_SUCCESS;
 }
 
-int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
+int dpumesh_init(dpumesh_ctx_t **out, int service_id,
                  const dpumesh_config_t *config) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)calloc(1, sizeof(dpumesh_ctx_t));
     if (!ctx) return -1;
     ctx->notify_efd = -1;   /* before any goto fail: cleanup must not close fd 0 */
 
-    init_config(ctx, config, app_name, worker_num);
+    init_config(ctx, config, service_id);
 
     if (init_doca_device(ctx) != DOCA_SUCCESS) goto fail;
     if (init_control_path(ctx) != DOCA_SUCCESS) goto fail;
     if (init_datapath(ctx) != DOCA_SUCCESS) goto fail;
 
-    /* Build the lock-free TX free-list: link 0->1->...->(num_slots-1)->empty,
-     * head = 0 (all free). slot_next[i] = i+1; the last points to num_slots (empty). */
+    /* Build the lock-free TX free-list over the POOL [0, arena_base): link
+     * 0->1->...->(arena_base-1)->arena_base(empty sentinel), head = 0 (all free).
+     * Arena slots [arena_base, num_slots) are served by the bitmap allocator. */
     ctx->slot_next = (uint32_t *)malloc((size_t)ctx->num_slots * sizeof(uint32_t));
     if (!ctx->slot_next) goto fail;
-    for (int i = 0; i < ctx->num_slots; i++)
-        ctx->slot_next[i] = (uint32_t)(i + 1);   /* last = num_slots = empty sentinel */
+    for (int i = 0; i < ctx->arena_base; i++)
+        ctx->slot_next[i] = (uint32_t)(i + 1);   /* last -> arena_base = empty sentinel */
     atomic_store(&ctx->free_head, (uint_fast64_t)0);  /* tag 0, head index 0 */
+
+    /* Contiguous zero-copy arena bitmap (only when carved via DPUMESH_ARENA_SLOTS). */
+    pthread_mutex_init(&ctx->arena_lock, NULL);
+    if (ctx->arena_base < ctx->num_slots) {
+        ctx->arena_used = (uint8_t *)calloc((size_t)(ctx->num_slots - ctx->arena_base), 1);
+        if (!ctx->arena_used) goto fail;
+    }
     for (int j = 0; j < MAX_EU_PER_POD; j++)
         pthread_mutex_init(&ctx->ring_locks[j], NULL);
 
@@ -813,6 +853,8 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
         pthread_mutex_destroy(&ctx->custody_locks[j]);
     if (ctx->custody_key)  { free(ctx->custody_key);  ctx->custody_key  = NULL; }
     if (ctx->custody_next) { free(ctx->custody_next); ctx->custody_next = NULL; }
+    if (ctx->arena_used)   { free(ctx->arena_used);   ctx->arena_used   = NULL; }
+    pthread_mutex_destroy(&ctx->arena_lock);
 
     /* Destroy DMA landing-zone mmap + buffer (Host RX DMA buffer).
      * Must happen before cleanup_objects destroys the device. */
@@ -857,7 +899,7 @@ int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
         int empty = 0;
         for (;;) {
             uint32_t head = (uint32_t)(old & 0xFFFFFFFFu);
-            if (head >= (uint32_t)ctx->num_slots) { empty = 1; break; }
+            if (head >= (uint32_t)ctx->arena_base) { empty = 1; break; }   /* pool exhausted */
             uint_fast64_t newv = (((old >> 32) + 1) << 32) | (uint_fast64_t)ctx->slot_next[head];
             if (atomic_compare_exchange_weak_explicit(&ctx->free_head, &old, newv,
                     memory_order_acquire, memory_order_acquire))
@@ -878,7 +920,15 @@ uint8_t *dpumesh_tx_buf(dpumesh_ctx_t *ctx, int slot) {
 
 void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
     if (slot < 0 || slot >= ctx->num_slots) return;
-    /* Lock-free push onto the Treiber free-list (no mutex, no cond_signal/futex). */
+    /* Arena slot → clear its bitmap bit (a contiguous run reappears once all its
+     * slots are freed). Per-slot free matches the DPU's per-(port,seq) TX_ACK. */
+    if (slot >= ctx->arena_base) {
+        pthread_mutex_lock(&ctx->arena_lock);
+        ctx->arena_used[slot - ctx->arena_base] = 0;
+        pthread_mutex_unlock(&ctx->arena_lock);
+        return;
+    }
+    /* Pool slot → lock-free push onto the Treiber free-list (no mutex, no cond). */
     uint_fast64_t old = atomic_load_explicit(&ctx->free_head, memory_order_relaxed);
     for (;;) {
         uint32_t head = (uint32_t)(old & 0xFFFFFFFFu);
@@ -888,6 +938,29 @@ void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
                 memory_order_release, memory_order_relaxed))
             return;
     }
+}
+
+int dpumesh_arena_alloc(dpumesh_ctx_t *ctx, int n) {
+    /* First-fit over the arena bitmap under arena_lock (n>1 is the rare large
+     * path). Returns the base slot index of n contiguous free slots, or -1 if
+     * there is no arena or no run of n. Each slot is later freed independently
+     * by dpumesh_tx_free (per-(port,seq) TX_ACK); a run reappears once all clear. */
+    if (n <= 0 || !ctx->arena_used) return -1;
+    int arena_n = ctx->num_slots - ctx->arena_base;
+    if (n > arena_n) return -1;
+    pthread_mutex_lock(&ctx->arena_lock);
+    int run = 0, base = 0;
+    for (int i = 0; i < arena_n; i++) {
+        if (ctx->arena_used[i]) { run = 0; continue; }
+        if (run == 0) base = i;
+        if (++run == n) {                       /* n consecutive free slots found */
+            for (int j = base; j < base + n; j++) ctx->arena_used[j] = 1;
+            pthread_mutex_unlock(&ctx->arena_lock);
+            return ctx->arena_base + base;      /* absolute slot index */
+        }
+    }
+    pthread_mutex_unlock(&ctx->arena_lock);
+    return -1;
 }
 
 int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
@@ -1086,7 +1159,6 @@ uint16_t dpumesh_alloc_port(dpumesh_ctx_t *ctx, int role, void *user) {
     for (uint32_t scanned = 0; scanned < DMESH_UPORT_BASE - 1; scanned++) {
         uint32_t p = ctx->next_port;
         ctx->next_port = (p + 1 >= DMESH_UPORT_BASE) ? 1 : p + 1;  /* wrap in [1, UPORT_BASE) */
-        if (p == 0) continue;
         struct dmesh_port_slot *psl = &ctx->ports[p];
         if (psl->role == DMESH_ROLE_FREE) {
             /* Per-port inbound ring is allocated once and KEPT for the lifetime of

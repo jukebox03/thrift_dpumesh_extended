@@ -23,7 +23,6 @@
 #include <stdint.h>
 #include <errno.h>
 #include <unistd.h>
-#include <sched.h>
 #include <sys/epoll.h>
 
 #include "thrift/transport/dpm.h"
@@ -54,11 +53,11 @@ static int echo_drain(dmesh_conn_t *c, unsigned long *n_msgs)
 
 int main(void)
 {
-    int worker_id = 11;
+    int service_id = 11;   /* the service this backend advertises (DPU assigns our pod_id) */
     if (getenv("BENCH_WORKER_ID"))
-        worker_id = atoi(getenv("BENCH_WORKER_ID"));
+        service_id = atoi(getenv("BENCH_WORKER_ID"));
 
-    dmesh_channel_t *s = dmesh_create_channel("echo-sock", worker_id);
+    dmesh_channel_t *s = dmesh_create_channel(service_id);
     if (!s) { fprintf(stderr, "[echo_sock] dmesh_create_channel failed\n"); return 1; }
 
     int dfd = dmesh_event_fd(s);                          /* the ONE channel fd */

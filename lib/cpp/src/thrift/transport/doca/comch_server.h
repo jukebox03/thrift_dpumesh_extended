@@ -61,9 +61,10 @@ pods_add_connection(struct objects *objs, struct doca_comch_connection *conn);
 int
 pods_remove_connection(struct objects *objs, struct doca_comch_connection *conn);
 
-/* Register pod_id for an existing connection. Returns 0 on success. */
+/* Register an existing connection. pod_id < 0 → the DPU assigns a free pod_id
+ * (the pods[] slot index). Returns the assigned pod_id (>= 0), or -1 on error. */
 int
 pods_register(struct objects *objs, struct doca_comch_connection *conn,
-              int32_t pod_id, int32_t service_id, const char *app_name);
+              int32_t pod_id, int32_t service_id);
 
 #endif // COMCH_SERVER_H

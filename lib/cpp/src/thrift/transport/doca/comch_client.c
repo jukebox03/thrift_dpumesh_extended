@@ -108,6 +108,17 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 			objs->rx_data_hook(objs->rx_hook_ctx, recv_buffer, msg_len);
 		break;
 
+	case DMESH_MSG_POD_ASSIGNED:
+		/* DPU assigned this node's pod_id at registration. Stash it for the
+		 * init-time register wait loop to pick up. NOT via rx_data_hook (the
+		 * PE thread / hook aren't wired until the end of dpumesh_init). */
+		if (msg_len >= sizeof(struct dmesh_pod_assigned_msg)) {
+			const struct dmesh_pod_assigned_msg *am =
+				(const struct dmesh_pod_assigned_msg *)recv_buffer;
+			__atomic_store_n(&objs->assigned_pod_id, am->pod_id, __ATOMIC_RELEASE);
+		}
+		break;
+
 	default:
 		DOCA_LOG_INFO("Received unknown message type from server: %u", recv_buffer[0]);
 		break;

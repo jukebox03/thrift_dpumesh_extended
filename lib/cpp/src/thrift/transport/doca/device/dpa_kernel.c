@@ -31,9 +31,6 @@ _Static_assert(DPA_DMA_COPY_MAX <= DPUMESH_SLOT_SIZE,
  * drain_all_rings inner iter. */
 #define RING_BATCH_CAP  32
 
-/* Forward declarations */
-static void drain_producer_completions(struct dpa_thread_arg *thread_arg);
-
 /* Reverse admission accounting — per-EU file-scope globals (fast DPA memory),
  * indexed by [eu_index][ring]. Each EU owns its own row (thread_arg->eu_index)
  * → single-writer per row, no atomics.

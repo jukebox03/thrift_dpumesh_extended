@@ -52,7 +52,10 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_client.c.o: \
  /usr/include/x86_64-linux-gnu/bits/stdlib-float.h /usr/include/assert.h \
  /opt/mellanox/doca/include/doca_version.h \
  /opt/mellanox/doca/include/doca_common_defines.h \
- /opt/mellanox/doca/include/doca_mmap.h \
+ /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/common.h \
+ /opt/mellanox/doca/include/doca_buf.h \
+ /opt/mellanox/doca/include/doca_buf_inventory.h \
  /opt/mellanox/doca/include/doca_types.h /usr/include/linux/types.h \
  /usr/include/x86_64-linux-gnu/asm/types.h \
  /usr/include/asm-generic/types.h /usr/include/asm-generic/int-ll64.h \
@@ -62,11 +65,8 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_client.c.o: \
  /usr/include/x86_64-linux-gnu/asm/posix_types.h \
  /usr/include/x86_64-linux-gnu/asm/posix_types_64.h \
  /usr/include/asm-generic/posix_types.h \
- /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
- /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/common.h \
- /opt/mellanox/doca/include/doca_buf.h \
- /opt/mellanox/doca/include/doca_buf_inventory.h \
- /opt/mellanox/doca/include/doca_dev.h /usr/include/time.h \
+ /opt/mellanox/doca/include/doca_dev.h \
+ /opt/mellanox/doca/include/doca_mmap.h /usr/include/time.h \
  /usr/include/x86_64-linux-gnu/bits/time.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_tm.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_itimerspec.h \

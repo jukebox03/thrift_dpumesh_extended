@@ -6,7 +6,6 @@
 #include <doca_dev.h>
 #include <doca_pe.h>
 #include <doca_comch.h>
-#include <doca_ctx.h>
 
 #include "comch_server.h"
 #include "comch_common.h"
@@ -16,8 +15,6 @@ struct dmesh_doca_dpa_thread;
 struct dmesh_doca_dpa_comch;
 struct doca_dpa;
 struct dma_ring;
-typedef uint64_t doca_dpa_dev_comch_producer_t;
-typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
 /* doca_dpa_dev_mmap_t is 32-bit in the SDK (doca_dpa_dev_buf.h:35) — must
  * stay uint32_t to match the dma_desc.mmap field at offset 0 (followed by
@@ -135,7 +132,6 @@ struct pod_state {
     struct doca_comch_connection *connection;
     int32_t pod_id;
     int32_t service_id;     /* this pod's service id (DPU service_table[service_id]=pod_id); SVC_NONE if none */
-    char app_name[64];
     int registered;         /* 1 = DMESH_MSG_POD_REGISTER received */
     int dma_ready;          /* 1 = both mmaps arrived, DPA ring added */
 
@@ -341,6 +337,10 @@ struct objects {
     /* Host-only fields (used by dpumesh_doca.c client side) */
     struct doca_mmap *local_mmap;
     void *dma_buffer;
+    /* Set by the client recv callback when a DMESH_MSG_POD_ASSIGNED arrives at
+     * init; the register wait loop polls it. -1 = not yet assigned. Single init
+     * thread drives doca_pe_progress, so the callback runs synchronously. */
+    int32_t assigned_pod_id;
 
     /* DPA (shared device, N EU threads for multi-EU data plane).
      *

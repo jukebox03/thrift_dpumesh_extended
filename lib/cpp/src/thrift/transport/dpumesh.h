@@ -60,8 +60,11 @@ typedef struct {
 typedef struct dpumesh_ctx dpumesh_ctx_t;
 
 /* ====== Lifecycle ====== */
-int  dpumesh_init(dpumesh_ctx_t **ctx, const char *app_name, int worker_id,
-                  const dpumesh_config_t *config);  /* NULL = use defaults */
+/* service_id = the service this node advertises (SVC_NONE for a pure client).
+ * The node's pod_id is assigned by the DPU at registration (dpumesh_get_pod_id
+ * returns it after init). config = NULL uses defaults. */
+int  dpumesh_init(dpumesh_ctx_t **ctx, int service_id,
+                  const dpumesh_config_t *config);
 void dpumesh_destroy(dpumesh_ctx_t *ctx);
 
 /* ====== Query configured values ====== */
@@ -70,7 +73,7 @@ int dpumesh_get_slot_size(dpumesh_ctx_t *ctx);
 /* Enable + return a readiness eventfd: a real fd that becomes readable whenever an
  * inbound request/response is delivered. Wait on it with a VANILLA epoll/poll/select
  * (no busy-poll); on wakeup, drain it with one read() of a uint64_t, then collect
- * work via dpumesh_dequeue(0) / dpumesh_poll_response(). Returns -1 on failure.
+ * work via dpumesh_dequeue(0) / dpumesh_conn_recv(). Returns -1 on failure.
  * Idempotent; the PE thread (DPUMESH_HOST_EPOLL=1) drives it notification-style. */
 int dpumesh_get_event_fd(dpumesh_ctx_t *ctx);
 
@@ -97,6 +100,11 @@ void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot);
  * (free-list empty) it BUSY-SPINS with capped backoff until a slot frees — it
  * does not fail/return -1. */
 int dpumesh_tx_alloc(dpumesh_ctx_t *ctx);
+
+/* Allocate n CONTIGUOUS TX slots from the zero-copy arena (DPUMESH_ARENA_SLOTS).
+ * Returns the base slot index (>=0), or -1 if no arena or no run of n. Non-
+ * blocking (first-fit under a lock). Each slot is freed with dpumesh_tx_free. */
+int dpumesh_arena_alloc(dpumesh_ctx_t *ctx, int n);
 
 /* Get pointer to TX buffer data for a slot (zero-copy write). */
 uint8_t *dpumesh_tx_buf(dpumesh_ctx_t *ctx, int slot);

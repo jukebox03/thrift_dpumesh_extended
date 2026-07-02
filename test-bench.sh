@@ -56,6 +56,7 @@ FLEXIO_LIB_DIR="/opt/mellanox/flexio/lib"
 IMG_BENCH_DPU="bench/bench-dpumesh:latest"
 IMG_ECHO_DPU="bench/echo-dpumesh:latest"
 IMG_LOOPBACK_DPU="bench/loopback-dpumesh:latest"   # self-routing validator (1 pod = client+server)
+IMG_PRELOAD_DPU="bench/preload-dpumesh:latest"     # LD_PRELOAD shim validator (vanilla TCP apps)
 IMG_BENCH_TCP="bench/bench-tcp:latest"
 IMG_ECHO_TCP="bench/echo-tcp:latest"
 IMG_ENVOY="envoyproxy/envoy:v1.30-latest"
@@ -183,6 +184,20 @@ build_bench_binaries() {
         -Wl,-rpath,/usr/local/lib -Wl,-rpath,"$DOCA_LIB_DIR"
     info "C bench binaries built (façade: bench_sock.c + echo_sock.c + loopback_sock.c)"
 
+    # LD_PRELOAD socket shim + its validators. tcp_echo / tcp_client are PURE
+    # POSIX socket programs (no dmesh headers) — running them unmodified over
+    # DPUmesh via the shim is exactly what the preload test proves.
+    gcc -O2 -fPIC -shared -o "$BENCH_DIR/libdmesh_preload.so" \
+        "$TRANSPORT_SRC/dmesh_preload.c" \
+        -I"$PROJ_ROOT/lib/cpp/src" \
+        -L"$BUILD_DOCA/lib" -L"$DOCA_LIB_DIR" \
+        $THRIFT_LINK_LIB -lpthread -ldl -ldoca_common -ldoca_comch \
+        -Wl,-rpath,/usr/local/lib -Wl,-rpath,"$DOCA_LIB_DIR"
+    gcc -O2 -o "$BENCH_DIR/tcp_echo"       "$BENCH_DIR/tcp_echo.c"
+    gcc -O2 -o "$BENCH_DIR/tcp_client"     "$BENCH_DIR/tcp_client.c"
+    gcc -O2 -o "$BENCH_DIR/preload_runner" "$BENCH_DIR/preload_runner.c"
+    info "LD_PRELOAD shim + vanilla TCP validators built"
+
     if ! command -v go >/dev/null 2>&1; then
         err "go not found in PATH"; exit 1
     fi
@@ -216,6 +231,12 @@ build_images() {
     cp -f "$BENCH_DIR/loopback_dpumesh" "$PROJ_ROOT/"
     build_image "$BENCH_DIR/Dockerfile.loopback_dpumesh" "$IMG_LOOPBACK_DPU" "$PROJ_ROOT"
     rm -f "$PROJ_ROOT/loopback_dpumesh"
+
+    cp -f "$BENCH_DIR/preload_runner" "$BENCH_DIR/tcp_echo" "$BENCH_DIR/tcp_client" \
+          "$BENCH_DIR/libdmesh_preload.so" "$PROJ_ROOT/"
+    build_image "$BENCH_DIR/Dockerfile.preload_dpumesh" "$IMG_PRELOAD_DPU" "$PROJ_ROOT"
+    rm -f "$PROJ_ROOT/preload_runner" "$PROJ_ROOT/tcp_echo" "$PROJ_ROOT/tcp_client" \
+          "$PROJ_ROOT/libdmesh_preload.so"
 
     # tcp bench — slim, build from BENCH_DIR directly
     build_image "$BENCH_DIR/Dockerfile.bench_tcp" "$IMG_BENCH_TCP" "$BENCH_DIR"
@@ -354,6 +375,9 @@ get_pod_cores() {
                 bench-tcp)        echo "2" ;;   # bench + sidecar1 share core 2
                 echo-tcp)         echo "3" ;;   # echo  + sidecar2 share core 3
                 loopback-dpumesh) echo "4,5" ;; # client+echo+PE threads in one pod
+                preload-dpumesh)  echo "4,5" ;; # shares loopback's cores (both are
+                                                # on-demand validators, never active
+                                                # at the same time)
                 echo-dpumesh-13)  echo "6" ;;   # test-7 extra backend
                 echo-dpumesh-14)  echo "7" ;;   # test-7 extra backend
                 *) echo "" ;;
@@ -378,7 +402,7 @@ pin_pods() {
         warn "cpupower not found; skipping DVFS lock"
     fi
 
-    for app in bench-dpumesh echo-dpumesh echo-dpumesh-13 echo-dpumesh-14 loopback-dpumesh bench-tcp echo-tcp; do
+    for app in bench-dpumesh echo-dpumesh echo-dpumesh-13 echo-dpumesh-14 loopback-dpumesh preload-dpumesh bench-tcp echo-tcp; do
         local cores pod_id
         cores=$(get_pod_cores "$app" "$profile")
         [ -z "$cores" ] && continue
@@ -601,6 +625,7 @@ spec:
         - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
         - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
         - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
+        - { name: DPUMESH_ARENA_SLOTS, value: "${DPUMESH_ARENA_SLOTS:-512}" }  # zero-copy arena (dmesh_alloc)
         securityContext: { privileged: true }
         volumeMounts:
         - { mountPath: /dev/infiniband, name: infiniband }
@@ -614,6 +639,50 @@ kind: Service
 metadata: { name: loopback-dpumesh }
 spec:
   selector: { app: loopback-dpumesh }
+  ports: [{ port: $CTRL_PORT, targetPort: $CTRL_PORT }]
+---
+# preload-dpumesh (service_id=15): LD_PRELOAD shim validator. The runner (NOT
+# preloaded) spawns tcp_echo + tcp_client — both VANILLA POSIX TCP binaries —
+# under LD_PRELOAD=libdmesh_preload.so. Each child registers ONE dmesh channel
+# at boot (2 pod registrations total, within MAX_PODS); every RUN opens fresh
+# connections, so conn churn (connect/FIN/close) is exercised per RUN.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: preload-dpumesh
+spec:
+  replicas: 0
+  selector: { matchLabels: { app: preload-dpumesh } }
+  template:
+    metadata: { labels: { app: preload-dpumesh } }
+    spec:
+      hostname: preload-dpumesh
+      containers:
+      - name: preload-dpumesh
+        image: docker.io/$IMG_PRELOAD_DPU
+        imagePullPolicy: Never
+        ports: [{ containerPort: $CTRL_PORT }]
+        env:
+        - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
+        - { name: PRELOAD_SVC, value: "15" }
+        - { name: ECHO_PORT, value: "9095" }
+        - { name: DMESH_PRELOAD_DEBUG, value: "${DMESH_PRELOAD_DEBUG:-0}" }
+        - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
+        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
+        - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
+        securityContext: { privileged: true }
+        volumeMounts:
+        - { mountPath: /dev/infiniband, name: infiniband }
+        - { mountPath: /usr/local/lib/libthrift.so.0.12.0, name: libthrift-so, subPath: libthrift.so.0.12.0 }
+      volumes:
+      - { name: infiniband, hostPath: { path: /dev/infiniband } }
+      - { name: libthrift-so, hostPath: { path: $BUILD_DOCA/lib, type: Directory } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: preload-dpumesh }
+spec:
+  selector: { app: preload-dpumesh }
   ports: [{ port: $CTRL_PORT, targetPort: $CTRL_PORT }]
 ---
 apiVersion: apps/v1
@@ -798,6 +867,7 @@ start_pods() {
     scale_up_with_wait "echo-dpumesh-14"  ""
     scale_up_with_wait "bench-dpumesh"    "pods: 2"
     scale_up_with_wait "loopback-dpumesh" "pods: 3"
+    scale_up_with_wait "preload-dpumesh"  "pods: 4"   # LD_PRELOAD shim validator
     # TCP: echo-tcp pod (echo + sidecar2) first, then bench-tcp pod
     # (bench + sidecar1). Sidecars are containers in these pods, not
     # standalone deployments. STRICT_DNS lazy resolution makes order
@@ -880,15 +950,15 @@ run_loopback() {
     # resolves svc 12 -> pod 12 (itself) -> own echo replies. Proves self-routing
     # + the oriented-tuple demux on a single host (request dst_port=0 -> accept,
     # reply dst_port=pc -> client, distinguished even though both legs are local).
-    local N="${1:-50000}" size="${2:-8192}"
+    local N="${1:-50000}" size="${2:-8192}" zc="${3:-0}"
     local pod_ip
     pod_ip=$(kubectl get pod -n "$NS" -l app=loopback-dpumesh --field-selector=status.phase=Running -o jsonpath='{.items[0].status.podIP}')
     if [ -z "$pod_ip" ]; then
         err "loopback-dpumesh pod not found — run '$0 deploy' first"; return 1
     fi
-    step "=== loopback (self-service): pod12 → service12 → pod12, N=$N size=${size}B ==="
+    step "=== loopback (self-service): pod12 → service12 → pod12, N=$N size=${size}B zerocopy=$zc ==="
     local resp
-    resp=$(printf 'RUN %s %s\n' "$N" "$size" | timeout 120s nc "$pod_ip" "$CTRL_PORT" || true)
+    resp=$(printf 'RUN %s %s %s\n' "$N" "$size" "$zc" | timeout 120s nc "$pod_ip" "$CTRL_PORT" || true)
     if [ -z "$resp" ]; then err "no response (timeout or pod down)"; return 1; fi
     if [[ "$resp" == ERR* ]]; then err "loopback replied: $resp"; return 1; fi
     # Parse: OK <ok> <fail> <served> <p50us>
@@ -903,12 +973,40 @@ run_loopback() {
     echo "============================================================"
 }
 
+run_preload() {
+    # LD_PRELOAD shim validation: the VANILLA tcp_client/tcp_echo binaries run
+    # UNMODIFIED over DPUmesh via libdmesh_preload.so inside the preload-dpumesh
+    # pod. $1 = N round-trips, $2 = msg size (may exceed 8KB — exercises
+    # auto-chunk + the conn route pin), $3 = conns opened fresh per RUN.
+    local N="${1:-5000}" size="${2:-1024}" conns="${3:-8}"
+    local pod_ip
+    pod_ip=$(kubectl get pod -n "$NS" -l app=preload-dpumesh --field-selector=status.phase=Running -o jsonpath='{.items[0].status.podIP}')
+    if [ -z "$pod_ip" ]; then
+        err "preload-dpumesh pod not found — run '$0 deploy' first"; return 1
+    fi
+    step "=== preload (LD_PRELOAD shim): N=$N size=${size}B conns=$conns ==="
+    local resp
+    resp=$(printf 'RUN %s %s %s\n' "$N" "$size" "$conns" | timeout 620s nc "$pod_ip" "$CTRL_PORT" || true)
+    if [ -z "$resp" ]; then err "no response (timeout or pod down)"; return 1; fi
+    if [[ "$resp" == ERR* ]]; then err "preload replied: $resp"; return 1; fi
+    # Parse: OK <ok> <fail> <p50us> <p99us>
+    read -r tag ok fail p50 p99 <<<"$resp"
+    echo
+    echo "============================================================"
+    echo "  LD_PRELOAD shim (vanilla TCP apps over DPUmesh)"
+    echo "============================================================"
+    printf "  OK / Fail:      %s / %s\n" "$ok" "$fail"
+    printf "  p50 latency:    %s us\n" "$p50"
+    printf "  p99 latency:    %s us\n" "$p99"
+    echo "============================================================"
+}
+
 ### ---------------------------------------------------------- utility ###
 
 show_logs() {
     # bench-tcp/echo-tcp pods now have 2 containers each (app + sidecar);
     # --all-containers prefixes each line with the container name.
-    for app in bench-dpumesh echo-dpumesh echo-dpumesh-13 echo-dpumesh-14 loopback-dpumesh bench-tcp echo-tcp; do
+    for app in bench-dpumesh echo-dpumesh echo-dpumesh-13 echo-dpumesh-14 loopback-dpumesh preload-dpumesh bench-tcp echo-tcp; do
         echo "=== $app ==="
         kubectl logs -n "$NS" -l "app=$app" --all-containers=true --prefix=true --tail=20 2>/dev/null || true
         echo
@@ -1002,7 +1100,12 @@ case "$CMD" in
     loopback)
         # Self-routing / loopback: pod 12 is client+server of its own service 12.
         pin_pods fair >/dev/null
-        run_loopback "${2:-50000}" "${3:-8192}"
+        run_loopback "${2:-50000}" "${3:-8192}" "${4:-0}"   # $4=1 → zero-copy (dmesh_alloc)
+        ;;
+    preload)
+        # LD_PRELOAD shim: vanilla TCP apps (tcp_client/tcp_echo) over DPUmesh.
+        pin_pods fair >/dev/null
+        run_preload "${2:-5000}" "${3:-1024}" "${4:-8}"
         ;;
     dpumesh-hw)
         # HW limit chase: dpumesh 측만 multi-core. echo-dpumesh "1,5", bench
@@ -1059,6 +1162,7 @@ case "$CMD" in
         echo "  dpumesh     <RPS> <DUR> <SIZE> [<CONNS>]  # 1-core fair (TCP 대조군용)"
         echo "  tcp         <RPS> <DUR> <SIZE> [<CONNS>]  # 1-core fair (sidecar 모델)"
         echo "  dpumesh-hw  <RPS> <DUR> <SIZE> [<CONNS>]  # multi-core (HW 한계 측정)"
+        echo "  preload     <N> <SIZE> [<CONNS>]          # LD_PRELOAD shim (vanilla TCP 앱)"
         echo "  pin / pin-fair                            # fair 모드 재핀"
         echo "  pin-hw                                    # hw 모드 재핀 (수동 토글)"
         echo "  logs                                      # bench/echo pod 로그"

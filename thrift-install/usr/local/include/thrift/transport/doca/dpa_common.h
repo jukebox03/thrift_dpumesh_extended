@@ -91,7 +91,7 @@ enum dpa_msg_type {
 	DPA_MSG_REV_DONE     = 5, /* DPA→DPU: reverse DMA completed (DPU→CPU) */
 };
 
-/* DPA->DPU completion immediate — packed to EXACTLY 16 bytes (one WQE BB) to
+/* DPA->DPU completion immediate — packed to 20 bytes (route_group added; 2nd WQE BB) to
  * minimize PCIe immediate-data cost on dma_copy. `type` MUST stay at offset 0 (the
  * recv callback peeks raw[0] to dispatch). Carries the endpoint tuple so the DPU
  * can route (dst_pod==BLANK -> resolve dst_service) and the host can demux by
@@ -99,8 +99,8 @@ enum dpa_msg_type {
  *   src_service is NOT on the wire (16B budget): the DPU derives the caller's
  *   service from src_pod's registration (assumes ONE service per pod — widen the
  *   wire if a pod ever hosts multiple services).
- * Layout is naturally aligned (uint16 on even offsets, pos@12) — no padding:
- *   type0 src_pod1 dst_pod2 dst_svc3 src_port4 dst_port6 seq8 length10 pos12 = 16B. */
+ * Layout is naturally aligned (uint16 on even offsets, pos@12); route_group@16 adds 3B tail pad:
+ *   type0 src_pod1 dst_pod2 dst_svc3 src_port4 dst_port6 seq8 length10 pos12 route_group16 = 20B. */
 struct comch_dma_comp_msg {
 	uint8_t  type;        /* DPA_MSG_FWD_DONE / DPA_MSG_REV_DONE (offset 0 — peeked) */
 	int8_t   src_pod_id;  /* originating pod (always concrete) */

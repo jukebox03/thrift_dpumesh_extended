@@ -82,7 +82,7 @@ void expired_consumer_callback(struct doca_comch_event_consumer *event,
 	(void)id;
 }
 
-doca_error_t init_comch_consumer(struct doca_comch_connection *connection,
+static doca_error_t init_comch_consumer(struct doca_comch_connection *connection,
 				 struct doca_mmap *user_mmap,
 				 struct comch_consumer_cb_config *cfg,
 				 struct doca_comch_consumer **consumer,

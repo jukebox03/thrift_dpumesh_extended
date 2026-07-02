@@ -764,7 +764,6 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, int idx, struct dpa_thread_arg *
     doca_dpa_dev_comch_consumer_t dpa_consumer;
     uint32_t send_consumer_id;
     uint32_t recv_consumer_id;
-    uint32_t dpu_consumer_id;
 
     result = doca_comch_consumer_completion_get_dpa_handle(comch->consumer_comp, &dpa_consumer_comp);
     if (result != DOCA_SUCCESS) {
@@ -791,7 +790,6 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, int idx, struct dpa_thread_arg *
         DOCA_LOG_ERR("Failed to get recv.consumer ID: %s", doca_error_get_name(result));
         return result;
     }
-    dpu_consumer_id = recv_consumer_id;
 
     if (send_consumer_id != recv_consumer_id) {
         DOCA_LOG_INFO("DPA MsgQ consumer IDs differ: send.consumer=%u recv.consumer=%u (using recv.consumer)",
@@ -810,7 +808,7 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, int idx, struct dpa_thread_arg *
     arg->dpa_producer_comp = dpa_producer_comp;
     arg->dpa_consumer = dpa_consumer;
     arg->dpa_producer = dpa_producer;
-    arg->dpu_consumer_id = dpu_consumer_id;
+    arg->dpu_consumer_id = recv_consumer_id;
     arg->num_rings = 0;  /* rings added dynamically via setup_pod_dma */
 
     DOCA_LOG_INFO("DPA thread arg: consumer_comp=0x%lx, producer_comp=0x%lx, consumer=0x%lx, producer=0x%lx, dpu_consumer_id=%u (send.consumer=%u recv.consumer=%u)",

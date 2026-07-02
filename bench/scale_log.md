@@ -2992,3 +2992,161 @@ fixed stale comments (poll_response→conn_recv, request/response→conn/inbox, 
 per-conn-eventfd, rev_rr round-robin, bench read auto-send). All host .c `gcc -fsyntax-only` clean;
 full `deploy` (device dpa_kernel + ARM + host) exit 0. Re-validated: RPC 100K = 99,452 p50 184.9us
 0-fail; loopback 50K 0-fail; large 32KB 100,000/0 621 MB/s. Perf-neutral, no behavior change.
+
+# 2026-07-02 (session 3) — API: service_id-only + DPU-assigned pod_id; zero-copy dmesh_alloc/slot_register
+
+Three API changes (user-directed), each deployed + tested via test-bench.sh (all 0-fail):
+
+## Task 1 — service_id-only channel, pod_id assigned by the DPU (full replace, WIRE CHANGE)
+`dmesh_create_channel(int service_id)` (dropped app_name + host-chosen pod_id). Host registers with
+pod_id=-1; DPU allocates a free pod_id (pods[] slot index, unique per live pod) and replies with a
+new `DMESH_MSG_POD_ASSIGNED`; host blocks in init (bounded ~2s, PE-progressed by hand) until it lands,
+NOT via rx_data_hook (gatekeeper case added to comch_client recv switch). app_name deleted from wire
+(dmesh_register_msg) + pod_state. lb_pick's DPUMESH_LB_RR entries are now SERVICE ids resolved via
+service_table (pod_ids are DPU-assigned, unknowable to the harness). Benches: echo/loopback pass
+BENCH_WORKER_ID as service_id; bench = DMESH_SVC_NONE (pure client); loopback connects to its OWN
+declared service_id (was dmesh_pod_id()). Results: loopback 50K 0-fail (startup-race discriminator),
+RPC 100K=99,453 p50 179us, 200K=198,909, large 32K 100,000/0 — all = baseline, perf-neutral.
+
+## Task 2 — zero-copy dmesh_alloc / dmesh_slot_register (contiguous arena)
+dma_buffer partitioned: pool [0,arena_base) = Treiber free-list (unchanged, lock-free); arena
+[arena_base,num_slots) = bitmap first-fit under a small mutex, carved by DPUMESH_ARENA_SLOTS (default
+0 → arena_base=num_slots → hot path BIT-IDENTICAL). dpumesh_tx_free routes by index (pool push vs
+arena bit-clear); custody/TX_ACK/cleanup untouched. `dmesh_alloc(s,n)`→{ptr,slot,n} (n==1 pool
+lock-free, n>1 arena). `dmesh_slot_register(c,b,len)` flush-first then adopts b as the conn's tx (conn
+gains tx_region_n); `dmesh_flush` ships a >1 region as route-pinned chunks (shared route_group), frees
+unused tail slots; `dmesh_free` releases an unsent alloc; `dmesh_close` frees a buffered region. conn
+model = SINGLE slot + flush-first (custody list already holds many outstanding shipped slots).
+
+## Task 3 — write ship-error hardening (folded in)
+dmesh_write on ship failure no longer over-counts the dropped full slot in the returned `done`
+(returns done-cap) and clears cur_group. Latent/unreachable today (enqueue blocks on ring-full, only
+rejects malformed) but reachable once registered buffers exist.
+
+## Zero-copy validation (loopback, DPUMESH_ARENA_SLOTS=512, RUN N SIZE ZC) — all 0-fail
+| test | ok/fail | p50 | note |
+|---|---|---|---|
+| non-zc 8KB   | 50,000/0 | 127us | existing path regression |
+| zc 8KB (n=1, pool)   | 50,000/0 | 127us | dmesh_alloc(1)+register+flush |
+| zc 32KB (n=4, arena) | 20,000/0 | 176us | arena alloc + region-flush(4 route-pin chunks) + read reassembly |
+echo served cumulative = 180,000 = 50k + 50k + 20k×4 ⇒ 32KB shipped as exactly 4 chunks, route-pinned,
+reassembled in order (content-verified per-offset). Arena alloc/free 20k cycles, no leak/hang. DPU log
+clean. Allocator refactor (arena default 0) separately re-validated perf-neutral: 100K=99,455 / 200K=
+198,905 / large 100,000/0.
+
+## API naming (user-directed)
+Service-taking params are consistently `service_id`: dmesh_create_channel(int service_id),
+dmesh_connect(s, int dst_service_id). Wire/struct field `dst_service` kept (cascades to sw_descriptor/
+dma_desc/DPU — out of scope for a param rename).
+
+# 2026-07-02 (session 4) — 2nd cleanup sweep + full reliable re-test
+
+## Cleanup sweep #2 (workflow-verified, applied on top of the API changes)
+Full-transport fan-out (12 groups, discover → adversarial verify). 19 findings SAFE+applied,
+1 RISKY skipped (ready_push fwd-decl behind a design-rationale comment), 0 REJECT. Applied:
+- DEAD: dpa_kernel.c drain_producer_completions fwd-decl; echo_sock.c <sched.h>; comch_client.h
+  <doca_mmap.h>; object.h <doca_ctx.h> + 2 duplicate typedefs (producer_t/completion_t, already in
+  comch_common.h); comch_server.c 4 unused includes (../dpumesh.h, dpa.h, dpa_common.h,
+  doca_comch_consumer.h).
+- REDUNDANT/SIMPLIFY: dpumesh_doca.c unreachable `if(p==0)continue` in alloc_port; dpa.c
+  dpu_consumer_id pass-through temp folded to recv_consumer_id (3-line); ring.c next_head temp
+  folded; bench_sock.c pipeline `depth=P` temp folded; comch_consumer.c init_comch_consumer → static.
+- STALE COMMENTS: dpumesh.h poll_response→conn_recv; dpumesh_doca.c next_port range [1,65535]→
+  [1,UPORT_BASE); dpa_common.h comch_dma_comp_msg 16B→20B (×2, layout+route_group).
+All host .c gcc -fsyntax-only clean; full deploy (device+ARM+host) exit 0.
+
+## Full test suite — fresh deploy, churn-safe order (overload tests LAST) — ALL 0-fail
+Loopback (self-service pod12; zero-copy dmesh_alloc path exercised):
+| test | ok/fail | p50 | note |
+|---|---|---|---|
+| loopback non-zc 8KB   | 50,000/0  | 160us | baseline path |
+| loopback ZC 8KB (n=1 pool)   | 50,000/0  | 152us | dmesh_alloc(1)+register+flush |
+| loopback ZC 32KB (n=4 arena) | 20,000/0  | 170us | arena alloc + region-flush(4 route-pin chunks) + reassembly |
+
+RPC warm ramp (fair 1-core, 1KB, 10s):
+| rps | achieved | p50 | p99 | p999 | ok/fail |
+|---|---|---|---|---|---|
+| 30K  | 29,837  | 181us | 565us    | 1,825us  | 300,000/0 |
+| 100K | 99,449  | 190us | 279us    | 736us    | 1,000,000/0 |
+| 150K | 149,177 | 222us | 318us    | 1,052us  | 1,500,000/0 |
+| 200K | 198,890 | 267us | 30,000us | 44,106us | 2,000,000/0 |
+
+Pipeline (fresh deploy, run FIRST — see churn note):
+| rps | achieved | p50 | p99 | ok/fail |
+|---|---|---|---|---|
+| 50K  | 49,727 | 166us | 316us | 500,000/0 |
+| 100K | 99,450 | 211us | 265us | 1,000,000/0 |
+
+One-way + large (overload-prone, run LAST):
+| test | achieved | p50 | p99 | ok/fail | MB/s |
+|---|---|---|---|---|---|
+| one-way 6K/1KB      | 5,960 | 449us  | 40ms  | 48,000/0 | 11.6 |
+| large 16KB @2K/64c  | 1,989 | 651us  | 1.8ms | 20,000/0 | 62.2 |
+| large 32KB @2K/64c  | 1,984 | 1.21ms | 141ms | 20,000/0 | 124.0 |
+| large 64KB @1K/64c  | 994   | 2.47ms | 88ms  | 10,000/0 | 124.3 |
+large 32/64KB p99 100-180ms = offered load AT the ~124-149 MB/s host↔DPU DMA cap (expected overload
+latency, 0-fail, content-verified). DPU log hot-path clean throughout.
+
+## RELIABILITY NOTE — pipeline "14K collapse" is the PRE-EXISTING upstream-churn ceiling, NOT a regression
+On the FIRST test batch, pipeline (30/50/100K) collapsed to ~14K achieved with multi-SECOND p50 —
+reproducible across a 20s-idle isolated re-run. Root cause is NOT this session's code: a fresh
+redeploy + pipeline-run-FIRST gives fully healthy 49,727 / 99,450 (p50 166/211us, 0-fail). The
+collapse is the documented pre-existing upstream-churn ceiling drop (200K→~12K, recovers on
+redeploy/low-load) exposed when a churn/overload test (large-64KB above the DMA cap, one-way burst)
+precedes pipeline in the same deploy. Discriminator: RPC 200K stayed healthy in the SAME contaminated
+deploy, so it is pipeline/uP-churn-specific, not general degradation. Mitigation for reliable numbers:
+run pipeline before overload tests, or redeploy between. All session-4 code changes are perf-neutral,
+0-regression (RPC 200K=198,890=baseline; pipeline fresh=99,450; zero-copy 0-fail).
+
+---
+
+# 2026-07-03 — LD_PRELOAD socket shim (libdmesh_preload.so) + connection route pin — BUILT + VALIDATED
+
+## What & why
+Two-layer design (plan.md): the native dmesh_* API stays the optimized product; a NEW
+LD_PRELOAD shim (lib/cpp/src/thrift/transport/dmesh_preload.c) runs UNMODIFIED,
+dynamically-linked POSIX socket apps over DPUmesh. Mapped TCP connects/listens
+(DMESH_PRELOAD_MAP / _LISTEN + _SVC env) become dmesh conns; everything else passes
+through. FD REALIZATION: a private eventfd is dup2()'d over the app's fd number, so
+epoll/poll/select/close/dup need NO interposition (real kernel fds). A dispatcher
+thread is the single dmesh_accept/next_ready consumer and the SOLE dmesh_close caller
+(close() only queues) — no ready-pop vs free race. Byte-stream semantics: dmesh_read's
+rx_pos cursor already gives short reads; send() = write+flush per call.
+
+## dpm.h: dmesh_pin_route(c) — connection-level backend affinity, ZERO DPU/DPA/wire change
+Socket apps assume total order per connection; per-message LB breaks it. dmesh_pin_route
+claims a route-affinity group (the SAR route_group table in dpu_route, unchanged) and
+stamps it on EVERY message + FIN of the conn → the DPU pins the whole conn to the backend
+picked for its first message. pin_group=0 (default) is bit-identical to before.
+
+## Bring-up bugs found (in order)
+1. runner↔client stdout protocol polluted by DOCA SDK logs on the pipe → skip-until-RESULT.
+2. DPU pod-table FULL (8): pods_remove_connection exists + slots are reused, BUT the comch
+   disconnection event NEVER FIRED for abruptly killed host processes (>1 min observed) →
+   every preload-pod restart leaks 2 slots until the next DPU restart. Mitigations: runner
+   never exits on child death (restart would burn slots); clean deploy resets. FOLLOW-UP:
+   dead-connection detection/reclaim + DPA ring-array reclaim.
+3. ROOT CAUSE of the silent hang: dmesh_accept returns the conn already HOLDING its first
+   message (delivery predates the handle), so the ready list never re-edges for it — an
+   epoll app never saw the accepted fd readable. FIX: dispatcher asserts the new conn's
+   eventfd at accept-wrap time. (Native echo never hit this: it serves at accept.)
+
+## Results (fair pin; preload pod shares cores 4,5 with loopback; DMESH_PRELOAD_DEBUG=1)
+| test (vanilla tcp_client/tcp_echo over shim) | OK/Fail | p50 | p99 |
+|---|---|---|---|
+| 200 × 1 KB, 2 conns   | 200/0   | 137 µs | 632 µs |
+| 5000 × 1 KB, 8 conns  | 5000/0  | 123 µs | 522 µs |
+| 20000 × 8 KB, 16 conns| 20000/0 | 136 µs | 583 µs |
+| 3000 × 32 KB, 8 conns (auto-chunk ×4 + conn pin, stream reassembly) | 3000/0 | 152 µs | 573 µs |
+| 5000 × 1 KB ×2 back-to-back (leak check) | 5000/0, 5000/0 | 121/119 µs | 407/535 µs |
+Content is memcmp-verified per message; conns are opened FRESH per RUN (connect/FIN/close
+churn each run) while the two child processes keep their 2 channel registrations.
+
+## Native regression (dpm.h pin change) — neutral
+Warm ramp 8192B: 30K → 29,689/0 · 100K → 99,451/0 · 200K → 198,917/0 (= baseline);
+loopback 20000 × 8 KB → 20000/0, p50 153 µs. DPU log level back at 40.
+
+## Files
+dmesh_preload.c (new shim) · dpm.h (pin_group + dmesh_pin_route) · bench/tcp_echo.c,
+tcp_client.c, preload_runner.c (vanilla validators + pod entrypoint, new) ·
+Dockerfile.preload_dpumesh (new) · test-bench.sh (build/image/manifest/pin/`preload` cmd)

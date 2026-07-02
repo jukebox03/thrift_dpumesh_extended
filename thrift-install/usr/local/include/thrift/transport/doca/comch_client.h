@@ -2,7 +2,6 @@
 #define COMCH_CLIENT_H
 
 #include <doca_error.h>
-#include <doca_mmap.h>
 #include <stdbool.h>
 #include "common.h"
 

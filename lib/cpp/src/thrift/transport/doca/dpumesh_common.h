@@ -37,8 +37,8 @@
  * resolves dst_service -> a backend pod PER MESSAGE (dpu_route mock, future L7;
  * per-message load balancing), owning the upstream. A backend REPLY carries a
  * concrete dst_pod (its DPU-facing peer) -> delivered direct, no re-routing.
- *   service_id : own int8 space [0,127]   (registered via app_name)
- *   pod_id     : own int8 space [0,127]
+ *   service_id : own int8 space [0,127]   (declared by the host at register)
+ *   pod_id     : own int8 space [0,127]   (ASSIGNED BY THE DPU at register)
  * service_id and pod_id are SEPARATE fields (not a shared/partitioned namespace). */
 #define DMESH_POD_BLANK     (-1)   /* dst_pod == -1 -> DPU must resolve dst_service */
 #define DMESH_PORT_BLANK     0     /* dst_port == 0 -> service listener / accept queue */
