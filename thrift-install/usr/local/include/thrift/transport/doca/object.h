@@ -45,6 +45,7 @@ typedef struct {
     uint16_t seq;          /* per-conn sequence (opaque passthrough) */
     uint32_t length;
     uint32_t buf_offset;   /* FORWARD: offset in pod's RX DMA buffer; REV_NOTIFY: pos in Host RX buf */
+    uint8_t  route_group;  /* FORWARD: route-affinity key (0 = normal LB); REV_NOTIFY: unused */
     int32_t  pod_idx;      /* FORWARD: index into pods[]; REV_NOTIFY: unused (-1) */
 } dpu_comp_entry_t;
 
@@ -371,6 +372,17 @@ struct objects {
                       * host whose mmaps arrive DURING init (before the DPA msgq is
                       * up) doesn't setup too early; those pods run in a deferred
                       * pass in run_dpu_worker once this is published. */
+    /* Route affinity (large-message SAR): route_group byte -> pinned backend pod, so every
+     * chunk of one large message reassembles on ONE backend even under per-message LB. 256
+     * entries (route_group is a byte), overwrite-on-reuse — self-healing, never corrupts (a
+     * stale pin only risks a suboptimal backend). Single ARM thread → no lock. -1 = unset. */
+    int32_t  route_group_backend[256];
+    /* Test-only per-message round-robin LB across a fixed backend list (env DPUMESH_LB_RR,
+     * e.g. "11,13,14") so route-affinity can be exercised under real scatter. count 0 =
+     * normal service_table routing (production). */
+    int32_t  lb_rr_pods[8];
+    int      lb_rr_count;
+    uint32_t lb_rr_cursor;
     int dpa_thread_running[MAX_DPA_RINGS];  /* per-EU: 1 = thread k started */
     int dpa_thread_running_any;             /* 1 = at least one EU started (keepalive guard) */
 

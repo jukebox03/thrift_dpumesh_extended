@@ -213,21 +213,71 @@ dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *src_pod,
 
 /* ====== L7 routing seam (MOCK) ======
  *
- * dpu_route() is the single point where the DPU decides the destination pod for
- * a forward completion. The mock returns the host-provided desc.dst_pod_id
- * verbatim (identity routing); a routing table or body parsing plugs in here.
+ * dpu_route() is the single point where the DPU decides the destination pod for a
+ * forward completion. Production MOCK: service_table[svc] (one pod per service).
+ * Two features layer on top: (a) ROUTE-AFFINITY — a non-zero route_group pins every
+ * chunk of one large (SAR) message to ONE backend so they reassemble even under
+ * per-message LB; (b) a TEST round-robin LB (DPUMESH_LB_RR) to exercise (a) under
+ * real scatter. A real L7 proxy (body parse / LB / policy) plugs into lb_pick().
+ * Single ARM thread → the group table + RR cursor need no lock.
  */
+static inline int32_t
+lb_pick(struct objects *objs, int16_t svc)
+{
+    if (objs->lb_rr_count > 0) {   /* TEST: round-robin across the configured backends */
+        for (int i = 0; i < objs->lb_rr_count; i++) {
+            int32_t p = objs->lb_rr_pods[(objs->lb_rr_cursor++) % (uint32_t)objs->lb_rr_count];
+            if (find_pod_by_id(objs, p))
+                return p;
+        }
+        return -1;
+    }
+    if (svc >= 0 && svc < POD_ID_SPACE) {   /* production: single backend per service */
+        int p = objs->service_table[svc];
+        if (p >= 0)
+            return p;
+    }
+    return -1;
+}
+
 static inline int32_t
 dpu_route(struct objects *objs, const dpu_comp_entry_t *entry)
 {
-    /* Already resolved (established request or any response → dst_pod filled by
-     * the client/server) → deliver direct, no re-routing (connection-level LB). */
+    /* Already resolved (established request or any response → dst_pod filled by the
+     * client/server) → deliver direct, no re-routing (connection-level LB). */
     if (entry->dst_pod_id != DMESH_POD_BLANK)
         return entry->dst_pod_id;
-    /* First request of a connection (dst_pod==BLANK): resolve dst_service -> pod.
-     * MOCK: simple table lookup. The L7 proxy (body parse / LB / policy) plugs in
-     * HERE. Unknown service -> -1 (caller drops + TX_ACKs the sender). */
+
     int16_t svc = entry->dst_service;
+    uint8_t rg  = entry->route_group;        /* 0 = normal LB; 1..255 = affinity group */
+
+    /* Route-affinity: an auto-chunked large message stamps EVERY chunk with the same
+     * non-zero route_group (a GLOBAL rolling id, so concurrent messages differ) so the
+     * chunks pin to ONE backend and reassemble even under multi-backend LB. Whichever
+     * chunk reaches this single ARM thread FIRST LB-picks (lb_pick — RR under the
+     * DPUMESH_LB_RR test, else the service table) + records the pin; the rest reuse it.
+     * OVERWRITE-ON-REUSE, no delete: the pin is set by the first-arriving chunk and
+     * reused by all others, so ORDER-INDEPENDENT (chunks that round-robin across
+     * EU-sharding rings can reach here out of order, yet all resolve to the one
+     * recorded backend) and COLLISION-SAFE (if two messages ever share an id — >255
+     * concurrent — both simply pin to one backend, still reassembling). A pin to a
+     * since-dead backend is re-picked. 256-entry table, single ARM thread → no lock.
+     * (is_last-DELETE was rejected: it would free a pin mid-message under either
+     * hazard → scatter. See scale_log 2026-07-02.) */
+    if (rg != 0) {
+        int32_t pinned = objs->route_group_backend[rg];
+        if (pinned >= 0 && find_pod_by_id(objs, pinned))
+            return pinned;
+        int32_t b = lb_pick(objs, svc);
+        if (b >= 0) objs->route_group_backend[rg] = b;
+        return b;
+    }
+
+    /* No affinity (route_group==0) → normal per-message routing via the service table.
+     * The TEST RR-LB (lb_pick) is applied ONLY to route_group!=0 (SAR) traffic above,
+     * so it never hijacks ordinary RPC / pipeline / loopback routing — one deploy can
+     * validate those regressions AND SAR affinity together. Unknown service → -1
+     * (caller drops + TX_ACKs the sender). */
     if (svc >= 0 && svc < POD_ID_SPACE) {
         int p = objs->service_table[svc];
         if (p >= 0)
@@ -604,6 +654,24 @@ run_dpu_worker(struct objects *objs)
     for (int i = 0; i < POD_ID_SPACE; i++) {
         objs->pod_id_to_slot[i] = -1;
         objs->service_table[i]  = -1;
+    }
+
+    /* Route-affinity table (route_group -> pinned backend) starts empty; TEST RR-LB off. */
+    for (int i = 0; i < 256; i++)
+        objs->route_group_backend[i] = -1;
+    objs->lb_rr_count = 0;
+    objs->lb_rr_cursor = 0;
+    { const char *e = getenv("DPUMESH_LB_RR");   /* TEST: "11,13,14" → per-message RR-LB */
+      if (e && *e) {
+          char tmp[64]; snprintf(tmp, sizeof tmp, "%s", e);
+          char *save = NULL, *tok = strtok_r(tmp, ",", &save);
+          while (tok && objs->lb_rr_count < 8) {
+              objs->lb_rr_pods[objs->lb_rr_count++] = atoi(tok);
+              tok = strtok_r(NULL, ",", &save);
+          }
+          DOCA_LOG_INFO("DPUMESH_LB_RR: per-message round-robin LB across %d backends",
+                        objs->lb_rr_count);
+      }
     }
 
     /* Init DPU connection tracking (model B). Heap-allocated — too large to embed

@@ -74,7 +74,7 @@ dmesh_close(c);                                  // sends a FIN so the DPU frees
 | **Connection** | persistent, full-duplex byte stream | persistent, full-duplex **message** stream **owned by the DPU** | same mental model; the backend you talk to is the DPU's choice |
 | **Setup** | 3-way **handshake** | **none** — `connect` is local; the DPU routes each message | peer liveness is *not* checked at connect; apply your own timeout |
 | **Framing** | byte stream (you frame it) | **message** — one whole body, atomic | no partial-read loop, no `EPOLLOUT` dance — the whole body is at `read` |
-| **Size** | unbounded | **≤ 8 KB per message** (the DPA `dma_copy` limit) | chunk larger payloads into independent messages (§5) |
+| **Size** | unbounded | **atomic message ≤ 8 KB** (the DPA `dma_copy` limit); a larger `dmesh_write` **auto-chunks** | you may `write` ANY length — >8 KB is split into ≤ 8 KB chunks, all **route-pinned to one backend** (§5); the reader loops `dmesh_read` and frames its own length (§3) |
 | **Ordering** | in-order in a connection | in-order **on a connection to one backend**; **none** across backends | under LB, replies on one conn can arrive out of order |
 | **RPC matching** | n/a | **none** — the transport delivers, you correlate | pipelining several outstanding? match replies by your own req-id |
 | **EOF** | `read()==0` | **`read()==0`** — the peer sent a FIN (`dmesh_close`) | identical: `read()==0` ⇒ close your side |
@@ -131,8 +131,8 @@ All calls are **non-blocking**. "would-block" = the listed sentinel **with `errn
 ### Read / write / sendfile / flush / close
 | Function | Returns / errno |
 |---|---|
-| `ssize_t dmesh_read(dmesh_conn_t *c, void *buf, size_t len)` | `>0` bytes of the next inbound message; **`0` = EOF** (peer closed; sticky → `dmesh_close(c)`); `-1` = would-block (`EAGAIN`). **One whole message per call** — if several are pending on the conn (you pipelined, or a burst coalesced), **loop until `EAGAIN`** to drain them all (there is no batch/multi-message read). Inbound is in **arrival** order — under per-message LB that is **not** request order (correlate yourself). **No implicit send.** |
-| `ssize_t dmesh_write(dmesh_conn_t *c, const void *buf, size_t len)` | **Buffers** outbound body bytes → returns `len`. Consecutive writes accumulate into one message; the first write after a flush starts a new message. Flush many messages without reading (pipelining is allowed from the start). `-1` = would exceed `slot_size` (`EMSGSIZE`). Acquiring a TX slot busy-spins under saturation (never fails). |
+| `ssize_t dmesh_read(dmesh_conn_t *c, void *buf, size_t len)` | `>0` bytes of the next inbound message (chunk); **`0` = EOF** (peer closed; sticky → `dmesh_close(c)`); `-1` = would-block (`EAGAIN`). **One whole message per call** — if several are pending on the conn (you pipelined, a burst coalesced, or a >8 KB message auto-chunked), **loop until `EAGAIN`** (there is no batch read). To receive a >8 KB message, **loop and concatenate** chunks until you have the length YOUR protocol declares (framing is yours; chunks are route-pinned + in order, so arrival order = send order). Inbound is in **arrival** order — under per-message LB that is **not** request order (correlate yourself). **No implicit send.** |
+| `ssize_t dmesh_write(dmesh_conn_t *c, const void *buf, size_t len)` | **Buffers** outbound body bytes → returns `len`. Consecutive writes accumulate into one message; the first write after a flush starts a new message. **ANY length is allowed** — a message larger than `slot_size` is **auto-chunked** across slots, every chunk **route-pinned to one backend** (§5), so there is **no `EMSGSIZE`**. Flush many messages without reading (pipelining allowed from the start). Acquiring a TX slot busy-spins under saturation (never fails). |
 | `ssize_t dmesh_sendfile(dmesh_conn_t *c, int in_fd, off_t *offset, size_t count)` | Appends ≤`count` bytes from `in_fd` into the current message (**capped at `slot_size` → may be SHORT; check the return**); advances `*offset` if non-NULL. `0` = EOF on `in_fd`, `-1` on read error / no room (`EMSGSIZE`). |
 | `int dmesh_flush(dmesh_conn_t *c)` | **The explicit ship — REQUIRED to send.** `0` = sent (or nothing buffered → no-op; a zero-length message is reserved for the FIN). `-1` `EBADMSG` = descriptor fault (close the conn). (Acquiring the TX slot happened in `write` and busy-spins under saturation, so flush itself never returns `EAGAIN`.) |
 | `int dmesh_close(dmesh_conn_t *c)` | **Graceful close.** Sends a **FIN** (zero-length, behind all prior data) so the peer's `dmesh_read` returns `0` and the DPU frees the upstream; then frees local state. A buffered-but-unflushed message is discarded (flush first). Concurrent close is safe. Returns `0`. Safe on `NULL`. |
@@ -141,6 +141,29 @@ All calls are **non-blocking**. "would-block" = the listed sentinel **with `errn
 - `void *c->user_data` — **app-owned** (like epoll's `data.ptr`): set it after `accept`/`connect`,
   and `dmesh_next_ready` hands the conn back so you read your context off it. The transport never
   touches it.
+
+### Large messages (> `slot_size`) — transparent, **no special API**
+There is **no** `write_large`/`read_large`. Send a payload of any length with plain
+`dmesh_write` + `dmesh_flush`: `write` **auto-chunks** it across ≤ `slot_size` slots and pins
+every chunk to **one backend** (a shared route-affinity key, §5), so the chunks arrive **in
+order on that backend**. Receive it with a plain `dmesh_read` **loop**: concatenate chunks in
+arrival order until you have the length **your** protocol declares — framing/completeness is the
+app's job, exactly like a byte stream. Because the chunks are pinned + in order, arrival order
+== send order; if affinity ever scattered them the chunks would arrive out of order and your
+content check would catch it. (`bench/bench_sock.c` mode=3 is the worked example.)
+
+```c
+// SEND any length — write auto-chunks + route-pins; flush ships the last chunk.
+dmesh_write(c, big, big_len); dmesh_flush(c);
+// RECEIVE — loop + concatenate until YOUR header's length is satisfied.
+size_t got = 0; while (got < want) { ssize_t n = dmesh_read(c, buf+got, want-got);
+    if (n > 0) got += n; else if (n == 0) break; else sched_yield(); }
+```
+
+> A large message is **not** a transport primitive — the wire stays atomic ≤ 8 KB and
+> chunk-agnostic. The **route-affinity key** (§5) is the only DPU support; a grouped
+> (multi-slot) message forgoes per-message LB by design (its chunks must pin to one backend
+> to reassemble). No in-band header, no blocking reassembly helper — just write and read-loop.
 
 **Lifecycles:**
 ```
@@ -271,15 +294,27 @@ Header + body must fit one ≤ 8 KB message (chunk larger payloads at the app la
 - **Routing granularity is one whole message (one slot).** The DPU makes **one** routing decision
   per message and delivers it to **exactly one** backend — a message cannot be split across
   destinations. A message is atomic at **≤ 8 KB**; there is **no transport concept of a message that
-  spans slots**. Chunk larger payloads into independent ≤ 8 KB messages at the app layer, and note
-  that once a service load-balances across several backends the transport does **not** guarantee
-  such chunks land on the same backend (keep a coherent unit to one slot).
+  spans slots** at the wire level. But `dmesh_write` **auto-chunks** a larger payload into ≤ 8 KB
+  wire messages for you (§3) and route-pins them, so the app just writes any length.
+- **Route-affinity (keeps a large message's chunks together).** Each wire message carries a
+  **route-affinity key** (`route_group`, one byte): the DPU pins every message sharing a non-zero
+  key to the **same** backend (a small `route_group → backend` table on the single ARM thread — no
+  lock). Key `0` (a single-slot `dmesh_write`) = normal per-message LB. When a `dmesh_write` spans
+  slots, it stamps ONE key (a **global** rolling id, so concurrent large messages get distinct
+  keys) on all of that message's chunks, so — even when a service load-balances across several
+  backends — every chunk lands on one backend and reassembles. The table is **overwrite-on-reuse**:
+  whichever chunk reaches the ARM first records the pin and the rest reuse it, so it is
+  **order-independent** (chunks that round-robin across EU-sharding rings can arrive out of order)
+  and **collision-safe** (if two messages ever share a key, both simply pin to one backend). A
+  grouped message forgoes per-message LB by design. (An `is_last`-DELETE that frees the pin per
+  message was considered and **rejected** — under either hazard it can free a pin mid-message and
+  scatter the chunks; the bounded self-healing table is used instead.)
 - **Response↔request matching is the app's job.** The transport does no matching, and this DPU
   proxy routes at the **connection** level, not the **request** level (it never parses the body). A
   protocol-parsing L7 proxy could correlate by stream-id; a metadata-driven DPU cannot. Carry a
   req-id and match on it — **especially** because per-message LB can reorder replies (§4c).
 - **Delivery & readiness.** Bodies DMA host→DPU→host straight into the receiver's RX buffer; only a
-  small descriptor + a 16-byte completion ride the control path. The PE thread delivers each message
+  small descriptor + a 20-byte completion ride the control path. The PE thread delivers each message
   to its conn's inbox and, on the inbox's empty→non-empty edge, publishes the conn to a **ready
   list** and wakes the one endpoint eventfd. `dmesh_next_ready` drains it — no per-conn fd, no scan.
 - **Teardown (FIN).** `dmesh_close` sends a zero-length **FIN** (behind all prior data on the conn);
@@ -314,7 +349,7 @@ Scenario: **pod 10** is a client of **service 11**, which has two backends, **po
    descriptor posted per message (dma_desc, 64 B — the body is NOT in it, only a pointer + the tuple):
         { mmap, addr = &dma_buffer[slot], size,
           src = (pod, port),  dst = (service, pod, port),  seq,  valid }     ← the "oriented tuple"
-   completion returned per DMA (16 B on the control path): { type, src/dst pod, ports, seq, len, pos }
+   completion returned per DMA (20 B on the control path): { type, src/dst pod, ports, seq, len, pos, route_group }
 ```
 
 **One message — `pod10:pC → service 11`, LB'd to `pod 11`, then its reply:**
@@ -352,6 +387,6 @@ backends and are matched by your **req-id**, not by order.
   is read out of it in place, so the DPU never memcpy's).
 - **descriptor** (`dma_desc`) — the small wire record posted per message: a pointer to the body
   slot + the **oriented tuple** `(src pod/port, dst service/pod/port, seq)`. The body travels by
-  DMA; only the descriptor and a 16 B completion ride the control path.
+  DMA; only the descriptor and a 20 B completion ride the control path.
 - **uP** — the DPU-assigned upstream id: the backend's server-conn port, and the key the DPU maps
   ↔ `(client pod, client port, backend)` to route replies home.

@@ -40,7 +40,7 @@ static int echo_drain(dmesh_conn_t *c, unsigned long *n_msgs)
     ssize_t n;
     for (;;) {
         n = dmesh_read(c, buf, sizeof buf);
-        if (n > 0) {                                      /* a whole message → echo it */
+        if (n > 0) {                                      /* a whole message (chunk) → echo it */
             dmesh_write(c, buf, (size_t)n);
             dmesh_flush(c);                               /* ship the echo */
             (*n_msgs)++;

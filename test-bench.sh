@@ -270,11 +270,16 @@ start_dpu() {
     # PE notification handles, woken only by real DPA→DPU completions (the EU
     # busy-loops, so no WAKE/timerfd needed). 0 = legacy busy-poll fallback.
     local event_loop="${DPUMESH_EVENT_LOOP:-1}"
-    step "=== Starting dpumesh_dpu (DPA EU threads=$dpa_threads, rings_per_pod=$rings_per_pod, event_loop=$event_loop) ==="
+    # TEST: per-message round-robin LB across a backend list (e.g. "11,13,14") applied
+    # ONLY to route_group!=0 (SAR large-message) traffic, so route-affinity can be
+    # exercised under real scatter without disturbing normal RPC/pipeline/loopback.
+    # Empty (default) = production single-backend service_table routing.
+    local lb_rr="${DPUMESH_LB_RR:-}"
+    step "=== Starting dpumesh_dpu (DPA EU threads=$dpa_threads, rings_per_pod=$rings_per_pod, event_loop=$event_loop, lb_rr='$lb_rr') ==="
     stop_dpu
     ssh "$DPU_HOST" "cat > /tmp/start_dpu_bench.sh << 'LAUNCHER'
 #!/bin/bash
-screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_DPA_THREADS=$dpa_threads DPUMESH_RINGS_PER_POD=$rings_per_pod DPUMESH_EVENT_LOOP=$event_loop ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
+screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_DPA_THREADS=$dpa_threads DPUMESH_RINGS_PER_POD=$rings_per_pod DPUMESH_EVENT_LOOP=$event_loop DPUMESH_LB_RR=$lb_rr ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
 sleep 2
 pgrep -f 'dpumesh_dpu.*03:00' || echo NO_PID
 LAUNCHER
@@ -984,6 +989,17 @@ case "$CMD" in
         # messages → one harvest drains a BATCH (multi-slot read). conn-reuse path.
         pin_pods fair >/dev/null
         RUN_MODE=2 run_bench "dpumesh" "${@:2}"
+        ;;
+    dpumesh-large)
+        # Large-message (>slot_size) round-trip: plain dmesh_write AUTO-CHUNKS the
+        # payload across slots + route-affinity pins EVERY chunk to ONE backend; the
+        # client reassembles with a plain dmesh_read loop (byte stream, app frames) and
+        # verifies content per-offset — arrival-order correctness IS the affinity proof
+        # (scatter would arrive out of order). Async/windowed → also measures MB/s.
+        # SIZE is the LOGICAL message size (e.g. 32768); pass CONNS ($4) high for
+        # throughput. Deploy with DPUMESH_LB_RR="11,13,14" to exercise affinity scatter.
+        pin_pods fair >/dev/null
+        RUN_MODE=3 run_bench "dpumesh" "${@:2}"
         ;;
     loopback)
         # Self-routing / loopback: pod 12 is client+server of its own service 12.

@@ -111,10 +111,15 @@ struct comch_dma_comp_msg {
 	uint16_t seq;         /* per-conn sequence (match key with port) */
 	uint16_t length;      /* payload length (<= DPUMESH_SLOT_SIZE) */
 	uint32_t pos;         /* buffer offset (forward: DPU dpu_buf; reverse: Host RX) */
+	uint8_t  route_group; /* forward route-affinity key (0 = normal LB); reverse: unused. The ARM
+	                       * dpu_route reads this to pin a large message's chunks to one backend. */
 };
-/* Sent as immediate via doca_dpa_dev_comch_producer_dma_copy() — HW max 32 bytes. */
-_Static_assert(sizeof(struct comch_dma_comp_msg) == 16,
-               "comch_dma_comp_msg must be exactly 16 bytes (one WQE BB)");
+/* Sent as immediate via doca_dpa_dev_comch_producer_dma_copy() — HW max 32 bytes.
+ * route_group grew this 16B->20B (2nd WQE BB); scale_log measured 20B perf-neutral. */
+_Static_assert(sizeof(struct comch_dma_comp_msg) == 20,
+               "comch_dma_comp_msg must be exactly 20 bytes (route_group added; 2nd WQE BB)");
+_Static_assert(offsetof(struct comch_dma_comp_msg, route_group) == 16,
+               "comch_dma_comp_msg.route_group offset mismatch");
 _Static_assert(offsetof(struct comch_dma_comp_msg, type) == 0,
                "comch_dma_comp_msg.type must be at offset 0 (recv-cb peeks raw[0])");
 /* src/dst_pod_id travel as int8 on the wire (dst==-1 = DMESH_POD_BLANK, the
@@ -180,7 +185,9 @@ struct dma_desc {
 	int8_t   src_service;          /* 1B caller service (SVC_NONE if none) */
 	int8_t   dst_service;          /* 1B callee service (routing input when dst_pod==BLANK) */
 	int32_t dst_pod_id;            /* 4B routing target; DMESH_POD_BLANK(-1) -> DPU resolves dst_service */
-	int8_t flags;                  /* 1B (reserved/unused — was OP_/CASE_; kept for offset stability) */
+	uint8_t route_group;           /* 1B route-affinity key (reuses the old reserved flags byte).
+	                                * 0 = normal per-message LB; !=0 pins every chunk of one large
+	                                * (SAR) message to ONE backend so they reassemble. FORWARD-only. */
 	uint8_t pad0[3];               /* 3B alignment for src_pod_id */
 	int32_t src_pod_id;            /* 4B (original forward sender; on reverse rings,
 	                                * ring->pod_id is the receiver, so the source
@@ -201,7 +208,7 @@ _Static_assert(offsetof(struct dma_desc, addr) == 4, "dma_desc.addr offset misma
 _Static_assert(offsetof(struct dma_desc, size) == 12, "dma_desc.size offset mismatch");
 _Static_assert(offsetof(struct dma_desc, seq) == 16, "dma_desc.seq offset mismatch");
 _Static_assert(offsetof(struct dma_desc, dst_pod_id) == 24, "dma_desc.dst_pod_id offset mismatch");
-_Static_assert(offsetof(struct dma_desc, flags) == 28, "dma_desc.flags offset mismatch");
+_Static_assert(offsetof(struct dma_desc, route_group) == 28, "dma_desc.route_group offset mismatch");
 _Static_assert(offsetof(struct dma_desc, src_pod_id) == 32, "dma_desc.src_pod_id offset mismatch");
 _Static_assert(offsetof(struct dma_desc, valid) == 63, "dma_desc.valid offset mismatch");
 

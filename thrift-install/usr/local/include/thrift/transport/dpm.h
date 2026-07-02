@@ -47,6 +47,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sched.h>
+#include <time.h>
 #include <sys/types.h>
 
 #include "dpumesh.h"
@@ -62,6 +63,10 @@ typedef struct dmesh_channel {
     dpumesh_ctx_t *ctx;
     int            pod_id;
     int            slot_size;   /* cached max body size */
+    uint32_t       next_group;  /* GLOBAL rolling route-affinity id source (atomic across
+                                 * all conns → 1..255): concurrent large messages get
+                                 * DISTINCT groups. A per-conn counter would collide —
+                                 * every conn's first large message would pick id 1. */
 } dmesh_channel_t;
 
 /* Connection — a persistent full-duplex link to one peer. */
@@ -91,6 +96,13 @@ typedef struct dmesh_conn {
     int       tx_slot;         /* -1 = no message buffered */
     uint8_t  *tx_buf;
     uint32_t  tx_len;
+
+    /* route-affinity for auto-chunked large messages. cur_group = the current
+     * (un-flushed) message's route_group: 0 while it still fits one slot, assigned on
+     * its FIRST slot overflow (from the channel's GLOBAL id source) so every chunk of
+     * the message pins to ONE backend, cleared at flush. A single-slot message keeps
+     * cur_group=0 → normal per-message LB. */
+    uint8_t   cur_group;
 } dmesh_conn_t;
 
 /* ===== Endpoint lifecycle ===== */
@@ -239,15 +251,68 @@ static inline int dmesh_tx_ensure(dmesh_conn_t *c) {
     return 0;
 }
 
+/* INTERNAL: ship the currently-buffered TX slot as one message stamped with
+ * route_group byte `rg` (0 = normal per-message LB; 1..255 = pin all chunks sharing
+ * this id to one backend). Resets the TX buffer. Returns 0, -1 (EBADMSG) on fault. */
+static inline int dmesh_ship_slot(dmesh_conn_t *c, uint8_t rg) {
+    dpumesh_ctx_t *ctx = c->ep->ctx;
+    c->seq++;                                        /* per-conn outbound message id */
+    sw_descriptor_t d;
+    memset(&d, 0, sizeof(d));
+    d.body_buf_slot = c->tx_slot;
+    d.body_len      = c->tx_len;
+    d.src_port      = c->local_port;
+    d.seq           = c->seq;
+    d.dst_service   = c->dst_service;
+    if (c->role == DMESH_ROLE_CLIENT) {              /* client → service (per-message LB) */
+        d.dst_pod  = DMESH_POD_BLANK;
+        d.dst_port = DMESH_PORT_BLANK;
+    } else {                                         /* server → its learned peer */
+        d.dst_pod  = c->remote_pod;
+        d.dst_port = c->remote_port;
+    }
+    d.route_group = rg;
+    d.valid = 1;
+    if (dpumesh_enqueue(ctx, &d) < 0) {
+        dpumesh_tx_free(ctx, c->tx_slot);
+        c->tx_slot = -1; c->tx_buf = NULL; c->tx_len = 0;
+        errno = EBADMSG;
+        return -1;
+    }
+    /* The DPU's BATCH_FWD_ACK frees this slot (it may be DMA-read until delivered). */
+    dpumesh_tx_track(ctx, c->local_port, c->seq, c->tx_slot);
+    c->tx_slot = -1; c->tx_buf = NULL; c->tx_len = 0;
+    return 0;
+}
+
 /* write(): BUFFER outbound body bytes into the current message (shipped by flush).
  * Consecutive writes accumulate; the first write after a flush starts a NEW message.
- * No single-outstanding restriction — you can flush many messages without reading. */
+ * A message LARGER than one slot is AUTO-CHUNKED across slots — on overflow the full
+ * slot ships as a chunk (all chunks of the message share one route_group so the DPU
+ * pins them to ONE backend, reassemble-able even under per-message LB) and a fresh
+ * slot continues. So the app just writes ANY length; there is no size limit and no
+ * EMSGSIZE. The receiver is a plain dmesh_read loop (it frames its own length). */
 static inline ssize_t dmesh_write(dmesh_conn_t *c, const void *buf, size_t len) {
-    if (dmesh_tx_ensure(c) < 0) return -1;
+    const uint8_t *p = (const uint8_t *)buf;
     int cap = c->ep->slot_size;
-    if (c->tx_len + len > (uint32_t)cap) { errno = EMSGSIZE; return -1; }
-    memcpy(c->tx_buf + c->tx_len, buf, len);
-    c->tx_len += (uint32_t)len;
+    size_t done = 0;
+    while (done < len) {
+        if (dmesh_tx_ensure(c) < 0) return done ? (ssize_t)done : -1;
+        size_t room = (size_t)cap - c->tx_len;
+        if (room == 0) {                             /* slot full + more to write → spill */
+            if (c->cur_group == 0) {                 /* first overflow → claim a GLOBAL group */
+                uint32_t g = __atomic_fetch_add(&c->ep->next_group, 1u, __ATOMIC_RELAXED);
+                c->cur_group = (uint8_t)((g % 255u) + 1u);   /* 1..255, never 0 */
+            }
+            if (dmesh_ship_slot(c, c->cur_group) < 0) /* ship the full slot as a chunk */
+                return done ? (ssize_t)done : -1;
+            continue;                                /* next iter tx_ensure gets a fresh slot */
+        }
+        size_t n = len - done; if (n > room) n = room;
+        memcpy(c->tx_buf + c->tx_len, p + done, n);
+        c->tx_len += (uint32_t)n;
+        done += n;
+    }
     return (ssize_t)len;
 }
 
@@ -267,55 +332,24 @@ static inline ssize_t dmesh_sendfile(dmesh_conn_t *c, int in_fd, off_t *offset, 
     return n;
 }
 
-/* flush(): ship the buffered message. REQUIRED to send. A CLIENT always ships with
- * dst_pod=BLANK — the DPU load-balances the service PER MESSAGE (never a pinned pod);
- * a SERVER ships to its learned DPU-facing peer. The TX slot is freed by the DPU's
- * BATCH_FWD_ACK (dpumesh_tx_track). An EMPTY flush (no bytes buffered) is a NO-OP: a
- * zero-length message on the wire is the FIN marker (dmesh_close), never a user
- * message — so flushing nothing sends nothing rather than spuriously closing the peer.
+/* flush(): ship the buffered message's final chunk. REQUIRED to send. A message that
+ * spanned slots (auto-chunked in write → cur_group set) ships this last chunk with the
+ * same route_group (so it too pins to the message's backend), then clears the group
+ * context; a single-slot message ships route_group=0 (normal per-message LB). A CLIENT
+ * ships dst_pod=BLANK (DPU LB's per message); a SERVER ships to its learned peer. An
+ * EMPTY flush (no bytes buffered) is a NO-OP (a 0-length wire message is the FIN only,
+ * never a user message).
  *   0 = sent (or nothing to send); -1 EBADMSG = descriptor fault (close the conn). */
 static inline int dmesh_flush(dmesh_conn_t *c) {
-    dpumesh_ctx_t *ctx = c->ep->ctx;
     if (c->tx_slot < 0 || c->tx_len == 0) {          /* nothing buffered → no-op (0-len = FIN only) */
-        if (c->tx_slot >= 0) { dpumesh_tx_free(ctx, c->tx_slot); c->tx_slot = -1; c->tx_buf = NULL; c->tx_len = 0; }
+        if (c->tx_slot >= 0) { dpumesh_tx_free(c->ep->ctx, c->tx_slot); c->tx_slot = -1; c->tx_buf = NULL; c->tx_len = 0; }
+        c->cur_group = 0;
         return 0;
     }
-
-    c->seq++;                                        /* per-conn outbound message id */
-
-    sw_descriptor_t d;
-    memset(&d, 0, sizeof(d));
-    d.body_buf_slot = c->tx_slot;
-    d.body_len      = c->tx_len;
-    d.src_port      = c->local_port;
-    d.seq           = c->seq;
-    d.dst_service   = c->dst_service;
-    if (c->role == DMESH_ROLE_CLIENT) {
-        /* Model B: the client ALWAYS addresses its service (never pins a pod). The
-         * DPU routes every message and owns the upstream to the chosen backend. */
-        d.dst_pod  = DMESH_POD_BLANK;
-        d.dst_port = DMESH_PORT_BLANK;
-    } else {
-        /* A backend replies to its learned peer = (client_pod, uP); the DPU maps
-         * uP back to the client. */
-        d.dst_pod  = c->remote_pod;
-        d.dst_port = c->remote_port;
-    }
-    d.valid = 1;
-
-    if (dpumesh_enqueue(ctx, &d) < 0) {
-        dpumesh_tx_free(ctx, c->tx_slot);
-        c->tx_slot = -1; c->tx_buf = NULL; c->tx_len = 0;
-        errno = EBADMSG;
-        return -1;
-    }
-    /* The DPU's TX_ACK frees this slot (it may still be DMA-read until delivered). */
-    dpumesh_tx_track(ctx, c->local_port, c->seq, c->tx_slot);
-
-    c->tx_slot = -1;                                 /* handed off; next write starts a new message */
-    c->tx_buf  = NULL;
-    c->tx_len  = 0;
-    return 0;
+    uint8_t rg = c->cur_group;                       /* 0 = single-slot (normal LB); else the group */
+    int r = dmesh_ship_slot(c, rg);
+    c->cur_group = 0;                                /* clear: next write = a new message/unit */
+    return r;                                        /* 0 or -1 (EBADMSG) */
 }
 
 /* INTERNAL: send a FIN — a zero-length message addressed to the established peer.
@@ -365,6 +399,17 @@ static inline int dmesh_close(dmesh_conn_t *c) {
     free(c);
     return 0;
 }
+
+/* ===== Large messages (> slot_size) — transparent, NO special API =====
+ * There is no write_large/read_large. A payload larger than one slot is handled by
+ * plain dmesh_write + dmesh_flush: write AUTO-CHUNKS across slots and pins every chunk
+ * of the message to ONE backend (a shared route_group, §route-affinity), so the chunks
+ * arrive in order on that backend and can be reassembled. The receiver is a plain
+ * dmesh_read LOOP: read chunks in arrival order and concatenate until you have the
+ * length YOUR protocol declares (framing/completeness is the app's job, like a byte
+ * stream). Because the chunks are pinned + in order, arrival order == send order — if
+ * affinity ever failed the chunks would arrive out of order and the app's content
+ * check would catch it. bench/bench_sock.c (mode=3) is the worked example. */
 
 /* ===== Event-loop integration =====
  * ONE fd: dmesh_event_fd(s). Register it in a vanilla epoll set; it becomes readable

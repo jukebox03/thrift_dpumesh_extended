@@ -111,6 +111,7 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             entry.dst_port = comp_msg->dst_port;
             entry.seq = seq;
             entry.length = payload_len;
+            entry.route_group = comp_msg->route_group;  /* forward route-affinity key (0 = normal LB) */
 
             /* Zero-copy: record buffer offset instead of heap-copying.
              * End-node slot-based admission keeps in-flight bytes ≤ buf_size

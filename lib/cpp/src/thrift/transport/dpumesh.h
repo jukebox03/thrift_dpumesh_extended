@@ -52,6 +52,9 @@ typedef struct {
     uint16_t dst_port;              /* dest port; DMESH_PORT_BLANK(0) -> accept queue */
     uint16_t seq;                   /* per-conn sequence (match key with port) */
     int8_t   valid;
+    uint8_t  route_group;           /* route-affinity key (0 = normal per-message LB); the façade
+                                     * SAR stamps all chunks of one large message with the same
+                                     * value so the DPU routes them to ONE backend (reassembly). */
 } sw_descriptor_t;
 
 /* ====== Opaque context ====== */

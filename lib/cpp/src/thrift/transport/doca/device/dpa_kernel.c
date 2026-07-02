@@ -241,6 +241,7 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         comp.dst_service = desc->dst_service;
         comp.src_pod_id = ring->pod_id;          /* forward: sender = this ring's pod */
         comp.dst_pod_id = desc->dst_pod_id;      /* may be DMESH_POD_BLANK → DPU resolves */
+        comp.route_group = desc->route_group;    /* opaque passthrough → ARM dpu_route pins the group */
 
         doca_dpa_dev_comch_producer_dma_copy(producer,
                                     dpu_consumer_id,

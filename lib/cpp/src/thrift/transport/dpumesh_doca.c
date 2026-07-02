@@ -977,6 +977,7 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     dma->dst_service = (int8_t)desc->dst_service;
     dma->dst_pod_id  = desc->dst_pod;
     dma->src_pod_id  = ctx->pod_id;
+    dma->route_group = desc->route_group;   /* route-affinity key (0 = normal per-message LB) */
 
     __sync_synchronize();
     dma->valid = 1;

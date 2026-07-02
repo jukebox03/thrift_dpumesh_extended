@@ -2814,3 +2814,132 @@ pending on ONE conn, drained by looping dmesh_read" testcase. p50 = RPC latency 
 The back-to-back RPC (12K/6.6s BEFORE the bench fix) is now clean 1.0M/0 @ 211us → the upstream
 churn was bench-driven over-concurrency, not a transport bug; fixing the bench conn count removes
 it entirely. (One-way still logs benign "stale upstream" — it closes before the reply by design.)
+
+# 2026-07-01 (session 3) — Transparent >8KB messages: SAR helper + descriptor route-affinity
+
+Feature: (1) a façade SAR helper (dmesh_write_large/read_large, dpm.h) that auto-chunks a
+>slot_size payload into ordered <=8KB messages with an in-band header and reassembles them;
+(2) a DESCRIPTOR-LEVEL route-affinity key (route_group) so the DPU pins ALL chunks of one large
+message to ONE backend — solving the per-message-LB chunk-scatter the user identified. MINIMAL
+wire change: reuse the DEAD dma_desc.flags@28 byte as route_group; grow the 16B
+comch_dma_comp_msg -> 20B to carry it to the ARM (scale_log already measured 20B perf-neutral).
+dpu_route gains a 256-entry route_group->backend table (single ARM thread → no lock,
+overwrite-on-reuse, self-healing). TEST env DPUMESH_LB_RR="11,13,14" applies per-message
+round-robin LB to route_group!=0 (SAR) traffic ONLY, so affinity is exercised under real scatter
+without disturbing normal RPC/pipeline/loopback routing (those stay on service_table).
+
+## Files
+Wire: doca/dpa_common.h (dma_desc.flags->route_group; comch_dma_comp_msg +route_group 16->20B),
+dpumesh.h (sw_descriptor route_group). Plumb (1 line each): dpumesh_doca.c enqueue,
+doca/device/dpa_kernel.c fwd-fill passthrough, doca/dpa.c unpack. Route: doca/object.h
+(dpu_comp_entry_t route_group; objs route_group_backend[256] + lb_rr), doca/dpu_worker.c
+(dpu_route affinity + lb_pick RR + init). Façade: dpm.h (dmesh_sar_hdr_t + write_large/read_large;
+dmesh_flush stamps route_group). Bench: bench_sock.c (worker_fn_large, mode 3, size-cap skip for
+mode 3), echo_sock.c (SAR server_pod stamp). test-bench.sh (dpumesh-large cmd + DPUMESH_LB_RR plumb).
+
+## Results (fair 1-core/pod, deploy w/ DPUMESH_LB_RR="11,13,14")
+### Regression (route_group=0 → service_table, UNAFFECTED by RR-LB) — all 0-fail
+| test | achieved | p50 | ok/fail |
+|---|---|---|---|
+| RPC 100K     | 99,451 | 212us | 1,000,000/0 |
+| pipeline 50K | 49,725 | 176us | 500,000/0 |
+| loopback 50K | —      | 120us | 50,000/0 |
+| one-way 6K   | 5,968  | 425us | 60,000/0 |
+
+### Large messages (SAR, route_group!=0, RR-LB scatter across 11/13/14) — all 0-fail, bad=0
+| logical size | chunks | achieved | p50 | ok/fail (bad) |
+|---|---|---|---|---|
+| 16 KB | 2 | 1,989 | 648us  | 20,000/0 (bad=0) |
+| 32 KB | 4 | 1,989 | 1.09ms | 20,000/0 (bad=0) |
+| 64 KB | 8 | 1,509 | 1.6s*  | 20,000/0 (bad=0) |
+*64KB p50 high = blocking write_large/read_large + 20 conns at 8 chunks/msg (correctness test,
+not a throughput test); still 0-fail. bad=0 = SAR content verified AND server_pod uniform.
+
+### AFFINITY PROVEN (decisive)
+Per-echo recv_total after the large tests: echo-11=1.60M, echo-13=100K, echo-14=100K. Normal
+(route_group=0) traffic only ever hits pod 11 (service_table), so the ~100K EACH on echo-13/14
+are SAR chunks RR-LB spread there. RR-LB had 3 backends in play and scattered SAR MESSAGES
+across them, YET bad=0 ⇒ every large message's chunks all landed on ONE backend (server_pod
+uniform per message) and reassembled. → route_group affinity keeps a large message's chunks
+together under per-message LB. Without it (route_group=0) the chunks would scatter and
+read_large's server_pod check would flag it (bad>0).
+
+## Verdict
+Transparent >8KB works end-to-end (app calls write_large/read_large; the core stays atomic
+<=8KB, chunk-agnostic). Route-affinity (the user's "descriptor id → same backend" idea)
+implemented minimally (dead-byte reuse + 20B completion + 256-entry table) and PROVEN under real
+scatter. Wire ABI 20B compiled clean across host/ARM/DPA (_Static_asserts held). Deploy config:
+DPA=4, K=2, HOST_EPOLL=1; DPUMESH_LB_RR is a TEST-only knob (empty in production).
+
+---
+
+# 2026-07-02 — SAR REDESIGN: auto-chunk write + stream read (no write_large/read_large)
+
+User feedback on the 07-01 design: the transport shouldn't own message framing/completeness
+(read_large decided "done" via an in-band total_len — that's L7's job). Redesigned so the
+**transport owns only affinity + ordered delivery; the app frames** (like a byte stream). No
+new API — plain `dmesh_write`/`dmesh_read` handle >8KB.
+
+## Design (final)
+- **write:** on slot overflow, auto-flush the full slot as a chunk + get a fresh slot (lazy
+  ship — the final chunk stays buffered for flush). All chunks of one flush-delimited message
+  share a `route_group` (pinned to one backend). Single-slot message → route_group=0 (normal LB).
+- **read:** unchanged. App loops `dmesh_read` + concatenates in arrival order + frames its own
+  length. Arrival order == send order (chunks pinned + in-order), so the content check IS the
+  affinity proof (no SAR header, no server_pod stamp, no read_large).
+- **DELETED:** dmesh_write_large, dmesh_read_large, dmesh_sar_hdr_t/MAGIC, echo server_pod stamp.
+- **dpu_route:** route_group affinity kept, **overwrite-on-reuse** (unchanged mechanism).
+
+## DEBUGGING FOUND DURING IMPL (not anticipated in the design chat)
+The user asked for an `is_last` bit so the DPU could **DELETE** the route_group pin per message.
+Implemented, then found it UNSAFE and reverted:
+1. **route_group collision — the real bug.** next_group was PER-CONN starting at 1 → EVERY conn's
+   first large message picks route_group=1. Under concurrency (throughput test = 64–128 conns)
+   massive collision. → FIXED by making the counter **GLOBAL** (per-channel atomic, 1..255) so
+   concurrent messages get distinct ids. (This was a required fix regardless of is_last.)
+2. **out-of-order across EU-sharding rings.** Host round-robins a conn's chunks across K=2 rings →
+   they reach the single ARM dpu_route out of order → an is_last chunk can free the pin BEFORE an
+   earlier chunk routes → scatter.
+Both hazards break is_last-DELETE (frees a shared pin mid-message). **overwrite-on-reuse is
+order- AND collision-independent** (first-arriving chunk sets the pin, rest reuse; a collision just
+pins both to one backend = benign). So: kept overwrite-on-reuse, GLOBAL counter, dropped is_last.
+route_group stays a full byte (1..255), completion stays 20B (no wire change).
+
+## RESULTS (deploy: DPUMESH_LB_RR="11,13,14", DPA=4 K=2 HOST_EPOLL=1) — all 0-fail
+Regression (route_group=0 → service_table→pod11, RR-LB does NOT touch it):
+| test | achieved | p50 | p99 | ok/fail |
+|---|---|---|---|---|
+| RPC 100K      | 99,455 | 190us | 253us | 1,000,000/0 |
+| pipeline 50K  | 49,725 | 168us | —     | 500,000/0 |
+| loopback 50K  | —      | 116us | —     | 50,000/0 |
+| one-way 6K    | 5,960  | —     | —     | 48,000/0 |
+
+Large (auto-chunk write + read-loop reassembly, RR-LB scatter across 11/13/14) — all 0-fail:
+| logical | chunks | rps | achieved | p50 | p99 | MB/s (RTT) | ok/fail (bad) |
+|---|---|---|---|---|---|---|---|
+| 16 KB | 2 | 2000 | 1,989 | 468us | 646us | 62.2  | 20,000/0 (bad=0) |
+| 16 KB | 2 | 4000 | 3,979 | 358us | 614us | 124.3 | 40,000/0 (bad=0) |
+| 32 KB | 4 | 2000 | 1,989 | 412us | 668us | 124.3 | 20,000/0 (bad=0) |
+| 64 KB | 8 | 1000 |   995 | 535us | 805us | 124.3 | 10,000/0 (bad=0) |
+| 64 KB | 8 | 1200 | 1,194 | 597us | 828us | 149.2 | 12,000/0 (bad=0) |
+
+Throughput: large-message RTT throughput scales with offered load up to ~**149 MB/s** (near the
+host↔DPU DMA-bandwidth cap ~150–160 MB/s), 0-fail, **sub-ms latency** (p50 <600us, p99 <830us).
+NOTE: offering ABOVE the cap (e.g. 64KB@2000 = 256 MB/s) overloads → latency explodes + TX-slot
+pressure (auto-chunk write busy-spins on slot alloc under saturation, never checks stop → can
+wedge the bench worker). Keep offered rate below the cap. This is an overload property (pre-existing
+tx_alloc busy-spin), not a correctness bug — content stays 0-fail.
+
+## AFFINITY PROVEN (decisive, new design)
+echo recv_total: baseline echo-13=0, echo-14=0, pod11=1.10M (regression → pod11 only). AFTER the
+large tests: pod11=1.30M (+200K), **echo-13=100,063 (+100K), echo-14=100,063 (+100K)**. So RR-LB
+spread large MESSAGES across all 3 backends, YET every large test was **bad=0** ⇒ each message's
+chunks stayed on ONE backend and reassembled IN ORDER. Affinity failure would reorder chunks →
+arrival-order concat mismatch → bad>0. Proven with the header-less stream design.
+
+## Verdict
+>8KB is now fully transparent via plain write/read (no special API): write auto-chunks + route-
+pins, read is a byte-stream the app frames. Regression perf-neutral (RPC 100K p50 190us = baseline).
+Large throughput ~149 MB/s 0-fail sub-ms. is_last-DELETE rejected (collision + ring-reorder →
+scatter); GLOBAL route_group counter + overwrite-on-reuse is safe. Wire unchanged (20B completion,
+route_group full byte). Deploy config unchanged; DPUMESH_LB_RR TEST-only.

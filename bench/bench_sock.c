@@ -321,6 +321,102 @@ static void *worker_fn_pipeline(void *arg) {
     return NULL;
 }
 
+/* One in-flight LARGE request = one façade conn reassembling a >slot_size payload. */
+typedef struct {
+    dmesh_conn_t *c;
+    double   scheduled;     /* t0 for latency (coordinated-omission: scheduled time) */
+    double   launched;      /* send time, for the wall-clock timeout */
+    uint32_t id;            /* pattern seed = logical request index */
+    uint32_t got;           /* bytes reassembled so far */
+    int      active;
+} large_slot_t;
+
+/* Large-message generator (mode=3): each request is a >slot_size logical payload sent
+ * by PLAIN dmesh_write (which AUTO-CHUNKS it across slots + pins the chunks to ONE
+ * backend via route-affinity) + dmesh_flush, and read back by a PLAIN dmesh_read LOOP
+ * (a byte stream — the app frames its own length) concatenating chunks in ARRIVAL
+ * order until the whole payload is back. This is async/windowed (W payloads in flight,
+ * conn reused) so it measures THROUGHPUT (MB/s), not just correctness. The content
+ * check IS the affinity proof: chunks are route-pinned + in order, so arrival order ==
+ * send order — if affinity ever scattered them across backends the replies would race
+ * back out of order and the per-offset pattern check would fail. No server_pod stamp,
+ * no SAR header, no read_large. */
+static void *worker_fn_large(void *arg) {
+    worker_t *w = (worker_t *)arg;
+    int W = w->inflight > 0 ? w->inflight : 1;
+    large_slot_t *fl = calloc((size_t)W, sizeof(*fl));
+    uint8_t *body = malloc((size_t)w->msg_size);   /* send pattern */
+    uint8_t *rb   = malloc((size_t)w->msg_size);   /* recv scratch (one chunk at a time) */
+    if (!fl || !body || !rb) { free(fl); free(body); free(rb); atomic_store(w->stop, 1); return NULL; }
+
+    long next_j = 0, completed = 0;
+    const double timeout_s = (double)WAIT_TIMEOUT_MS / 1000.0;
+
+    while (completed < w->budget) {
+        if (atomic_load(w->stop)) break;
+        int did_work = 0;
+
+        /* ---- launch: write the whole payload (write() auto-chunks + pins), REUSE conn ---- */
+        for (int s = 0; s < W && next_j < w->budget; s++) {
+            if (fl[s].active) continue;
+            double scheduled = w->start_at + (double)next_j * w->interval_sec;
+            if (now_sec() < scheduled) break;              /* paced */
+            if (!fl[s].c) {
+                fl[s].c = dmesh_connect(g_s, g_dst_pod_id);
+                if (!fl[s].c) break;
+                atomic_fetch_add(&g_connects, 1);
+            }
+            uint32_t id = (uint32_t)next_j;
+            for (size_t k = 0; k < (size_t)w->msg_size; k++) body[k] = (uint8_t)(id + k);
+            if (dmesh_write(fl[s].c, body, (size_t)w->msg_size) < 0 || dmesh_flush(fl[s].c) < 0) {
+                dmesh_close(fl[s].c); fl[s].c = NULL;
+                atomic_fetch_add(w->fail, 1); atomic_fetch_add(&g_fail_reset, 1);
+                completed++; next_j++; did_work = 1; continue;
+            }
+            fl[s].scheduled = scheduled; fl[s].launched = now_sec();
+            fl[s].id = id; fl[s].got = 0; fl[s].active = 1;
+            next_j++; did_work = 1;
+        }
+
+        /* ---- harvest: concatenate chunks in arrival order + verify against pattern ---- */
+        for (int s = 0; s < W; s++) {
+            if (!fl[s].active) continue;
+            ssize_t n = -1; int bad = 0;
+            while (fl[s].got < (uint32_t)w->msg_size &&
+                   (n = dmesh_read(fl[s].c, rb, (size_t)w->msg_size)) > 0) {
+                if (fl[s].got + (uint32_t)n > (uint32_t)w->msg_size) { bad = 1; break; }
+                for (ssize_t i = 0; i < n; i++)
+                    if (rb[i] != (uint8_t)(fl[s].id + fl[s].got + (uint32_t)i)) { bad = 1; break; }
+                if (bad) break;
+                fl[s].got += (uint32_t)n;
+            }
+            if (fl[s].got >= (uint32_t)w->msg_size && !bad) {          /* complete + correct */
+                double lat_us = (now_sec() - fl[s].scheduled) * 1e6;
+                if (w->n_samples < w->cap) w->samples[w->n_samples++] = lat_us;
+                atomic_fetch_add(w->ok, 1);
+                fl[s].active = 0; completed++; did_work = 1;
+            } else if (bad) {                                          /* content wrong = scatter/corrupt */
+                atomic_fetch_add(&g_fail_bad, 1);
+                dmesh_close(fl[s].c); fl[s].c = NULL; atomic_fetch_add(w->fail, 1);
+                fl[s].active = 0; completed++; did_work = 1;
+            } else if (n == 0) {                                       /* peer FIN mid-message */
+                atomic_fetch_add(&g_fail_reset, 1);
+                dmesh_close(fl[s].c); fl[s].c = NULL; atomic_fetch_add(w->fail, 1);
+                fl[s].active = 0; completed++; did_work = 1;
+            } else if (now_sec() - fl[s].launched > timeout_s) {       /* stalled */
+                atomic_fetch_add(&g_fail_timeout, 1);
+                dmesh_close(fl[s].c); fl[s].c = NULL; atomic_fetch_add(w->fail, 1);
+                fl[s].active = 0; completed++; did_work = 1;
+            }
+        }
+
+        if (!did_work) { struct timespec ts = {0, 5000}; nanosleep(&ts, NULL); }
+    }
+    for (int s = 0; s < W; s++) if (fl[s].c) dmesh_close(fl[s].c);
+    free(fl); free(body); free(rb);
+    return NULL;
+}
+
 /* ------------------------------------------------------------ watchdog  */
 typedef struct {
     atomic_int *stop;
@@ -361,7 +457,10 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns, int
         write(conn_fd, e, strlen(e));
         return;
     }
-    if (msg_size > dmesh_msg_max(g_s)) {
+    /* mode 3 (large) sends a LOGICAL payload > slot_size — plain dmesh_write auto-
+     * chunks it — so the per-slot cap does NOT apply there. All other modes are one
+     * message per slot, so the cap holds. */
+    if (mode != 3 && msg_size > dmesh_msg_max(g_s)) {
         int n = snprintf(reply, sizeof(reply), "ERR size %d > slot_size %d\n",
                          msg_size, dmesh_msg_max(g_s));
         write(conn_fd, reply, (size_t)n);
@@ -398,8 +497,10 @@ static void run_test(int conn_fd, int rps, int dur, int msg_size, int conns, int
 
     void *(*worker_fn)(void *) =
         (mode == 1) ? worker_fn_oneway :
-        (mode == 2) ? worker_fn_pipeline : worker_fn_async;
-    const char *mode_name = (mode == 1) ? "oneway" : (mode == 2) ? "pipeline" : "rpc";
+        (mode == 2) ? worker_fn_pipeline :
+        (mode == 3) ? worker_fn_large : worker_fn_async;
+    const char *mode_name = (mode == 1) ? "oneway" : (mode == 2) ? "pipeline" :
+                            (mode == 3) ? "large" : "rpc";
     /* reset per-RUN observability counters */
     atomic_store(&g_connects, 0); atomic_store(&g_fail_timeout, 0);
     atomic_store(&g_fail_reset, 0); atomic_store(&g_fail_bad, 0);
