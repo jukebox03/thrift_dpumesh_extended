@@ -104,21 +104,6 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o: \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/../dpumesh.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/../doca/dpumesh_common.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/ring.h \
- /usr/include/arpa/inet.h /usr/include/netinet/in.h \
- /usr/include/x86_64-linux-gnu/sys/socket.h \
- /usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h \
- /usr/include/x86_64-linux-gnu/bits/socket.h \
- /usr/include/x86_64-linux-gnu/bits/socket_type.h \
- /usr/include/x86_64-linux-gnu/bits/sockaddr.h \
- /usr/include/x86_64-linux-gnu/asm/socket.h \
- /usr/include/asm-generic/socket.h \
- /usr/include/x86_64-linux-gnu/asm/sockios.h \
- /usr/include/asm-generic/sockios.h \
- /usr/include/x86_64-linux-gnu/bits/types/struct_osockaddr.h \
- /usr/include/x86_64-linux-gnu/bits/in.h /usr/include/unistd.h \
- /usr/include/x86_64-linux-gnu/bits/posix_opt.h \
- /usr/include/x86_64-linux-gnu/bits/environments.h \
- /usr/include/x86_64-linux-gnu/bits/confname.h \
- /usr/include/x86_64-linux-gnu/bits/getopt_posix.h \
- /usr/include/x86_64-linux-gnu/bits/getopt_core.h \
- /usr/include/x86_64-linux-gnu/bits/unistd_ext.h
+ /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/buffer.h \
+ /opt/mellanox/doca/include/doca_buf.h \
+ /opt/mellanox/doca/include/doca_buf_pool.h

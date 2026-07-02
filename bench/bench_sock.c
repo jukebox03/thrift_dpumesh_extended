@@ -4,8 +4,8 @@
  *
  *     socket()/bind()  ->  dmesh_create_channel()
  *     connect()        ->  dmesh_connect()
- *     write()          ->  dmesh_write()  (buffers; the read below ships it)
- *     read()           ->  dmesh_read()   (implicit send + the response; EAGAIN until it arrives)
+ *     write()          ->  dmesh_write()  (buffers; flush ships it)
+ *     read()           ->  dmesh_read()   (harvests the response; EAGAIN until it arrives)
  *     close()          ->  dmesh_close()
  *
  * A worker keeps a window of W REUSABLE conns: connect once per slot, then loop

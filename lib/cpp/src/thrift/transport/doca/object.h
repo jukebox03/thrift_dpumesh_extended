@@ -169,12 +169,10 @@ struct pod_state {
     /* DPU→CPU descriptor rings (K, one per EU). Under in-place forwarding the
      * reverse DMA reads from the source pod's dma_buffer via desc->mmap/addr, so
      * there is no separate destination TX data buffer. The single ARM thread is
-     * the sole writer of all K rings, so each stays single-producer (lock-free).
-     * rev_rr round-robins reverse DMAs across the K rings/EUs. */
+     * the sole writer of all K rings, so each stays single-producer (lock-free). */
     struct dma_ring *tx_rings[MAX_EU_PER_POD];
     struct doca_mmap *tx_ring_mmaps[MAX_EU_PER_POD];
     struct doca_buf_arr *tx_buf_arrs[MAX_EU_PER_POD];
-    uint32_t rev_rr;
 
     /* Host RX buffer mmap (exported from Host, DPA DMAs into this) */
     struct doca_mmap *host_rx_mmap;
@@ -342,14 +340,7 @@ struct objects {
 
     /* Host-only fields (used by dpumesh_doca.c client side) */
     struct doca_mmap *local_mmap;
-    struct doca_mmap *remote_mmap;
     void *dma_buffer;
-    void *remote_addr;
-    size_t remote_buf_size;
-    struct dma_ring *dma_ring;
-    struct doca_mmap *ring_mmap;    /* used for DMA ring mmap */
-
-    struct doca_buf_arr *buf_arr;
 
     /* DPA (shared device, N EU threads for multi-EU data plane).
      *

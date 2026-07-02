@@ -192,8 +192,8 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         if (!desc->valid)
             break;                       /* ring drained */
 
-        /* Host enforces desc->size <= DPUMESH_SLOT_SIZE_DEFAULT (= DPA_DMA_COPY_MAX
-         * = 8KB) via check_slot_size(). Anything larger is a caller bug; drop. */
+        /* Host enforces desc->size <= slot_size (= DPA_DMA_COPY_MAX = 8KB) in
+         * dpumesh_enqueue. Anything larger is a caller bug; drop. */
         if (desc->size > DPA_DMA_COPY_MAX) {
             DOCA_DPA_DEV_LOG_INFO("FWD: desc size %u > %u (slot cap); dropping ring=%u slot=%u\n",
                                   desc->size, DPA_DMA_COPY_MAX, r, thread_arg->desc_idx[r]);
@@ -354,6 +354,7 @@ static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
          * The reverse ring's ring->pod_id is the RECEIVER, so the source
          * identity must come from the descriptor. */
         comp.type = DPA_MSG_REV_DONE;
+        comp.route_group = 0;   /* forward-only field; keep the wire byte deterministic */
         comp.pos = ring->region_off + thread_arg->rev_pos[r];  /* absolute (EU-sharding) */
         comp.length = (uint16_t)desc->size;
         /* Endpoint tuple — opaque passthrough from the DPU-posted reverse desc.

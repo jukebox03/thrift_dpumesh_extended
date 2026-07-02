@@ -72,8 +72,6 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_common.c.o: \
  /usr/include/x86_64-linux-gnu/bits/types/FILE.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
  /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
- /opt/mellanox/doca/include/doca_dpa.h \
- /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/object.h \
  /usr/include/pthread.h /usr/include/sched.h \
  /usr/include/x86_64-linux-gnu/bits/sched.h \
@@ -92,10 +90,12 @@ lib/cpp/CMakeFiles/thrift.dir/src/thrift/transport/doca/comch_common.c.o: \
  /opt/mellanox/doca/include/doca_comch.h \
  /opt/mellanox/doca/include/doca_ctx.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_server.h \
+ /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/comch_client.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/common.h \
  /opt/mellanox/doca/include/doca_buf.h \
  /opt/mellanox/doca/include/doca_buf_inventory.h \
  /home/jukebox/thrift_dma_copy/thrift_dpumesh_extended/lib/cpp/src/thrift/transport/doca/dpa.h \
+ /opt/mellanox/doca/include/doca_dpa.h \
  /opt/mellanox/doca/include/doca_buf_array.h

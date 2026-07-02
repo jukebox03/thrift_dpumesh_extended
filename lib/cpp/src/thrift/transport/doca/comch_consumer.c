@@ -1,7 +1,6 @@
 #include "comch_consumer.h"
 #include "object.h"
 #include "buffer.h"
-#include "comch_common.h"
 
 #include <doca_comch.h>
 #include <doca_comch_consumer.h>

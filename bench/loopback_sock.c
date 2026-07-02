@@ -6,11 +6,11 @@
  *   echo thread             ->  accept -> read -> write -> flush -> close  (server)
  *   RUN handler             ->  connect(own service) -> write/flush/read   (client)
  *
- * The client's request is dst=(own service, pod=BLANK, port=0): the DPU resolves
- * the service to THIS pod and loops it back. On this single host the request lands
- * with dst_port=0 (-> accept queue, server side) while the reply lands with
- * dst_port=pc (-> client pending). The oriented-tuple demux distinguishes them
- * even though both legs are on the same host — that is exactly what this proves.
+ * The client's request is dst=(own service, pod=BLANK, port=BLANK): the DPU
+ * resolves the service to THIS pod and loops it back. On this single host the
+ * request lands with dst_port=uP (>= DMESH_UPORT_BASE -> server accept) while the
+ * reply lands with dst_port=pc (< BASE -> client conn). The port-range split keeps
+ * both kinds of conn in the one ports[] table — that is exactly what this proves.
  *
  * Uses ONLY the façade (dpm.h). No changes to the transport. Control-TCP daemon
  * like bench_sock.c: `RUN <N> <SIZE>` runs N loopback round-trips and replies

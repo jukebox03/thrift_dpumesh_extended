@@ -4,8 +4,6 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include "dpumesh_common.h"  /* DMA_RING_SIZE */
-
 struct dma_desc;
 struct doca_dev;
 struct doca_mmap;

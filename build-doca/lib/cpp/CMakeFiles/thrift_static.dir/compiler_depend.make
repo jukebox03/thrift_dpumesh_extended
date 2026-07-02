@@ -19278,8 +19278,6 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o:
   /usr/include/x86_64-linux-gnu/bits/types/FILE.h \
   /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
   /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
-  /opt/mellanox/doca/include/doca_dpa.h \
-  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
   ../lib/cpp/src/thrift/transport/doca/object.h \
   /usr/include/pthread.h \
   /usr/include/sched.h \
@@ -19300,12 +19298,14 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_common.c.o:
   /opt/mellanox/doca/include/doca_comch.h \
   /opt/mellanox/doca/include/doca_ctx.h \
   ../lib/cpp/src/thrift/transport/doca/comch_server.h \
+  /usr/lib/gcc/x86_64-linux-gnu/11/include/stdbool.h \
   ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/comch_client.h \
   ../lib/cpp/src/thrift/transport/doca/common.h \
   /opt/mellanox/doca/include/doca_buf.h \
   /opt/mellanox/doca/include/doca_buf_inventory.h \
   ../lib/cpp/src/thrift/transport/doca/dpa.h \
+  /opt/mellanox/doca/include/doca_dpa.h \
   /opt/mellanox/doca/include/doca_buf_array.h
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/comch_consumer.c.o: ../lib/cpp/src/thrift/transport/doca/comch_consumer.c \
@@ -19810,26 +19810,9 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/dpa.c.o: ../lib/c
   ../lib/cpp/src/thrift/transport/dpumesh.h \
   ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/ring.h \
-  /usr/include/arpa/inet.h \
-  /usr/include/netinet/in.h \
-  /usr/include/x86_64-linux-gnu/sys/socket.h \
-  /usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h \
-  /usr/include/x86_64-linux-gnu/bits/socket.h \
-  /usr/include/x86_64-linux-gnu/bits/socket_type.h \
-  /usr/include/x86_64-linux-gnu/bits/sockaddr.h \
-  /usr/include/x86_64-linux-gnu/asm/socket.h \
-  /usr/include/asm-generic/socket.h \
-  /usr/include/x86_64-linux-gnu/asm/sockios.h \
-  /usr/include/asm-generic/sockios.h \
-  /usr/include/x86_64-linux-gnu/bits/types/struct_osockaddr.h \
-  /usr/include/x86_64-linux-gnu/bits/in.h \
-  /usr/include/unistd.h \
-  /usr/include/x86_64-linux-gnu/bits/posix_opt.h \
-  /usr/include/x86_64-linux-gnu/bits/environments.h \
-  /usr/include/x86_64-linux-gnu/bits/confname.h \
-  /usr/include/x86_64-linux-gnu/bits/getopt_posix.h \
-  /usr/include/x86_64-linux-gnu/bits/getopt_core.h \
-  /usr/include/x86_64-linux-gnu/bits/unistd_ext.h
+  ../lib/cpp/src/thrift/transport/doca/buffer.h \
+  /opt/mellanox/doca/include/doca_buf.h \
+  /opt/mellanox/doca/include/doca_buf_pool.h
 
 lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/object.c.o: ../lib/cpp/src/thrift/transport/doca/object.c \
   /usr/include/stdc-predef.h \
@@ -19959,7 +19942,6 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o: ../lib/
   /usr/include/x86_64-linux-gnu/bits/stdint-intn.h \
   /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
   /usr/lib/gcc/x86_64-linux-gnu/11/include/stddef.h \
-  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   /usr/include/stdlib.h \
   /usr/include/x86_64-linux-gnu/bits/waitflags.h \
   /usr/include/x86_64-linux-gnu/bits/waitstatus.h \
@@ -20024,6 +20006,7 @@ lib/cpp/CMakeFiles/thrift_static.dir/src/thrift/transport/doca/ring.c.o: ../lib/
   /usr/include/x86_64-linux-gnu/asm/posix_types.h \
   /usr/include/x86_64-linux-gnu/asm/posix_types_64.h \
   /usr/include/asm-generic/posix_types.h \
+  ../lib/cpp/src/thrift/transport/doca/dpumesh_common.h \
   ../lib/cpp/src/thrift/transport/doca/object.h \
   /usr/include/pthread.h \
   /usr/include/sched.h \

@@ -19,11 +19,6 @@
 #include <doca_comch_consumer.h>
 #include <doca_log.h>
 
-/* Forward declaration — defined below server_message_recv_callback */
-doca_error_t
-server_send_msg_to_conn(struct objects *objs, struct doca_comch_connection *conn,
-                        const char *msg, size_t len);
-
 DOCA_LOG_REGISTER(COMCH_SERVER);
 
 static void server_send_task_completion_callback(struct doca_comch_task_send *task,
@@ -270,8 +265,7 @@ static void server_state_changed_callback(const union doca_data user_data,
 {
 	(void)ctx;
 	(void)prev_state;
-	struct objects *objs = (struct objects *)user_data.ptr;
-	(void)objs;
+	(void)user_data;
 
 	switch (next_state) {
 	case DOCA_CTX_STATE_IDLE:

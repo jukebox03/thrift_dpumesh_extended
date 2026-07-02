@@ -15,13 +15,10 @@
 #include "comch_consumer.h"
 #include "../dpumesh.h"
 #include "ring.h"
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "buffer.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
-#include <time.h>
 
 DOCA_LOG_REGISTER(DPA);
 
@@ -151,6 +148,7 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             rev_entry.seq = rev_comp->seq;
             rev_entry.length = rev_comp->length;
             rev_entry.buf_offset = rev_comp->pos;  /* position in Host RX buffer */
+            rev_entry.route_group = 0;             /* forward-only field */
             rev_entry.pod_idx = -1;
 
             if (ingest_push(objs, &rev_entry) != 0) {
@@ -452,13 +450,11 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
 
     memset(msgq, 0, sizeof(*msgq));
 
-    if (msgq->pe == NULL) {
-        result = doca_pe_create(&msgq->pe);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to create PE - %s",
-                    doca_error_get_name(result));
-            return result;
-        }
+    result = doca_pe_create(&msgq->pe);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to create PE - %s",
+                doca_error_get_name(result));
+        return result;
     }
 
     result = doca_comch_msgq_create(attr->dev, &msgq->msgq);
@@ -523,7 +519,7 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
     msgq->target_consumer_id = consumer_id;
 
     consumer_ctx = doca_comch_consumer_as_ctx(msgq->consumer);
-    /* DPU→DPA direction: must fit the largest message (ADD_RING, NEW_DESC, etc.) */
+    /* DPU→DPA direction: must fit the largest message (ADD_RING, ADD_REV_RING, etc.) */
     result = doca_comch_consumer_set_imm_data_len(msgq->consumer, sizeof(struct comch_msg));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set imm data len to %zu - %s",
@@ -967,8 +963,6 @@ destroy_buf_arr:
     *out_buf_arr = NULL;
     return result;
 }
-
-#include "buffer.h"
 
 /*
  * Fill ring info for a specific pod.

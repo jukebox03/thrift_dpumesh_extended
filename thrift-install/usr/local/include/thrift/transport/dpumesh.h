@@ -38,8 +38,7 @@ typedef struct {
 /* ====== SwDescriptor (host-internal RX/TX descriptor, packed) ====== */
 /* Host-internal descriptor (NOT a wire layout): the façade builds it for
  * dpumesh_enqueue (translated to dma_desc) and dpumesh_dequeue fills it from a
- * delivered completion. Carries the oriented endpoint tuple — see
- * design-endpoint-tuple.md §12.2. */
+ * delivered completion. Carries the oriented endpoint tuple — see api.md §5/§6. */
 typedef struct {
     int32_t  body_buf_slot;         /* TX slot (send) | RX landing byte-offset (recv) */
     uint32_t body_len;
@@ -111,7 +110,7 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc);
 /* ====== Connection API (connection-oriented, full-duplex — no RPC matching) ======
  *
  * A "port" IS a connection (like a socket fd): it owns a peer, an inbound message
- * queue, and an optional per-conn readiness eventfd. Inbound is routed by dst_port
+ * queue. Inbound is routed by dst_port
  * to the conn's inbox; there is NO request↔response matching. */
 
 /* Endpoint roles for dpumesh_alloc_port. */

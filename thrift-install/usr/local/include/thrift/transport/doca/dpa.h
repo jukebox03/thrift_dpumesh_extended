@@ -65,7 +65,6 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
 doca_error_t
 dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread, int eu_id);
 
-struct objects;
 doca_error_t
 dmesh_doca_dpa_comch_create(struct objects *objs, int idx);
 

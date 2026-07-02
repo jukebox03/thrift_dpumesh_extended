@@ -47,9 +47,9 @@ static void cleanup_ctx(struct dpumesh_ctx *ctx);
  * dpumesh_ctx — internal state
  * ==================================================================== */
 
-/* RX queue between PE thread (producer, drains rx_dma_buffer) and the
- * application consumer. Sized larger than worst-case concurrent in-flight so
- * the PE thread never has to drop on enqueue. */
+/* Accept queue between the PE thread (producer — a NEW conn's first message
+ * lands here) and dmesh_accept (consumer). Sized larger than worst-case
+ * concurrent new-conn bursts so the PE thread never has to drop on enqueue. */
 #define RX_QUEUE_SIZE 65536
 
 /* TX-slot custody: each flushed message parks its TX slot until the DPU's
@@ -73,10 +73,6 @@ static void cleanup_ctx(struct dpumesh_ctx *ctx);
  * whatever arrives, in send order per conn, until close. Allocated from one
  * host-unique pool so client and server ports never collide (loopback-safe). */
 #define DMESH_PORT_SPACE  65536
-#define DMESH_ROLE_FREE           0
-#define DMESH_ROLE_CLIENT         1
-#define DMESH_ROLE_SERVER         2
-#define DMESH_ROLE_SERVER_PENDING 3  /* PE-created new server conn, not yet accepted */
 /* Per-conn inbound queue depth (descriptors only — bodies stay in the shared RX
  * mmap, referenced by pos). Lazily malloc'd per LIVE conn (not 65536× pre-alloc).
  * Power of two. On overflow (app drains too slowly) the landing is reclaimed
@@ -146,12 +142,12 @@ struct dpumesh_ctx {
     /* DOCA objects */
     struct objects doca_objs;
     void *dma_buffer;          /* Host TX buffer (PCI mmap, CPU→DPU source) */
-    /* K forward descriptor rings (EU-sharding). dpumesh_enqueue round-robins
-     * across them via rr_counter; each ring_locks[j] serializes get_next_dma_desc
-     * + fill + valid=1 for ring j (single-producer per ring). K=1 = legacy. */
+    /* K forward descriptor rings (EU-sharding). dpumesh_enqueue conn-shards
+     * across them (ring = src_port % K); each ring_locks[j] serializes
+     * get_next_dma_desc + fill + valid=1 for ring j (single-producer per ring).
+     * K=1 = legacy. */
     struct dma_ring *dma_rings[MAX_EU_PER_POD];
     pthread_mutex_t ring_locks[MAX_EU_PER_POD];
-    atomic_uint rr_counter;
     /* Reverse credit region size = rx_dma_buf_size / k_rings. The DPA reports an
      * absolute landing pos; ring_idx = pos / rx_region_size selects which ring's
      * credit slot to return. K=1 → region = whole buffer → ring_idx always 0. */
@@ -193,7 +189,7 @@ struct dpumesh_ctx {
 
     /* Readiness eventfd for native-epoll integration. Lazily enabled by
      * dpumesh_get_event_fd(): once enabled, rx_deliver_desc writes the eventfd on
-     * each user-visible delivery (request -> RX ring, or response -> pending) so a
+     * each user-visible delivery (new conn -> accept RX ring, or established conn -> its inbox) so a
      * caller blocked in a vanilla epoll_wait() on this fd wakes up. The PE thread
      * itself already sleeps on the DOCA PE notification fd (DPUMESH_HOST_EPOLL), so
      * the whole chain is notification-driven, not busy-poll. -1 = not created. */
@@ -319,13 +315,6 @@ static inline void rx_credit_return(dpumesh_ctx_t *ctx, int pos)
     }
 }
 
-/* Reclaim an undeliverable RX entry (error/drop paths): return the landing
- * credit so the DPA can reuse that position. `slot` is the landing byte pos. */
-static void rx_reclaim(dpumesh_ctx_t *ctx, int slot)
-{
-    rx_credit_return(ctx, slot);
-}
-
 /* Lock-free SPMC dequeue. Multiple worker consumers race via CAS on
  * rx_deq; the single PE producer owns rx_enq. Returns 1 and fills *out on
  * success, 0 if the ring is empty. Never blocks. */
@@ -413,7 +402,7 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
         if (r == 0) {
             /* inbox full (app draining too slowly) → drop + reclaim the landing. */
             DOCA_LOG_ERR("RX deliver: conn %u inbox full, dropping seq=%u", dport, desc->seq);
-            rx_reclaim(ctx, slot);
+            rx_credit_return(ctx, slot);
         } else if (r == 2 && ctx->notify_enabled) {
             /* Re-read role: a concurrent dmesh_accept may have promoted this slot
              * SERVER_PENDING→SERVER AFTER our initial load (line above), in which
@@ -440,13 +429,19 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
             /* raced live between the initial load and the lock → coalesce to inbox */
             pthread_mutex_unlock(&ctx->port_lock);
             int r = inbox_push(psl, desc);
-            if (r == 0) rx_reclaim(ctx, slot);
+            if (r == 0) rx_credit_return(ctx, slot);
             else if (r == 2 && ctx->notify_enabled) { ready_push(ctx, dport); dpumesh_notify(ctx); }
             return;
         }
-        if (!psl->inbox)
+        if (!psl->inbox) {
             psl->inbox = (sw_descriptor_t *)malloc(DMESH_INBOX_RING * sizeof(sw_descriptor_t));
-        if (!psl->inbox) { pthread_mutex_unlock(&ctx->port_lock); rx_reclaim(ctx, slot); return; }
+            if (!psl->inbox) { pthread_mutex_unlock(&ctx->port_lock); rx_credit_return(ctx, slot); return; }
+        } else {
+            /* Return a prior owner's straggler deliveries (close/deliver race)
+             * before the head/tail reset discards them — mirrors alloc_port. */
+            sw_descriptor_t sd;
+            while (inbox_pop(psl, &sd)) rx_credit_return(ctx, sd.body_buf_slot);
+        }
         atomic_store_explicit(&psl->in_head, 0, memory_order_relaxed);
         atomic_store_explicit(&psl->in_tail, 0, memory_order_relaxed);
         psl->peer_pod  = desc->src_pod;
@@ -461,7 +456,7 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
         if ((int_fast32_t)(cseq - pos) != 0) {
             __atomic_store_n(&psl->role, DMESH_ROLE_FREE, __ATOMIC_RELEASE);   /* roll back */
             DOCA_LOG_ERR("RX deliver: accept queue full, dropping new conn uP=%u", dport);
-            rx_reclaim(ctx, slot);
+            rx_credit_return(ctx, slot);
             return;
         }
         c->desc = *desc;
@@ -472,15 +467,14 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
     }
 
     /* (3) FREE + a low (client) port → stale (conn closed) → reclaim the landing. */
-    rx_reclaim(ctx, slot);
+    rx_credit_return(ctx, slot);
 }
 
 /*
- * Parse + deliver one DMA-reverse entry at rx_dma_buffer[pos] whose body
- * length is dma_len. Per-request metadata (req_id, src_pod_id, dst_pod_id,
- * flags) is taken from the comch DMA_COMPLETION message — NOT from the DMA
- * payload. The DMA payload is the body itself (no in-band header).
- * Returns 0 on success, -1 on malformed/undeliverable.
+ * Parse + deliver one BATCH_REV_DONE entry at rx_dma_buffer[pos] whose body
+ * length is dma_len. Per-message metadata (the oriented endpoint tuple) is
+ * taken from the entry — NOT from the DMA payload, which is the body itself
+ * (no in-band header). Returns 0 on success, -1 on malformed/undeliverable.
  */
 static int process_rx_dma_entry(dpumesh_ctx_t *ctx, const struct dmesh_rev_done_entry *e) {
     uint32_t pos = e->pos, dma_len = e->length;
@@ -582,12 +576,8 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
             return;
         }
         for (uint32_t i = 0; i < n; i++) {
+            /* Bounds/size validation happens inside process_rx_dma_entry. */
             const struct dmesh_rev_done_entry *e = &b->entries[i];
-            if (!ctx->rx_dma_buffer || (size_t)e->pos + e->length > ctx->rx_dma_buf_size) {
-                DOCA_LOG_ERR("BATCH_REV_DONE: invalid pos=%u len=%u buf=%zu",
-                             e->pos, e->length, ctx->rx_dma_buf_size);
-                continue;
-            }
             if (process_rx_dma_entry(ctx, e) != 0)
                 DOCA_LOG_WARN("BATCH_REV_DONE: process_rx_dma_entry failed pos=%u len=%u",
                               e->pos, e->length);
@@ -746,7 +736,6 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     atomic_store(&ctx->free_head, (uint_fast64_t)0);  /* tag 0, head index 0 */
     for (int j = 0; j < MAX_EU_PER_POD; j++)
         pthread_mutex_init(&ctx->ring_locks[j], NULL);
-    atomic_init(&ctx->rr_counter, 0);
 
     /* Lock-free SPMC RX ring: seq[i] = i (cell i first writable at enq
      * position i), enq = deq = 0. */
@@ -783,7 +772,10 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num,
     ctx->doca_objs.rx_hook_ctx = ctx;
 
     ctx->pe_running = 1;
-    if (pthread_create(&ctx->pe_tid, NULL, pe_progress_fn, ctx) != 0) goto fail;
+    if (pthread_create(&ctx->pe_tid, NULL, pe_progress_fn, ctx) != 0) {
+        ctx->pe_running = 0;   /* cleanup must not join a never-created thread */
+        goto fail;
+    }
 
     DOCA_LOG_INFO("DPUmesh DOCA initialized: worker=%s pod_id=%d", ctx->worker_id, ctx->pod_id);
 
@@ -1055,10 +1047,10 @@ int dpumesh_get_slot_size(dpumesh_ctx_t *ctx) {
 
 /* Enable + return the readiness eventfd: a real fd that becomes readable
  * whenever an inbound request/response is delivered, so a caller can wait on it
- * with a VANILLA epoll/poll/select instead of busy-polling dequeue/poll_response.
+ * with a VANILLA epoll/poll/select instead of busy-polling dequeue/conn_recv.
  * The PE thread (notification-driven under DPUMESH_HOST_EPOLL=1) writes it on each
  * delivery. Drain it with a single read() of a uint64_t per wakeup, then collect
- * ready work via dpumesh_dequeue(0)/dpumesh_poll_response(). Returns -1 if the
+ * ready work via dpumesh_dequeue(0)/dpumesh_conn_recv(). Returns -1 if the
  * eventfd could not be created. Idempotent; level-triggered-friendly. */
 int dpumesh_get_event_fd(dpumesh_ctx_t *ctx) {
     if (!ctx || ctx->notify_efd < 0) return -1;

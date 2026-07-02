@@ -30,7 +30,7 @@ DOCA_LOG_REGISTER(DPU_WORKER);
 /* ====== TX_ACK send helper ====== */
 
 /* Try to send TX_ACK; on EAGAIN park to the deferred queue. No-op when src_pod
- * is gone (host's 2-second collision-wait reclaim is the safety net). */
+ * is gone (its host — and the slot's custody list — died with it). */
 static void
 send_or_defer_tx_ack(struct objects *objs, struct pod_state *src_pod,
                      uint16_t port, uint16_t seq)
@@ -51,7 +51,7 @@ send_or_defer_tx_ack(struct objects *objs, struct pod_state *src_pod,
             objs->deferred_tx_acks[n].seq  = seq;
         } else {
             DOCA_LOG_ERR("deferred TX_ACK queue full — dropping port=%u seq=%u (pod %d). "
-                         "Host slot will reclaim at 2s.",
+                         "Host TX slot stays in custody until close.",
                          port, seq, src_pod->pod_id);
         }
         return;
@@ -74,7 +74,7 @@ flush_txack_batch(struct objects *objs, struct pod_state *pod)
     doca_error_t r = server_send_batch_tx_ack_to(objs, pod->connection,
                                                  pod->txack_batch, pod->txack_batch_n);
     if (r != DOCA_ERROR_AGAIN)
-        pod->txack_batch_n = 0;   /* sent (or hard error → host 2s reclaim) */
+        pod->txack_batch_n = 0;   /* sent (a hard error drops the batch) */
 }
 
 /* Accumulate one TX_ACK into the src pod's batch; flush when full. Falls back to
@@ -117,7 +117,7 @@ flush_rev_done_batch(struct objects *objs, struct pod_state *pod)
                                                    pod->rev_done_batch, pod->rev_done_batch_n);
     if (r == DOCA_ERROR_AGAIN)
         return;  /* retain; retried */
-    pod->rev_done_batch_n = 0;   /* sent (or hard error → host 2s reclaim) */
+    pod->rev_done_batch_n = 0;   /* sent (a hard error drops the batch) */
 }
 
 /* Accumulate one REV_DONE into the target pod's batch; flush when full. Returns
@@ -163,13 +163,12 @@ batch_or_send_rev_done(struct objects *objs, struct pod_state *target_pod,
  * Returns DOCA_SUCCESS or DOCA_ERROR_AGAIN (TX descriptor ring full).
  */
 static doca_error_t
-dpu_enqueue_reverse_dma(struct objects *objs, struct pod_state *src_pod,
+dpu_enqueue_reverse_dma(struct pod_state *src_pod,
                         struct pod_state *dst_pod, int ring_k,
                         const dpu_comp_entry_t *ce, int32_t resolved_dst_pod,
                         uint32_t src_buf_offset, uint32_t body_len,
                         uint16_t out_src_port, uint16_t out_dst_port)
 {
-    (void)objs;
     /* Post the reverse desc to dst_pod's ring ring_k (the EU-sharding ring whose
      * EU owns dst_pod's rev region ring_k). The single ARM thread is the sole
      * writer of every ring → each stays single-producer (lock-free). */
@@ -341,7 +340,7 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
             struct pod_state *B = find_pod_by_id(objs, b);
             if (B && pod_data_ready(B) && B->tx_rings[0]) {
                 int kr = B->k_rings > 0 ? B->k_rings : 1;
-                (void)dpu_enqueue_reverse_dma(objs, fwd_buf_pod, B,
+                (void)dpu_enqueue_reverse_dma(fwd_buf_pod, B,
                                               (int)((uint32_t)uP % (uint32_t)kr),
                                               entry, b, entry->buf_offset, 0 /*FIN*/, uP, uP);
             }
@@ -399,7 +398,7 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
     int ring_k = (int)((uint32_t)out_dst_port % (uint32_t)kr);
 
     doca_error_t fwd_result = dpu_enqueue_reverse_dma(
-        objs, fwd_buf_pod, target_pod, ring_k, entry, resolved_dst_pod,
+        fwd_buf_pod, target_pod, ring_k, entry, resolved_dst_pod,
         entry->buf_offset, entry->length, out_src_port, out_dst_port);
 
     if (fwd_result == DOCA_ERROR_AGAIN)
@@ -446,8 +445,9 @@ drain_deferred_tx_acks(struct objects *objs)
             kept++;
             continue;
         }
-        /* Hard error — log and drop (host's 2s reclaim is the safety net
-         * for these once-in-a-blue-moon hard failures). */
+        /* Hard error — log and drop (the slot stays in the host's custody
+         * list until that conn closes; only these once-in-a-blue-moon hard
+         * failures ever leak one). */
         DOCA_LOG_WARN("deferred TX_ACK fatal for port=%u seq=%u: %s",
                       d->port, d->seq, doca_error_get_descr(rc));
         sent++;  /* count as "removed from queue" */
@@ -475,16 +475,12 @@ process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
     int32_t target_id = entry->dst_pod_id;
     struct pod_state *target_pod = find_pod_by_id(objs, target_id);
 
-    /* TX_ACK target = the ORIGINAL sender. On the client-request leg the reverse
-     * carries dst_port = uP (a DPU upstream id) and src_port was rewritten to uP;
-     * translate uP -> the client's real (pod,port) so the CLIENT frees its slot.
-     * On the reply leg (dst_port = a real client port) no translation — the sender
-     * is the backend at (pod, uP=its real local port). */
-    /* Forward-to-backend leg: the reverse carries dst_port = uP and src_port was
-     * rewritten to uP; translate uP -> the client's real (pod,port) so the CLIENT
-     * frees its slot. Reply leg (dst_port = a real client port) needs no translation
-     * — the sender is the backend at (pod, uP = its real local port). Upstream
-     * TEARDOWN happens in the client-FIN fan-out (process_forward_entry), not here. */
+    /* TX_ACK target = the ORIGINAL sender. On the client-request (forward-to-backend)
+     * leg the reverse carries dst_port = uP (a DPU upstream id) and src_port was
+     * rewritten to uP; translate uP -> the client's real (pod,port) so the CLIENT frees
+     * its slot. On the reply leg (dst_port = a real client port) no translation — the
+     * sender is the backend at (pod, uP = its real local port). Upstream TEARDOWN
+     * happens in the client-FIN fan-out (process_forward_entry), not here. */
     int32_t  ack_pod  = entry->src_pod_id;
     uint16_t ack_port = entry->src_port;
     if (entry->dst_port >= DMESH_UPORT_BASE && ct->upstream[entry->dst_port].in_use) {

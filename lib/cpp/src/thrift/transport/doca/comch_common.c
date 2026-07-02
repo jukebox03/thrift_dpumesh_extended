@@ -3,7 +3,6 @@
 #include <doca_log.h>
 #include <doca_error.h>
 #include <doca_mmap.h>
-#include <doca_dpa.h>
 
 #include "object.h"
 #include "comch_client.h"

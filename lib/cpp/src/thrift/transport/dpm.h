@@ -46,8 +46,6 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
-#include <sched.h>
-#include <time.h>
 #include <sys/types.h>
 
 #include "dpumesh.h"
@@ -128,7 +126,8 @@ static inline void dmesh_destroy_channel(dmesh_channel_t *s) {
 
 static inline int dmesh_pod_id(dmesh_channel_t *s)  { return s->pod_id; }
 static inline int dmesh_msg_max(dmesh_channel_t *s) { return s->slot_size; }
-/* The endpoint "listen" fd: readable when a NEW connection is pending (accept). */
+/* The ONE channel fd: readable when a NEW connection is pending (accept) OR any
+ * conn has inbound (next_ready). Calling it enables readiness delivery. */
 static inline int dmesh_event_fd(dmesh_channel_t *s) { return dpumesh_get_event_fd(s->ctx); }
 
 /* ===== internal helpers ===== */

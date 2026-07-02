@@ -2943,3 +2943,52 @@ pins, read is a byte-stream the app frames. Regression perf-neutral (RPC 100K p5
 Large throughput ~149 MB/s 0-fail sub-ms. is_last-DELETE rejected (collision + ring-reorder →
 scatter); GLOBAL route_group counter + overwrite-on-reuse is safe. Wire unchanged (20B completion,
 route_group full byte). Deploy config unchanged; DPUMESH_LB_RR TEST-only.
+
+# 2026-07-02 (session 2) — Cleanup build validation (rr_counter→conn-shard, dead-code sweep)
+
+Working-tree cleanup on top of the SAR redesign: removed the orphaned `atomic_uint rr_counter`
+(forward-ring selection is now `src_port % k_rings` conn-shard, not round-robin — the counter was
+already unused); deleted the `rx_reclaim()` wrapper (callers use `rx_credit_return` directly);
+moved BATCH_REV_DONE bounds check from `rx_data_hook` into `process_rx_dma_entry`; added an
+inbox-straggler drain on conn reuse (return prior owner's stragglers before head/tail reset);
+explicit `route_group=0` on the reverse completion (wire-byte determinism); dropped the unused
+`objs` param from `dpu_enqueue_reverse_dma`; `pe_running=0` on pthread_create failure; assorted
+stale-comment fixes (2s-reclaim→custody, OP_/CASE_ note, doc refs). Host syntax check clean; the
+one compile-breaker (orphan rr_counter init) was the only unfinished edit.
+
+## Results (fair 1-core/pod, 1024B, 10s, DPA=4 K=2, baked config) — ALL 0-fail
+RPC warm ramp:
+| test | achieved | p50 | p99 | p999 | ok/fail |
+|---|---|---|---|---|---|
+| RPC 30K  | 29,838  | 174us | 542us   | 769us    | 300,000/0   |
+| RPC 100K | 99,451  | 182us | 359us   | 4,894us  | 1,000,000/0 |
+| RPC 150K | 149,174 | 223us | 505us   | 20,694us | 1,500,000/0 |
+| RPC 200K | 198,893 | 273us | 20,113us| 43,494us | 2,000,000/0 |
+
+Path-specific:
+| test | achieved | p50 | ok/fail | validates |
+|---|---|---|---|---|
+| loopback 50K (8KB)        | —      | 132us | 50,000/0   | port-range demux (both legs, one host) |
+| pipeline 100K (1KB, d=8)  | 99,446 | 209us | 1,000,000/0 | conn-reuse + straggler-drain path |
+| large 32KB (4 chunks, 32c)| 9,946  | 278us | 100,000/0  | auto-chunk + route-affinity (bad=0) |
+
+DPU log clean (only benign `ctx DPA ops are empty` init WRN; no hot-path error/flood after 2M+ req).
+
+## Verdict
+Cleanup is **perf-neutral, 0 regression**: RPC 200K = 198,893 (= 198.9K baseline, exact). Large
+32KB 0-fail = chunks arrived in order ⇒ route-affinity intact. rr_counter removal safe (conn-shard
+already active). No behavior change from the dead-code/comment sweep.
+
+## Dead-code / comment sweep (workflow-verified, applied on top) — re-validated 0-regression
+12-file-group fan-out (discover → adversarial verify, tree-wide grep per candidate). 25 findings
+verified SAFE and applied; 1 REJECTED correctly (dmesh_sendfile — a DOCUMENTED public façade API in
+api.md, only *looked* dead from scale_log). Applied: removed 6 unused `struct objects` host fields
+(remote_mmap/remote_addr/remote_buf_size/dma_ring/ring_mmap/buf_arr) + unused `rev_rr`; dropped
+duplicate DMESH_ROLE_* macros (already in dpumesh.h); removed dead includes (dpa.c arpa/inet+socket+
+unistd+time, dpm.h sched+time, ring.h dpumesh_common, comch_consumer comch_common, comch_common
+doca_dpa); deleted redundant fwd-decls (comch_server server_send_msg_to_conn, dpa.h struct objects);
+unwrapped an always-true `msgq->pe==NULL` guard (memset zeroes it); collapsed a dead temp var;
+fixed stale comments (poll_response→conn_recv, request/response→conn/inbox, NEW_DESC→ADD_REV_RING,
+per-conn-eventfd, rev_rr round-robin, bench read auto-send). All host .c `gcc -fsyntax-only` clean;
+full `deploy` (device dpa_kernel + ARM + host) exit 0. Re-validated: RPC 100K = 99,452 p50 184.9us
+0-fail; loopback 50K 0-fail; large 32KB 100,000/0 621 MB/s. Perf-neutral, no behavior change.

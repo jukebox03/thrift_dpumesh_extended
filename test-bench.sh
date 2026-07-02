@@ -25,8 +25,6 @@
 #   같은 1 core 안에서 app만 풀로 사용 가능 — 이 차이가 비교의 핵심.
 #   bench-* daemon은 control TCP 9092로 RUN/PING 명령 수신.
 #
-# 기존 test-dpumesh.sh와 같은 DPU를 사용하므로 한 번에 한쪽만 deploy 가능.
-
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -1067,7 +1065,6 @@ case "$CMD" in
         echo "  status                                    # 상태"
         echo "  cleanup                                   # ns 삭제 + DPU 중지"
         echo
-        echo "Note: 같은 DPU를 사용하므로 test-dpumesh.sh와 동시 deploy 불가"
-        echo "      pin profile은 dpumesh/dpumesh-hw/tcp 명령마다 자동으로 맞춰줌"
+        echo "Note: pin profile은 dpumesh/dpumesh-hw/tcp 명령마다 자동으로 맞춰줌"
         ;;
 esac

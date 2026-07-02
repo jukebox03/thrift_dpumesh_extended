@@ -1,10 +1,7 @@
 #ifndef DPUMESH_COMMON_H
 #define DPUMESH_COMMON_H
 
-/* ====== DOCA / DPA limits ======
- * (The old OP_/CASE_ flag bytes were removed with the oriented-tuple redesign:
- * request-vs-response is no longer a wire flag — it falls out of which local
- * socket the dst_port resolves to. dma_desc.flags is now reserved/unused.) */
+/* ====== DOCA / DPA limits ====== */
 #define MAX_DPA_RINGS       8   /* per-EU ring capacity (forward + reverse each) */
 #define MAX_PODS            8
 
