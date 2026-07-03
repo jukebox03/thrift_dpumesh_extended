@@ -52,6 +52,28 @@ typedef struct {
     uint32_t tail;  /* enqueue index */
 } dpu_comp_queue_t;
 
+/* ===== L7-readiness routing hook (plan.md) =====
+ * Seam for a FUTURE Envoy-like L7 proxy on the DPU (prev/architecture.md):
+ * called once per BLANK-dst forward DATA message, BEFORE the default L4 route,
+ * with the message BODY readable in the src pod's staging buffer (the forward
+ * DMA has landed — the same completion-after-data ordering the in-place reverse
+ * DMA already relies on). Contract (v1):
+ *   - body is READ-ONLY and valid only for the duration of the call;
+ *   - return a live pod_id (ANY service — gateway-style content routing is
+ *     allowed; the client's dst_service is a hint), or DMESH_ROUTE_DROP to
+ *     drop the message (caller TX_ACKs the sender), or DMESH_ROUTE_DEFER to
+ *     fall through to the default L4 routing (service_table + route-affinity);
+ *   - FINs (0-length) and replies (concrete dst) never reach the hook;
+ *   - NULL hook (default) = bit-identical L4 behavior, zero body access.
+ * Runs on the single ARM routing thread today; a future multi-thread ROUTER
+ * shards this per src pod (prev/architecture.md §3–§5). */
+#define DMESH_ROUTE_DROP  (-1)   /* == the existing "unroutable" return */
+#define DMESH_ROUTE_DEFER (-2)   /* fall through to the default L4 route */
+struct objects;
+typedef int32_t (*dmesh_route_fn)(struct objects *objs,
+                                  const dpu_comp_entry_t *entry,
+                                  const uint8_t *body, uint32_t body_len);
+
 /* Force inline so these collapse into the caller. */
 #define CQ_INLINE static inline __attribute__((always_inline))
 
@@ -378,6 +400,13 @@ struct objects {
     int32_t  lb_rr_pods[8];
     int      lb_rr_count;
     uint32_t lb_rr_cursor;
+    /* L7-readiness routing hook (see typedef above). NULL (production default) =
+     * bit-identical L4 routing, body never touched. Installed at init only (env),
+     * before any traffic — no synchronization needed. l7_demo_* backs the TEST
+     * content-router route_l7_demo (env DPUMESH_L7_DEMO="svc[,svc...]"). */
+    dmesh_route_fn route_fn;
+    int32_t  l7_demo_svcs[8];
+    int      l7_demo_n;
     int dpa_thread_running[MAX_DPA_RINGS];  /* per-EU: 1 = thread k started */
     int dpa_thread_running_any;             /* 1 = at least one EU started (keepalive guard) */
 

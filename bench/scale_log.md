@@ -3285,3 +3285,41 @@ preload 5000×1KB×8c = 5000/0 p50 141µs · preload 600000×1KB×64c = 600000/0
 updated to the measured numbers (~150K plateau, 76% of native, 1–256c coverage,
 tripwires); plan.md STATUS/리스크 updated (thread-per-conn client validated, 256c
 incident OPEN w/ tripwires, measured perf replaces the ~100K expectation).
+
+# 2026-07-03 (session 4) — L7-readiness: routing hook seam + exact-count validation — BUILT + VALIDATED
+
+Goal (user): NOT building the L7 proxy yet — make the L4 layer able to host a future
+envoy-like L7 proxy on the DPU (body-parsing routing). Design/contracts in plan_l7.md;
+the multi-thread pipeline blueprint stays prev/architecture.md. Decisions: hook may
+route to ANY pod (gateway pattern) · this pass = hook seam + mock validation · body
+read-only (v1).
+
+## What was built
+- object.h: `dmesh_route_fn` typedef + DMESH_ROUTE_DROP/DEFER + objs->route_fn (+demo list).
+- dpu_worker.c: dpu_route(objs, entry, body, len) — hook dispatched BEFORE default L4
+  routing for BLANK-dst data messages; body ptr = fwd_buf_pod->dma_buffer + buf_offset,
+  materialized ONLY when a hook is installed. FINs/replies never reach the hook.
+- route_l7_demo (TEST, DPUMESH_L7_DEMO="svc[,svc…]"): routes by body[0] % n; rg!=0
+  (pinned/SAR) and empty bodies DEFER → pin semantics untouched (preload unaffected).
+- test-bench.sh start_dpu env plumbing; api.md §5 hook contracts + intro/§5 corrections
+  ("DPU never reads body" → only-with-policy; chunk ordering = conn-sharded FIFO,
+  head-chunk-first).
+
+## Validation (5 deploys; all EXACT counts, not statistics)
+| step | config | result |
+|---|---|---|
+| V1 regression | hook NULL | loopback 20000/0 · preload 5000/0 · RPC 30K/100K/200K 0-fail, 200K=198,924 = baseline (bit-identical) |
+| V2 parse cost | L7_DEMO="11" (same topology, hook+body-read per msg) | 100K p50 217µs · 200K=198,916 p50 317µs = NEUTRAL |
+| V3 full steer  | L7_DEMO="12" (all svc-11 traffic → pod 12) | bench 1,000,000/0 @99,451 p50 232µs (+15µs); loopback served 1 → 1,000,002 = EXACTLY 1M steered; cross-service delivery + uP reply mapping proven |
+| V4 byte-accuracy | L7_DEMO="11,12" (body[0] parity) | loopback RUN 48000/0; served = 24,001 = probe(1) + EXACTLY 24,000 (8/16 odd bytes of the deterministic 16-cycle) — ±0 equality vs garbage-noise ±~110 ⇒ ARM reads the exact DMA'd bytes per message; ONE conn's messages alternated backends per message, 0-fail |
+| V5 final | plain redeploy | 100K=99,451/0 · loopback 20000/0 · preload 5000/0 |
+(One deploy hit the known stale-pod kubectl-wait flake; re-deploy clean.)
+
+## Conclusions
+- L7-READY: body visible + byte-accurate at route time (completion-after-data ordering
+  holds for ARM CPU reads, not just the in-place reverse DMA); per-message content
+  routing works on one conn; any-pod (cross-service) routing + reply mapping intact;
+  hook seam costs nothing when absent and ~nothing when reading 1 byte/msg.
+- Production default unchanged (route_fn NULL). DPUMESH_L7_DEMO is a TEST knob like
+  DPUMESH_LB_RR. Real L7 next steps live in plan_l7.md (seam→pin-miss pick, per-src
+  ROUTER threads per prev/architecture.md, reply observe hook, rewrite contract).

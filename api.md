@@ -7,7 +7,8 @@ in-host sidecar tax).
 The DPU is an **L7-style proxy that owns every connection** (think Envoy): your app addresses a
 **`service_id`** — never a pod — and the DPU routes **each message** to a backend pod
 (**per-message load balancing**), owns the connection to that backend, and maps every reply back
-to you. Bodies move by DMA **host → DPU → host**; the DPU touches only metadata, never the body.
+to you. Bodies move by DMA **host → DPU → host**; by default the DPU touches only metadata —
+it reads a body only when an **L7 routing policy** is installed (the routing hook, §5).
 
 It is a **connection-oriented, full-duplex, message transport** — close to TCP in shape, but:
 
@@ -320,15 +321,32 @@ Header + body must fit one ≤ 8 KB message (chunk larger payloads at the app la
   `dmesh_write` spans slots, it stamps ONE key (a **channel-wide** rolling id, so one channel's
   concurrent large messages get distinct keys) on all of that message's chunks, so — even when a
   service load-balances across several backends — every chunk lands on one backend and
-  reassembles. The table is **overwrite-on-reuse**: whichever chunk reaches the ARM first records
-  the pin and the rest reuse it, so it is **order-independent** (chunks that round-robin across
-  EU-sharding rings can arrive out of order) and **collision-safe** — pins are scoped by the
-  message's **destination service**, so a key shared across channels/conns can only merge
-  same-service traffic onto one backend (skew, still reassembling); it can never route a message
-  to another service's backend. A grouped message forgoes per-message LB by design. (An
-  `is_last`-DELETE that frees the pin per message was considered and **rejected** — under either
-  hazard it can free a pin mid-message and scatter the chunks; the bounded self-healing table is
-  used instead.)
+  reassembles. In practice a message's chunks reach the ARM **in send order** (a connection's
+  messages are conn-sharded onto ONE forward ring, `src_port % K`, so they stay FIFO — the
+  **head chunk arrives first**, a property a future L7 parser relies on, see below); the table
+  is nevertheless **overwrite-on-reuse** — whichever chunk reaches the ARM first records the pin
+  and the rest reuse it — so correctness never depends on that ordering. It is **collision-safe**:
+  pins are scoped by the message's **destination service**, so a key shared across channels/conns
+  can only merge same-service traffic onto one backend (skew, still reassembling); it can never
+  route a message to another service's backend. A grouped message forgoes per-message LB by
+  design. (An `is_last`-DELETE that frees the pin per message was considered and **rejected** —
+  under either hazard it can free a pin mid-message and scatter the chunks; the bounded
+  self-healing table is used instead.)
+- **L7-readiness (the routing hook).** The single routing decision point (`dpu_route`, on the
+  DPU ARM) exposes a **pluggable hook** so a future Envoy-like L7 proxy can be plugged in
+  *without touching the transport*: for every BLANK-dst data message the hook is called **with
+  the message body readable** (the forward DMA has already landed in DPU staging — the same
+  completion-after-data ordering the in-place reverse DMA relies on) and may route to **any live
+  pod** (gateway-style: the client's `dst_service` is a hint, content decides), **drop** (the
+  sender is TX_ACKed), or **defer** to the default L4 route above. Contracts: the body is
+  **read-only** and valid only during the call (v1; in-place rewrite ≤ length is structurally
+  possible but not yet in the contract); **one flush = one L7 request unit** (protocol framing
+  inside it is the parser's job, and for a >8 KB request the parseable head must sit in the
+  first ≤ 8 KB chunk — which is guaranteed to arrive first); FINs and replies never reach the
+  hook. **No hook installed (production default) = the DPU never reads a body** and routing is
+  bit-identical. A TEST content-router (`DPUMESH_L7_DEMO="svc[,svc…]"`, routes by the first
+  body byte) exists to exercise the seam end-to-end; the full multi-thread L7 pipeline design
+  lives in `prev/architecture.md`, the current implementation state in `plan.md`.
 - **Response↔request matching is the app's job.** The transport does no matching, and this DPU
   proxy routes at the **connection** level, not the **request** level (it never parses the body). A
   protocol-parsing L7 proxy could correlate by stream-id; a metadata-driven DPU cannot. Carry a

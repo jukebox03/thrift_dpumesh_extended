@@ -243,12 +243,22 @@ lb_pick(struct objects *objs, int16_t svc)
 }
 
 static inline int32_t
-dpu_route(struct objects *objs, const dpu_comp_entry_t *entry)
+dpu_route(struct objects *objs, const dpu_comp_entry_t *entry,
+          const uint8_t *body, uint32_t body_len)
 {
     /* Already resolved (established request or any response → dst_pod filled by the
      * client/server) → deliver direct, no re-routing (connection-level LB). */
     if (entry->dst_pod_id != DMESH_POD_BLANK)
         return entry->dst_pod_id;
+
+    /* L7-readiness hook (plan.md): a registered policy sees the BODY and may
+     * route to ANY live pod (gateway-style), DROP, or DEFER to the L4 logic
+     * below. NULL (production default) = this branch only — bit-identical. */
+    if (objs->route_fn) {
+        int32_t r = objs->route_fn(objs, entry, body, body_len);
+        if (r != DMESH_ROUTE_DEFER)
+            return r;                        /* pod, or DROP(-1) = existing drop path */
+    }
 
     int16_t svc = entry->dst_service;
     uint8_t rg  = entry->route_group;        /* 0 = normal LB; 1..255 = affinity group */
@@ -291,6 +301,30 @@ dpu_route(struct objects *objs, const dpu_comp_entry_t *entry)
             return p;
     }
     return -1;
+}
+
+/* TEST content router (env DPUMESH_L7_DEMO="svc[,svc...]") — the trivial
+ * stand-in for a real L7 parser, installed as objs->route_fn. Routes each
+ * message by its FIRST BODY BYTE: index = body[0] % n → that service's
+ * backend. Proves the three properties a future L7 proxy needs from this L4
+ * (plan.md): body readable at route time (byte-accurate — validated by an
+ * exact-count test), per-message content routing on ONE conn, and
+ * cross-service delivery + reply mapping (the picked service may differ from
+ * the client's dst_service). Pinned/SAR traffic (route_group!=0) and empty
+ * bodies DEFER to the L4 pin table untouched; so does a not-yet-registered
+ * backend (routing must not fail just because the demo map is ahead of the
+ * pod registrations). No hot-path logging. */
+static int32_t
+route_l7_demo(struct objects *objs, const dpu_comp_entry_t *entry,
+              const uint8_t *body, uint32_t body_len)
+{
+    if (!body || body_len == 0 || entry->route_group != 0)
+        return DMESH_ROUTE_DEFER;
+    int32_t svc = objs->l7_demo_svcs[body[0] % (unsigned)objs->l7_demo_n];
+    int32_t pod = (svc >= 0 && svc < POD_ID_SPACE) ? objs->service_table[svc] : -1;
+    if (pod < 0 || !find_pod_by_id(objs, pod))
+        return DMESH_ROUTE_DEFER;
+    return pod;
 }
 
 /* ====== Deferred Completion Queue Drain ====== */
@@ -360,7 +394,12 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
 
     if (entry->dst_pod_id == DMESH_POD_BLANK) {
         /* ---- CLIENT REQUEST: resolve service -> backend, own an upstream ---- */
-        int32_t B = dpu_route(objs, entry);
+        /* The body is materialized for the L7 hook only — the staging pointer is
+         * plain ARM-addressable memory (fwd DMA landed before this completion;
+         * the in-place reverse DMA below relies on the same ordering). */
+        const uint8_t *body = objs->route_fn
+            ? (const uint8_t *)fwd_buf_pod->dma_buffer + entry->buf_offset : NULL;
+        int32_t B = dpu_route(objs, entry, body, entry->length);
         if (B < 0) {
             DOCA_LOG_ERR("forward: unresolved service=%d seq=%u", entry->dst_service, entry->seq);
             send_or_defer_tx_ack(objs, find_pod_by_id(objs, ack_pod), ack_port, entry->seq);
@@ -665,6 +704,25 @@ run_dpu_worker(struct objects *objs)
     memset(objs->route_group_backend, 0xFF, sizeof(objs->route_group_backend));
     objs->lb_rr_count = 0;
     objs->lb_rr_cursor = 0;
+    /* L7-readiness hook: production default = none (bit-identical L4 routing).
+     * DPUMESH_L7_DEMO="svc[,svc...]" installs the TEST content router. Installed
+     * here, before any thread starts — plain stores, no race. */
+    objs->route_fn = NULL;
+    objs->l7_demo_n = 0;
+    { const char *e = getenv("DPUMESH_L7_DEMO");
+      if (e && *e) {
+          char tmp[64]; snprintf(tmp, sizeof tmp, "%s", e);
+          char *save = NULL, *tok = strtok_r(tmp, ",", &save);
+          while (tok && objs->l7_demo_n < 8) {
+              objs->l7_demo_svcs[objs->l7_demo_n++] = atoi(tok);
+              tok = strtok_r(NULL, ",", &save);
+          }
+          if (objs->l7_demo_n > 0) {
+              objs->route_fn = route_l7_demo;
+              DOCA_LOG_WARN("TEST L7 demo content-router ON (%d services)", objs->l7_demo_n);
+          }
+      }
+    }
     { const char *e = getenv("DPUMESH_LB_RR");   /* TEST: "11,13,14" → per-message RR-LB */
       if (e && *e) {
           char tmp[64]; snprintf(tmp, sizeof tmp, "%s", e);

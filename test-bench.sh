@@ -294,11 +294,15 @@ start_dpu() {
     # exercised under real scatter without disturbing normal RPC/pipeline/loopback.
     # Empty (default) = production single-backend service_table routing.
     local lb_rr="${DPUMESH_LB_RR:-}"
-    step "=== Starting dpumesh_dpu (DPA EU threads=$dpa_threads, rings_per_pod=$rings_per_pod, event_loop=$event_loop, lb_rr='$lb_rr') ==="
+    # TEST: L7-readiness demo content-router (plan.md). "svc[,svc...]" routes each
+    # message by its first body byte across the listed services' backends. Empty
+    # (default) = hook uninstalled = bit-identical L4 routing.
+    local l7_demo="${DPUMESH_L7_DEMO:-}"
+    step "=== Starting dpumesh_dpu (DPA EU threads=$dpa_threads, rings_per_pod=$rings_per_pod, event_loop=$event_loop, lb_rr='$lb_rr', l7_demo='$l7_demo') ==="
     stop_dpu
     ssh "$DPU_HOST" "cat > /tmp/start_dpu_bench.sh << 'LAUNCHER'
 #!/bin/bash
-screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_DPA_THREADS=$dpa_threads DPUMESH_RINGS_PER_POD=$rings_per_pod DPUMESH_EVENT_LOOP=$event_loop DPUMESH_LB_RR=$lb_rr ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
+screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_DPA_THREADS=$dpa_threads DPUMESH_RINGS_PER_POD=$rings_per_pod DPUMESH_EVENT_LOOP=$event_loop DPUMESH_LB_RR=$lb_rr DPUMESH_L7_DEMO=$l7_demo ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
 sleep 2
 pgrep -f 'dpumesh_dpu.*03:00' || echo NO_PID
 LAUNCHER
