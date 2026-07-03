@@ -346,7 +346,7 @@ Header + body must fit one ≤ 8 KB message (chunk larger payloads at the app la
   hook. **No hook installed (production default) = the DPU never reads a body** and routing is
   bit-identical. A TEST content-router (`DPUMESH_L7_DEMO="svc[,svc…]"`, routes by the first
   body byte) exists to exercise the seam end-to-end; the full multi-thread L7 pipeline design
-  lives in `prev/architecture.md`, the current implementation state in `plan.md`.
+  is not yet specified (TBD), the current implementation state in `plan.md`.
 - **Response↔request matching is the app's job.** The transport does no matching, and this DPU
   proxy routes at the **connection** level, not the **request** level (it never parses the body). A
   protocol-parsing L7 proxy could correlate by stream-id; a metadata-driven DPU cannot. Carry a

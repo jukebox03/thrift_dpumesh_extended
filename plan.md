@@ -1,7 +1,7 @@
 # DPUmesh — 현재 구현 상태 (2026-07-03)
 
 > 무엇이 구현되어 있는지의 스냅샷. 성능 수치의 근거는 `bench/scale_log.md`,
-> API 사용법은 `api.md`, 미래 L7 파이프라인 청사진은 `prev/architecture.md`.
+> API 사용법은 `api.md`. 미구현 항목(L7 파이프라인 등)의 설계는 미정.
 > 해결 방식이 미정인 항목은 사실만 기록한다 (설계는 별도 결정).
 
 ## 전송 코어 (host: dpm.h + dpumesh_doca.c)
@@ -56,13 +56,14 @@
 - env: `DMESH_PRELOAD_LISTEN/_SVC/_MAP/_DEBUG`. 한계(v1): AF_INET SOCK_STREAM,
   fork 불가, stdio(FILE*)/raw-syscall(Go) 우회, half-close 근사.
 
-## 성능 (실측; config: DPA=4 K=2 EVENT_LOOP=1 HOST_EPOLL=1 NUM_SLOTS=4096 ARENA=512)
+## 성능 (실측; config: DPA=4 K=2 EVENT_LOOP=1 HOST_EPOLL=1 NUM_SLOTS=4096; ARENA=512는 loopback pod만)
 
 - native RPC 8KB: **200K 램프 198.9K 0-fail** (warm ramp 필수 — cold-jump는 링 wedge).
 - preload 1KB: **plateau ~150K @64conns** (native의 ~76%), 128c 클린.
 - large 16/32/64KB: 0-fail, ~124-149MB/s (호스트↔DPU DMA-BW 영역).
-- 천장 = **DPA dma_copy op-rate** (~1.6M ops/s 공유; 8KB 기준 257K/pair). op당
-  고정 비용 → 작은 메시지는 8KB 패킹이 경제적 (그래서 라우팅 단위=slot 긴장 존재).
+- 천장 ≈ **DPA dma_copy op-rate** (~1.6M ops/s 공유; 8KB 기준 257K/pair) — 단 이 귀속은
+  elimination-only 추정이며 07-03 창에서 재측정 안 됨(이 창 실측 최대 198.9K). op당 고정
+  비용 → 작은 메시지는 8KB 패킹이 경제적 (그래서 라우팅 단위=slot 긴장 존재).
 
 ## 테스트 하네스
 
@@ -74,11 +75,15 @@
 
 ## 미구현 / 열린 항목 (사실만; 해결 방식은 추후 결정)
 
-- **L7 proxy 본체** — 파서/정책/멀티스레드 파이프라인 (청사진 `prev/architecture.md`).
+- **L7 proxy 본체** — 파서/정책/멀티스레드 파이프라인 (설계 미정; 현재는 §DPU의 route_fn 훅 seam만).
+- **Thrift 트랜스포트 래퍼(`TDpumesh*`) 재작성** — 옛 req_id/OP_ API 참조로 死+빌드제외
+  (`lib/cpp/CMakeLists.txt`); 현재 dmesh_/dpumesh_ façade로 포팅 필요 (삭제 아님·재작성 결정).
 - **slot 내 sub-message 라우팅·집계** — scatter-gather DMA 방향, 설계는 사용자 결정.
 - **DPU 죽은-연결 pod-slot 회수** — 비정상 종료 시 comch disconnect 이벤트 미발생
   → 슬롯 미회수 (MAX_PODS=8), full deploy로만 초기화.
 - thread-per-conn **서버** 심화 검증 미완 (클라이언트는 256스레드까지 검증).
 - 실제 앱(nginx/redis류) 포팅 시험 미실시.
+- **recv-pool 커플링(잠재)** — `comch_consumer.c`의 `recv_tasks_max=CC_DATA_PATH_TASK_NUM`이
+  in-flight를 DPA thread 수와 무관하게 max로 고정 (≥4-EU stall 소지; N=4 기본이라 경계).
 - 256-conn 폭주 1회성 유실 — 미재현(×23), tripwire 장착, OPEN.
 - upstream-churn 천장 저하 — pre-existing, 재배포/저부하로 회복.
