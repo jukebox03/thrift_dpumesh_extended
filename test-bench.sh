@@ -194,7 +194,7 @@ build_bench_binaries() {
         $THRIFT_LINK_LIB -lpthread -ldl -ldoca_common -ldoca_comch \
         -Wl,-rpath,/usr/local/lib -Wl,-rpath,"$DOCA_LIB_DIR"
     gcc -O2 -o "$BENCH_DIR/tcp_echo"       "$BENCH_DIR/tcp_echo.c"
-    gcc -O2 -o "$BENCH_DIR/tcp_client"     "$BENCH_DIR/tcp_client.c"
+    gcc -O2 -o "$BENCH_DIR/tcp_client"     "$BENCH_DIR/tcp_client.c" -lpthread
     gcc -O2 -o "$BENCH_DIR/preload_runner" "$BENCH_DIR/preload_runner.c"
     info "LD_PRELOAD shim + vanilla TCP validators built"
 
@@ -989,8 +989,8 @@ run_preload() {
     resp=$(printf 'RUN %s %s %s\n' "$N" "$size" "$conns" | timeout 620s nc "$pod_ip" "$CTRL_PORT" || true)
     if [ -z "$resp" ]; then err "no response (timeout or pod down)"; return 1; fi
     if [[ "$resp" == ERR* ]]; then err "preload replied: $resp"; return 1; fi
-    # Parse: OK <ok> <fail> <p50us> <p99us>
-    read -r tag ok fail p50 p99 <<<"$resp"
+    # Parse: OK <ok> <fail> <p50us> <p99us> <rps>
+    read -r tag ok fail p50 p99 rps <<<"$resp"
     echo
     echo "============================================================"
     echo "  LD_PRELOAD shim (vanilla TCP apps over DPUmesh)"
@@ -998,6 +998,7 @@ run_preload() {
     printf "  OK / Fail:      %s / %s\n" "$ok" "$fail"
     printf "  p50 latency:    %s us\n" "$p50"
     printf "  p99 latency:    %s us\n" "$p99"
+    printf "  Achieved RPS:   %s\n" "${rps:-n/a}"
     echo "============================================================"
 }
 

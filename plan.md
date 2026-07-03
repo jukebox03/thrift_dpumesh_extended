@@ -5,9 +5,19 @@
 > 8KB×20000/16conns, 32KB×3000(auto-chunk+pin), back-to-back 안정, p50 ~120–150µs.
 > native 회귀 무영향(30K/100K/200K 램프 + loopback 전부 0-fail, 200K=198.9K 베이스라인).
 > 상세 수치/버그 이력은 bench/scale_log.md 2026-07-03 섹션, API 문서는 api.md §7.
-> 잔여 후속 항목: ①DPU 죽은-연결 슬롯 회수(아래 리스크), ②blocking/멀티스레드 심화
-> 검증(현재 blocking client는 검증됨, thread-per-conn 서버는 미검증), ③실제 앱
-> (nginx/redis류) 포팅 시험.
+> 잔여 후속 항목: ①DPU 죽은-연결 슬롯 회수(아래 리스크), ②thread-per-conn **서버**
+> 심화 검증(blocking + thread-per-conn **클라이언트**는 256스레드×256conn까지 검증
+> 완료 — scale_log 07-03 session 3), ③실제 앱(nginx/redis류) 포팅 시험,
+> ④256-conn 폭주 1회성 메시지 유실(미재현 ×23, tripwire 장착 — 아래 리스크).
+> (완료) 한계 실측 — 1KB plateau ~150K RPS@64c = native의 ~76% ("절반" 예상 상회);
+> tcp_client는 thread-per-conn + SO_RCVTIMEO 5s(유실=카운트되는 실패, 행 불가) +
+> RESULT에 RPS 필드. 상세 scale_log 07-03 session 3.
+> (완료) 2026-07-03 코드리뷰 수정분 배포+검증 — route_group pin 테이블
+> (service, id) 스코프(**DPU 변경**; 종전 전역 테이블은 id 재사용 시 타 서비스
+> backend로 오배송 가능, echo-only 검증이라 미검출 → served-카운터 discriminator로
+> 양성 검증) + shim 하드닝(SOCK_STREAM 게이트, fd 상한, 이중 FIN 억제, listener
+> close 정리, RCVTIMEO 데드라인, writev 병합, fcntl64/sendfile64). 전 테스트
+> 0-fail, 상세 scale_log 07-03 session 2.
 
 목표: **기존 최적화 API(`dmesh_*`)는 동결**한 채, 무수정 socket 앱이 `LD_PRELOAD`로
 DPUmesh 위에서 돌게 하는 호환층을 얹는다. 두 API는 하나가 될 수 없다(readiness 모델,
@@ -105,11 +115,13 @@ getsockname getpeername dup dup2 dup3 sendfile(+sendfile64)`
 새 파일 (bench/):
 - `tcp_echo.c` — **순수 POSIX socket epoll echo 서버** (dmesh 헤더 include 없음).
   커널 TCP로도 그대로 도는 것이 "vanilla" 증명.
-- `tcp_client.c` — 순수 blocking TCP 클라이언트 데몬: stdin에서 `RUN <N> <SIZE>
-  <CONNS>` 를 받아 fresh 연결 CONNS개 열고 단건 왕복 N회(내용 검증) 후
-  `RESULT <ok> <fail> <p50us> <p99us>` 출력. (프로세스를 유지하는 이유: 채널 1개 =
-  DPU pod 등록 1개. RUN마다 재등록하면 MAX_PODS=8 슬롯이 소진됨. 연결 churn은
-  RUN마다 발생하므로 FIN/accept/close 경로는 매 RUN 검증됨)
+- `tcp_client.c` — 순수 blocking TCP 클라이언트 데몬(**thread-per-conn**): stdin에서
+  `RUN <N> <SIZE> <CONNS>` 를 받아 fresh 연결 CONNS개를 **각자의 스레드**로 열고 N을
+  분할해 단건 왕복(내용 검증), `RESULT <ok> <fail> <p50us> <p99us> <rps>` 출력.
+  `SO_RCVTIMEO=5s`로 유실 = TIMEOUT stderr + 실패 카운트(행 불가; POSIX라 vanilla성
+  유지). (프로세스를 유지하는 이유: 채널 1개 = DPU pod 등록 1개. RUN마다 재등록하면
+  MAX_PODS=8 슬롯이 소진됨. 연결 churn은 RUN마다 발생하므로 FIN/accept/close 경로는
+  매 RUN 검증됨)
 - `preload_runner.c` — pod entrypoint: 부팅 시 tcp_echo(preload)와
   tcp_client(preload)를 기동해 두고, 제어 포트 9092로 `RUN N SIZE CONNS` 수신 →
   client stdin에 전달 → 결과를 `OK ...`로 응답 (loopback pod와 같은 프로토콜 모양).
@@ -144,8 +156,15 @@ getsockname getpeername dup dup2 dup3 sendfile(+sendfile64)`
   점검 + DPA ring 배열 회수**.)
 - **uP churn**: RUN마다 연결을 새로 열므로 대량 churn 시 기존의 upstream-churn 한계가
   보일 수 있음 (기지 사항; 테스트 크기 조절).
-- 성능 기대치: preload 경로는 per-conn-fd 모델이므로 **~100K급이 정상** (native
-  200-240K의 절반). 이 갭은 결함이 아니라 설계된 대가.
+- **256-conn 폭주 1회성 유실 (OPEN, 07-03)**: 256 동시 connect 폭주 꼬리에서 ~21개
+  conn의 첫 교환이 무음 유실(conn은 양쪽 성립, 전 로그/카운터 클린) → 당시 타임아웃
+  없던 클라이언트가 영구 행. 이후 23×256c 폭주(원 이력 재연·back-to-back churn·유휴→
+  폭주 소크) 전부 0-fail로 **미재현**. tripwire 상시 장착: client SO_RCVTIMEO(유실=
+  카운트+RUN 완료) + shim accept-드롭 로그/드레인 지속. 재발 시 즉시 증거 확보됨.
+  상세 scale_log 07-03 session 3.
+- 성능 실측 (07-03; 예상 대체): 1KB **plateau ~150K RPS@64c** = 같은 배포 native
+  199K의 ~76% ("절반 ~100K" 예상 상회). conn당 ~7K(RTT-bound), knee 32-64c, 128c는
+  같은 스루풋에 지연 2배. 이 갭은 결함이 아니라 per-conn-fd 모델의 설계된 대가.
 
 ## 파일 목록 (변경/신규)
 | 파일 | 종류 | 내용 |

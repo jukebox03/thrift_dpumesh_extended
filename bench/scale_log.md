@@ -3150,3 +3150,138 @@ loopback 20000 × 8 KB → 20000/0, p50 153 µs. DPU log level back at 40.
 dmesh_preload.c (new shim) · dpm.h (pin_group + dmesh_pin_route) · bench/tcp_echo.c,
 tcp_client.c, preload_runner.c (vanilla validators + pod entrypoint, new) ·
 Dockerfile.preload_dpumesh (new) · test-bench.sh (build/image/manifest/pin/`preload` cmd)
+
+# 2026-07-03 (session 2) — LD_PRELOAD review fixes — BUILT + DEPLOYED + VALIDATED
+
+Code-review findings on the 07-03 shim + pin, fixed. Build checks: shim .so gcc
+clean, dpu_worker/object gcc -fsyntax-only clean, kernel-TCP passthrough smoke
+3000/0 + 2000/0 with the new shim. Deployed + full HW validation below (deploy #1
+aborted on the known stale-pod kubectl-wait flake, deploy #2 clean exit 0).
+
+## Fix 1 — route_group pin table now keyed (dst_service, rg)  [DPU: dpu_worker.c + object.h]
+`route_group_backend[256]` was ONE global array: group ids are per-channel rolling
+255-counters, so unrelated channels/conns routinely reuse a byte, and a reused id
+returned the OLD pin regardless of the message's dst_service → a pinned conn (or
+auto-chunked large message) could be silently routed to ANOTHER SERVICE's backend
+(pin entries never expire; overwrite only on dead backend). All existing 0-fail
+results were blind to this: every validation backend (svc 11/12/15) is an echo, so
+wrong-service delivery still echoes the right bytes. Table is now
+`[POD_ID_SPACE][256]` (128 KB, ARM-local): a collision can only merge SAME-service
+traffic (balance skew, ordering intact); cross-service redirection is structurally
+impossible. Docs updated (api.md §3/§5, dpm.h pin_group, object.h). Pre-existing
+since the 07-02 route-affinity work; dmesh_pin_route widened exposure (every preload
+conn holds an id for its lifetime). FOLLOW-UP for a real test: a non-echo
+discriminator backend (reply carries server identity).
+
+## Fix 2..n — shim (dmesh_preload.c) hardening
+- install_fd: bound-check fd < PRELOAD_MAX_FDS before g_fds[] write (OOB with >64K fds).
+- connect(): SO_TYPE==SOCK_STREAM gate (a UDP connect to a mapped port stayed kernel-TCP
+  in docs but was converted in code).
+- shutdown(SHUT_WR)+close(): dispatcher now suppresses dmesh_close's second FIN
+  (wr_closed → peer_closed before close). Was harmless on the DPU (FIN fan-out finds no
+  upstream) but wasted a TX slot + ACK round trip.
+- Listener close: pending-accept-queue conns are dmesh_close'd (FIN) instead of leaking;
+  post-close inbound conns are closed at wrap (g_listener_closed vs "not listening yet").
+- SO_RCVTIMEO: now a whole-call deadline (partial wakes no longer restart the clock);
+  getsockopt returns the stored timeout, SO_TYPE=SOCK_STREAM, SND/RCVBUF=256K (never 0).
+- writev/sendmsg: gather into ONE message + single flush (was one message per iov).
+- fcntl64/sendfile64 interposed (plan §Phase B listed them; were missing).
+- channel_init: fail early if dmesh_event_fd()<0 (deaf dispatcher); no wake-fd re-create
+  leak on register-retry.
+- Docs: stdio FILE* bypass documented (api.md §7 limits + header comment); api.md §7
+  "~100K measured" reworded (that figure is the 06-30 per-conn-fd experiment, the shim
+  itself is not throughput-benchmarked).
+
+## HW validation (fresh deploy, churn-safe order) — ALL 0-fail
+| test | OK/Fail | p50 | p99 | note |
+|---|---|---|---|---|
+| loopback 20000×8KB          | 20000/0 | 120µs | —     | startup-race discriminator |
+| preload 200×1KB ×2c         | 200/0   | 131µs | 487µs | smoke |
+| preload 5000×1KB ×8c        | 5000/0  | 120µs | 602µs | |
+| preload 20000×8KB ×16c      | 20000/0 | 133µs | 584µs | |
+| preload 3000×32KB ×8c       | 3000/0  | 147µs | 403µs | auto-chunk ×4 + conn pin |
+| preload 5000×1KB ×8c (b2b)  | 5000/0  | 123µs | 571µs | back-to-back, no leak |
+| RPC 30K / 100K / 200K, 8KB  | 300K/0 · 1M/0 · 2M/0 | 181/218/315µs | 0.5/0.5/28.9ms | 29,837 / 99,449 / 198,907 = baseline |
+| loopback ZC 5000×32KB       | 5000/0  | 163µs | —     | svc 12 pins rg 1..255 |
+| large 32KB @2K/64c (svc 11) | 20000/0 | 484µs | 631µs | 124.3 MB/s, = 07-02 baseline |
+
+## Fix 1 POSITIVE discriminator (not maskable by echo)
+Sequence engineered so the OLD global table would misroute: loopback ZC 32KB first
+(svc 12 pins route_groups 1..255 to pod 12), THEN native large 32KB to svc 11 whose
+channel claims the SAME rg bytes. Old code: dpu_route(rg) returns pod 12 → ~80,000
+foreign chunks land on the loopback pod (test still passes — pod 12 echoes; that is
+exactly why it was never caught). New code: loopback's served counter probed before/
+after = 40,000 → 40,001 (+1 = the probe itself) ⇒ ZERO svc-11 messages followed
+svc-12's pins. Per-service pin scoping proven on HW, not just by passing tests.
+
+DPU log clean over the whole window (init-time SDK warns only); log level at 40.
+Deferred: none of the fixed paths regressed; remaining follow-ups stay ①②③ in
+plan.md (dead-conn slot reclaim, thread-per-conn depth, real-app porting).
+
+# 2026-07-03 (session 3) — preload throughput ladder + 256-conn wedge (OPEN INVESTIGATION)
+
+## Ladder (thread-per-conn tcp_client, 1KB, fresh conns per RUN, cores 4,5) — 0-fail through 128c
+| conns | RPS | p50 | p99 |
+|---|---|---|---|
+| 1   | 7,108   | 119µs | 450µs |
+| 4   | 29,919  | 127µs | 339µs |
+| 8   | 59,865  | 131µs | 174µs |
+| 16  | 98,263  | 159µs | 220µs |
+| 32  | 134,064 | 222µs | 410µs |
+| 64  | 151,247 | 412µs | 588µs |
+| 128 | 148,209 | 854µs | 1,280µs |
+Linear ~6-7K/conn (closed-loop RTT-bound) to 16c; PLATEAU ~150K at 64c; 128c = same
+throughput, 2× latency ⇒ server-side saturation ~150K. (Native same deploy: 198.9K.)
+Kernel-TCP sanity of the new harness (local): 1c=48K, 16c=155K, 64c=159K, 0-fail.
+
+## 256c RUN = WEDGE (evidence captured BEFORE any restart; pod untouched)
+800000×1KB×256c never returned. Evidence chain:
+- tcp_client: 24 threads = main(join,futex) + dispatcher + PE + **21 workers asleep in
+  poll** (do_poll), utime frozen across 5s ⇒ hard wedge, zero progress.
+- Stuck workers' utime 0-2 ticks + tids 585-616 = LAST-spawned tail ⇒ each hung on its
+  FIRST message, during the tail of the 256-conn connect storm.
+- Both processes: ALL eventfd counters 0 (fdinfo); echo fd census shows the 21 conns
+  ESTABLISHED on the echo side too (2 fds/conn) yet idle ⇒ msg vanished silently on an
+  established conn's first exchange (request not served OR first reply lost).
+- DPU log CLEAN (level 40 incl. ERR: no ring-busy, no accept-queue-full, no unresolved-
+  service, no stale-upstream). Host pod logs clean. NOT the cold-jump forward-ring wedge
+  (no ring logs; the other 235 conns then completed 3,125 msgs EACH at ~150K).
+- Ruled out by code/evidence: accept rx_ring overflow (65536 + would log), DMA ring full
+  (4096 + would log+fail write), fd exhaustion (~530 << limit; failure mode would be EOF
+  not hang), client-side lost-wakeup (efd=0 + drain-retry discipline; delivery would
+  assert efd with reader asleep).
+- HARNESS FLAW (compounding): thread-per-conn tcp_client has NO read timeout (vanilla) —
+  one lost message = permanent RUN hang; runner (single-threaded ctrl, client stuck in
+  pthread_join) jams the preload validator until a full deploy.
+STATUS: root cause OPEN — loss localized to conn-setup burst window ≥256 simultaneous
+connects; exact hop needs instrumented rerun (DMESH_PRELOAD_DEBUG=1 host-side).
+Preload conn-scale: 128c clean / 256c breaks. Pod left wedged for evidence; full deploy
+required to recover (pod restart alone forbidden — DPU slot leak).
+
+## Reproduction campaign (same day, fresh deploy w/ DMESH_PRELOAD_DEBUG=1) — NOT REPRODUCED
+Detection nets added FIRST, so any hit yields evidence instead of a wedge:
+- tcp_client: SO_RCVTIMEO=5s (plain POSIX, stays vanilla) — lost reply → "TIMEOUT
+  conn=<i> at msg <k>" stderr + counted fail + thread stops; RUN always completes.
+- shim dispatcher: dmesh_accept ENOMEM drop now LOGGED ("accept DROPPED a pending
+  conn") and the drain loop CONTINUES past it (was: silent + drain loop break —
+  stranded queued accepts until the next fd edge; latent stall fixed).
+23 × 256-conn storms (~5.9M msgs), ALL 0-fail, zero TIMEOUT/DROPPED lines:
+sanity ×1 · exact original ladder history then 256c ×1 · back-to-back hammer ×10
+(close-churn of 256 conns between storms) · idle-130s→storm ×1 (DPA EU park→wake
+under burst, EVENT_LOOP=1) · soak (60s idle + storm) ×10. Post-campaign health:
+native 100K = 99,452/0, loopback 20000/0 p50 162µs — no state leak from ~6,800
+conn churn. Throughput with DEBUG=1 unchanged (146-156K plateau).
+VERDICT: the 07-03 wedge is a RARE race (<~1/23 storms; single occurrence — prior
+deploy also differed: interleaved native/large/loopback history + multi-minute
+idle + DEBUG off). Left OPEN with tripwires armed: any future occurrence produces
+TIMEOUT/DROPPED lines + completed RUN counts instead of a wedged pod. NOTE: this
+deploy runs DMESH_PRELOAD_DEBUG=1 (per-conn stderr on preload pod only, measured
+perf-neutral); the knob defaults 0 on the next plain deploy.
+
+## Final redeploy (DMESH_PRELOAD_DEBUG back to 0) + sanity — clean
+Plain deploy (knob default 0, verified in pod env; zero shim stderr lines). Sanity:
+preload 5000×1KB×8c = 5000/0 p50 141µs · preload 600000×1KB×64c = 600000/0 @137K
+(plateau class) · native 200K = 198,912/0 (baseline). api.md §7 cost/validation
+updated to the measured numbers (~150K plateau, 76% of native, 1–256c coverage,
+tripwires); plan.md STATUS/리스크 updated (thread-per-conn client validated, 256c
+incident OPEN w/ tripwires, measured perf replaces the ~100K expectation).

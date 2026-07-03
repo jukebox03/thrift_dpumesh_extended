@@ -254,24 +254,29 @@ dpu_route(struct objects *objs, const dpu_comp_entry_t *entry)
     uint8_t rg  = entry->route_group;        /* 0 = normal LB; 1..255 = affinity group */
 
     /* Route-affinity: an auto-chunked large message stamps EVERY chunk with the same
-     * non-zero route_group (a GLOBAL rolling id, so concurrent messages differ) so the
-     * chunks pin to ONE backend and reassemble even under multi-backend LB. Whichever
-     * chunk reaches this single ARM thread FIRST LB-picks (lb_pick — RR under the
-     * DPUMESH_LB_RR test, else the service table) + records the pin; the rest reuse it.
-     * OVERWRITE-ON-REUSE, no delete: the pin is set by the first-arriving chunk and
-     * reused by all others, so ORDER-INDEPENDENT (chunks that round-robin across
+     * non-zero route_group (a per-channel rolling id, so one channel's concurrent
+     * messages differ); a dmesh_pin_route'd conn stamps its one id on every message.
+     * All messages sharing a key pin to ONE backend. Whichever message reaches this
+     * single ARM thread FIRST LB-picks (lb_pick — RR under the DPUMESH_LB_RR test,
+     * else the service table) + records the pin; the rest reuse it.
+     * The table is keyed (dst_service, rg), NOT rg alone: id counters are per-channel
+     * and only 255 wide, so unrelated channels/conns routinely reuse a byte — service
+     * scoping confines a collision to same-service traffic (both pin to one backend:
+     * balance skew, ordering/reassembly intact) and makes cross-service redirection
+     * structurally impossible (an rg reused by another service gets its own entry).
+     * OVERWRITE-ON-REUSE, no delete: ORDER-INDEPENDENT (chunks that round-robin across
      * EU-sharding rings can reach here out of order, yet all resolve to the one
-     * recorded backend) and COLLISION-SAFE (if two messages ever share an id — >255
-     * concurrent — both simply pin to one backend, still reassembling). A pin to a
-     * since-dead backend is re-picked. 256-entry table, single ARM thread → no lock.
-     * (is_last-DELETE was rejected: it would free a pin mid-message under either
-     * hazard → scatter. See scale_log 2026-07-02.) */
+     * recorded backend); a pin to a since-dead backend is re-picked. Single ARM
+     * thread → no lock. (is_last-DELETE was rejected: it would free a pin mid-message
+     * under either hazard → scatter. See scale_log 2026-07-02.) */
     if (rg != 0) {
-        int32_t pinned = objs->route_group_backend[rg];
+        if (svc < 0 || svc >= POD_ID_SPACE)
+            return -1;                       /* unroutable either way (caller drops) */
+        int32_t pinned = objs->route_group_backend[svc][rg];
         if (pinned >= 0 && find_pod_by_id(objs, pinned))
             return pinned;
         int32_t b = lb_pick(objs, svc);
-        if (b >= 0) objs->route_group_backend[rg] = b;
+        if (b >= 0) objs->route_group_backend[svc][rg] = b;
         return b;
     }
 
@@ -655,9 +660,9 @@ run_dpu_worker(struct objects *objs)
         objs->service_table[i]  = -1;
     }
 
-    /* Route-affinity table (route_group -> pinned backend) starts empty; TEST RR-LB off. */
-    for (int i = 0; i < 256; i++)
-        objs->route_group_backend[i] = -1;
+    /* Route-affinity table ((service, route_group) -> pinned backend) starts empty;
+     * TEST RR-LB off. 0xFF bytes == -1 for two's-complement int32. */
+    memset(objs->route_group_backend, 0xFF, sizeof(objs->route_group_backend));
     objs->lb_rr_count = 0;
     objs->lb_rr_cursor = 0;
     { const char *e = getenv("DPUMESH_LB_RR");   /* TEST: "11,13,14" → per-message RR-LB */

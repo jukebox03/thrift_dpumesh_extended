@@ -129,7 +129,7 @@ All calls are **non-blocking**. "would-block" = the listed sentinel **with `errn
 | `dmesh_conn_t *dmesh_connect(dmesh_channel_t *s, int dst_service_id)` | New **client** connection bound to a **`dst_service_id`** (the same id the backend passed to `dmesh_create_channel`). Local, no round-trip — every `write+flush` is routed by the DPU (per-message LB); no pod is chosen or learned here. A dead/unregistered service is **not** detected. `NULL`+`ENOMEM` on OOM. |
 | `dmesh_conn_t *dmesh_accept(dmesh_channel_t *s)` | Next **inbound** connection the DPU created to your pod, holding its first message (body ready) with the peer learned; or `NULL`+`EAGAIN` if none pending. **Non-blocking.** (`NULL`+`ENOMEM` = rare alloc failure: the message is dropped, its RX credit reclaimed; an accept-until-NULL loop just skips it.) |
 | `dmesh_conn_t *dmesh_next_ready(dmesh_channel_t *s)` | Pop the next connection that **has inbound** (the DPU-facing poller named it) and return the **same** handle you created — or `NULL` when drained. **No scan, no per-conn fd.** After waking on `dmesh_event_fd`, loop this and `dmesh_read` each returned conn to EAGAIN. Single-consumer (your event loop). |
-| `void dmesh_pin_route(dmesh_conn_t *c)` | **Pin this conn to ONE backend** (connection-level LB, like a TCP proxy): every subsequent message (and the FIN) carries one route-affinity key, so the DPU routes them all to the backend picked for the **first** message — replies then arrive in **send order**. Call right after `dmesh_connect`, before any write; idempotent; no-op on a server conn. Forgoes per-message LB **by design** — use when the app assumes socket-style total order (the LD_PRELOAD shim pins every conn, §7). Keys share a global 255-id space: two pinned conns may share a backend (balance skew, never a correctness issue). |
+| `void dmesh_pin_route(dmesh_conn_t *c)` | **Pin this conn to ONE backend** (connection-level LB, like a TCP proxy): every subsequent message (and the FIN) carries one route-affinity key, so the DPU routes them all to the backend picked for the **first** message — replies then arrive in **send order**. Call right after `dmesh_connect`, before any write; idempotent; no-op on a server conn. Forgoes per-message LB **by design** — use when the app assumes socket-style total order (the LD_PRELOAD shim pins every conn, §7). Keys are a per-channel rolling 255-id space and the DPU scopes each pin **by destination service**: two pinned conns to the **same** service may share a backend (balance skew, never a correctness issue); a key reused by a different service's conn gets its own pin (cross-service redirection is impossible). |
 
 ### Read / write / sendfile / flush / close
 | Function | Returns / errno |
@@ -315,17 +315,20 @@ Header + body must fit one ≤ 8 KB message (chunk larger payloads at the app la
   wire messages for you (§3) and route-pins them, so the app just writes any length.
 - **Route-affinity (keeps a large message's chunks together).** Each wire message carries a
   **route-affinity key** (`route_group`, one byte): the DPU pins every message sharing a non-zero
-  key to the **same** backend (a small `route_group → backend` table on the single ARM thread — no
-  lock). Key `0` (a single-slot `dmesh_write`) = normal per-message LB. When a `dmesh_write` spans
-  slots, it stamps ONE key (a **global** rolling id, so concurrent large messages get distinct
-  keys) on all of that message's chunks, so — even when a service load-balances across several
-  backends — every chunk lands on one backend and reassembles. The table is **overwrite-on-reuse**:
-  whichever chunk reaches the ARM first records the pin and the rest reuse it, so it is
-  **order-independent** (chunks that round-robin across EU-sharding rings can arrive out of order)
-  and **collision-safe** (if two messages ever share a key, both simply pin to one backend). A
-  grouped message forgoes per-message LB by design. (An `is_last`-DELETE that frees the pin per
-  message was considered and **rejected** — under either hazard it can free a pin mid-message and
-  scatter the chunks; the bounded self-healing table is used instead.)
+  key to the **same** backend (a small `(dst_service, key) → backend` table on the single ARM
+  thread — no lock). Key `0` (a single-slot `dmesh_write`) = normal per-message LB. When a
+  `dmesh_write` spans slots, it stamps ONE key (a **channel-wide** rolling id, so one channel's
+  concurrent large messages get distinct keys) on all of that message's chunks, so — even when a
+  service load-balances across several backends — every chunk lands on one backend and
+  reassembles. The table is **overwrite-on-reuse**: whichever chunk reaches the ARM first records
+  the pin and the rest reuse it, so it is **order-independent** (chunks that round-robin across
+  EU-sharding rings can arrive out of order) and **collision-safe** — pins are scoped by the
+  message's **destination service**, so a key shared across channels/conns can only merge
+  same-service traffic onto one backend (skew, still reassembling); it can never route a message
+  to another service's backend. A grouped message forgoes per-message LB by design. (An
+  `is_last`-DELETE that frees the pin per message was considered and **rejected** — under either
+  hazard it can free a pin mid-message and scatter the chunks; the bounded self-healing table is
+  used instead.)
 - **Response↔request matching is the app's job.** The transport does no matching, and this DPU
   proxy routes at the **connection** level, not the **request** level (it never parses the body). A
   protocol-parsing L7 proxy could correlate by stream-id; a metadata-driven DPU cannot. Carry a
@@ -442,16 +445,26 @@ arrive **in order** — the socket contract; load is still balanced **across**
 connections.
 
 **Cost.** The shim deliberately re-buys the per-conn-fd readiness model the native API
-avoids (one eventfd signal per message): expect roughly **half** the native clean
-ceiling (measured ~100K vs ~200K class) — the price of transparency, paid only by
-preloaded apps. Native `dmesh_*` callers are unaffected.
+avoids (one eventfd signal per message). Measured (1 KB round trips, thread-per-conn
+vanilla client, 2-core pod, scale_log 07-03): ~7K RPS per connection (closed-loop
+RTT-bound, p50 ~130 µs), scaling near-linearly to 16 conns, then a **plateau of ~150K
+RPS at 64 conns** (128 conns = same throughput at 2× latency). That is ~76% of the
+native ceiling on the same deploy (~199K) — better than the ~½ originally projected
+from the per-conn-fd experiment (scale_log 06-30). The price of transparency, paid
+only by preloaded apps. Native `dmesh_*` callers are unaffected.
 
 **Limits (v1).** AF_INET `SOCK_STREAM` only; most `SO_*` options are accepted no-ops;
 `shutdown(SHUT_WR)` sends the FIN (no true half-close — late replies are
 undeliverable); no fork-shared sockets (DOCA is not fork-safe); statically-linked or
-raw-syscall binaries (e.g. Go) bypass `LD_PRELOAD` entirely.
+raw-syscall binaries (e.g. Go) bypass `LD_PRELOAD` entirely, and so does **stdio**
+(`FILE*` via `fdopen` — glibc stdio calls its internal `__read`/`__write`, not the
+interposable symbols); use direct `read`/`write`/`send`/`recv` on shimmed sockets.
 
 **Validation.** `bench/tcp_echo.c` (vanilla epoll echo) + `bench/tcp_client.c`
-(vanilla blocking client) run the SAME binaries over kernel TCP and over DPUmesh
-(`./test-bench.sh preload <N> <SIZE> <CONNS>`): 0-fail across 1 KB–32 KB (32 KB =
-auto-chunk + pin + stream reassembly), p50 ~120–150 µs, back-to-back stable.
+(vanilla **thread-per-conn** blocking client; sets `SO_RCVTIMEO=5s` so a lost message
+is a counted failure, never a hang) run the SAME binaries over kernel TCP and over
+DPUmesh (`./test-bench.sh preload <N> <SIZE> <CONNS>`): 0-fail across 1 KB–32 KB
+(32 KB = auto-chunk + pin + stream reassembly) and 1–256 connections — including 23×
+256-conn simultaneous-connect storms and idle→storm cycles — p50 ~120–150 µs,
+back-to-back stable. One unreproduced 256-conn-storm message-loss incident is tracked
+OPEN with tripwires armed (scale_log 07-03 session 3).

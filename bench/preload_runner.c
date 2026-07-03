@@ -157,6 +157,7 @@ int main(void) {
          * the RESULT line. Generous overall ceiling for big RUNs. */
         unsigned long long ok = 0, fail = 0;
         unsigned p50 = 0, p99 = 0;
+        unsigned long rps = 0;
         int got = 0;
         for (;;) {
             if (read_line(cli_out, resp, sizeof resp, 600000) <= 0) break;
@@ -168,8 +169,8 @@ int main(void) {
             close(cfd);
             continue;                  /* stay up — see the child_exited note */
         }
-        if (sscanf(resp, "RESULT %llu %llu %u %u", &ok, &fail, &p50, &p99) == 4)
-            dprintf(cfd, "OK %llu %llu %u %u\n", ok, fail, p50, p99);
+        if (sscanf(resp, "RESULT %llu %llu %u %u %lu", &ok, &fail, &p50, &p99, &rps) == 5)
+            dprintf(cfd, "OK %llu %llu %u %u %lu\n", ok, fail, p50, p99, rps);
         else
             dprintf(cfd, "ERR bad_result\n");
         close(cfd);

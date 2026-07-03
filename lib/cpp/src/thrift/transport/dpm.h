@@ -109,9 +109,11 @@ typedef struct dmesh_conn {
      * bit-identical to the pre-pin behavior). Non-zero = a route_group stamped on
      * EVERY outbound message of this conn (and its FIN), so the DPU pins the whole
      * conn to the ONE backend picked for its first message — restoring socket-like
-     * total order on the conn (per-message LB is forgone by design). Groups share a
-     * global 255-id space: two pinned conns may share an id and thus a backend —
-     * affects balance, never correctness (dpu_route is collision-safe). */
+     * total order on the conn (per-message LB is forgone by design). Group ids are a
+     * per-channel rolling 255-space, so unrelated conns/channels reuse a byte; the
+     * DPU keys its pin table by (dst_service, id), so a collision can only merge
+     * SAME-SERVICE traffic onto one backend (balance skew, ordering intact) — it can
+     * never redirect a conn to another service's backend. */
     uint8_t   pin_group;
 } dmesh_conn_t;
 
@@ -518,7 +520,9 @@ static inline void dmesh_send_fin(dmesh_conn_t *c) {
     d.dst_service   = c->dst_service;
     d.dst_pod       = c->remote_pod;                       /* the learned peer conn */
     d.dst_port      = c->remote_port;
-    d.route_group   = c->pin_group;                        /* pinned conn: FIN follows its backend */
+    d.route_group   = c->pin_group;                        /* informational: neither DPU FIN path
+                                                            * routes by rg (client FIN = conntrack
+                                                            * fan-out; server FIN = concrete dst) */
     d.valid         = 1;
     if (dpumesh_enqueue(ctx, &d) < 0) { dpumesh_tx_free(ctx, slot); return; }
     dpumesh_tx_track(ctx, c->local_port, c->seq, slot);    /* freed by its own TX_ACK */
