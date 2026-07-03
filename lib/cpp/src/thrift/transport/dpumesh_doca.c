@@ -246,13 +246,13 @@ static void *pe_progress_fn(void *arg) {
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)arg;
     struct doca_pe *pe = ctx->doca_objs.pe;
 
-    /* DPUMESH_HOST_EPOLL=1: sleep on the PE notification fd instead of spinning.
-     * The host comch PE receives ONLY real completions (REV_DONE / TX_ACK from
-     * the DPU), each of which raises the notification fd — there is NO silent-
-     * wakeup path here (unlike the DPU forward ring), so epoll is safe and cuts
-     * this thread's idle CPU to ~0. Default 0 = the baked adaptive-spin loop. */
-    int want_epoll = 0;
-    { const char *e = getenv("DPUMESH_HOST_EPOLL"); if (e && atoi(e) != 0) want_epoll = 1; }
+    /* Sleep on the PE notification fd instead of spinning (baked ON). The host
+     * comch PE receives ONLY real completions (REV_DONE / TX_ACK from the DPU),
+     * each of which raises the notification fd — there is NO silent-wakeup path
+     * here (unlike the DPU forward ring), so epoll is safe and cuts this thread's
+     * idle CPU to ~0 (p99 tail win). If the epoll setup below fails it falls back
+     * to the adaptive-spin loop. */
+    int want_epoll = 1;
 
     doca_notification_handle_t pfd = 0;
     int ep = -1;
@@ -597,27 +597,15 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
 static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, int service_id) {
     const char *env_val;
 
-    if (config && config->num_slots > 0)
-        ctx->num_slots = config->num_slots;
-    else if ((env_val = getenv("DPUMESH_NUM_SLOTS")) != NULL && atoi(env_val) > 0)
-        ctx->num_slots = atoi(env_val);
-    else
-        ctx->num_slots = DPUMESH_NUM_SLOTS_DEFAULT;
+    /* num_slots (32 MB / 8 KB = 4096) and slot_size (8 KB, the DPA dma_copy limit)
+     * are baked; a programmatic config override still wins. */
+    ctx->num_slots = (config && config->num_slots > 0) ? config->num_slots
+                                                       : DPUMESH_NUM_SLOTS_DEFAULT;
+    ctx->slot_size = (config && config->slot_size > 0) ? config->slot_size
+                                                       : DPUMESH_SLOT_SIZE_DEFAULT;
 
-    if (config && config->slot_size > 0)
-        ctx->slot_size = config->slot_size;
-    else if ((env_val = getenv("DPUMESH_SLOT_SIZE")) != NULL && atoi(env_val) > 0)
-        ctx->slot_size = atoi(env_val);
-    else
-        ctx->slot_size = DPUMESH_SLOT_SIZE_DEFAULT;
-
-    /* K = forward rings per pod (EU-sharding). Must match the DPU's
-     * DPUMESH_RINGS_PER_POD so host TX rings pair 1:1 with DPU per-pod rings. */
-    if ((env_val = getenv("DPUMESH_RINGS_PER_POD")) != NULL && atoi(env_val) > 0)
-        ctx->k_rings = atoi(env_val);
-    else
-        ctx->k_rings = DPUMESH_RINGS_PER_POD_DEFAULT;
-    if (ctx->k_rings > MAX_EU_PER_POD) ctx->k_rings = MAX_EU_PER_POD;
+    /* K = forward rings per pod (EU-sharding), baked to 2 — must match the DPU. */
+    ctx->k_rings = DPUMESH_RINGS_PER_POD_DEFAULT;
 
     /* Contiguous zero-copy arena: the top DPUMESH_ARENA_SLOTS slots are carved out
      * of the pool for dmesh_alloc(n>1). Default 0 → no arena, pool = all slots

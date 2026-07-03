@@ -21,6 +21,7 @@ deps += dependency('doca-common')
 deps += dependency('doca-comch')
 deps += dependency('doca-argp')
 deps += dependency('doca-dpa')
+deps += dependency('doca-dma')   # ARM generic SG-DMA engine for the L7-proxy egress (dpu_proxy.c)
 deps += dependency('libflexio')
 
 srcs = [
@@ -37,6 +38,7 @@ srcs = [
     'comch_consumer.c',
     'comch_msgq.c',
     'dpa.c',
+    'dpu_proxy.c',
 ]
 
 # Build DPA kernel via DPACC

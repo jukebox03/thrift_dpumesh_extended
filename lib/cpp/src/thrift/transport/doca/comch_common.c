@@ -120,6 +120,11 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		pod->remote_addr = remote_addr;
 		pod->remote_buf_size = buf_size;
 	} else { /* DMA_RING */
+		/* Save this forward ring's host base VA (same index the ring mmap was
+		 * stored at above). The proxy egress admission (dpu_proxy.c) DMA-reads
+		 * the host freed counter at base + DMA_RING_SIZE*sizeof(dma_desc) — the
+		 * +1 credit slot — the same counter the DPA reverse admission polls. */
+		pod->ring_host_addrs[pod->ring_mmap_count] = remote_addr;
 		pod->ring_mmap_count++;
 	}
 

@@ -12,6 +12,7 @@
 #include "comch_msgq.h"
 #include "buffer.h"
 #include "ring.h"
+#include "dpu_proxy.h"
 #include "../dpumesh.h"
 
 #include <doca_log.h>
@@ -79,8 +80,9 @@ flush_txack_batch(struct objects *objs, struct pod_state *pod)
 
 /* Accumulate one TX_ACK into the src pod's batch; flush when full. Falls back to
  * the single-send path when the pod is gone or the batch is already full and a
- * prior flush is still pending (AGAIN). */
-static void
+ * prior flush is still pending (AGAIN).
+ * Non-static: the proxy engine (dpu_proxy.c) releases custody through this. */
+void
 batch_or_send_tx_ack(struct objects *objs, struct pod_state *src_pod,
                      uint16_t port, uint16_t seq)
 {
@@ -106,8 +108,9 @@ batch_or_send_tx_ack(struct objects *objs, struct pod_state *src_pod,
  * 2-pod cap; coalescing K responses into one msg cuts the PE reap rate K-fold. */
 
 /* Flush a pod's accumulated REV_DONE batch as one message. On AGAIN the batch is
- * retained (retried by the next flush, including the idle proc==0 flush). */
-static void
+ * retained (retried by the next flush, including the idle proc==0 flush).
+ * Non-static: the proxy engine (dpu_proxy.c) shares this accumulator. */
+void
 flush_rev_done_batch(struct objects *objs, struct pod_state *pod)
 {
     if (!pod || pod->rev_done_batch_n == 0)
@@ -210,31 +213,19 @@ dpu_enqueue_reverse_dma(struct pod_state *src_pod,
     return DOCA_SUCCESS;
 }
 
-/* ====== L7 routing seam (MOCK) ======
+/* ====== L4 routing ======
  *
  * dpu_route() is the single point where the DPU decides the destination pod for a
- * forward completion. Production MOCK: service_table[svc] (one pod per service).
- * Two features layer on top: (a) ROUTE-AFFINITY — a non-zero route_group pins every
- * chunk of one large (SAR) message to ONE backend so they reassemble even under
- * per-message LB; (b) a TEST round-robin LB (DPUMESH_LB_RR) to exercise (a) under
- * real scatter. A real L7 proxy (body parse / LB / policy) plugs into lb_pick().
- * Single ARM thread → the group table + RR cursor need no lock.
+ * forward completion: service_table[svc] (one backend per service), with ROUTE-
+ * AFFINITY layered on top — a non-zero route_group pins every chunk of one large
+ * (SAR) message to ONE backend so they reassemble. Single ARM thread → the group
+ * table needs no lock. (A body-parsing L7 proxy lives in the separate
+ * DPUMESH_PROXY engine, dpu_proxy.c — see api.md §8.)
  */
 static inline int32_t
 lb_pick(struct objects *objs, int16_t svc)
 {
-    if (objs->lb_rr_count > 0) {   /* TEST: round-robin across the configured backend SERVICES */
-        for (int i = 0; i < objs->lb_rr_count; i++) {
-            /* Entries are SERVICE ids (pod_ids are DPU-assigned, not knowable by
-             * the test harness); resolve each to its pod via the service table. */
-            int32_t s = objs->lb_rr_pods[(objs->lb_rr_cursor++) % (uint32_t)objs->lb_rr_count];
-            int32_t p = (s >= 0 && s < POD_ID_SPACE) ? objs->service_table[s] : -1;
-            if (p >= 0 && find_pod_by_id(objs, p))
-                return p;
-        }
-        return -1;
-    }
-    if (svc >= 0 && svc < POD_ID_SPACE) {   /* production: single backend per service */
+    if (svc >= 0 && svc < POD_ID_SPACE) {   /* single backend per service */
         int p = objs->service_table[svc];
         if (p >= 0)
             return p;
@@ -242,33 +233,19 @@ lb_pick(struct objects *objs, int16_t svc)
     return -1;
 }
 
-static inline int32_t
-dpu_route(struct objects *objs, const dpu_comp_entry_t *entry,
-          const uint8_t *body, uint32_t body_len)
+/* L4 default route: service table + route-affinity pin (no "already resolved"
+ * short-circuit). This is the shared body used by both dpu_route() below and the
+ * proxy engine's DEFERred request segs (dpu_proxy.c → dpu_route_l4). Single ARM
+ * thread → the pin table needs no lock. */
+int32_t
+dpu_route_l4(struct objects *objs, int16_t svc, uint8_t rg)
 {
-    /* Already resolved (established request or any response → dst_pod filled by the
-     * client/server) → deliver direct, no re-routing (connection-level LB). */
-    if (entry->dst_pod_id != DMESH_POD_BLANK)
-        return entry->dst_pod_id;
-
-    /* L7-readiness hook (plan.md): a registered policy sees the BODY and may
-     * route to ANY live pod (gateway-style), DROP, or DEFER to the L4 logic
-     * below. NULL (production default) = this branch only — bit-identical. */
-    if (objs->route_fn) {
-        int32_t r = objs->route_fn(objs, entry, body, body_len);
-        if (r != DMESH_ROUTE_DEFER)
-            return r;                        /* pod, or DROP(-1) = existing drop path */
-    }
-
-    int16_t svc = entry->dst_service;
-    uint8_t rg  = entry->route_group;        /* 0 = normal LB; 1..255 = affinity group */
-
     /* Route-affinity: an auto-chunked large message stamps EVERY chunk with the same
      * non-zero route_group (a per-channel rolling id, so one channel's concurrent
      * messages differ); a dmesh_pin_route'd conn stamps its one id on every message.
      * All messages sharing a key pin to ONE backend. Whichever message reaches this
-     * single ARM thread FIRST LB-picks (lb_pick — RR under the DPUMESH_LB_RR test,
-     * else the service table) + records the pin; the rest reuse it.
+     * single ARM thread FIRST LB-picks (lb_pick → the service table) + records the
+     * pin; the rest reuse it.
      * The table is keyed (dst_service, rg), NOT rg alone: id counters are per-channel
      * and only 255 wide, so unrelated channels/conns routinely reuse a byte — service
      * scoping confines a collision to same-service traffic (both pin to one backend:
@@ -291,10 +268,7 @@ dpu_route(struct objects *objs, const dpu_comp_entry_t *entry,
     }
 
     /* No affinity (route_group==0) → normal per-message routing via the service table.
-     * The TEST RR-LB (lb_pick) is applied ONLY to route_group!=0 (SAR) traffic above,
-     * so it never hijacks ordinary RPC / pipeline / loopback routing — one deploy can
-     * validate those regressions AND SAR affinity together. Unknown service → -1
-     * (caller drops + TX_ACKs the sender). */
+     * Unknown service → -1 (caller drops + TX_ACKs the sender). */
     if (svc >= 0 && svc < POD_ID_SPACE) {
         int p = objs->service_table[svc];
         if (p >= 0)
@@ -303,28 +277,15 @@ dpu_route(struct objects *objs, const dpu_comp_entry_t *entry,
     return -1;
 }
 
-/* TEST content router (env DPUMESH_L7_DEMO="svc[,svc...]") — the trivial
- * stand-in for a real L7 parser, installed as objs->route_fn. Routes each
- * message by its FIRST BODY BYTE: index = body[0] % n → that service's
- * backend. Proves the three properties a future L7 proxy needs from this L4
- * (plan.md): body readable at route time (byte-accurate — validated by an
- * exact-count test), per-message content routing on ONE conn, and
- * cross-service delivery + reply mapping (the picked service may differ from
- * the client's dst_service). Pinned/SAR traffic (route_group!=0) and empty
- * bodies DEFER to the L4 pin table untouched; so does a not-yet-registered
- * backend (routing must not fail just because the demo map is ahead of the
- * pod registrations). No hot-path logging. */
-static int32_t
-route_l7_demo(struct objects *objs, const dpu_comp_entry_t *entry,
-              const uint8_t *body, uint32_t body_len)
+static inline int32_t
+dpu_route(struct objects *objs, const dpu_comp_entry_t *entry)
 {
-    if (!body || body_len == 0 || entry->route_group != 0)
-        return DMESH_ROUTE_DEFER;
-    int32_t svc = objs->l7_demo_svcs[body[0] % (unsigned)objs->l7_demo_n];
-    int32_t pod = (svc >= 0 && svc < POD_ID_SPACE) ? objs->service_table[svc] : -1;
-    if (pod < 0 || !find_pod_by_id(objs, pod))
-        return DMESH_ROUTE_DEFER;
-    return pod;
+    /* Already resolved (established request or any response → dst_pod filled by the
+     * client/server) → deliver direct, no re-routing (connection-level LB). */
+    if (entry->dst_pod_id != DMESH_POD_BLANK)
+        return entry->dst_pod_id;
+
+    return dpu_route_l4(objs, entry->dst_service, entry->route_group);
 }
 
 /* ====== Deferred Completion Queue Drain ====== */
@@ -394,12 +355,7 @@ process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
 
     if (entry->dst_pod_id == DMESH_POD_BLANK) {
         /* ---- CLIENT REQUEST: resolve service -> backend, own an upstream ---- */
-        /* The body is materialized for the L7 hook only — the staging pointer is
-         * plain ARM-addressable memory (fwd DMA landed before this completion;
-         * the in-place reverse DMA below relies on the same ordering). */
-        const uint8_t *body = objs->route_fn
-            ? (const uint8_t *)fwd_buf_pod->dma_buffer + entry->buf_offset : NULL;
-        int32_t B = dpu_route(objs, entry, body, entry->length);
+        int32_t B = dpu_route(objs, entry);
         if (B < 0) {
             DOCA_LOG_ERR("forward: unresolved service=%d seq=%u", entry->dst_service, entry->seq);
             send_or_defer_tx_ack(objs, find_pod_by_id(objs, ack_pod), ack_port, entry->seq);
@@ -574,9 +530,20 @@ process_completion_queue(struct objects *objs, int max_batch)
 
         int result;
         if (entry->entry_type == COMP_ENTRY_REV_NOTIFY) {
+            /* Legacy DPA reverse-DMA completion. In proxy mode egress runs
+             * through the ARM SG-DMA engine, so no REV_NOTIFY is ever produced;
+             * the branch stays as a safety net. */
             result = process_rev_notify_entry(objs, entry);
             if (result == 0)
                 break;  /* comch send busy, retry next iteration */
+        } else if (objs->proxy) {
+            /* Proxy mode: request AND reply forward completions feed the per-conn
+             * input window → proxy_route (mock) → per-dst SG-DMA egress engine.
+             * Returns 1 consumed, 0 retry (alloc/pool pressure — retain entry),
+             * -1 dropped (sender already TX_ACKed). */
+            result = px_ingest_forward(objs, entry);
+            if (result == 0)
+                break;  /* engine backpressure, retry next iteration */
         } else {
             result = process_forward_entry(objs, entry);
             if (result == 0)
@@ -608,12 +575,20 @@ dpu_drain_iteration(struct objects *objs)
      * slots are available. */
     drain_deferred_tx_acks(objs);
 
-    /* Drain deferred completion queue (reverse DMA enqueue). 128/pass — safe
-     * because consumer_pe is progressed above, keeping DPA recv tasks recycled. */
+    /* Drain deferred completion queue (reverse DMA enqueue, or proxy ingest).
+     * 128/pass — safe because consumer_pe is progressed above, keeping DPA recv
+     * tasks recycled. */
     int proc = process_completion_queue(objs, 128);
+
+    /* Proxy egress: submit queued per-dst SG-DMA batches + emit completed
+     * batches' REV_DONE entries and custody TX_ACKs. No-op (returns 0) when the
+     * engine is off (objs->proxy == NULL). */
+    int px_progressed = px_drain(objs);
+
     /* Idle (no completions this pass) → flush partial TX_ACK + REV_DONE batches so
      * low-load latency is not held by coalescing. This is the only batch-flush
-     * site (the periodic keepalive no longer flushes here). */
+     * site (the periodic keepalive no longer flushes here). In proxy mode the SG
+     * engine emits into these same accumulators, so this flushes its tail too. */
     if (proc == 0)
         for (int i = 0; i < objs->num_pods; i++) {
             flush_txack_batch(objs, &objs->pods[i]);
@@ -645,7 +620,7 @@ dpu_drain_iteration(struct objects *objs)
     /* Drain consumer_retry tasks stashed by the consumer completion callback. */
     objects_drain_consumer_retry(objs);
 
-    return (did_consumer || did_ctrl || proc > 0);
+    return (did_consumer || did_ctrl || proc > 0 || px_progressed);
 }
 
 /* Send DPA_MSG_WAKE to every running EU (the ~1 ms keepalive). A parked EU is not
@@ -670,19 +645,16 @@ run_dpu_worker(struct objects *objs)
 {
     doca_error_t result;
 
-    /* Driver selection. DPUMESH_EVENT_LOOP=1 (default) runs the event-driven main
-     * loop: the ARM SLEEPS on epoll over the two PE notification handles, waking on
-     * a real DPA→DPU completion (FWD_DONE/REV_DONE), a host control message, OR a
-     * ~1 ms epoll timeout. On each tick it sends the 1 ms DPU→DPA WAKE keepalive
-     * (the DPA EU parks when idle and a silent desc->valid=1 store can't wake it,
-     * so the ARM pokes it ~1 kHz). This is NOT busy-poll — the ARM sleeps between
-     * ticks, so idle CPU is a few % (≈1 kHz wakeups), vs a full core for busy-poll.
-     * EVENT_LOOP=0 = the legacy busy-poll loop (burns a full ARM core), fallback. */
+    /* Event-driven main loop: the ARM SLEEPS on epoll over the two PE notification
+     * handles, waking on a real DPA→DPU completion (FWD_DONE/REV_DONE), a host
+     * control message, OR a ~1 ms epoll timeout. On each tick it sends the 1 ms
+     * DPU→DPA WAKE keepalive (the DPA EU parks when idle and a silent desc->valid=1
+     * store can't wake it, so the ARM pokes it ~1 kHz). This is NOT busy-poll — the
+     * ARM sleeps between ticks, so idle CPU is a few % (≈1 kHz wakeups), vs a full
+     * core for busy-poll. If the epoll setup fails, it falls back to busy-poll. */
     const double keepalive_sec = 0.001;   /* 1 ms DPU→DPA WAKE cadence */
     struct timespec now, last_kick;
     double kick_elapsed;
-    int event_loop = 1;
-    { const char *e = getenv("DPUMESH_EVENT_LOOP"); if (e) event_loop = (atoi(e) != 0); }
 
     DOCA_LOG_INFO("Starting DPU worker");
 
@@ -699,42 +671,9 @@ run_dpu_worker(struct objects *objs)
         objs->service_table[i]  = -1;
     }
 
-    /* Route-affinity table ((service, route_group) -> pinned backend) starts empty;
-     * TEST RR-LB off. 0xFF bytes == -1 for two's-complement int32. */
+    /* Route-affinity table ((service, route_group) -> pinned backend) starts empty.
+     * 0xFF bytes == -1 for two's-complement int32. */
     memset(objs->route_group_backend, 0xFF, sizeof(objs->route_group_backend));
-    objs->lb_rr_count = 0;
-    objs->lb_rr_cursor = 0;
-    /* L7-readiness hook: production default = none (bit-identical L4 routing).
-     * DPUMESH_L7_DEMO="svc[,svc...]" installs the TEST content router. Installed
-     * here, before any thread starts — plain stores, no race. */
-    objs->route_fn = NULL;
-    objs->l7_demo_n = 0;
-    { const char *e = getenv("DPUMESH_L7_DEMO");
-      if (e && *e) {
-          char tmp[64]; snprintf(tmp, sizeof tmp, "%s", e);
-          char *save = NULL, *tok = strtok_r(tmp, ",", &save);
-          while (tok && objs->l7_demo_n < 8) {
-              objs->l7_demo_svcs[objs->l7_demo_n++] = atoi(tok);
-              tok = strtok_r(NULL, ",", &save);
-          }
-          if (objs->l7_demo_n > 0) {
-              objs->route_fn = route_l7_demo;
-              DOCA_LOG_WARN("TEST L7 demo content-router ON (%d services)", objs->l7_demo_n);
-          }
-      }
-    }
-    { const char *e = getenv("DPUMESH_LB_RR");   /* TEST: "11,13,14" → per-message RR-LB */
-      if (e && *e) {
-          char tmp[64]; snprintf(tmp, sizeof tmp, "%s", e);
-          char *save = NULL, *tok = strtok_r(tmp, ",", &save);
-          while (tok && objs->lb_rr_count < 8) {
-              objs->lb_rr_pods[objs->lb_rr_count++] = atoi(tok);
-              tok = strtok_r(NULL, ",", &save);
-          }
-          DOCA_LOG_INFO("DPUMESH_LB_RR: per-message round-robin LB across %d backends",
-                        objs->lb_rr_count);
-      }
-    }
 
     /* Init DPU connection tracking (model B). Heap-allocated — too large to embed
      * on the stack. calloc zeroes every in_use flag; next_uport starts at BASE. */
@@ -755,28 +694,14 @@ run_dpu_worker(struct objects *objs)
      * setup_pod_dma so a fast host's early mmaps don't set up before the msgq. */
     objs->dpu_ready = 0;
 
-    /* Resolve N (DPA EU threads) + K (rings/pod) from env NOW — BEFORE the comch
-     * server starts accepting pods. Otherwise a host that connects and sends its
-     * DMA_RING exports before init_dpa_objects (step 3) sets k_rings makes
-     * process_mmap_msg see k_rings=0 -> kmax=1, so it rejects the pod's 2nd forward
-     * ring ("extra DMA_RING k=1 ignored") and that pod never reaches dma_ready (a
-     * startup race that a fast host — e.g. one that no longer allocates the datapath
-     * consumer — hits deterministically). init_dpa_objects re-checks `<= 0`, so it
-     * now skips re-resolving and uses these. Mirrors init_dpa_objects' clamps. */
-    {
-        const char *env = getenv("DPUMESH_DPA_THREADS");
-        int n = (env && *env) ? atoi(env) : 4;
-        if (n < 1) n = 1;
-        if (n > MAX_DPA_RINGS) n = MAX_DPA_RINGS;
-        objs->num_dpa_threads = n;
-
-        const char *kenv = getenv("DPUMESH_RINGS_PER_POD");
-        int k = (kenv && *kenv) ? atoi(kenv) : DPUMESH_RINGS_PER_POD_DEFAULT;
-        if (k < 1) k = 1;
-        if (k > objs->num_dpa_threads) k = objs->num_dpa_threads;
-        if (k > MAX_EU_PER_POD) k = MAX_EU_PER_POD;
-        objs->k_rings = k;
-    }
+    /* N (DPA EU threads) + K (forward rings/pod) — baked to the measured config
+     * (N=4 EUs, K=2 rings, so a 2-pod pair spreads across 4 distinct EUs; K=2 is
+     * the sweet spot, K=4 is flat — the DPA op-rate caps ~810K dma_copy/s). Set
+     * BEFORE the comch server accepts pods so process_mmap_msg sees the right K
+     * (else it rejects a pod's 2nd forward ring and that pod never reaches
+     * dma_ready). init_dpa_objects re-checks `<= 0`, so it reuses these. */
+    objs->num_dpa_threads = 4;
+    objs->k_rings = DPUMESH_RINGS_PER_POD_DEFAULT;   /* = 2 */
 
     /* 1. comch control path server (waits for first connection) */
     result = init_comch_ctrl_path_server("DPUMesh", objs, true);
@@ -855,27 +780,21 @@ run_dpu_worker(struct objects *objs)
         }
     }
 
-    DOCA_LOG_INFO("DPU worker initialized (event-based), entering main loop");
-
-    if (!event_loop) {
-        /* ===== Legacy busy-poll driver (fallback) =====
-         * Spin dpu_drain_iteration() continuously (burns a full ARM core) + the
-         * 1 ms keepalive WAKE to poke the parked EU, same as the event loop. */
-        clock_gettime(CLOCK_MONOTONIC, &last_kick);
-        while (true) {
-            dpu_drain_iteration(objs);
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            kick_elapsed = (now.tv_sec - last_kick.tv_sec) +
-                           (now.tv_nsec - last_kick.tv_nsec) / 1e9;
-            if (kick_elapsed >= keepalive_sec) {
-                dpu_send_wake(objs);
-                last_kick = now;
-            }
-        }
-        return;  /* not reached */
+    /* 7. L7-proxy L4 engine (dpu_proxy.c). Requires objs->dev (opened in
+     *    dpu_main before run_dpu_worker) + objs->pe (step 1) live. env
+     *    DPUMESH_PROXY unset → objs->proxy stays NULL and every path above is
+     *    bit-identical (the legacy per-slot forward/reverse machinery). */
+    result = px_init(objs);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to init L7-proxy L4 engine: %s",
+                     doca_error_get_descr(result));
+        cleanup_objects(objs);
+        return;
     }
 
-    /* ===== Event-driven driver (default) =====
+    DOCA_LOG_INFO("DPU worker initialized (event-based), entering main loop");
+
+    /* ===== Event-driven driver =====
      * epoll over {consumer_pe fd, ctrl pe fd}. Each pass: drain → send the 1 ms
      * keepalive WAKE on cadence → if idle, arm → re-poll → block on epoll with a
      * 1 ms timeout (so we wake to re-send the keepalive even with no completion).

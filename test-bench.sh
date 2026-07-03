@@ -57,6 +57,7 @@ IMG_BENCH_DPU="bench/bench-dpumesh:latest"
 IMG_ECHO_DPU="bench/echo-dpumesh:latest"
 IMG_LOOPBACK_DPU="bench/loopback-dpumesh:latest"   # self-routing validator (1 pod = client+server)
 IMG_PRELOAD_DPU="bench/preload-dpumesh:latest"     # LD_PRELOAD shim validator (vanilla TCP apps)
+IMG_STREAM_DPU="bench/stream-dpumesh:latest"       # byte-stream / L7-proxy frame validator (DPUMESH_PROXY=frame)
 IMG_BENCH_TCP="bench/bench-tcp:latest"
 IMG_ECHO_TCP="bench/echo-tcp:latest"
 IMG_ENVOY="envoyproxy/envoy:v1.30-latest"
@@ -182,7 +183,14 @@ build_bench_binaries() {
         -L"$BUILD_DOCA/lib" -L"$DOCA_LIB_DIR" \
         $THRIFT_LINK_LIB -lpthread -ldoca_common -ldoca_comch \
         -Wl,-rpath,/usr/local/lib -Wl,-rpath,"$DOCA_LIB_DIR"
-    info "C bench binaries built (façade: bench_sock.c + echo_sock.c + loopback_sock.c)"
+    # byte-stream / L7-proxy frame validator (drives DPUMESH_PROXY=frame): sends
+    # length-prefixed frames, verifies byte-exact echo + served-byte exact-count.
+    gcc -O2 -o "$BENCH_DIR/stream_dpumesh" "$BENCH_DIR/stream_sock.c" \
+        -I"$PROJ_ROOT/lib/cpp/src" \
+        -L"$BUILD_DOCA/lib" -L"$DOCA_LIB_DIR" \
+        $THRIFT_LINK_LIB -lpthread -ldoca_common -ldoca_comch \
+        -Wl,-rpath,/usr/local/lib -Wl,-rpath,"$DOCA_LIB_DIR"
+    info "C bench binaries built (façade: bench_sock.c + echo_sock.c + loopback_sock.c + stream_sock.c)"
 
     # LD_PRELOAD socket shim + its validators. tcp_echo / tcp_client are PURE
     # POSIX socket programs (no dmesh headers) — running them unmodified over
@@ -232,6 +240,10 @@ build_images() {
     build_image "$BENCH_DIR/Dockerfile.loopback_dpumesh" "$IMG_LOOPBACK_DPU" "$PROJ_ROOT"
     rm -f "$PROJ_ROOT/loopback_dpumesh"
 
+    cp -f "$BENCH_DIR/stream_dpumesh" "$PROJ_ROOT/"
+    build_image "$BENCH_DIR/Dockerfile.stream_dpumesh" "$IMG_STREAM_DPU" "$PROJ_ROOT"
+    rm -f "$PROJ_ROOT/stream_dpumesh"
+
     cp -f "$BENCH_DIR/preload_runner" "$BENCH_DIR/tcp_echo" "$BENCH_DIR/tcp_client" \
           "$BENCH_DIR/libdmesh_preload.so" "$PROJ_ROOT/"
     build_image "$BENCH_DIR/Dockerfile.preload_dpumesh" "$IMG_PRELOAD_DPU" "$PROJ_ROOT"
@@ -276,33 +288,19 @@ stop_dpu() {
 }
 
 start_dpu() {
-    # DPA EU thread count. Default 4 so EU-sharding K=2 spreads the 2-pod pair
-    # across 4 distinct EUs (pod10->EU0,1; pod11->EU2,3). Topology, not a toggle.
-    local dpa_threads="${DPUMESH_DPA_THREADS:-4}"
     # DPU log level (40=WARN+; 50=INFO+).
     local log_level="${DPUMESH_LOG_LEVEL:-40}"
-    # EU-sharding: rings per pod. Default 2 (the measured sweet spot: K=2 drives
-    # 4 EUs; K=4 is flat — the DPA op-rate caps ~810K dma_copy/s). needs
-    # DPA_THREADS >= K. bench/echo host pods must use the SAME value (apply_k8s).
-    local rings_per_pod="${DPUMESH_RINGS_PER_POD:-2}"
-    # Event-driven DPU main loop (default 1): the DPU ARM sleeps on epoll over the
-    # PE notification handles, woken only by real DPA→DPU completions (the EU
-    # busy-loops, so no WAKE/timerfd needed). 0 = legacy busy-poll fallback.
-    local event_loop="${DPUMESH_EVENT_LOOP:-1}"
-    # TEST: per-message round-robin LB across a backend list (e.g. "11,13,14") applied
-    # ONLY to route_group!=0 (SAR large-message) traffic, so route-affinity can be
-    # exercised under real scatter without disturbing normal RPC/pipeline/loopback.
-    # Empty (default) = production single-backend service_table routing.
-    local lb_rr="${DPUMESH_LB_RR:-}"
-    # TEST: L7-readiness demo content-router (plan.md). "svc[,svc...]" routes each
-    # message by its first body byte across the listed services' backends. Empty
-    # (default) = hook uninstalled = bit-identical L4 routing.
-    local l7_demo="${DPUMESH_L7_DEMO:-}"
-    step "=== Starting dpumesh_dpu (DPA EU threads=$dpa_threads, rings_per_pod=$rings_per_pod, event_loop=$event_loop, lb_rr='$lb_rr', l7_demo='$l7_demo') ==="
+    # L7-proxy L4 engine (api.md §8, dpu_proxy.c). Unset (default) = engine off,
+    # legacy per-slot path bit-identical. "passthru" = one seg per message (wire-
+    # identical boundaries; parity/regression). "frame" = length-prefix byte-stream
+    # parser routed by svc byte (drive it with the `stream` command / stream_sock.c).
+    # (DPA EU count, rings/pod, event-loop are baked into the binary — no longer env.)
+    local proxy="${DPUMESH_PROXY:-}"
+    step "=== Starting dpumesh_dpu (proxy='$proxy') ==="
     stop_dpu
     ssh "$DPU_HOST" "cat > /tmp/start_dpu_bench.sh << 'LAUNCHER'
 #!/bin/bash
-screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_DPA_THREADS=$dpa_threads DPUMESH_RINGS_PER_POD=$rings_per_pod DPUMESH_EVENT_LOOP=$event_loop DPUMESH_LB_RR=$lb_rr DPUMESH_L7_DEMO=$l7_demo ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
+screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_PROXY=$proxy ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
 sleep 2
 pgrep -f 'dpumesh_dpu.*03:00' || echo NO_PID
 LAUNCHER
@@ -382,6 +380,8 @@ get_pod_cores() {
                 preload-dpumesh)  echo "4,5" ;; # shares loopback's cores (both are
                                                 # on-demand validators, never active
                                                 # at the same time)
+                stream-dpumesh)   echo "4,5" ;; # on-demand frame validator (shares
+                                                # the loopback/preload cores)
                 echo-dpumesh-13)  echo "6" ;;   # test-7 extra backend
                 echo-dpumesh-14)  echo "7" ;;   # test-7 extra backend
                 *) echo "" ;;
@@ -406,7 +406,7 @@ pin_pods() {
         warn "cpupower not found; skipping DVFS lock"
     fi
 
-    for app in bench-dpumesh echo-dpumesh echo-dpumesh-13 echo-dpumesh-14 loopback-dpumesh preload-dpumesh bench-tcp echo-tcp; do
+    for app in bench-dpumesh echo-dpumesh echo-dpumesh-13 echo-dpumesh-14 loopback-dpumesh stream-dpumesh preload-dpumesh bench-tcp echo-tcp; do
         local cores pod_id
         cores=$(get_pod_cores "$app" "$profile")
         [ -z "$cores" ] && continue
@@ -488,9 +488,6 @@ spec:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
         - { name: BENCH_WORKER_ID, value: "10" }
         - { name: BENCH_DST_POD_ID, value: "11" }
-        - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
-        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
-        - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
         - { name: ASYNC_THREADS, value: "${ASYNC_THREADS:-4}" }
         # Pipeline depth (mode=2 / dpumesh-pipeline): outstanding msgs PER conn.
         # Default 8 (unchanged); set >16 to exercise deep-pipeline TX-slot custody.
@@ -530,9 +527,6 @@ spec:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
         - { name: BENCH_WORKER_ID, value: "11" }
         - { name: ECHO_THREADS, value: "${ECHO_THREADS:-3}" }
-        - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
-        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
-        - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리.
         volumeMounts:
@@ -563,9 +557,6 @@ spec:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
         - { name: BENCH_WORKER_ID, value: "13" }
         - { name: ECHO_THREADS, value: "${ECHO_THREADS:-3}" }
-        - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
-        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
-        - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
         securityContext: { privileged: true }
         volumeMounts:
         - { mountPath: /dev/infiniband, name: infiniband }
@@ -593,9 +584,6 @@ spec:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
         - { name: BENCH_WORKER_ID, value: "14" }
         - { name: ECHO_THREADS, value: "${ECHO_THREADS:-3}" }
-        - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
-        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
-        - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
         securityContext: { privileged: true }
         volumeMounts:
         - { mountPath: /dev/infiniband, name: infiniband }
@@ -626,9 +614,6 @@ spec:
         env:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
         - { name: BENCH_WORKER_ID, value: "12" }
-        - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
-        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
-        - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
         - { name: DPUMESH_ARENA_SLOTS, value: "${DPUMESH_ARENA_SLOTS:-512}" }  # zero-copy arena (dmesh_alloc)
         securityContext: { privileged: true }
         volumeMounts:
@@ -643,6 +628,46 @@ kind: Service
 metadata: { name: loopback-dpumesh }
 spec:
   selector: { app: loopback-dpumesh }
+  ports: [{ port: $CTRL_PORT, targetPort: $CTRL_PORT }]
+---
+# stream-dpumesh (pod_id=16, service_id=16): byte-stream / L7-proxy frame
+# validator. Like loopback it is BOTH client and echo server of its OWN service,
+# but it emits length-prefixed frames the DPU frame mock reframes + routes (needs
+# the DPU launched with DPUMESH_PROXY=frame). replicas:0 + NOT in start_pods (it
+# is a special-mode validator, and MAX_PODS=8 is tight) — the `stream` command
+# scales it up on demand.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stream-dpumesh
+spec:
+  replicas: 0
+  selector: { matchLabels: { app: stream-dpumesh } }
+  template:
+    metadata: { labels: { app: stream-dpumesh } }
+    spec:
+      hostname: stream-dpumesh
+      containers:
+      - name: stream-dpumesh
+        image: docker.io/$IMG_STREAM_DPU
+        imagePullPolicy: Never
+        ports: [{ containerPort: $CTRL_PORT }]
+        env:
+        - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
+        - { name: BENCH_WORKER_ID, value: "16" }
+        securityContext: { privileged: true }
+        volumeMounts:
+        - { mountPath: /dev/infiniband, name: infiniband }
+        - { mountPath: /usr/local/lib/libthrift.so.0.12.0, name: libthrift-so, subPath: libthrift.so.0.12.0 }
+      volumes:
+      - { name: infiniband, hostPath: { path: /dev/infiniband } }
+      - { name: libthrift-so, hostPath: { path: $BUILD_DOCA/lib, type: Directory } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: stream-dpumesh }
+spec:
+  selector: { app: stream-dpumesh }
   ports: [{ port: $CTRL_PORT, targetPort: $CTRL_PORT }]
 ---
 # preload-dpumesh (service_id=15): LD_PRELOAD shim validator. The runner (NOT
@@ -671,9 +696,6 @@ spec:
         - { name: PRELOAD_SVC, value: "15" }
         - { name: ECHO_PORT, value: "9095" }
         - { name: DMESH_PRELOAD_DEBUG, value: "${DMESH_PRELOAD_DEBUG:-0}" }
-        - { name: DPUMESH_NUM_SLOTS, value: "${DPUMESH_NUM_SLOTS:-4096}" }
-        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
-        - { name: DPUMESH_HOST_EPOLL, value: "${DPUMESH_HOST_EPOLL:-1}" }
         securityContext: { privileged: true }
         volumeMounts:
         - { mountPath: /dev/infiniband, name: infiniband }
@@ -1006,12 +1028,60 @@ run_preload() {
     echo "============================================================"
 }
 
+run_stream() {
+    # Byte-stream / L7-proxy frame validator (needs the DPU launched with
+    # DPUMESH_PROXY=frame). The stream-dpumesh pod (pod_id=16) is client+echo of
+    # its own service 16; it emits length-prefixed frames the DPU frame mock
+    # reframes + routes by svc byte. Scaled up on demand (not in start_pods).
+    #   $1 = N round-trips, $2 = payload bytes/frame, $3 = svc list (default self,
+    #        e.g. "11,13,14" fans out to the echo backends), $4 = frames/write.
+    # svcs default "self" (NOT empty): an empty middle field collapses under the
+    # daemon's positional sscanf and slides fpw into the svc slot. "self" = the
+    # pod's own service (self-loopback). Skip the DPU-log wait ("" 2nd arg) — at
+    # -l 40 the register line isn't emitted, so it only ever false-times-out.
+    local N="${1:-20000}" size="${2:-1024}" svcs="${3:-self}" fpw="${4:-1}"
+    # IDEMPOTENT: only scale up if no Running pod exists. scale_up_with_wait
+    # restarts the pod (scale 0→1), and REPEATED restarts hit a DPU control-plane
+    # setup fragility (DPA msgq AGAIN on ADD_RING → setup_pod_dma fails → the pod
+    # never becomes dma_ready). So reuse a healthy pod across back-to-back runs;
+    # a broken/absent pod needs a clean redeploy, not another restart here.
+    local have
+    have=$(kubectl get pod -n "$NS" -l app=stream-dpumesh --field-selector=status.phase=Running -o name 2>/dev/null | head -1)
+    if [ -z "$have" ]; then
+        scale_up_with_wait "stream-dpumesh" ""
+    else
+        info "reusing running stream-dpumesh pod (no restart)"
+    fi
+    local pod_ip
+    pod_ip=$(kubectl get pod -n "$NS" -l app=stream-dpumesh --field-selector=status.phase=Running -o jsonpath='{.items[0].status.podIP}')
+    if [ -z "$pod_ip" ]; then
+        err "stream-dpumesh pod not found"; return 1
+    fi
+    step "=== stream (L7-proxy frame): N=$N size=${size}B svcs='${svcs:-self(16)}' frames/write=$fpw ==="
+    local resp
+    resp=$(printf 'RUN %s %s %s %s\n' "$N" "$size" "$svcs" "$fpw" | timeout 180s nc "$pod_ip" "$CTRL_PORT" || true)
+    if [ -z "$resp" ]; then err "no response (timeout or pod down)"; return 1; fi
+    if [[ "$resp" == ERR* ]]; then err "stream replied: $resp"; return 1; fi
+    # Parse: OK <ok> <fail> <served_bytes> <p50us>
+    read -r tag ok fail served p50 <<<"$resp"
+    echo
+    echo "============================================================"
+    echo "  stream (L7-proxy frame byte-stream) result"
+    echo "============================================================"
+    printf "  OK / Fail:        %s / %s\n" "$ok" "$fail"
+    printf "  Served (echo B):  %s\n" "$served"
+    printf "  p50 latency:      %s us\n" "$p50"
+    echo "  (byte-exact: OK==N & fail==0; the DPU frame mock reframed + routed"
+    echo "   every frame; served bytes = echoed byte-stream volume.)"
+    echo "============================================================"
+}
+
 ### ---------------------------------------------------------- utility ###
 
 show_logs() {
     # bench-tcp/echo-tcp pods now have 2 containers each (app + sidecar);
     # --all-containers prefixes each line with the container name.
-    for app in bench-dpumesh echo-dpumesh echo-dpumesh-13 echo-dpumesh-14 loopback-dpumesh preload-dpumesh bench-tcp echo-tcp; do
+    for app in bench-dpumesh echo-dpumesh echo-dpumesh-13 echo-dpumesh-14 loopback-dpumesh stream-dpumesh preload-dpumesh bench-tcp echo-tcp; do
         echo "=== $app ==="
         kubectl logs -n "$NS" -l "app=$app" --all-containers=true --prefix=true --tail=20 2>/dev/null || true
         echo
@@ -1098,7 +1168,7 @@ case "$CMD" in
         # verifies content per-offset — arrival-order correctness IS the affinity proof
         # (scatter would arrive out of order). Async/windowed → also measures MB/s.
         # SIZE is the LOGICAL message size (e.g. 32768); pass CONNS ($4) high for
-        # throughput. Deploy with DPUMESH_LB_RR="11,13,14" to exercise affinity scatter.
+        # throughput.
         pin_pods fair >/dev/null
         RUN_MODE=3 run_bench "dpumesh" "${@:2}"
         ;;
@@ -1106,6 +1176,15 @@ case "$CMD" in
         # Self-routing / loopback: pod 12 is client+server of its own service 12.
         pin_pods fair >/dev/null
         run_loopback "${2:-50000}" "${3:-8192}" "${4:-0}"   # $4=1 → zero-copy (dmesh_alloc)
+        ;;
+    stream)
+        # Byte-stream / L7-proxy frame validator. REQUIRES the DPU launched with
+        # DPUMESH_PROXY=frame (redeploy: DPUMESH_PROXY=frame $0 deploy). Scales the
+        # stream-dpumesh pod up on demand, sends length-prefixed frames the DPU
+        # reframes + routes, checks byte-exact echo. $4 = svc list (default self;
+        # "11,13,14" fans out), $5 = frames/write (default 1; >1 packs a burst).
+        pin_pods fair >/dev/null
+        run_stream "${2:-20000}" "${3:-1024}" "${4:-}" "${5:-1}"
         ;;
     preload)
         # LD_PRELOAD shim: vanilla TCP apps (tcp_client/tcp_echo) over DPUmesh.
@@ -1168,6 +1247,7 @@ case "$CMD" in
         echo "  tcp         <RPS> <DUR> <SIZE> [<CONNS>]  # 1-core fair (sidecar 모델)"
         echo "  dpumesh-hw  <RPS> <DUR> <SIZE> [<CONNS>]  # multi-core (HW 한계 측정)"
         echo "  preload     <N> <SIZE> [<CONNS>]          # LD_PRELOAD shim (vanilla TCP 앱)"
+        echo "  stream      <N> <SIZE> [<SVCS>] [<FPW>]   # L7-proxy frame byte-stream (DPUMESH_PROXY=frame로 배포)"
         echo "  pin / pin-fair                            # fair 모드 재핀"
         echo "  pin-hw                                    # hw 모드 재핀 (수동 토글)"
         echo "  logs                                      # bench/echo pod 로그"

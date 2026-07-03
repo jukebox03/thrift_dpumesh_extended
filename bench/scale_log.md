@@ -3323,3 +3323,107 @@ read-only (v1).
 - Production default unchanged (route_fn NULL). DPUMESH_L7_DEMO is a TEST knob like
   DPUMESH_LB_RR. Real L7 next steps live in plan_l7.md (seam→pin-miss pick, per-src
   ROUTER threads per prev/architecture.md, reply observe hook, rewrite contract).
+
+# 2026-07-04 — L7 proxy L4 engine (DPUMESH_PROXY, byte-stream reframing) — BUILT + VALIDATED (frame mock)
+
+Goal (user, plan.md): make the DPU an envoy-like L7 proxy. L7 (parse + route/LB) = future,
+MOCK for now; L4 (this pass) = execute a per-connection routing decision as a BYTE STREAM via
+scatter-gather DMA. Deliverable = the proxy return format (`dmesh_route_seg{off,len,dst}` +
+`consumed`) and the whole L4 engine that runs it. NOT a throughput lever — goal is L7 function
++ DPU CPU savings + latency. Off by default (`DPUMESH_PROXY` unset = legacy per-slot path
+bit-identical).
+
+## What was built / wired
+- dpu_proxy.{h,c} (author): the L4 engine — per-conn INPUT WINDOW (zero-copy views over DPU
+  staging + cursor; a SEAM buffer aligns the unconsumed tail only when a parse stalls across
+  extents) → `proxy_route` (MOCK) → per-(dst pod, region) LANE → ARM generic doca_dma
+  chained-buf SG-DMA (one op/batch) + batched REV_DONE → custody TX_ACK at egress. Reply path
+  = same machinery, dst from conntrack (uP→client). Mocks: `passthru` (1 seg/msg, wire-identical
+  = parity) and `frame` (`[u32 len][u8 svc][payload]`, routes each whole frame by svc byte).
+- WIRING (this session): dpu_worker.c — px_init (init step 7), forward completion → px_ingest_forward
+  when objs->proxy set, px_drain in dpu_drain_iteration, dpu_route_l4 split out of dpu_route,
+  batch_or_send_tx_ack/flush_rev_done_batch un-static+exported. comch_common.c — store
+  ring_host_addrs[idx] on DMA_RING import (host freed-counter addr for egress admission).
+  meson.build — +doca-dma +dpu_proxy.c. bench/stream_sock.c + Dockerfile + test-bench.sh
+  (`DPUMESH_PROXY` env, `stream` command, idempotent run_stream).
+- Config: DPA_THREADS=4, RINGS_PER_POD=2, EVENT_LOOP=1; proxy mock=frame, seam_max=524288,
+  sg_pieces=64 (device cap). Deploy: `DPUMESH_PROXY=frame ./test-bench.sh deploy`.
+
+## Local wire-contract test (pre-deploy, host gcc)
+stream_sock.c build_frame ↔ dpu_proxy.c px_mock_frame parse cross-checked: 6/6 (single frame,
+FPW batch, partial-frame-wait=seam trigger, reply-side peer routing, unknown-svc DEFER,
+corrupt-length poison). Confirms the app↔DPU frame format agrees before spending a deploy.
+
+## Validation (clean redeploy; all EXACT byte counts, not statistics; DPU log 0 drops/poison)
+served = echo-side bytes written back, CUMULATIVE on the reused pod → check DELTAS.
+| test | command | result |
+|---|---|---|
+| self 1 KB | `stream 30 1024` | 30/0 byte-exact · served 30,870 = 30×1029 (1029 = 5-hdr+1024) · p50 114.3 µs |
+| SEAM >8 KB | `stream 200 20000` | 200/0 byte-exact · served Δ = 4,001,000 = 200×20005 EXACT · p50 169.2 µs (frame=20005 B → dmesh_write auto-chunks 3 arrivals → seam rebuilds contiguous → 3-piece chained SG-DMA → delivered as ≤8 KB chunks) |
+| multi-frame/write | `stream 2000 512 self 4` | 2000/0 byte-exact · served Δ = 4,136,000 = 2000×4×517 EXACT · p50 113.9 µs (4 frames packed in one dmesh_write → 4 segs parsed from ONE window) |
+| fan-out | `stream 1000 512 11,13,14` | 1000/0 byte-exact · served FLAT (echoed on backends 11/13/14 via per-backend upstream + conntrack reply mapping, not self) · p50 202.5 µs |
+
+## Harness bugs found + fixed (test-only, no DPU-code change)
+1. Empty SVC_LIST arg collapsed under the daemon's positional sscanf → fpw slid into the svc
+   slot → frames tagged svc=1 → `unroutable seg (svc=1)` drops (DPU log), client 5 s reply
+   timeout → nc "no response". Fixed: bash sends "self" placeholder + daemon maps "self"/"-"→own
+   svc; added consecutive-fail early-abort (was a multi-hour wedge risk).
+2. run_stream did scale_up_with_wait (scale 0→1) EVERY call → restarted the pod each run; 3
+   restarts wedged DPU EU-0 msgq (`dpa.c ADD_RING send AGAIN retries=10000` → setup_pod_dma
+   fails for the reused pod slot → never dma_ready). PERSISTENT (2 fresh pods failed identically)
+   = pre-existing DPU teardown/setup fragility, NOT proxy code. Fixed run_stream to be IDEMPOTENT
+   (reuse a Running pod, no restart); recovery = fresh `dpumesh_dpu` (clean redeploy).
+
+## Conclusions
+- L4 ENGINE VALIDATED end-to-end on the frame mock: per-conn window, length-prefix reframing,
+  seam (a frame spanning arrivals rebuilt contiguous), multi-piece chained SG-DMA egress,
+  multi-frame-per-window, multi-backend fan-out + reply mapping, custody (0 drops, byte-exact,
+  served-exact), symmetric reply path. p50 114 µs (1 KB) → 169 µs (20 KB) → 202 µs (cross-pod).
+- Fan-out dest-exactness shown INDIRECTLY (byte-exact round-trip + served FLAT on the stream pod
+  = frames echoed elsewhere); a per-backend recv_total exact-count is still owed (echo prints
+  only every 100K).
+- NOT yet run: proxy-off regression baseline, `DPUMESH_PROXY=passthru` parity vs the existing
+  suite, L4-ARM-CPU / notify cost. Deploy run by ME in FOREGROUND completed without hang (the
+  old hang was background-execution-specific).
+
+# 2026-07-04 (session 2) — Option cleanup: bake tuning knobs + delete route_fn/L7_DEMO/LB_RR — DONE + VALIDATED
+
+Goal (user): the config surface grew ~17 env knobs during exploration — reduce to the ones you
+meaningfully adjust, remove legacy. Keep: `DPUMESH_PROXY` (L7 proxy on/off) + LD_PRELOAD
+(`DMESH_PRELOAD_*`) + `DPUMESH_PCI_ADDR` (device) + `DPUMESH_SERVICE_ID`. Zero-copy API
+(`DPUMESH_ARENA_SLOTS` + dmesh_alloc/slot_register) explicitly UNTOUCHED.
+
+## What changed
+- BAKED (getenv removed → compiled to the deployed winners; reference table = api.md §9):
+  NUM_SLOTS=4096 (`DPUMESH_NUM_SLOTS_DEFAULT`), SLOT_SIZE=8192, DPA_THREADS=4
+  (`objs->num_dpa_threads=4`), RINGS_PER_POD=2 (`DPUMESH_RINGS_PER_POD_DEFAULT`), EVENT_LOOP=1
+  (busy-poll-ONLY driver deleted; setup-fail fallback kept), HOST_EPOLL=1 (⚠ code default was 0,
+  deployed=1 → baked 1), PROXY_SEAM_MAX=512KB (`PX_SEAM_MAX_DEFAULT`).
+- DELETED (legacy): `route_fn` hook + `route_l7_demo` + `DPUMESH_L7_DEMO` + `DMESH_ROUTE_DROP/DEFER`
+  + objs->route_fn/l7_demo_* (the per-message L7 seam — superseded by the byte-stream proxy §8);
+  `DPUMESH_LB_RR` + `lb_pick` RR branch + objs->lb_rr_* (→ lb_pick = service_table only). dpu_route
+  now = "already-resolved short-circuit → dpu_route_l4 (service table + route-affinity)".
+- test-bench.sh: start_dpu launcher passes only `DPUMESH_PROXY`; k8s manifests dropped
+  NUM_SLOTS/RINGS_PER_POD/HOST_EPOLL. api.md: §5 hook bullet → §8 pointer, §3 env note trimmed,
+  §9 baked-config reference added.
+- Files: dpu_worker.c (−251/+…), object.h (−45), dpa.c, dpu_proxy.c, dpumesh_doca.c, api.md,
+  test-bench.sh. All host+DPU sources `gcc -fsyntax-only` clean; **BF3 ninja build clean** (only
+  pre-existing bench write-unused-result warnings) — the refactor compiles for real, not just
+  syntax-checks.
+
+## Validation (clean redeploy DPUMESH_PROXY=frame; compare to 07-04 session-1 pre-cleanup)
+Bakes == the exact values the deploy already set, so behavior must be UNCHANGED — confirmed:
+| test | command | result | vs pre-cleanup |
+|---|---|---|---|
+| self 1 KB | `stream 30 1024` | 30/0 · served 30,870 = 30×1029 | IDENTICAL |
+| SEAM >8 KB | `stream 200 20000` | 200/0 · served Δ = 4,001,000 = 200×20005 | IDENTICAL |
+| multi-frame/write | `stream 2000 512 self 4` | 2000/0 · served Δ = 4,136,000 = 2000×4×517 | IDENTICAL |
+| fan-out | `stream 1000 512 11,13,14` | 1000/0 · served FLAT (echoed on 11/13/14) | IDENTICAL |
+DPU log: **0 drops/poison/unroutable/AGAIN**. px_init: `mock=frame, seam_max=524288, sg_pieces=64`
+(baked seam cap correct). p50 104–163 µs warm (first cold N=30 = 419 µs = scale-up warmup jitter).
+
+## Conclusion
+Config surface cut to the 2 meaningful runtime toggles (DPUMESH_PROXY + LD_PRELOAD) + 2 essentials
+(PCI + service) + zero-copy arena; 7 tuning knobs baked, route_fn/L7_DEMO/LB_RR deleted. Refactor
+builds on the BF3 and is byte-for-byte behavior-identical (all EXACT counts match, 0 drops). Baked
+values + their constants/files documented in api.md §9 for future adjustment (edit constant + rebuild).

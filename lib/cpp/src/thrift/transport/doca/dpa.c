@@ -295,31 +295,13 @@ init_dpa_objects(struct objects *objs)
 {
     doca_error_t result;
 
-    /* Resolve N = number of DPA EU threads (multi-EU data plane),
-     * clamped to [1, MAX_DPA_RINGS]. */
-    if (objs->num_dpa_threads <= 0) {
-        /* Default 4 = the measured production config (2-pod pair × K=2 rings = 4
-         * active EUs). test-bench.sh sets DPUMESH_DPA_THREADS explicitly, so this
-         * default only governs a direct (non-deploy) invocation — it just keeps
-         * that off the single-EU (~74K) floor. */
-        int n = 4;
-        const char *env = getenv("DPUMESH_DPA_THREADS");
-        if (env && *env) {
-            n = atoi(env);
-            if (n < 1) n = 1;
-            if (n > MAX_DPA_RINGS) n = MAX_DPA_RINGS;
-        }
-        objs->num_dpa_threads = n;
-    }
-    /* Resolve K = rings per pod (EU-sharding), clamped to [1, num_dpa_threads]:
-     * a pod cannot spread across more EUs than exist. */
+    /* N (DPA EU threads) + K (rings/pod) are baked to the measured config (N=4,
+     * K=2) in run_dpu_worker before this runs; these guards only backstop a direct
+     * (non-worker) init and keep N off the single-EU (~74K) floor. */
+    if (objs->num_dpa_threads <= 0)
+        objs->num_dpa_threads = 4;
     if (objs->k_rings <= 0) {
-        int k = DPUMESH_RINGS_PER_POD_DEFAULT;
-        const char *kenv = getenv("DPUMESH_RINGS_PER_POD");
-        if (kenv && *kenv) {
-            k = atoi(kenv);
-            if (k < 1) k = 1;
-        }
+        int k = DPUMESH_RINGS_PER_POD_DEFAULT;   /* = 2 */
         if (k > objs->num_dpa_threads) k = objs->num_dpa_threads;
         if (k > MAX_EU_PER_POD) k = MAX_EU_PER_POD;
         objs->k_rings = k;
