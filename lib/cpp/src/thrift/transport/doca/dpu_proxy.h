@@ -25,17 +25,37 @@
  * let the host overwrite the staging bytes mid-read.
  *
  * Enabled by env DPUMESH_PROXY (unset = engine absent, legacy per-slot path
- * bit-identical):
- *   DPUMESH_PROXY=passthru|1  one seg per arrived message, dst deferred to
- *                             the L4 default route (service table + route-
- *                             affinity pins) — wire-identical message
- *                             boundaries and routing; parity/regression mock.
- *   DPUMESH_PROXY=frame       length-prefixed frame parser (the byte-stream
- *                             demo): [u32 len][u8 svc][payload]; waits for
- *                             whole frames (exercises the window/tail/seam),
- *                             routes each frame by its svc byte (gateway-
- *                             style), any length (a >8KB frame is delivered
- *                             as consecutive <=8KB byte-stream chunks).
+ * bit-identical). The mock is chosen PER CONNECTION, not once per deploy, so a
+ * single DPU can serve vanilla (LD_PRELOAD / shim) apps AND the frame validator
+ * at the same time — they are fully independent:
+ *
+ *   DPUMESH_PROXY=passthru|1  deploy default = passthru: one seg per arrived
+ *                             message, dst deferred to the L4 default route
+ *                             (service table + route-affinity pins) — wire-
+ *                             identical boundaries/routing. Works with ANY
+ *                             byte stream (no app framing needed).
+ *   DPUMESH_PROXY=frame       deploy default = frame for EVERY request stream
+ *                             (legacy all-frame behavior).
+ *   DPUMESH_PROXY_FRAME_SVC=<csv>  the services whose REQUEST streams use the
+ *                             length-prefixed frame demo parser ([u32 len][u8
+ *                             svc][payload]); every other service's requests use
+ *                             passthru. This is the knob that mixes both app
+ *                             kinds in one deploy, e.g.
+ *                             DPUMESH_PROXY=passthru DPUMESH_PROXY_FRAME_SVC=16.
+ *   DPUMESH_PROXY_L7_SVC=<csv>  the services whose REQUEST streams run the REAL
+ *                             L7 hook — dmesh_l7_route() in dpu_l7.c (see
+ *                             dpu_l7.h). Checked before FRAME_SVC. This is the
+ *                             production L7 slot; px_parse_l7 gives the hook a
+ *                             bounded HEAD window and streams the body via SG
+ *                             (no whole-message copy).
+ *
+ * REPLY streams ALWAYS use passthru regardless of the above: a reply's dst is
+ * the single conntrack peer, so per-frame vs whole-arrival segmentation yields
+ * a byte-identical delivered stream — framing a reply would only add seam cost.
+ *
+ * The frame parser waits for whole frames (exercising the window/tail/seam) and
+ * routes each frame by its svc byte (gateway-style), any length (a >8KB frame is
+ * delivered as consecutive <=8KB byte-stream chunks).
  */
 
 #include <stdint.h>

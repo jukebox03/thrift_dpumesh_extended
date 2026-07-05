@@ -39,6 +39,7 @@
 #endif
 
 #include "dpu_proxy.h"
+#include "dpu_l7.h"     /* the L7 author hook (dmesh_l7_route) */
 
 #include "object.h"
 #include "dpu_worker.h"
@@ -82,6 +83,17 @@ DOCA_LOG_REGISTER(DPU_PROXY);
  * poison the conn via the stalled-at-seam-cap path. */
 #define PX_FRAME_MAX        (256u * 1024u)
 #define PX_FRAME_HDR        5u
+
+/* L7 head-only path: the parser (dmesh_l7_route, dpu_l7.c) is given at most a
+ * PX_HEAD_MAX contiguous window to read a message HEAD (length + routing key);
+ * the BODY is never linearized — it ships from staging via SG. So the only copy
+ * is a bounded <=PX_HEAD_MAX assembly, and only when a head straddles a slot.
+ * A head larger than this poisons the conn (cf. Envoy max_request_headers_kb). */
+#define PX_HEAD_MAX         (4u * 1024u)
+/* Max bytes shipped as ONE egress unit on the L7 path — keeps a unit within the
+ * SG piece cap (PX_SG_PIECES_MAX slots) and the host RX region. A larger message
+ * streams as consecutive units, in order, to the one resolved backend. */
+#define PX_L7_UNIT_MAX      (128u * 1024u)
 
 /* Refresh the (DMA-read) host credit cache when headroom drops below this
  * many entries — same lazy scheme as the DPA reverse admission. */
@@ -193,11 +205,21 @@ struct px_conn {
     uint16_t fin_ack_port, fin_ack_seq;
     uint16_t egress_seq;              /* per-conn delivery unit counter */
     int      dst_service_set;
+    dmesh_proxy_route_fn route_fn;    /* linear parser (passthru/frame); NULL for L7 */
+    uint32_t parse_win_max;           /* seam cap for THIS conn (seam_max, or PX_HEAD_MAX for L7) */
+    int      is_l7;                   /* 1 = head-only L7 path (px_parse_l7) */
+    uint32_t msg_remaining;           /* L7: bytes left to ship of the in-progress message */
+    int32_t  msg_dst;                 /* L7: backend resolved once at the message head */
 };
 
 struct dmesh_proxy {
-    dmesh_proxy_route_fn fn;
-    const char *mock_name;
+    /* Per-connection mock selection (NOT one global mock): a REQUEST stream
+     * frames iff its addressed service is designated frame; every other request
+     * and EVERY reply uses passthru. This is what lets vanilla (shim) apps and
+     * the frame validator share one deploy — see px_service_frames(). */
+    int      default_frame;              /* DPUMESH_PROXY=frame → request default = frame */
+    uint8_t  svc_frame[POD_ID_SPACE];    /* DPUMESH_PROXY_FRAME_SVC csv → force-frame these services */
+    uint8_t  svc_l7[POD_ID_SPACE];       /* DPUMESH_PROXY_L7_SVC csv → route via the L7 author hook */
     uint32_t seam_max;
     uint32_t sg_pieces_max;
 
@@ -313,6 +335,52 @@ static struct px_conn *px_conn_get(struct dmesh_proxy *px, int32_t pod, uint16_t
 
 static void px_drop_window(struct objects *objs, struct px_conn *c, const char *why);
 
+/* The parsers (defined at the bottom). px_parse dispatches between them
+ * per-connection, so they are referenced above their definitions. */
+static int px_mock_passthru(struct objects *objs, dmesh_proxy_conn *conn,
+                            const uint8_t *buf, uint32_t avail,
+                            struct dmesh_route_seg *segs, int max, uint32_t *consumed);
+static int px_mock_frame(struct objects *objs, dmesh_proxy_conn *conn,
+                         const uint8_t *buf, uint32_t avail,
+                         struct dmesh_route_seg *segs, int max, uint32_t *consumed);
+/* Head-only L7 loop (defined near px_parse). Its own loop — not a linear
+ * parser — because it ships bodies beyond the contiguous view via SG. */
+static void px_parse_l7(struct objects *objs, struct px_conn *c);
+
+/* A REQUEST stream frames iff its addressed service is designated frame
+ * (DPUMESH_PROXY_FRAME_SVC), else falls back to the deploy default
+ * (DPUMESH_PROXY=frame → frame; passthru/1 → passthru). */
+static int px_service_frames(struct dmesh_proxy *px, int16_t svc) {
+    if (svc >= 0 && svc < POD_ID_SPACE && px->svc_frame[svc])
+        return 1;
+    return px->default_frame;
+}
+
+/* Resolve a connection's parse path ONCE at first arrival (sets c fields):
+ *   - replies always pass through (dst = the single conntrack peer, so
+ *     segmentation cannot change the delivered byte stream);
+ *   - a request to an L7 service (DPUMESH_PROXY_L7_SVC) → head-only L7 loop
+ *     (route_fn NULL, is_l7=1, bounded head window);
+ *   - a request to a frame service (or default=frame) → the frame demo;
+ *   - otherwise → passthru (vanilla / shim). */
+static void px_resolve_route(struct dmesh_proxy *px, struct px_conn *c,
+                             int is_reply, int16_t svc) {
+    c->is_l7 = 0;
+    c->parse_win_max = px->seam_max;
+    if (!is_reply && svc >= 0 && svc < POD_ID_SPACE && px->svc_l7[svc]) {
+        c->is_l7 = 1;
+        c->parse_win_max = PX_HEAD_MAX;       /* bounded head window — no whole-message seam */
+        c->route_fn = NULL;                   /* uses px_parse_l7, not a linear parser */
+        return;
+    }
+    if (is_reply)
+        c->route_fn = px_mock_passthru;
+    else if (px_service_frames(px, svc))
+        c->route_fn = px_mock_frame;
+    else
+        c->route_fn = px_mock_passthru;
+}
+
 static void px_conn_del(struct objects *objs, struct px_conn *c) {
     struct dmesh_proxy *px = objs->proxy;
     if (c->parse_pos < c->stream_end)
@@ -373,6 +441,16 @@ static void px_view(struct objects *objs, struct px_conn *c,
     *avail = (uint32_t)(a->stream_base + a->len - c->parse_pos);
 }
 
+/* Head window for the L7 path: the same view as px_view but capped at
+ * PX_HEAD_MAX. The parser reads only the message HEAD here; the body ships from
+ * staging via SG and is never linearized. */
+static void px_head_view(struct objects *objs, struct px_conn *c,
+                         const uint8_t **buf, uint32_t *avail) {
+    px_view(objs, c, buf, avail);
+    if (*avail > PX_HEAD_MAX)
+        *avail = PX_HEAD_MAX;
+}
+
 /* Copy stream bytes [from, to) out of the window's staging extents. */
 static void px_copy_stream(struct objects *objs, struct px_conn *c,
                            uint8_t *dst, uint64_t from, uint64_t to) {
@@ -411,11 +489,14 @@ static int px_seam_grow(struct objects *objs, struct px_conn *c) {
     if (c->stream_end <= view_end)
         return 0;                              /* nothing beyond the view yet */
 
-    uint64_t want_end = base + px->seam_max;
+    /* Per-conn cap: seam_max for the linear (frame) path, PX_HEAD_MAX for L7
+     * (the head window never grows into the body). */
+    uint32_t win = c->parse_win_max ? c->parse_win_max : px->seam_max;
+    uint64_t want_end = base + win;
     if (want_end > c->stream_end)
         want_end = c->stream_end;
     if (want_end <= view_end)
-        return 0;                              /* seam cap reached */
+        return 0;                              /* window cap reached */
 
     uint32_t need = (uint32_t)(want_end - base);
     if (need > c->seam_cap) {
@@ -669,6 +750,11 @@ static void px_parse(struct objects *objs, struct px_conn *c) {
     struct dmesh_proxy *px = objs->proxy;
     struct dmesh_route_seg segs[DMESH_PROXY_SEG_MAX];
 
+    if (c->is_l7) {                            /* head-only path — its own loop */
+        px_parse_l7(objs, c);
+        return;
+    }
+
     while (c->parse_pos < c->stream_end) {
         if (c->pub.is_reply) {
             /* the reply's dst is predetermined — L4 conntrack lookup */
@@ -686,7 +772,9 @@ static void px_parse(struct objects *objs, struct px_conn *c) {
         px_view(objs, c, &buf, &avail);
         if (avail == 0)
             break;
-        int n = px->fn(objs, &c->pub, buf, avail, segs, DMESH_PROXY_SEG_MAX, &consumed);
+        /* Per-connection parser/router, resolved at first arrival. */
+        dmesh_proxy_route_fn fn = c->route_fn ? c->route_fn : px_mock_passthru;
+        int n = fn(objs, &c->pub, buf, avail, segs, DMESH_PROXY_SEG_MAX, &consumed);
         if (n < 0) {
             px_poison(objs, c, "proxy_route returned error");
             return;
@@ -703,11 +791,80 @@ static void px_parse(struct objects *objs, struct px_conn *c) {
          * input. Align the tail into the seam; if the view is already maximal
          * and capped while more bytes exist, the parser can never proceed. */
         if (!px_seam_grow(objs, c)) {
-            if (c->seam_on && c->seam_len >= px->seam_max &&
-                c->stream_end > c->seam_base + px->seam_max)
+            if (c->seam_on && c->seam_len >= c->parse_win_max &&
+                c->stream_end > c->seam_base + c->parse_win_max)
                 px_poison(objs, c, "parser stalled at seam cap");
             break;
         }
+    }
+}
+
+/* Head-only L7 loop: parse each message's HEAD in a bounded window, then stream
+ * its bytes to the resolved backend via SG — the body is never linearized. */
+static void px_parse_l7(struct objects *objs, struct px_conn *c) {
+    struct dmesh_l7_ctx ctx;
+    ctx.service     = c->pub.dst_service;
+    ctx.client_pod  = c->pub.src_pod;
+    ctx.client_port = c->pub.src_port;
+
+    while (c->parse_pos < c->stream_end) {
+        if (c->msg_remaining == 0) {           /* at a message boundary → parse its head */
+            /* Re-anchor the head window at THIS message: a seam grown for a
+             * previous head is capped relative to its own base, so reusing it
+             * for a later message could stall short of PX_HEAD_MAX. Dropping it
+             * lets px_head_view re-anchor (zero-copy tail, or a fresh bounded
+             * seam) at parse_pos. */
+            if (c->seam_on && c->parse_pos > c->seam_base) {
+                c->seam_on = 0;
+                c->seam_len = 0;
+            }
+            const uint8_t *buf;
+            uint32_t avail;
+            px_head_view(objs, c, &buf, &avail);   /* <= PX_HEAD_MAX contiguous */
+            if (avail == 0)
+                break;
+            int32_t target = c->pub.dst_service;
+            int r = dmesh_l7_route(buf, avail, &ctx, &target);
+            if (r < 0) {
+                px_poison(objs, c, "l7 route error");
+                return;
+            }
+            if (r == 0) {                      /* head not fully seen yet */
+                if (avail >= PX_HEAD_MAX) {    /* head bigger than the window → poison */
+                    px_poison(objs, c, "l7 head exceeds PX_HEAD_MAX");
+                    return;
+                }
+                if (!px_seam_grow(objs, c))    /* assemble more head bytes (bounded), or wait */
+                    break;
+                continue;
+            }
+            c->msg_remaining = (uint32_t)r;    /* total message length (body need not be here) */
+            /* Resolve the backend ONCE so every chunk of this message pins to it
+             * (in order). A content-chosen service resolves per-message; the
+             * default keeps the L4 route + route-affinity of the head arrival. */
+            c->msg_dst = (target == c->pub.dst_service)
+                         ? dpu_route_l4(objs, c->pub.dst_service, px_rg_at(c, c->parse_pos))
+                         : dpu_route_l4(objs, (int16_t)target, 0);
+        }
+
+        /* Ship the next chunk of the in-progress message from staging via SG.
+         * Bounded so one unit stays within the SG piece cap + host RX region. */
+        uint64_t arrived = c->stream_end - c->parse_pos;
+        if (arrived == 0)
+            break;                             /* body incomplete → wait for more arrivals */
+        uint32_t chunk = c->msg_remaining;
+        if ((uint64_t)chunk > arrived)
+            chunk = (uint32_t)arrived;
+        if (chunk > PX_L7_UNIT_MAX)
+            chunk = PX_L7_UNIT_MAX;
+
+        struct dmesh_route_seg seg;
+        seg.off = 0;                           /* px_ship_seg: sbeg = parse_pos + off */
+        seg.len = chunk;
+        seg.dst = c->msg_dst;                  /* concrete pod (<0 → drop-accounted inside) */
+        px_ship_seg(objs, c, &seg);
+        px_advance(objs, c, chunk);            /* claimed bytes drop nothing; frees spent arrivals */
+        c->msg_remaining -= chunk;
     }
 }
 
@@ -778,6 +935,8 @@ int px_ingest_forward(struct objects *objs, void *ventry) {
     if (!c->dst_service_set) {
         c->pub.dst_service = e->dst_service;
         c->dst_service_set = 1;
+        /* Resolve this connection's parse path once (L7 / frame / passthru). */
+        px_resolve_route(px, c, is_reply, e->dst_service);
     }
 
     if (e->length == 0) {                      /* FIN */
@@ -1266,7 +1425,32 @@ static int px_mock_frame(struct objects *objs, dmesh_proxy_conn *conn,
     return n;
 }
 
+/* (The L7 path is NOT a linear dmesh_proxy_route_fn — it ships bodies beyond the
+ * contiguous view via SG, so it lives in px_parse_l7 above, calling the author
+ * hook dmesh_l7_route directly.) */
+
 /* ====== init ====== */
+
+/* Parse a csv of service ids from `env` into a POD_ID_SPACE flag table.
+ * Returns the number of distinct in-range ids set. */
+static int px_parse_svc_csv(const char *env, uint8_t *table) {
+    int count = 0;
+    if (!env || !*env)
+        return 0;
+    const char *p = env;
+    while (*p) {
+        char *end;
+        long v = strtol(p, &end, 10);
+        if (end == p) break;                       /* not a number → stop */
+        if (v >= 0 && v < POD_ID_SPACE && !table[v]) {
+            table[(int)v] = 1;
+            count++;
+        }
+        p = end;
+        while (*p == ',' || *p == ' ') p++;
+    }
+    return count;
+}
 
 int px_init(struct objects *objs) {
     const char *env = getenv("DPUMESH_PROXY");
@@ -1278,13 +1462,12 @@ int px_init(struct objects *objs) {
     if (!px)
         return DOCA_ERROR_NO_MEMORY;
 
-    if (strcmp(env, "frame") == 0) {
-        px->fn = px_mock_frame;
-        px->mock_name = "frame";
-    } else {
-        px->fn = px_mock_passthru;
-        px->mock_name = "passthru";
-    }
+    /* Deploy default request mode (legacy: DPUMESH_PROXY=frame → frame-all,
+     * else passthru). Per-service overrides: DPUMESH_PROXY_L7_SVC (author hook,
+     * checked first) and DPUMESH_PROXY_FRAME_SVC (frame demo). */
+    px->default_frame = (strcmp(env, "frame") == 0) ? 1 : 0;
+    int n_l7_svc    = px_parse_svc_csv(getenv("DPUMESH_PROXY_L7_SVC"),    px->svc_l7);
+    int n_frame_svc = px_parse_svc_csv(getenv("DPUMESH_PROXY_FRAME_SVC"), px->svc_frame);
     px->seam_max = PX_SEAM_MAX_DEFAULT;
 
     px->buckets = (struct px_conn **)calloc(PX_CONN_HASH, sizeof(*px->buckets));
@@ -1338,8 +1521,10 @@ int px_init(struct objects *objs) {
     if (ret != DOCA_SUCCESS) goto fail;
 
     objs->proxy = px;
-    DOCA_LOG_WARN("DPU PROXY MODE ON (L4 window+SG-DMA engine; mock=%s, seam_max=%u, sg_pieces=%u)",
-                  px->mock_name, px->seam_max, px->sg_pieces_max);
+    DOCA_LOG_WARN("DPU PROXY MODE ON (L4 window+SG-DMA engine; request-default=%s, l7-services=%d, "
+                  "frame-services=%d, replies=passthru, seam_max=%u, sg_pieces=%u)",
+                  px->default_frame ? "frame" : "passthru", n_l7_svc, n_frame_svc,
+                  px->seam_max, px->sg_pieces_max);
     return DOCA_SUCCESS;
 
 oom:

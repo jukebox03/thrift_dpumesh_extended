@@ -563,27 +563,49 @@ int proxy_route(conn, const uint8_t *buf, uint32_t avail,
 - **Ordering.** One receiving conn always lands in ONE lane (FIFO), so a conn's delivery order =
   segment order; one unit's chunks are never interleaved with another's.
 
-**The two mocks** (the L7 parser is **not** built here — these validate the L4 engine):
-| `DPUMESH_PROXY=` | behavior | purpose |
+**The parser is chosen per connection** from the addressed service — **not** a single global
+choice. So a vanilla (shim) app, the frame demo, and a real L7 service **coexist in one deploy**,
+independently.
+| env | behavior | purpose |
 |---|---|---|
-| *(unset)* | engine absent — legacy per-slot path | production default, **bit-identical** |
-| `passthru` | one segment per arrived message; `dst` = the §5 L4 route | parity / regression (wire-identical boundaries + routing) |
-| `frame` | `[u32 len][u8 svc][payload]` — routes each **whole frame** by its `svc` byte; a >8 KB frame ships as consecutive ≤8 KB chunks | the byte-stream demo — exercises the window / tail / **seam** |
+| `DPUMESH_PROXY` *(unset)* | engine absent — legacy per-slot path | production default, **bit-identical** |
+| `DPUMESH_PROXY=passthru` \| `1` | deploy default = **passthru**: one segment per arrived message; `dst` = the §5 L4 route. Works with **any** byte stream (no app framing). | parity / regression + the vanilla (shim) path |
+| `DPUMESH_PROXY=frame` | deploy default = **frame** for every request stream (legacy all-frame) | the byte-stream demo |
+| `DPUMESH_PROXY_FRAME_SVC=<csv>` | services whose **request** streams use the frame demo parser `[u32 len][u8 svc][payload]` (routes each whole frame by `svc`; a >8 KB frame ships as ≤8 KB chunks) | mix app kinds: `DPUMESH_PROXY=passthru DPUMESH_PROXY_FRAME_SVC=16` |
+| `DPUMESH_PROXY_L7_SVC=<csv>` | services whose **request** streams run the **real L7 hook** — `dmesh_l7_route` in `dpu_l7.c` (checked before frame) | the production L7 slot |
+
+**Writing an L7 parser.** Implement one function, `dmesh_l7_route`, in `dpu_l7.c` (contract in
+`dpu_l7.h`): you are shown only the **head** of the front message (a bounded ≤`PX_HEAD_MAX`
+window); return the whole message's **total length** (`>0`, may far exceed the head window), `0`
+= "head not fully here", or `<0` = malformed; optionally set `*target` to route by content. The
+engine **streams the body from staging via SG** — it is never linearized, so a large message
+costs **no per-slot memcpy**; the only copy is the ≤`PX_HEAD_MAX` head, and only when a head
+straddles a slot. The hook is **stateless, no malloc, no locks**. Assign its services with
+`DPUMESH_PROXY_L7_SVC`; a head larger than `PX_HEAD_MAX` poisons the conn (cf. Envoy
+`max_request_headers_kb`). Everything else is unaffected.
+
+**Reply streams always pass through** regardless of the above: a reply's `dst` is the single
+conntrack peer, so per-frame vs whole-arrival segmentation delivers a **byte-identical** stream —
+framing a reply would only add seam cost.
 
 Drive `frame` with `bench/stream_sock.c` (`./test-bench.sh stream <N> <SIZE> [<SVC_LIST>] [<FPW>]`):
 it sends length-prefixed frames and checks **byte-exact** echo + a **served-byte exact-count**.
+Deploy it two ways: legacy `DPUMESH_PROXY=frame`, or decoupled
+`DPUMESH_PROXY=passthru DPUMESH_PROXY_FRAME_SVC=16` — the latter passes `./test-bench.sh preload`
+(vanilla shim, svc 15) and `./test-bench.sh stream` (frame, svc 16) against the **same** DPU.
 Validated (scale_log 07-04): byte-exact for self-loopback (1 KB), a >8 KB frame (seam), several
 frames per write (`FPW`), and fan-out across backends (`SVC_LIST`) — 0 drops. **Status:** the L4
-engine is mock-validated; the real body-parsing L7 (parse + LB + policy) is future — it plugs into
-`proxy_route` **without touching the transport**.
+engine is validated and the L7 plug-in slot (`dpu_l7.c`) is wired; writing the real body parser
+(parse + LB + policy) is the author's step and needs **no transport changes**.
 
 ---
 
 ## 9. Baked data-plane configuration (reference)
 
 The data-plane tuning that used to be `DPUMESH_*` env knobs is now **compiled in** at the values
-measured as best; the only runtime env left is `DPUMESH_PROXY` (§8), `DPUMESH_PCI_ADDR`,
-`DPUMESH_SERVICE_ID`, `DPUMESH_ARENA_SLOTS` (§3), and the `DMESH_PRELOAD_*` shim vars (§7). **To
+measured as best; the only runtime env left is `DPUMESH_PROXY` + `DPUMESH_PROXY_FRAME_SVC` +
+`DPUMESH_PROXY_L7_SVC` (§8), `DPUMESH_PCI_ADDR`, `DPUMESH_SERVICE_ID`, `DPUMESH_ARENA_SLOTS` (§3),
+and the `DMESH_PRELOAD_*` shim vars (§7). **To
 change a baked value, edit the named constant/assignment and rebuild** (no env override).
 
 | Setting | Baked value | Constant / assignment | File |

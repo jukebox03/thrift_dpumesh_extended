@@ -74,6 +74,7 @@
 /usr/local/include/thrift/transport/doca/common.h
 /usr/local/include/thrift/transport/doca/dpa_common.h
 /usr/local/include/thrift/transport/doca/dpumesh_common.h
+/usr/local/include/thrift/transport/doca/dpu_l7.h
 /usr/local/include/thrift/transport/doca/config.h
 /usr/local/include/thrift/transport/doca/comch_consumer.h
 /usr/local/include/thrift/transport/doca/ring.h

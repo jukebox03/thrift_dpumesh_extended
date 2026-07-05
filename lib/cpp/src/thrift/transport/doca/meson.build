@@ -39,6 +39,7 @@ srcs = [
     'comch_msgq.c',
     'dpa.c',
     'dpu_proxy.c',
+    'dpu_l7.c',
 ]
 
 # Build DPA kernel via DPACC

@@ -3427,3 +3427,62 @@ Config surface cut to the 2 meaningful runtime toggles (DPUMESH_PROXY + LD_PRELO
 (PCI + service) + zero-copy arena; 7 tuning knobs baked, route_fn/L7_DEMO/LB_RR deleted. Refactor
 builds on the BF3 and is byte-for-byte behavior-identical (all EXACT counts match, 0 drops). Baked
 values + their constants/files documented in api.md §9 for future adjustment (edit constant + rebuild).
+
+---
+
+# 2026-07-05 · L7 head-only streaming (bounded head copy, body via SG) — CODE LANDED, HW PENDING
+
+**Problem (verified in code, not measured):** the L7/frame path linearizes a WHOLE message into
+the seam (`px_copy_stream` memcpy) just to give the parser a contiguous view — but egress ships
+from staging via SG regardless. For byte-stream apps (LD_PRELOAD) whose messages don't align to
+8 KB slots, that is a per-slot memcpy of the entire body — pure waste.
+
+**Change:** new head-only L7 path (`DPUMESH_PROXY_L7_SVC=<csv>`), gated per service so passthru/
+frame/reply paths stay byte-identical.
+- `dpu_l7.h` / `dpu_l7.c`: author hook `dmesh_l7_route(head, len, ctx, *target)` returns the
+  message TOTAL length from the HEAD (may far exceed the head window); body never seen.
+- `px_parse_l7` (dpu_proxy.c): parses the head in a bounded ≤`PX_HEAD_MAX`(4 KB) window (zero-copy
+  when the head fits a slot; ≤4 KB copy only when a head straddles), resolves the backend once,
+  then streams `[parse_pos, +min(remaining, arrived, PX_L7_UNIT_MAX=128 KB)]` via existing SG
+  `px_ship_seg` — body never linearized. Large messages stream in ≤128 KB units (≤17 SG pieces,
+  under the 64 cap), in order, to one backend.
+- Engine: seam cap made per-conn (`parse_win_max`; PX_HEAD_MAX for L7, seam_max for frame);
+  stall/poison check uses it; head-window re-anchored per message.
+
+**Verification so far:** `gcc -fsyntax-only` clean on dpu_proxy.c (DOCA includes) and dpu_l7.c
+(`-Wall -Wextra`). passthru/frame/reply unchanged (dispatch gated on `is_l7`). Self-reviewed
+custody/advance/FIN/streaming interactions (drop-accounting reuses the existing frame path).
+
+**Regression test is clean:** the default `dmesh_l7_route` parses the SAME wire format as the
+`stream` validator (`[u32 total_len][u8 svc][payload]`), so `./test-bench.sh stream` drives the L7
+head-only path directly. Head-only must be BYTE-IDENTICAL to frame mode (same client + byte-exact +
+served-count checks); SIZE>8 KB specifically exercises head-only streaming vs whole-message seam.
+
+## HW results (2026-07-05, cluster recovered)
+
+Env recovery first (07-04 reboot dropped 3 non-persistent boot configs): (1) swap re-enabled →
+kubelet `failSwapOn` crash-loop (NRestarts=10242) → `swapoff -a` + fstab comment; (2) DPU
+unreachable — host `tmfifo_net0` lost `192.168.100.1/24` → re-added; (3) flannel CrashLoopBackOff —
+`br_netfilter` not loaded (`/proc/sys/net/bridge/bridge-nf-call-iptables` missing) → `modprobe
+br_netfilter` + `sysctl`. After all three, node Ready + pods up. New binary confirmed by px_init log
+line `request-default=..., l7-services=N`.
+
+Frame baseline on the NEW binary (regression): `stream 200 20000` → **200/0, served 4,001,000** —
+IDENTICAL to 07-04. Frame path unchanged. ✓
+
+L7 head-only (`DPUMESH_PROXY=passthru DPUMESH_PROXY_L7_SVC=16`; px_init `l7-services=1`). Served is a
+DPU cumulative counter → deltas shown:
+| test | OK/Fail | served Δ | expected | vs frame |
+|---|---|---|---|---|
+| `stream 200 20000` (**>8 KB → head-only streaming vs whole-seam**) | 200/0 | 4,001,000 | 200×20005 | **IDENTICAL** |
+| `stream 30 1024` | 30/0 | 30,870 | 30×1029 | **IDENTICAL** |
+| `stream 2000 512 self 4` (multi-frame/write) | 2000/0 | 4,136,000 | 2000×4×517 | **IDENTICAL** |
+| `preload 5000 1024 8` (vanilla shim, svc 15 passthru) | 5000/0 | 26,446 RPS, p50 122µs/p99 175µs | — | unaffected |
+DPU log: **0 poison/drop/unroutable/AGAIN/stall**. p50 ~114–161 µs.
+
+## Conclusion
+Head-only L7 (bounded ≤PX_HEAD_MAX head window + body streamed from staging via SG, no whole-message
+seam) is **byte-exact** with the frame whole-message-seam path across small (1 KB), >8 KB (seam case),
+and multi-frame/write — 0 fail, 0 DPU-side drops. Vanilla shim (passthru) unaffected; frame path no
+regression. The per-slot seam memcpy for byte-stream L7 traffic is eliminated with identical delivery.
+VALIDATED.

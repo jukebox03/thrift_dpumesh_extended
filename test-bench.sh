@@ -291,16 +291,24 @@ start_dpu() {
     # DPU log level (40=WARN+; 50=INFO+).
     local log_level="${DPUMESH_LOG_LEVEL:-40}"
     # L7-proxy L4 engine (api.md §8, dpu_proxy.c). Unset (default) = engine off,
-    # legacy per-slot path bit-identical. "passthru" = one seg per message (wire-
-    # identical boundaries; parity/regression). "frame" = length-prefix byte-stream
-    # parser routed by svc byte (drive it with the `stream` command / stream_sock.c).
+    # legacy per-slot path bit-identical. "passthru" = deploy default one-seg-per-
+    # message (wire-identical boundaries; parity/regression). "frame" = deploy
+    # default length-prefix byte-stream parser routed by svc byte.
+    # The parser is chosen PER CONNECTION by the addressed service:
+    #   DPUMESH_PROXY_L7_SVC="<csv>"    → the real L7 author hook (dpu_l7.c)
+    #   DPUMESH_PROXY_FRAME_SVC="<csv>" → the frame demo/validator
+    # everything else (and every reply) passes through. So vanilla shim apps, the
+    # frame validator, and an L7 service all share ONE deploy, e.g.
+    #   DPUMESH_PROXY=passthru DPUMESH_PROXY_FRAME_SVC=16 DPUMESH_PROXY_L7_SVC=11
     # (DPA EU count, rings/pod, event-loop are baked into the binary — no longer env.)
     local proxy="${DPUMESH_PROXY:-}"
-    step "=== Starting dpumesh_dpu (proxy='$proxy') ==="
+    local frame_svc="${DPUMESH_PROXY_FRAME_SVC:-}"
+    local l7_svc="${DPUMESH_PROXY_L7_SVC:-}"
+    step "=== Starting dpumesh_dpu (proxy='$proxy' frame_svc='$frame_svc' l7_svc='$l7_svc') ==="
     stop_dpu
     ssh "$DPU_HOST" "cat > /tmp/start_dpu_bench.sh << 'LAUNCHER'
 #!/bin/bash
-screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_PROXY=$proxy ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
+screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_PROXY=$proxy DPUMESH_PROXY_FRAME_SVC=$frame_svc DPUMESH_PROXY_L7_SVC=$l7_svc ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
 sleep 2
 pgrep -f 'dpumesh_dpu.*03:00' || echo NO_PID
 LAUNCHER
@@ -1178,11 +1186,15 @@ case "$CMD" in
         run_loopback "${2:-50000}" "${3:-8192}" "${4:-0}"   # $4=1 → zero-copy (dmesh_alloc)
         ;;
     stream)
-        # Byte-stream / L7-proxy frame validator. REQUIRES the DPU launched with
-        # DPUMESH_PROXY=frame (redeploy: DPUMESH_PROXY=frame $0 deploy). Scales the
-        # stream-dpumesh pod up on demand, sends length-prefixed frames the DPU
-        # reframes + routes, checks byte-exact echo. $4 = svc list (default self;
-        # "11,13,14" fans out), $5 = frames/write (default 1; >1 packs a burst).
+        # Byte-stream / L7-proxy frame validator (stream-dpumesh = svc 16). Needs
+        # svc 16 in frame mode: either the legacy all-frame deploy
+        #   DPUMESH_PROXY=frame $0 deploy
+        # or the DECOUPLED deploy that also serves vanilla shim apps:
+        #   DPUMESH_PROXY=passthru DPUMESH_PROXY_FRAME_SVC=16 $0 deploy
+        # (then `$0 preload` and `$0 stream` both pass against the SAME DPU).
+        # Scales the stream-dpumesh pod up on demand, sends length-prefixed frames
+        # the DPU reframes + routes, checks byte-exact echo. $4 = svc list (default
+        # self; "11,13,14" fans out), $5 = frames/write (default 1; >1 packs a burst).
         pin_pods fair >/dev/null
         run_stream "${2:-20000}" "${3:-1024}" "${4:-}" "${5:-1}"
         ;;
