@@ -3486,3 +3486,127 @@ seam) is **byte-exact** with the frame whole-message-seam path across small (1 K
 and multi-frame/write — 0 fail, 0 DPU-side drops. Vanilla shim (passthru) unaffected; frame path no
 regression. The per-slot seam memcpy for byte-stream L7 traffic is eliminated with identical delivery.
 VALIDATED.
+
+---
+
+# 2026-07-08 · P1: lock-free forward ring (host-only Vyukov MPSC) — BUILT + HW-VALIDATED
+
+Context: moving toward per-CONNECTION mmap buffers (to kill the shared Treiber TX slot
+pool + custody + arena on the host, and align with the socket model). Step 1: make the
+per-pod K forward descriptor rings LOCK-FREE so multiple conns/threads post without the
+per-ring mutex. Ring COUNT unchanged (DPA polls rings, not data buffers — see below).
+
+## What changed (HOST-ONLY; DPA/DPU untouched)
+- ring.h: struct dma_ring += `enq_pos` (monotonic producer ticket) + `seq[]` (per-slot
+  Vyukov cell sequence, HOST memory, init seq[i]=i). The DPU reverse ring leaves them
+  unused (single ARM producer -> get_next_dma_desc + head).
+- ring.c: setup_dma_ring allocs+inits seq[]; setup_dpu_tx_ring sets seq=NULL.
+- dpumesh_doca.c: dmesh_enqueue claim = Vyukov. fetch-add ticket t; own slot t%size when
+  seq==t, OR the prev occupant (ticket t-size) has PUBLISHED (seq==t-size+1) AND the DPA
+  CONSUMED it (valid==0) -> reclaim; then publish valid=1, then seq=t+1. Removed
+  ring_locks[] (decl/init/destroy) + the get_next_dma_desc call on the host path.
+
+## Why NOT the simpler CAS+valid (rejected)
+A first attempt (CAS the shared head, gate on valid==0) had a producer-PREEMPTION lapping
+hazard: a producer that wins its ticket but stalls before publishing leaves valid==0, so a
+lapping producer (ticket t+size, same slot) sees "free" and OVERWRITES the slot -> double
+use / lost message. Walked a size=2 counter-example; reverted it. Vyukov's per-slot seq
+fixes it: a stalled producer leaves seq UNADVANCED (still t-size+1, not t+1), so the
+lapping producer's reclaim check fails and it WAITS. DPA needs NO change because its
+existing valid=0 IS the "consumed" signal; the seq bookkeeping is entirely host-side (the
+next-gen producer reclaims when it observes valid==0). Ordering key: publish valid=1
+BEFORE the release-store of seq=t+1, so a reclaiming producer that sees the seq also sees
+valid's effect (never a stale pre-consume 0).
+
+## HW validation (plain deploy, no proxy; must be behavior-IDENTICAL to the mutex)
+| test | result | vs baseline |
+|---|---|---|
+| native RPC 30K/5s/1KB   | 150,000/0 · p50 172µs | — |
+| native RPC 100K/8s/1KB  | 800,000/0 · p50 191µs | — |
+| native RPC 200K/10s/1KB | 2,000,000/0 · 198,892 RPS · p50 277µs | = baseline (198.9K) |
+| loopback 20000×8KB      | 20,000/0 · served 20,000 · p50 117µs | = baseline |
+| preload shim 5000×1KB×8c| 5,000/0 · p50 141µs · 24.8K RPS | = baseline |
+All 0-fail; 5 tests back-to-back (no redeploy) -> no state leak. Lock-free ring is
+bit-identical at the native ceiling. DPU log 0 errors ("ctx DPA ops are empty" WRNs =
+normal DPA init; "DPU register timeout — continuing" at deploy = known benign flake, pods
+Running + all tests passed). Host `gcc -fsyntax-only` clean on both edited files.
+
+## Next
+E0: forward DPA `ring->host_mmap` -> `desc->mmap` (host already stamps its own
+ctx->dpa_mmap_handle there) — tests whether a HOST-computed DPA handle is usable by the
+DPA, which decides if per-conn TX buffers need a DPU registration round-trip or can be
+host-only. Then P2a (host TX per-conn: delete Treiber pool + arena + custody), P2b (host
+RX per-conn: delete shared rx credit). Config: DPUMESH_CONN_POOL / DPUMESH_CONN_SLOTS
+(user-tunable pool size = max concurrent conns; shim uses the façade so it is transparent).
+
+## E0 experiment (same day) — host-computed DPA handle NOT usable by the DPA → NEGATIVE
+Goal: decide whether per-conn TX buffers can be HOST-ONLY (host computes each buffer's DPA
+handle, stamps desc->mmap, no DPU round-trip) or need a DPU import + handle-return.
+Change (1 line, dpa_kernel.c): forward dma_copy SOURCE `ring->host_mmap` (DPU-imported) ->
+`desc->mmap` (host stamps ctx->dpa_mmap_handle = its own doca_mmap_dev_get_dpa_handle).
+Result: **native 30K = 0 / 300 (ALL FAIL)**, 0 RPS. The host-computed handle (host device
+has no access to the DPU's DPA) is NOT usable by the DPA — forward delivery breaks
+completely. DPU log: no explicit DMA error line (silent drop). Reverted + redeployed ->
+30K back to 150,000/0. CONCLUSION: true per-conn SEPARATE mmaps require a DPU-side import +
+handle-return handshake (host cannot self-serve the handle).
+
+## Design pivot exposed by E0: per-conn REGIONS vs per-conn separate MMAPS
+E0's negative means separate per-conn mmaps need a DPU registration round-trip (pool +
+handshake). BUT the user's stated complexity target (kill the Treiber slot pool + custody
+linked-list + arena + discontiguous allocation) is ALSO achieved by partitioning the ONE
+existing shared TX mmap into N per-conn contiguous REGIONS — each conn owns a region as a
+single-producer ring — with ZERO DPU change and ZERO handshake (desc->mmap stays the shared
+ring->host_mmap; desc->addr carries the region offset; forward DPA unchanged). Regions match
+the socket SO_SNDBUF model (per-conn buffer, not per-conn MR) and moot the mkey-count
+question. Trade: regions cap concurrent conns at buffer_size/region_size (configurable) and
+give no per-conn MR isolation. Decision surfaced to the user.
+
+---
+
+# 2026-07-08 · Bottleneck: DMA COUNT vs DATA-VOLUME — POSITIVELY RESOLVED (count-bound)
+
+Question (before committing to a per-conn contiguous-ring + 8KB-coalescing rewrite): is the
+transport ceiling bound by DMA **count** (ops/s, fixed per-op cost) or DMA **data volume**
+(bytes/s, bandwidth)? If count -> coalescing (fewer, bigger DMAs) is the lever and contiguity
+is justified; if bandwidth -> coalescing is pointless. History flip-flopped 3x so we demanded
+positive evidence (per feedback_no_invented_terms / bench_elimination_unreliable).
+
+## Method + results (all HW, this deploy)
+1. **DMA-engine size sweep** (`bench/mrbench/run_countbw.sh` — dma_mrbench mode C, ARM-issued,
+   DPU-local; ops/s + GB/s vs transfer size; linear fit 1/ops = c + b*S):
+   - ops/s FLAT ~3.6M from 64B..8KB, then falls; GB/s flat ~53-72 above 16KB.
+   - fit: c = **235 ns/op** (count), b = **0.014 ns/byte** (volume), crossover **S* = 16.8 KB**.
+   - at 1KB: 94% count / 6% volume; at 8KB: 67% / 33%. -> DMA engine is COUNT-bound <=16KB.
+   - CAVEAT: ARM-local, NOT the DPA-over-PCIe path — SHAPE transfers, absolute numbers do not.
+2. **Transport size sweep** (real bench, fixed RPS): native RPC **1KB = 198,892** vs
+   **8KB = 198,920** RPS (0-fail) — RPS **FLAT across size**, GB/s scales 8x (0.39 -> 3.11 RTT).
+   -> the transport ceiling is PER-OP, size-insensitive -> NOT bandwidth/data-volume.
+3. **Real DPA dma_copy rate** (temp instrumentation: ARM comp_queue drains exactly 1 entry per
+   DPA-issued dma_copy; periodic stderr rate). At the 240K ceiling: **~960K-1.0M dma_copy/s**
+   -> **4 dma_copies/RPC** (client->DPU fwd, DPU->backend rev, backend->DPU fwd, DPU->client rev)
+   x 240K = 0.96M. **comp_q usage = 0** -> the ARM is NOT the bottleneck (keeps up, no backlog).
+   Note: ARM-local mrbench = 3.6M ops/s but the DPA-issued (comch-producer over PCIe) path is
+   ~1M/s — ~3.6x slower; the code comment already documented "DPA op-rate caps ~810K dma_copy/s".
+4. **EU/ring parallelism sweep** (temp N=8, K=4 vs baseline N=4, K=2):
+   K=4 ceiling **233K** (300K req -> 233K + 984 fail, p50 1.4s) <= K=2 ceiling **258K**. More
+   EUs/rings do NOT raise the DPA op-rate — it is a SHARED wall (confirms "K=4 flat" positively).
+   N=4 ceiling: 270K req -> 258K achieved (p50 159ms = overload), matches perf_ceiling_map ~257K.
+
+## Conclusion (positive evidence)
+- **The bottleneck is per-op COUNT, not data volume.** RPS is flat across message size; the DPA
+  dma_copy op-rate (~1M/s) is a SHARED wall that more EUs/rings cannot raise; 4 dma/RPC x 258K
+  ~= that wall. Bandwidth is nowhere near (8KB@200K = 3.1 GB/s vs >50 GB/s engine asymptote).
+- A SECOND per-op-count cap co-exists (dpu_worker.c comment: the single host PE thread reaping
+  one REV_DONE per response), already partly cut by BATCH_REV_DONE. Either way it is per-op
+  COUNT, and coalescing addresses BOTH: one DMA carrying N messages -> N-fold fewer dma_copies
+  AND N-fold fewer completion messages.
+- => **Coalescing (pack same-direction messages into fewer, bigger DMAs) is the real throughput
+  lever, and the per-conn contiguous ring that enables it is JUSTIFIED** — the benefit is
+  realized under MULTIPLEXING (gRPC/few-conn-deep, many messages per conn per direction), which
+  is the actual target (single-msg-per-RPC bench packs nothing). The earlier ARM-local estimate
+  ("DMA has 4-9x headroom, not the bottleneck") was INVALID for the DPA-PCIe path — corrected.
+
+## State
+Baseline restored: P1 Vyukov + N=4/K=2 + no instrumentation; native 200K = 198,664 / 0. Temp
+changes (comp_queue dma-rate print, num_dpa_threads=8, RINGS_PER_POD=4) reverted via git. New
+tool kept: bench/mrbench/run_countbw.sh (+ countbw.csv). dma_mrbench unchanged.

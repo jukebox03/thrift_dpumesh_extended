@@ -24,9 +24,20 @@ int setup_dma_ring(struct objects *objs, size_t size, struct dma_ring **out_ring
     *out_ring = ring;
     ring->size = size;          /* logical ring size (host wraps at this) */
     ring->head = 0;
+    ring->enq_pos = 0;
     ring->descs = NULL;
     ring->busy_head = 0xFFFFFFFFu;
     ring->busy_probes = 0;
+
+    /* Per-slot Vyukov cell sequence (host memory): seq[i]=i so slot i is first
+     * writable by ticket i (generation 0). Lock-free MPSC producer state. */
+    ring->seq = (uint64_t *)malloc((size_t)size * sizeof(uint64_t));
+    if (!ring->seq) {
+        free(ring);
+        *out_ring = NULL;
+        return DOCA_ERROR_NO_MEMORY;
+    }
+    for (size_t i = 0; i < (size_t)size; i++) ring->seq[i] = i;
 
     /* Allocate one EXTRA slot. Slots 0..size-1 are normal dma_desc entries;
      * slot `size` holds the RX credit counter. Host atomically bumps its first
@@ -39,6 +50,7 @@ int setup_dma_ring(struct objects *objs, size_t size, struct dma_ring **out_ring
                            DOCA_ACCESS_FLAG_PCI_READ_WRITE);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to allocate DMA resources: %s", doca_error_get_descr(result));
+        free(ring->seq);
         free(ring);
         *out_ring = NULL;
         return result;
@@ -55,6 +67,7 @@ int setup_dma_ring(struct objects *objs, size_t size, struct dma_ring **out_ring
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to export mmap and buffer to DPU: %s", doca_error_get_descr(result));
         destroy_mmap_and_free_buffer(ring->mmap, ring->descs);
+        free(ring->seq);
         free(ring);
         *out_ring = NULL;
         return result;
@@ -73,6 +86,8 @@ int setup_dpu_tx_ring(struct doca_dev *dev, size_t size,
 
     ring->size = size;
     ring->head = 0;
+    ring->enq_pos = 0;
+    ring->seq = NULL;           /* reverse ring is single-producer → no Vyukov seq */
     ring->descs = NULL;
     ring->busy_head = 0xFFFFFFFFu;
     ring->busy_probes = 0;

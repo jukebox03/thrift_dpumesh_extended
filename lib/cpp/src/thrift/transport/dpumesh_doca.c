@@ -142,11 +142,10 @@ struct dpumesh_ctx {
     struct objects doca_objs;
     void *dma_buffer;          /* Host TX buffer (PCI mmap, CPU→DPU source) */
     /* K forward descriptor rings (EU-sharding). dpumesh_enqueue conn-shards
-     * across them (ring = src_port % K); each ring_locks[j] serializes
-     * get_next_dma_desc + fill + valid=1 for ring j (single-producer per ring).
-     * K=1 = legacy. */
+     * across them (ring = src_port % K). Posting is LOCK-FREE MPSC — a Vyukov
+     * bounded queue lives in each ring (enq_pos ticket + per-slot seq[]); no
+     * per-ring mutex. K=1 = legacy. */
     struct dma_ring *dma_rings[MAX_EU_PER_POD];
-    pthread_mutex_t ring_locks[MAX_EU_PER_POD];
     /* Reverse credit region size = rx_dma_buf_size / k_rings. The DPA reports an
      * absolute landing pos; ring_idx = pos / rx_region_size selects which ring's
      * credit slot to return. K=1 → region = whole buffer → ring_idx always 0. */
@@ -762,8 +761,6 @@ int dpumesh_init(dpumesh_ctx_t **out, int service_id,
         ctx->arena_used = (uint8_t *)calloc((size_t)(ctx->num_slots - ctx->arena_base), 1);
         if (!ctx->arena_used) goto fail;
     }
-    for (int j = 0; j < MAX_EU_PER_POD; j++)
-        pthread_mutex_init(&ctx->ring_locks[j], NULL);
 
     /* Lock-free SPMC RX ring: seq[i] = i (cell i first writable at enq
      * position i), enq = deq = 0. */
@@ -858,7 +855,7 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
     cleanup_objects(&ctx->doca_objs);
 
     for (int j = 0; j < MAX_EU_PER_POD; j++)
-        pthread_mutex_destroy(&ctx->ring_locks[j]);
+        if (ctx->dma_rings[j]) { free(ctx->dma_rings[j]->seq); ctx->dma_rings[j]->seq = NULL; }
     if (ctx->slot_next) free(ctx->slot_next);
     if (ctx->rx_ring) free(ctx->rx_ring);
     if (ctx->ports) { free(ctx->ports); ctx->ports = NULL; pthread_mutex_destroy(&ctx->port_lock); }
@@ -990,27 +987,38 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
      * preserved; different conns spread across the K rings/EUs (throughput kept). */
     int ridx = (int)((unsigned)desc->src_port % (unsigned)ctx->k_rings);
     struct dma_ring *ring = ctx->dma_rings[ridx];
-    pthread_mutex_t *rlock = &ctx->ring_locks[ridx];
-    pthread_mutex_lock(rlock);
 
-    /* Block with exponential backoff until a DMA ring slot frees. DPA
-     * advances the ring tail as it consumes descriptors. Backoff capped at
-     * 50µs. */
+    /* Lock-free MPSC claim (Vyukov bounded queue) — replaces the per-ring mutex.
+     * enq_pos hands out a monotonic ticket t; the producer owns slot t%size for
+     * generation t. It may write when the cell is free for t: seq==t (first use /
+     * already reclaimed) OR the previous occupant (ticket t-size) has PUBLISHED
+     * (seq==t-size+1) AND the DPA has CONSUMED it (valid==0) → reclaim. A stalled
+     * producer leaves seq unadvanced, so a lapping producer WAITS here instead of
+     * overwriting the slot — generation-safe with just the `valid` flag, no lock,
+     * DPA untouched. A cell not yet free is real backpressure (capped backoff). */
+    uint64_t t = __atomic_fetch_add(&ring->enq_pos, 1, __ATOMIC_RELAXED);
+    ring_slot = (uint32_t)(t % ring->size);
+    dma = &ring->descs[ring_slot];
     {
         struct timespec backoff = {0, 1000}; /* 1µs initial */
-        while (1) {
-            dma = get_next_dma_desc(ring);
-            if (dma)
+        for (;;) {
+            uint64_t s = __atomic_load_n(&ring->seq[ring_slot], __ATOMIC_ACQUIRE);
+            if (s == t) break;                                   /* free for me */
+            if (t >= ring->size && s == t - ring->size + 1 && dma->valid == 0) {
+                /* prev generation published + DPA-consumed → reclaim this cell */
+                __atomic_store_n(&ring->seq[ring_slot], t, __ATOMIC_RELEASE);
                 break;
-            pthread_mutex_unlock(rlock);
+            }
+            /* prev generation not yet published+consumed → ring full here
+             * (throttled WARN, best-effort under concurrency) */
+            uint64_t pr = __atomic_fetch_add(&ring->busy_probes, 1, __ATOMIC_RELAXED);
+            if ((pr & 4095u) == 0)
+                DOCA_LOG_WARN("DMA ring %d busy at slot=%u (size=%u) [stuck x%llu]",
+                              ridx, ring_slot, ring->size, (unsigned long long)(pr + 1));
             nanosleep(&backoff, NULL);
-            if (backoff.tv_nsec < 50000) /* cap at 50µs */
-                backoff.tv_nsec *= 2;
-            pthread_mutex_lock(rlock);
+            if (backoff.tv_nsec < 50000) backoff.tv_nsec *= 2;
         }
     }
-
-    ring_slot = (uint32_t)(dma - ring->descs);
 
     /* TX slot lifetime: the façade calls dpumesh_tx_track right after this enqueue
      * to park the slot in the conn's custody list; the DPU's BATCH_FWD_ACK frees it
@@ -1033,12 +1041,15 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
     dma->route_group = desc->route_group;   /* route-affinity key (0 = normal per-message LB) */
 
     __sync_synchronize();
-    dma->valid = 1;
+    dma->valid = 1;                                     /* publish to DPA */
+    /* Vyukov: mark this cell PRODUCED so the next generation (ticket t+size) can
+     * reclaim it once the DPA consumes this descriptor (valid→0). Release-ordered
+     * AFTER valid=1, so a reclaiming producer that observes this seq also sees
+     * valid's effect (never a stale pre-consume 0). */
+    __atomic_store_n(&ring->seq[ring_slot], t + 1, __ATOMIC_RELEASE);
 
     DOCA_LOG_DBG("ENQUEUE: seq=%u dst_svc=%d dst_pod=%d ring=%d slot=%u len=%u",
                  desc->seq, desc->dst_service, desc->dst_pod, ridx, ring_slot, desc->body_len);
-
-    pthread_mutex_unlock(rlock);
 
     return 0;
 }
