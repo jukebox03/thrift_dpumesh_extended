@@ -10,12 +10,14 @@ The DPU is an **L7-style proxy that owns every connection** (think Envoy): your 
 to you. Bodies move by DMA **host → DPU → host**; by default the DPU touches only metadata —
 it reads a body only when the **L7 proxy engine** is enabled (`DPUMESH_PROXY`, §8).
 
-It is a **connection-oriented, full-duplex, message transport** — close to TCP in shape, but:
+It is a **connection-oriented, full-duplex, byte-stream transport** — close to TCP in shape, but:
 
 - **You address a service, not a peer.** `dmesh_connect(service)` opens a connection *to the DPU*
   tagged with a service. The DPU picks the backend **per message** and owns the upstream to it.
-- **Message-framed:** each message is one whole body **≤ 8 KB**, delivered **atomically** and
-  **in send order** on a connection *to a given backend*.
+- **Byte stream, like TCP.** `write` **appends** to the connection's send buffer; `flush` ships the
+  committed bytes, **coalescing** many small writes into few, large ≤ 8 KB DMAs (the throughput
+  win). The receiver `read`s a byte stream and **frames its own length** — a whole write is not
+  guaranteed to arrive as one `read`. Bytes are **in send order** on a connection to a given backend.
 - **NOT request/response.** The transport does **no** request↔response matching. If you keep
   several requests outstanding, **you** correlate replies (a req-id in the body) — under
   per-message LB, replies on one connection can arrive **out of order**.
@@ -74,8 +76,8 @@ dmesh_close(c);                                  // sends a FIN so the DPU frees
 | **Load balancing** | none (one peer) | **per message** — the DPU picks a backend for *each* message | one conn's messages may spread across backends |
 | **Connection** | persistent, full-duplex byte stream | persistent, full-duplex **message** stream **owned by the DPU** | same mental model; the backend you talk to is the DPU's choice |
 | **Setup** | 3-way **handshake** | **none** — `connect` is local; the DPU routes each message | peer liveness is *not* checked at connect; apply your own timeout |
-| **Framing** | byte stream (you frame it) | **message** — one whole body, atomic | no partial-read loop, no `EPOLLOUT` dance — the whole body is at `read` |
-| **Size** | unbounded | **atomic message ≤ 8 KB** (the DPA `dma_copy` limit); a larger `dmesh_write` **auto-chunks** | you may `write` ANY length — >8 KB is split into ≤ 8 KB chunks, all **route-pinned to one backend** (§5); the reader loops `dmesh_read` and frames its own length (§3) |
+| **Framing** | byte stream (you frame it) | **byte stream** (you frame it) — writes coalesce, reads are short at arrival boundaries | frame your own length + loop `read` to `EAGAIN`, exactly like TCP; no `EPOLLOUT` dance |
+| **Size** | unbounded | **`write` ANY length** — buffered in the conn's byte-ring, shipped as ≤ 8 KB DMAs (the DPA `dma_copy` limit) | no `EMSGSIZE`; the transport chops the stream into ≤ 8 KB wire DMAs and the reader reassembles by its own framing (§3) |
 | **Ordering** | in-order in a connection | in-order **on a connection to one backend**; **none** across backends | under LB, replies on one conn can arrive out of order |
 | **RPC matching** | n/a | **none** — the transport delivers, you correlate | pipelining several outstanding? match replies by your own req-id |
 | **EOF** | `read()==0` | **`read()==0`** — the peer sent a FIN (`dmesh_close`) | identical: `read()==0` ⇒ close your side |
@@ -120,8 +122,9 @@ All calls are **non-blocking**. "would-block" = the listed sentinel **with `errn
 
 > **Env:** `DPUMESH_PCI_ADDR` selects the DOCA device; `DPUMESH_SERVICE_ID` overrides the
 > `service_id` arg. (There is no `DPUMESH_POD_ID` — the DPU assigns `pod_id`.)
-> `DPUMESH_ARENA_SLOTS=N` carves the top N TX slots into a contiguous zero-copy arena for
-> `dmesh_alloc(n>1)` (default 0 = no arena; single-slot `dmesh_alloc(1)` always works via the pool).
+> `DPUMESH_CONN_POOL=N` sets the number of per-connection TX byte-rings = **max concurrent
+> connections** (default 256); each ring is `num_slots*slot_size / N` bytes (default 128 KB), the
+> connection's socket send buffer. Fewer, deeper connections (gRPC multiplexing) → smaller `N`.
 > (Data-plane tuning — buffer slots, slot size, DPA EU count, EU-sharding, PE-sleep — is
 > baked into the binaries; the DPU L7-proxy engine is the one runtime toggle, `DPUMESH_PROXY`, §8.)
 
@@ -136,53 +139,56 @@ All calls are **non-blocking**. "would-block" = the listed sentinel **with `errn
 ### Read / write / sendfile / flush / close
 | Function | Returns / errno |
 |---|---|
-| `ssize_t dmesh_read(dmesh_conn_t *c, void *buf, size_t len)` | `>0` bytes of the next inbound message (chunk); **`0` = EOF** (peer closed; sticky → `dmesh_close(c)`); `-1` = would-block (`EAGAIN`). **One whole message per call** — if several are pending on the conn (you pipelined, a burst coalesced, or a >8 KB message auto-chunked), **loop until `EAGAIN`** (there is no batch read). To receive a >8 KB message, **loop and concatenate** chunks until you have the length YOUR protocol declares (framing is yours; chunks are route-pinned + in order, so arrival order = send order). Inbound is in **arrival** order — under per-message LB that is **not** request order (correlate yourself). **No implicit send.** |
-| `ssize_t dmesh_write(dmesh_conn_t *c, const void *buf, size_t len)` | **Buffers** outbound body bytes → returns `len`. Consecutive writes accumulate into one message; the first write after a flush starts a new message. **ANY length is allowed** — a message larger than `slot_size` is **auto-chunked** across slots, every chunk **route-pinned to one backend** (§5), so there is **no `EMSGSIZE`**. Flush many messages without reading (pipelining allowed from the start). Acquiring a TX slot busy-spins under saturation (never fails). |
-| `ssize_t dmesh_sendfile(dmesh_conn_t *c, int in_fd, off_t *offset, size_t count)` | Appends ≤`count` bytes from `in_fd` into the current message (**capped at `slot_size` → may be SHORT; check the return**); advances `*offset` if non-NULL. `0` = EOF on `in_fd`, `-1` on read error / no room (`EMSGSIZE`). |
-| `int dmesh_flush(dmesh_conn_t *c)` | **The explicit ship — REQUIRED to send.** `0` = sent (or nothing buffered → no-op; a zero-length message is reserved for the FIN). `-1` `EBADMSG` = descriptor fault (close the conn). (Acquiring the TX slot happened in `write` and busy-spins under saturation, so flush itself never returns `EAGAIN`.) |
+| `ssize_t dmesh_read(dmesh_conn_t *c, void *buf, size_t len)` | Up to `len` bytes of the inbound **byte stream**; **`0` = EOF** (peer closed; sticky → `dmesh_close(c)`); `-1` = would-block (`EAGAIN`). Reads are a **byte stream, exactly like TCP** — a call returns whatever bytes have arrived (a short read at an arrival boundary is normal), so **frame your own length** and **loop until `EAGAIN`** to drain. Bytes arrive **in send order on a connection to one backend**; under per-message LB across backends that is **not** request order (correlate with a req-id, or `dmesh_pin_route` for socket order). **No implicit send.** |
+| `ssize_t dmesh_write(dmesh_conn_t *c, const void *buf, size_t len)` | **Appends** `len` bytes to the conn's outbound byte stream (its byte-ring) → returns `len`. **ANY length** — no `EMSGSIZE`. Bytes are buffered, not sent, until `dmesh_flush`; consecutive writes **coalesce** so `flush` ships them as few, large ≤`slot_size` DMAs (the throughput win). Busy-spins under saturation (never fails). Pipelining allowed from the first byte. |
+| `ssize_t dmesh_sendfile(dmesh_conn_t *c, int in_fd, off_t *offset, size_t count)` | Appends ≤`count` bytes from `in_fd` straight into the byte-ring (**capped at `slot_size` → may be SHORT; check the return**); advances `*offset` if non-NULL. `0` = EOF on `in_fd`, `-1` on read error (`EMSGSIZE` if `count==0`). |
+| `int dmesh_flush(dmesh_conn_t *c)` | **The explicit ship — REQUIRED to send.** Carves the conn's committed-but-unsent bytes into ≤`slot_size` descriptors (coalescing) and posts them. `0` = sent (or nothing buffered → no-op). `-1` `EBADMSG` = descriptor fault (close the conn). Never returns `EAGAIN` (backpressure is absorbed in `write`/`alloc`). |
 | `int dmesh_close(dmesh_conn_t *c)` | **Graceful close.** Sends a **FIN** (zero-length, behind all prior data) so the peer's `dmesh_read` returns `0` and the DPU frees the upstream; then frees local state. A buffered-but-unflushed message is discarded (flush first). Concurrent close is safe. Returns `0`. Safe on `NULL`. |
 
-### Zero-copy TX (optional) — `dmesh_alloc` / `dmesh_slot_register`
-Skip the `dmesh_write` memcpy by filling transport DMA memory directly.
+### Zero-copy TX — `dmesh_alloc` / `dmesh_commit`
+Fill transport DMA memory **directly** instead of memcpy'ing through `dmesh_write`. Every connection
+owns a **contiguous byte-ring** (its socket send buffer); `dmesh_alloc` hands you a pointer straight
+into it — of **any length**, not slot-granular — you fill it in place, `dmesh_commit` finalizes the
+bytes, and `dmesh_flush` ships them. Same ring, same wire, no copy.
 | Function | Returns / errno |
 |---|---|
-| `dmesh_buf_t dmesh_alloc(dmesh_channel_t *s, int n)` | A run of **n contiguous** TX slots to write into directly: `{uint8_t *ptr; int slot; int n;}`. `n==1` uses the lock-free pool; `n>1` needs a contiguous arena (`DPUMESH_ARENA_SLOTS>0`). `ptr==NULL` on failure (no/too-small arena, or `n<=0`). |
-| `int dmesh_slot_register(dmesh_conn_t *c, dmesh_buf_t b, uint32_t len)` | Adopt pre-filled `b` as this conn's outbound message — `dmesh_flush` then ships it with **no memcpy**. Any bytes already buffered are **flushed first**. `len` = valid bytes (`<= b.n*slot_size`); a `b.n>1` region ships as route-pinned chunks. Returns the conn's previous empty single slot to recycle, or `-1`. `-1`+`EINVAL` on a bad buffer. Call at a message boundary, then `dmesh_flush`. |
-| `void dmesh_free(dmesh_channel_t *s, dmesh_buf_t b)` | Release a `dmesh_alloc` buffer you did **not** ship (frees all `b.n` slots). |
+| `void *dmesh_alloc(dmesh_conn_t *c, size_t len)` | A pointer to **`len` CONTIGUOUS bytes** at this conn's write head — the DMA source; fill it directly. **Busy-spins** under backpressure (waits for the conn's own TX_ACKs to free ring space). `NULL` if `len==0`, `len` exceeds the per-conn ring (`DPUMESH_CONN_POOL` sets its size), or the conn is not established. |
+| `int dmesh_commit(dmesh_conn_t *c, size_t len)` | Finalize `len` (**≤ the alloc'd len**) bytes as committed data, ready for `dmesh_flush`. Returns `0`. Commit *less* than you alloc'd to send a short message; the unused tail is reclaimed. |
 
 ```c
-// zero-copy send: alloc → fill transport memory → register → flush (no memcpy)
-dmesh_buf_t b = dmesh_alloc(s, 1);
-if (b.ptr) { fill(b.ptr, len); dmesh_slot_register(c, b, len); dmesh_flush(c); }
+// zero-copy send: alloc a pointer into the ring → fill it → commit → flush (no memcpy)
+void *p = dmesh_alloc(c, len);          // len bytes, contiguous, in transport DMA memory
+if (p) { fill(p, len); dmesh_commit(c, len); dmesh_flush(c); }
 ```
+> `dmesh_write(c, buf, len)` is exactly `dmesh_alloc`+`memcpy`+`dmesh_commit` fused — both feed the
+> same byte-ring, so you can mix per-message (`write`) and zero-copy (`alloc`/`commit`) on one conn.
 
 ### Accessor
 - `void *c->user_data` — **app-owned** (like epoll's `data.ptr`): set it after `accept`/`connect`,
   and `dmesh_next_ready` hands the conn back so you read your context off it. The transport never
   touches it.
 
-### Large messages (> `slot_size`) — transparent, **no special API**
-There is **no** `write_large`/`read_large`. Send a payload of any length with plain
-`dmesh_write` + `dmesh_flush`: `write` **auto-chunks** it across ≤ `slot_size` slots and pins
-every chunk to **one backend** (a shared route-affinity key, §5), so the chunks arrive **in
-order on that backend**. Receive it with a plain `dmesh_read` **loop**: concatenate chunks in
-arrival order until you have the length **your** protocol declares — framing/completeness is the
-app's job, exactly like a byte stream. Because the chunks are pinned + in order, arrival order
-== send order; if affinity ever scattered them the chunks would arrive out of order and your
-content check would catch it. (`bench/bench_sock.c` mode=3 is the worked example.)
+### Large payloads (> `slot_size`) — transparent, **no special API**
+There is **no** `write_large`/`read_large`. `dmesh_write` takes **any length** — the byte-ring
+buffers it and `dmesh_flush` chops the stream into ≤ `slot_size` wire DMAs. Receive it with a
+plain `dmesh_read` **loop**, concatenating until you have the length **your** protocol declares —
+framing/completeness is the app's job, exactly like a TCP byte stream.
 
 ```c
-// SEND any length — write auto-chunks + route-pins; flush ships the last chunk.
+// SEND any length — write buffers into the byte-ring; flush ships it as ≤ slot_size DMAs.
 dmesh_write(c, big, big_len); dmesh_flush(c);
 // RECEIVE — loop + concatenate until YOUR header's length is satisfied.
 size_t got = 0; while (got < want) { ssize_t n = dmesh_read(c, buf+got, want-got);
     if (n > 0) got += n; else if (n == 0) break; else sched_yield(); }
 ```
 
-> A large message is **not** a transport primitive — the wire stays atomic ≤ 8 KB and
-> chunk-agnostic. The **route-affinity key** (§5) is the only DPU support; a grouped
-> (multi-slot) message forgoes per-message LB by design (its chunks must pin to one backend
-> to reassemble). No in-band header, no blocking reassembly helper — just write and read-loop.
+> **Ordering across a multi-DMA payload.** The stream is chopped into independent ≤ 8 KB DMAs, each
+> routed **per DMA** (per-message LB). To a service with **one** backend that is always in order.
+> To a service that load-balances across **several** backends, `dmesh_pin_route(c)` first so the
+> whole connection pins to one backend and the DMAs stay in send order (the LD_PRELOAD shim pins
+> every conn, §7). Unpinned + multi-backend, a large payload's DMAs may land on different backends —
+> use a connection-level pin, or frame at a granularity ≤ 8 KB. (A single `dmesh_write` larger than
+> the per-conn ring, 128 KB by default, needs an intervening `dmesh_flush` to drain the ring.)
 
 **Lifecycles:**
 ```
@@ -604,14 +610,15 @@ engine is validated and the L7 plug-in slot (`dpu_l7.c`) is wired; writing the r
 
 The data-plane tuning that used to be `DPUMESH_*` env knobs is now **compiled in** at the values
 measured as best; the only runtime env left is `DPUMESH_PROXY` + `DPUMESH_PROXY_FRAME_SVC` +
-`DPUMESH_PROXY_L7_SVC` (§8), `DPUMESH_PCI_ADDR`, `DPUMESH_SERVICE_ID`, `DPUMESH_ARENA_SLOTS` (§3),
+`DPUMESH_PROXY_L7_SVC` (§8), `DPUMESH_PCI_ADDR`, `DPUMESH_SERVICE_ID`, `DPUMESH_CONN_POOL` (§1),
 and the `DMESH_PRELOAD_*` shim vars (§7). **To
 change a baked value, edit the named constant/assignment and rebuild** (no env override).
 
 | Setting | Baked value | Constant / assignment | File |
 |---|---|---|---|
 | TX/RX slots per pod | `4096` | `DPUMESH_NUM_SLOTS_DEFAULT` → `ctx->num_slots` | `dpumesh.h` / `dpumesh_doca.c` |
-| Slot size (max atomic message) | `8192` (8 KB — DPA `dma_copy` cap) | `DPUMESH_SLOT_SIZE_DEFAULT` → `ctx->slot_size` | `dpumesh.h` / `dpumesh_doca.c` |
+| Slot size (max wire DMA) | `8192` (8 KB — DPA `dma_copy` cap) | `DPUMESH_SLOT_SIZE_DEFAULT` → `ctx->slot_size` | `dpumesh.h` / `dpumesh_doca.c` |
+| Per-conn TX rings (max concurrent conns) | `256` (128 KB byte-ring each) | `DPUMESH_CONN_POOL` env → `ctx->conn_pool` | `dpumesh_doca.c` |
 | DPA EU threads (N) | `4` | `objs->num_dpa_threads = 4` | `doca/dpu_worker.c` |
 | Forward rings per pod / EU-sharding (K) | `2` | `DPUMESH_RINGS_PER_POD_DEFAULT` → `k_rings` | `doca/dpumesh_common.h` (DPU + host) |
 | DPU main loop | event-driven epoll (busy-poll auto-fallback on setup failure) | — (literal path) | `doca/dpu_worker.c` |

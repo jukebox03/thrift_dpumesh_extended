@@ -96,21 +96,31 @@ uint8_t *dpumesh_rx_buf(dpumesh_ctx_t *ctx, int slot);
 /* Free an RX buffer slot after reading. */
 void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot);
 
-/* Allocate a TX buffer slot. Returns a slot index (>=0). Under backpressure
- * (free-list empty) it BUSY-SPINS with capped backoff until a slot frees — it
- * does not fail/return -1. */
-int dpumesh_tx_alloc(dpumesh_ctx_t *ctx);
+/* Per-conn TX BYTE-RING (socket send buffer). A conn owns a contiguous byte region;
+ * messages pack at byte granularity. Lifecycle: reserve -> (fill) -> commit -> ship.
+ *
+ * dpumesh_tx_reserve(port, len): reserve len CONTIGUOUS bytes at the write head and
+ *   return a pointer into TX DMA memory to fill (zero-copy). BUSY-SPINS under back-
+ *   pressure until the conn's own TX_ACKs free room. NULL if no region / bad len.
+ * dpumesh_tx_commit(port, len): finalize len (<= reserved) bytes as a committed
+ *   message, ready to ship.
+ * dpumesh_tx_discard_unsent(port): drop committed-but-unsent bytes (close-before-flush).
+ * dpumesh_tx_next_send(port, &moff, &len): pop the next descriptor to ship from the
+ *   committed range as (mmap byte offset, len<=slot_size); 1 if one, 0 if none. Does
+ *   NOT advance the send head — enqueue it, then call dpumesh_tx_sent.
+ * dpumesh_tx_sent(port, seq, len): record the shipped descriptor (seq->end) + advance
+ *   the send head, so a BATCH_FWD_ACK(port,seq) reclaims it. */
+uint8_t *dpumesh_tx_reserve(dpumesh_ctx_t *ctx, uint16_t port, uint32_t len);
+void     dpumesh_tx_commit(dpumesh_ctx_t *ctx, uint16_t port, uint32_t len);
+void     dpumesh_tx_discard_unsent(dpumesh_ctx_t *ctx, uint16_t port);
+int      dpumesh_tx_next_send(dpumesh_ctx_t *ctx, uint16_t port, size_t *out_moff, uint32_t *out_len);
+void     dpumesh_tx_sent(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq, uint32_t len);
 
-/* Allocate n CONTIGUOUS TX slots from the zero-copy arena (DPUMESH_ARENA_SLOTS).
- * Returns the base slot index (>=0), or -1 if no arena or no run of n. Non-
- * blocking (first-fit under a lock). Each slot is freed with dpumesh_tx_free. */
-int dpumesh_arena_alloc(dpumesh_ctx_t *ctx, int n);
-
-/* Get pointer to TX buffer data for a slot (zero-copy write). */
-uint8_t *dpumesh_tx_buf(dpumesh_ctx_t *ctx, int slot);
-
-/* Free a TX buffer slot (on error path). */
-void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot);
+/* Borrow/return a per-conn TX region id (max concurrent conns = the region pool).
+ * Used internally by the port allocator; borrow returns -1 when the pool is
+ * exhausted. */
+int  dpumesh_region_borrow(dpumesh_ctx_t *ctx);
+void dpumesh_region_return(dpumesh_ctx_t *ctx, int rid);
 
 /* Enqueue a descriptor to TX SQ. Returns 0 on success, -1 on failure. */
 int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc);
@@ -158,11 +168,6 @@ int dpumesh_conn_recv(dpumesh_ctx_t *ctx, uint16_t port, sw_descriptor_t *out);
  * service WITHOUT scanning every conn or holding a per-conn fd. Drain each returned
  * conn to EAGAIN (edge-triggered re-arm). Single-consumer (the event-loop thread). */
 void *dpumesh_next_ready(dpumesh_ctx_t *ctx);
-
-/* Record a SENT TX slot for (port,seq) so its DPU TX_ACK frees it (the BATCH_FWD_ACK
- * handler reclaims it). Call after a successful dpumesh_enqueue. A conn may have many
- * un-ACKed slots in flight (full-duplex / pipelined); never blocks. */
-void dpumesh_tx_track(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq, int tx_slot);
 
 #ifdef __cplusplus
 }

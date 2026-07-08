@@ -3610,3 +3610,169 @@ positive evidence (per feedback_no_invented_terms / bench_elimination_unreliable
 Baseline restored: P1 Vyukov + N=4/K=2 + no instrumentation; native 200K = 198,664 / 0. Temp
 changes (comp_queue dma-rate print, num_dpa_threads=8, RINGS_PER_POD=4) reverted via git. New
 tool kept: bench/mrbench/run_countbw.sh (+ countbw.csv). dma_mrbench unchanged.
+
+---
+
+# 2026-07-08 · P2a-1: per-conn TX slot-ring — BUILT, validated <=64c, 128c pool-exhaustion OPEN
+
+Replaced the shared Treiber TX slot pool + per-slot custody linked-list + zero-copy arena
+with PER-CONNECTION contiguous slot-rings (socket send-buffer model), the first brick of the
+per-conn contiguous-buffer redesign justified by the DMA-count bottleneck finding above.
+
+## What changed (host-only; wire + DPA unchanged, per-message descriptors kept)
+- struct: dmesh_port_slot += tx_region + SPSC ring cursors (tx_rhead alloc / tx_rtail
+  freed-on-ACK). ctx: DELETED free_head/slot_next (Treiber), arena_base/used/lock (arena),
+  custody_key/next/locks; ADDED conn_pool/conn_rslots + region_free stack + slot_seq[num_slots].
+- The num_slots TX mmap is partitioned into conn_pool regions of conn_rslots = num_slots/pool
+  slots (32MB unchanged, NO buffer growth). Config: DPUMESH_CONN_POOL (default 256 -> 16
+  slots/conn). A conn borrows a region at connect/accept, owns it as a FIFO ring, returns it
+  at close (after the ring drains so slots are never overwritten mid-DMA).
+- dpumesh_tx_alloc(ctx,PORT) / dpumesh_tx_free(ctx,PORT,slot); tx_track -> slot_seq stamp;
+  BATCH_FWD_ACK reclaim -> tx_reclaim_ack (advance ring tail when slot_seq matches, FIFO).
+  dmesh_alloc/slot_register (channel-scoped zero-copy) DISABLED -> returns NULL (conn-scoped
+  reserve/commit is P2a-2); shim/dmesh_write path unaffected. dpumesh_arena_alloc deleted.
+- host gcc -fsyntax-only clean (dpumesh_doca.c + dpm.h); BF3 build clean; deploys.
+
+## HW validation
+| test | result | verdict |
+|---|---|---|
+| loopback 20000x8KB (1 conn) | 20,000/0 · p50 123µs | PASS — ring alloc/ship/reclaim/close correct |
+| native rpc 100K/8s/1KB, 64c | 800,000/0 · p50 199µs | PASS — multi-conn + region reuse |
+| preload shim 5000x1KB, 64c (warm) | 5,000/0 · 102K RPS | PASS — accept + close churn |
+| preload shim 5000x1KB, 64c (1st, cold) | 4,892/47 · 937 RPS | cold-start jitter (2nd/3rd clean) |
+| preload shim 8000x1KB, 128c | HANG (>150s) + "stale upstream" flood | **OPEN — see below** |
+
+## OPEN: 128-conn preload pool exhaustion
+Root cause (analysis): the region pool (POOL=256) plus the close-time drain-spin
+(port_put_region holds a conn's region until its TX ring drains) collide at high conn count.
+At 128c a close storm has ~128 regions draining WHILE ~128 new connects each need one =
+256 = POOL exactly -> transient exhaustion -> connect/alloc fails -> early FIN -> the backend's
+in-flight reply hits a freed upstream ("stale upstream uP=... pod 6") -> dropped -> the shim
+client's blocking recv 5s-times-out -> cascade/hang. 64c (64 draining + 64 new = 128 << 256)
+has headroom -> clean. So the CORE ring is correct; the region-lifecycle x pool sizing is
+under-provisioned for high conn counts. Fix candidates (next): (a) larger POOL headroom, e.g.
+DPUMESH_CONN_POOL=512 (8 slots/conn) so drain-holds + new connects fit; (b) DEFERRED
+(non-spinning) region return decoupled from the slot drain; (c) shorter drain timeout. NOT yet
+chosen. Deployed state runs P2a-1 (works <=64c; regresses vs the old 256c preload).
+
+---
+
+# 2026-07-08 · P2a-1 128c hang — ROOT-CAUSED (2 region-lifecycle bugs) + FIXED, now 0-fail to 256c
+
+The 128c "stale upstream flood + hang" was NOT the core ring — it was two per-conn TX **region
+leaks/holds** that only bite at high conn count. Both fixed; P2a-1 now passes back-to-back.
+
+## Bug 1 — region LEAK on accept-queue-full rollback (dpumesh_doca.c rx_deliver_desc)
+A new SERVER conn borrows its region (port_take_region) BEFORE the accept-queue-full check.
+The rollback (`accept queue full, dropping new conn`) set role=FREE and returned WITHOUT
+returning the region -> one region leaked per drop. At 128c the accept queue fills often ->
+cumulative leak drains the 256-region pool -> every new server conn then fails port_take_region
+-> backend stops accepting -> clients 5s-timeout -> early FIN -> stale upstream -> hang.
+64c rarely fills the queue -> no leak -> clean. FIX: dpumesh_region_return in the rollback.
+
+## Bug 2 — blocking drain-spin HELD the region across close (2x region peak)
+port_put_region spun up to 1s on close holding the region until the ring drained, on the app
+thread. Two harms: (a) it stalled the vanilla server's single epoll thread on every close;
+(b) it held the region for the whole drain, so a close-storm+reconnect overlaps
+128(draining)+128(new)=256=POOL -> exhaustion. This made 128c run-1 pass but run-2/3 hang
+back-to-back (run-1's closes still holding regions when run-2 connects). 64c (64+64<256) had
+headroom -> clean back-to-back. FIX: **non-blocking deferred return** (try_return_region):
+close marks role=FREE and returns the region ONLY if already drained; otherwise the PE's
+reclaim (tx_reclaim_ack) returns it on the last ACK. Until returned the port is FREE-but-
+draining (tx_region>=0) and ALL alloc paths (alloc_port / alloc_port_specific / SERVER_PENDING)
+skip it, so a slot is never reused mid-DMA and no straggler ACK survives reuse (return ==
+fully drained). Close never blocks the app thread; region peak == actual concurrent conns.
+
+## HW validation (after both fixes, single deploy)
+| test | result |
+|---|---|
+| loopback 20000x8KB (1c) | 20,000/0 · p50 169µs |
+| native rpc 100K/8s/1KB, 64c | 800,000/0 · p50 200µs |
+| preload 8000x1KB, 128c — run 1/2/3 back-to-back | 8,000/0 each · runs 2-3 = 131K RPS (no hang) |
+| preload 12000x1KB, 256c (POOL=256 edge) | 12,000/0 · 123K RPS |
+
+P2a-1 (per-conn TX slot-ring) is now correct + leak-free back-to-back to 256c. Deleted:
+Treiber pool, per-slot custody linked-list, zero-copy arena, dpumesh_arena_alloc. Config:
+DPUMESH_CONN_POOL (default 256 -> 16 slots/conn @ num_slots 4096). Non-blocking region
+lifecycle is the load-bearing correctness piece. Next: P2a-2 (byte-pack + 8KB coalescing).
+
+---
+
+# 2026-07-08 · P2a-2: 8KB slot-coalescing VALIDATED — pipeline 262K → 1.19M RPS (~4.5x), 0-fail
+
+The DMA-COUNT bottleneck thesis (proved earlier: ~1M dma_copy/s wall, 4 dma/RPC → ~262K RPC
+ceiling on one DPU) predicts that COALESCING many small messages into one 8KB DMA lifts the
+ceiling. Tested it end-to-end on the per-conn ring (P2a-1). Result: decisive.
+
+## What the transport already gives + the one change
+dmesh_write already ACCUMULATES consecutive writes into the conn's current slot; flush ships it.
+dmesh_read is byte-stream WITHIN a descriptor (returns min(len,avail), advances rx_pos). So a
+COALESCED descriptor (N msgs packed in 8KB) is read back transparently as N msg_size reads, and
+the demux is by ORDER (rid in-order verify), not per-msg seq. The echo reads sizeof(buf)=8192 →
+consumes a whole coalesced 8KB descriptor in ONE read and echoes 8KB in ONE flush, so the reply
+leg coalesces too. Net: ALL 4 DMA legs (host→DPU, DPU→backend, backend→DPU, DPU→client) drop
+from per-message to per-8KB. Change = a bench toggle only (BENCH_COALESCE, mode=2 pipeline):
+fill a P-deep burst with NO per-message flush, then ONE flush ships the burst. No transport edit.
+
+## HW measurement (pipeline, 1KB msg, P=8, 64 conns, single DPU pair)
+| target | BASELINE (flush/msg) | COALESCED (burst→1 flush) |
+|---|---|---|
+| 300K | 262K achieved · **p50 570 ms** (saturated backlog) | 298K · p50 209µs |
+| 400K | — | 397K · p50 220µs · 0-fail |
+| 500K | — | 497K · p50 227µs · 0-fail |
+| 600K | — | 596K · p50 246µs · 0-fail |
+| 800K | — | 794K · p50 306µs · 0-fail |
+| 1.0M | — | 993K · p50 521µs · 0-fail |
+| 1.2M | — | **1,192,039 · p50 466µs · 0-fail** (still climbing) |
+| 200K (sanity) | — | 198K · p50 188µs · 0-fail |
+
+Baseline pipeline ceiling ~262K matches the DMA-count wall exactly (p50 explodes to 570ms once
+target > ceiling). Coalesced scales past 1.19M with LOW latency and 0-fail — **~4.5x throughput,
+not yet saturated**, and ~2700x lower latency at 300K (570ms → 209µs). This POSITIVELY confirms:
+(1) the wall was DMA COUNT, not bandwidth; (2) coalescing is THE throughput lever; (3) the
+per-conn contiguous ring (P2a-1) makes coalescing clean (one conn's msgs pack into its own
+contiguous slot, one descriptor, in send order). BENCH_COALESCE kept (opt-in, default 0 =
+baseline). Real apps get this via cork/MSG_MORE-style batching (future shim work). NOTE: pods
+currently deployed with BENCH_COALESCE=1; redeploy without it to restore the baseline default.
+
+---
+
+# 2026-07-08 · TX BYTE-RING + zero-copy alloc/commit (4-cursor) — BUILT + fully VALIDATED
+
+Reworked the per-conn TX slot-ring (P2a-1) into a per-conn contiguous BYTE-RING with the
+user's 4-cursor buffer-management model, and added the conn-scoped zero-copy alloc/commit API.
+HOST-ONLY change: the DPU/DPA see only (addr,size), so the forward descriptor's body_buf_slot
+now carries a BYTE OFFSET (enqueue computes addr = dma_buffer + offset); no DPU/DPA/wire change.
+
+## Model (4 cursors chase around each conn's contiguous region)
+  free(tx_f) <= send(tx_s) <= commit(tx_c) <= write/alloc(tx_w),  tx_w-tx_f <= conn_bytes
+  - reserve(port,len) -> pointer at tx_w (bip-buffer pad on wrap; tx_wmark skips the tail)
+  - commit(port,len)  -> advance tx_w+tx_c (finalize a message; byte granularity, no slot waste)
+  - next_send/sent    -> flush carves [tx_s,tx_c) into <=slot_size descriptors (coalesce), records
+                         each shipped unit (seq->end cursor) in a per-region send-unit FIFO
+  - reclaim (PE)      -> BATCH_FWD_ACK(port,seq) pops the FIFO front, advances tx_f (frees bytes)
+  dmesh_write = reserve+memcpy+commit; dmesh_alloc/dmesh_commit = the zero-copy path (same ring,
+  filled in place). Non-blocking region return (P2a-1 fix) carried over: region freed when tx_f==tx_w.
+
+## Deletions / API changes
+  Removed: dpumesh_tx_alloc/tx_buf/tx_free/tx_track, slot_seq, dmesh_tx_ensure/ship_at/ship_slot,
+  the channel-scoped dmesh_alloc(s,n)/dmesh_slot_register/dmesh_free + dmesh_buf_t usage, cur_group
+  + tx_slot/tx_buf/tx_len/tx_region_n conn fields. Added: dpumesh_tx_reserve/commit/discard_unsent/
+  next_send/sent, TX_SU_DEPTH=64 send-unit FIFO, conn_bytes. New public zero-copy: void*
+  dmesh_alloc(conn,len) + int dmesh_commit(conn,len). LD_PRELOAD shim UNCHANGED (stable façade).
+
+## HW validation (all 0-fail, one deploy)
+| test | result |
+|---|---|
+| loopback non-zero-copy 20000x8KB | 20,000/0 · p50 154µs |
+| loopback ZERO-COPY (dmesh_alloc/commit) 20000x8KB | 20,000/0 · p50 121µs |
+| native rpc 100K/8s/1KB, 64c | 800,000/0 · p50 199µs |
+| preload shim 5000x1KB, 64c | 5,000/0 |
+| preload shim 8000x1KB, 128c back-to-back x2 | 8,000/0 each (no hang, no region leak) |
+| pipeline BASELINE (flush/msg), 300K/1KB/64c | 259K (== pre-byte-ring 262K, no regression) |
+| pipeline COALESCED, 300K/800K/1.2M /1KB/64c | 298K/795K/1,192,011 · 0-fail (coalescing preserved) |
+
+Byte-stream delivery both ends (receiver frames its own; §8 L7 direction). Route-affinity auto-pin
+of >8KB messages is DROPPED (byte-stream has no boundaries) — pin the conn for socket order, or
+rely on a single backend. A single dmesh_write > conn_bytes (128KB) needs an intervening flush
+(not hit by any bench). Deployed; api.md rewrite pending.

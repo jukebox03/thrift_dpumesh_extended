@@ -52,17 +52,12 @@ static void cleanup_ctx(struct dpumesh_ctx *ctx);
  * concurrent new-conn bursts so the PE thread never has to drop on enqueue. */
 #define RX_QUEUE_SIZE 65536
 
-/* TX-slot custody: each flushed message parks its TX slot until the DPU's
- * BATCH_FWD_ACK frees it (the ACK carries the message's (port,seq)). Held as a
- * per-conn singly-linked LIFO list threaded through custody_next[] (indexed by
- * tx_slot) and headed by the conn's port slot (dmesh_port_slot.tx_head), with
- * custody_key[slot] = (port<<16|seq) matching the ACK. A conn may keep ANY number
- * of un-ACKed sends outstanding (unbounded pipelining); total live nodes are
- * bounded by num_slots (a slot can't be re-allocated until its ACK unlinks it),
- * so there is no per-conn cap and no leak — this replaces the old fixed drain[16]
- * that silently dropped (and leaked) the 17th+ outstanding slot. Sharded locks
- * (by port) serialize a conn's track (app thread) vs its ACK-free (PE thread). */
-#define TX_CUSTODY_SHARDS 256u
+/* Per-conn TX send-unit FIFO depth: the max number of shipped-but-un-ACKed
+ * descriptors a single connection may keep outstanding. Each shipped descriptor
+ * records (seq -> end cursor) in su_seq/su_end[region*TX_SU_DEPTH + i]; a
+ * BATCH_FWD_ACK(port,seq) pops the FIFO front and advances the conn's free cursor.
+ * Power of two (masked). Bounds in-flight descriptors per conn (backpressure). */
+#define TX_SU_DEPTH 64u
 
 /* Connection table (connection-oriented, full-duplex — NOT request/response).
  * Index = local port [1,65535]; port 0 = BLANK (a fresh-connection message → the
@@ -90,10 +85,26 @@ struct dmesh_port_slot {
     sw_descriptor_t *inbox;           /* malloc'd ring[DMESH_INBOX_RING] */
     atomic_uint_fast32_t in_head;     /* consumer (app) */
     atomic_uint_fast32_t in_tail;     /* producer (PE) */
-    /* Head of this conn's un-ACKed sent-TX-slot custody list (-1 = empty); links
-     * through ctx->custody_next[]. Persists across a port's FREE→reuse so a
-     * straggler ACK still finds its slot; drained only by ACKs and at destroy. */
-    int32_t          tx_head;
+    /* Per-conn TX BYTE-RING (socket send buffer). This conn owns the contiguous byte
+     * region [tx_region*conn_bytes, +conn_bytes) of the shared TX mmap. FOUR monotonic
+     * byte cursors (uint64; byte offset in region = cursor % conn_bytes) chase around:
+     *   tx_w  alloc/write head — where the next message body is written / alloc'd (owner)
+     *   tx_c  commit           — bytes finalized as whole messages, ready to ship (owner)
+     *   tx_s  send             — bytes a descriptor was posted for (owner, at flush)
+     *   tx_f  free             — bytes ACKed by the DPU, reclaimable (PE thread)
+     * Invariant tx_f <= tx_s <= tx_c <= tx_w and tx_w - tx_f <= conn_bytes. Owner cursors
+     * are plain (single writer = the conn's app thread); tx_f is atomic (PE writes on ACK,
+     * owner reads for backpressure). tx_wmark = bip-buffer wrap point: a body that would
+     * straddle the region end skips the tail, and tx_wmark marks where live bytes end
+     * before the wrap so free wraps in step. Send-unit FIFO (su_head owner / su_tail PE)
+     * maps each shipped descriptor's seq -> its end cursor (ctx->su_seq / su_end) so an
+     * ACK advances tx_f. tx_region = -1 until a region is borrowed at connect/accept. */
+    int32_t          tx_region;
+    uint64_t         tx_w, tx_c, tx_s;      /* owner-thread cursors */
+    atomic_uint_fast64_t tx_f;              /* PE-thread cursor (ACK reclaim) */
+    uint64_t         tx_wmark;              /* bip-buffer wrap watermark (owner) */
+    atomic_uint_fast16_t su_head;           /* send-unit FIFO head (owner writes/release, PE reads) */
+    atomic_uint_fast16_t su_tail;           /* send-unit FIFO tail (PE writes/release, owner reads) */
 };
 /* Ready-list SPSC ops (monotonic counters; PE producer, app consumer). The list
  * carries conn PORTS; dmesh_next_ready maps each to its slot->user. Provably never
@@ -160,20 +171,25 @@ struct dpumesh_ctx {
     /* Persistent buffer for initial registration to avoid stack UAF */
     struct dmesh_register_msg reg_msg;
 
-    /* TX slot management — lock-free Treiber free-list of slot indices.
-     * free_head packs (tag<<32 | head_index); head_index==arena_base = empty.
-     * The tag (bumped per op) defeats ABA. slot_next[i] links free slots.
-     * The free-list covers ONLY the pool [0, arena_base); slots [arena_base,
-     * num_slots) are the contiguous zero-copy arena (dpumesh_arena_alloc). */
-    atomic_uint_fast64_t free_head;
-    uint32_t *slot_next;
-    /* Contiguous zero-copy arena: the top (num_slots - arena_base) slots serve
-     * dmesh_alloc(n>1). Bitmap first-fit under arena_lock (n>1 is the rare large
-     * path; single-slot alloc stays on the lock-free pool). arena_base==num_slots
-     * ⇒ no arena (default), pool = all slots, hot path bit-identical. */
-    int arena_base;
-    uint8_t *arena_used;       /* [num_slots - arena_base]; 1 = allocated. NULL if no arena */
-    pthread_mutex_t arena_lock;
+    /* TX buffer management — PER-CONNECTION contiguous BYTE-RINGS (socket send-buffer
+     * model). The shared TX mmap (num_slots * slot_size bytes) is partitioned into
+     * conn_pool REGIONS of conn_bytes = (num_slots/conn_pool)*slot_size bytes each. A
+     * conn borrows a region at connect/accept (region_free stack) and owns it as a
+     * byte-ring with FOUR cursors in its dmesh_port_slot (alloc/commit/send/free),
+     * so there is NO shared free-list, NO custody list, and NO arena — each conn's
+     * bytes are contiguous and single-owner (lock-free SPSC). Messages pack at byte
+     * granularity (variable length, no per-slot waste); zero-copy alloc/commit write
+     * straight into the ring. The send-unit FIFO su_seq/su_end (TX_SU_DEPTH entries
+     * per region) maps each shipped descriptor's (port,seq) -> its end cursor, so a
+     * BATCH_FWD_ACK(port,seq) advances the conn's free cursor tx_f (FIFO reclaim). */
+    int   conn_pool;           /* number of per-conn regions (= max concurrent conns) */
+    int   conn_rslots;         /* slots per region = num_slots / conn_pool */
+    int   conn_bytes;          /* bytes per region = conn_rslots * slot_size (byte-ring size) */
+    uint16_t *su_seq;          /* [conn_pool * TX_SU_DEPTH]: shipped descriptor's seq (reclaim key) */
+    uint64_t *su_end;          /* [conn_pool * TX_SU_DEPTH]: that descriptor's end cursor (tx_f target) */
+    int32_t *region_free;      /* [conn_pool]: stack of free region ids */
+    int      region_top;       /* stack top (# free regions) */
+    pthread_mutex_t region_lock;   /* guards region_free stack (connect/close only) */
 
     /* RX descriptor queue — lock-free bounded SPMC ring (1 producer = PE
      * thread, N consumers = server workers). dpumesh_dequeue spin-polls it
@@ -202,13 +218,6 @@ struct dpumesh_ctx {
      * the whole chain is notification-driven, not busy-poll. -1 = not created. */
     int notify_efd;
     volatile int notify_enabled;
-
-    /* TX-slot custody: per-conn un-ACKed sent-slot lists (see TX_CUSTODY_SHARDS).
-     * custody_next[slot] links a conn's outstanding slots (head in ports[].tx_head);
-     * custody_key[slot] = (port<<16|seq) so its BATCH_FWD_ACK frees the right slot. */
-    uint32_t *custody_key;     /* [num_slots] */
-    int32_t  *custody_next;    /* [num_slots]; -1 = list end */
-    pthread_mutex_t custody_locks[TX_CUSTODY_SHARDS];
 
     /* Endpoint port table + allocator (oriented-tuple demux). */
     struct dmesh_port_slot *ports;     /* [DMESH_PORT_SPACE] */
@@ -393,6 +402,11 @@ static inline int ready_pop(dpumesh_ctx_t *ctx, uint16_t *port) {
  * dst_port==BLANK never reaches a host: a client addresses a service and the DPU
  * always resolves to a concrete port before delivering. Bodies stay in the shared
  * RX mmap (pos); only the descriptor is queued. */
+/* Per-conn TX region lifecycle + FIFO reclaim (defined with the TX functions below).
+ * port_take_region is used by the PE (SERVER_PENDING) above its definition. */
+static int  port_take_region(dpumesh_ctx_t *ctx, struct dmesh_port_slot *psl);
+static inline void tx_reclaim_ack(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq);
+
 static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int slot)
 {
     uint16_t dport = desc->dst_port;
@@ -440,6 +454,14 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
             else if (r == 2 && ctx->notify_enabled) { ready_push(ctx, dport); dpumesh_notify(ctx); }
             return;
         }
+        if (psl->tx_region >= 0) {
+            /* FREE but the prior conn's TX region is still draining (this uP was
+             * reused before its ring drained) → can't create a conn on it yet;
+             * drop (the client retries). Rare — uPs cycle slowly. */
+            pthread_mutex_unlock(&ctx->port_lock);
+            rx_credit_return(ctx, slot);
+            return;
+        }
         if (!psl->inbox) {
             psl->inbox = (sw_descriptor_t *)malloc(DMESH_INBOX_RING * sizeof(sw_descriptor_t));
             if (!psl->inbox) { pthread_mutex_unlock(&ctx->port_lock); rx_credit_return(ctx, slot); return; }
@@ -454,6 +476,11 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
         psl->peer_pod  = desc->src_pod;
         psl->peer_port = desc->src_port;
         psl->user      = NULL;
+        if (port_take_region(ctx, psl) < 0) {   /* pool exhausted → drop this new conn */
+            pthread_mutex_unlock(&ctx->port_lock);
+            rx_credit_return(ctx, slot);
+            return;
+        }
         __atomic_store_n(&psl->role, DMESH_ROLE_SERVER_PENDING, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&ctx->port_lock);
 
@@ -462,6 +489,8 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
         uint_fast32_t cseq = atomic_load_explicit(&c->seq, memory_order_acquire);
         if ((int_fast32_t)(cseq - pos) != 0) {
             __atomic_store_n(&psl->role, DMESH_ROLE_FREE, __ATOMIC_RELEASE);   /* roll back */
+            dpumesh_region_return(ctx, psl->tx_region);   /* MUST return the region we borrowed */
+            psl->tx_region = -1;                          /* else the pool leaks a region per drop */
             DOCA_LOG_ERR("RX deliver: accept queue full, dropping new conn uP=%u", dport);
             rx_credit_return(ctx, slot);
             return;
@@ -543,27 +572,11 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
             DOCA_LOG_ERR("BATCH_TX_ACK: len=%u short for count=%u", len, n);
             return;
         }
-        for (uint32_t i = 0; i < n; i++) {
-            uint16_t port = b->acks[i].port;
-            if (port == 0 || port >= DMESH_PORT_SPACE) continue;
-            uint32_t key = dmesh_key(port, b->acks[i].seq);
-            struct dmesh_port_slot *psl = &ctx->ports[port];
-            pthread_mutex_t *lk = &ctx->custody_locks[port & (TX_CUSTODY_SHARDS - 1)];
-            int freed = -1;
-            pthread_mutex_lock(lk);
-            /* Unlink the (port,seq) node from this conn's custody list. */
-            int32_t *link = &psl->tx_head;
-            while (*link >= 0) {
-                int s = *link;
-                if (ctx->custody_key[s] == key) { *link = ctx->custody_next[s]; freed = s; break; }
-                link = &ctx->custody_next[s];
-            }
-            pthread_mutex_unlock(lk);
-            /* Free outside the shard lock (Treiber push is itself lock-free). A miss
-             * (freed<0) = an already-freed / duplicate / dropped-under-overload ACK
-             * → harmless no-op. */
-            if (freed >= 0) dpumesh_tx_free(ctx, freed);
-        }
+        /* Each ACK advances the conn's TX ring tail (FIFO). A miss (seq !=
+         * tail's) = an already-freed / duplicate / dropped-under-overload ACK →
+         * harmless no-op. */
+        for (uint32_t i = 0; i < n; i++)
+            tx_reclaim_ack(ctx, b->acks[i].port, b->acks[i].seq);
         return;
     }
 
@@ -606,14 +619,21 @@ static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, int 
     /* K = forward rings per pod (EU-sharding), baked to 2 — must match the DPU. */
     ctx->k_rings = DPUMESH_RINGS_PER_POD_DEFAULT;
 
-    /* Contiguous zero-copy arena: the top DPUMESH_ARENA_SLOTS slots are carved out
-     * of the pool for dmesh_alloc(n>1). Default 0 → no arena, pool = all slots
-     * (hot path unchanged). Clamp so the pool keeps at least 1 slot. */
-    int arena_slots = 0;
-    if ((env_val = getenv("DPUMESH_ARENA_SLOTS")) != NULL && atoi(env_val) > 0)
-        arena_slots = atoi(env_val);
-    if (arena_slots > ctx->num_slots - 1) arena_slots = ctx->num_slots - 1;
-    ctx->arena_base = ctx->num_slots - arena_slots;   /* == num_slots when no arena */
+    /* Per-conn TX byte-ring pool: partition the num_slots*slot_size TX buffer into
+     * DPUMESH_CONN_POOL regions (default 256 → conn_rslots = num_slots/256 = 16 slots
+     * = conn_bytes = 128 KB per conn = a socket send buffer). conn_pool = max
+     * concurrent conns; conn_bytes = per-conn ring size. conn_rslots is clamped >= 2
+     * so a message (<= slot_size) plus a bip pad always fits in one wrap. Tune per
+     * workload: fewer, deeper conns (gRPC multiplexing) = smaller pool. */
+    int pool = 256;
+    if ((env_val = getenv("DPUMESH_CONN_POOL")) != NULL && atoi(env_val) > 0)
+        pool = atoi(env_val);
+    if (pool < 1) pool = 1;
+    if (pool > ctx->num_slots / 2) pool = ctx->num_slots / 2;   /* conn_rslots >= 2 */
+    ctx->conn_pool   = pool;
+    ctx->conn_rslots = ctx->num_slots / pool;          /* >= 2 */
+    if (ctx->conn_rslots < 2) ctx->conn_rslots = 2;
+    ctx->conn_bytes  = ctx->conn_rslots * ctx->slot_size;   /* byte-ring size per conn */
 
     /* This node's service id (what it advertises; DPU sets service_table[service_id]
      * = the assigned pod_id). SVC_NONE = client-only. Comes from the caller;
@@ -746,21 +766,19 @@ int dpumesh_init(dpumesh_ctx_t **out, int service_id,
     if (init_control_path(ctx) != DOCA_SUCCESS) goto fail;
     if (init_datapath(ctx) != DOCA_SUCCESS) goto fail;
 
-    /* Build the lock-free TX free-list over the POOL [0, arena_base): link
-     * 0->1->...->(arena_base-1)->arena_base(empty sentinel), head = 0 (all free).
-     * Arena slots [arena_base, num_slots) are served by the bitmap allocator. */
-    ctx->slot_next = (uint32_t *)malloc((size_t)ctx->num_slots * sizeof(uint32_t));
-    if (!ctx->slot_next) goto fail;
-    for (int i = 0; i < ctx->arena_base; i++)
-        ctx->slot_next[i] = (uint32_t)(i + 1);   /* last -> arena_base = empty sentinel */
-    atomic_store(&ctx->free_head, (uint_fast64_t)0);  /* tag 0, head index 0 */
-
-    /* Contiguous zero-copy arena bitmap (only when carved via DPUMESH_ARENA_SLOTS). */
-    pthread_mutex_init(&ctx->arena_lock, NULL);
-    if (ctx->arena_base < ctx->num_slots) {
-        ctx->arena_used = (uint8_t *)calloc((size_t)(ctx->num_slots - ctx->arena_base), 1);
-        if (!ctx->arena_used) goto fail;
-    }
+    /* Per-conn TX byte-ring pool: partition the TX buffer into conn_pool contiguous
+     * regions of conn_bytes each. region_free is the stack of free region ids (all
+     * free at start; pop order 0,1,2,...). su_seq/su_end are the per-region send-unit
+     * FIFOs (TX_SU_DEPTH entries each) mapping a shipped descriptor's seq -> its end
+     * cursor, so a BATCH_FWD_ACK(port,seq) advances the conn's free cursor (reclaim). */
+    ctx->su_seq      = (uint16_t *)calloc((size_t)ctx->conn_pool * TX_SU_DEPTH, sizeof(uint16_t));
+    ctx->su_end      = (uint64_t *)calloc((size_t)ctx->conn_pool * TX_SU_DEPTH, sizeof(uint64_t));
+    ctx->region_free = (int32_t  *)malloc((size_t)ctx->conn_pool * sizeof(int32_t));
+    if (!ctx->su_seq || !ctx->su_end || !ctx->region_free) goto fail;
+    for (int i = 0; i < ctx->conn_pool; i++)
+        ctx->region_free[i] = ctx->conn_pool - 1 - i;   /* pop yields 0,1,2,... */
+    ctx->region_top = ctx->conn_pool;
+    pthread_mutex_init(&ctx->region_lock, NULL);
 
     /* Lock-free SPMC RX ring: seq[i] = i (cell i first writable at enq
      * position i), enq = deq = 0. */
@@ -776,20 +794,14 @@ int dpumesh_init(dpumesh_ctx_t **out, int service_id,
     ctx->notify_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     ctx->notify_enabled = 0;
 
-    /* TX-slot custody arrays + sharded locks (replaces the old pending table). */
-    ctx->custody_key  = (uint32_t *)malloc((size_t)ctx->num_slots * sizeof(uint32_t));
-    ctx->custody_next = (int32_t  *)malloc((size_t)ctx->num_slots * sizeof(int32_t));
-    if (!ctx->custody_key || !ctx->custody_next) goto fail;
-    for (unsigned j = 0; j < TX_CUSTODY_SHARDS; j++)
-        pthread_mutex_init(&ctx->custody_locks[j], NULL);
-
     /* Endpoint port table + allocator (oriented-tuple demux). calloc → every slot
-     * role=FREE. Ports allocated from 1 (0 = BLANK sentinel). tx_head must start -1
-     * (calloc's 0 would falsely name TX slot 0 as un-ACKed). */
+     * role=FREE. Ports allocated from 1 (0 = BLANK sentinel). tx_region must start
+     * -1 (no region borrowed); port_take_region resets the byte-ring cursors + FIFO
+     * when a region is borrowed at connect/accept. */
     ctx->ports = (struct dmesh_port_slot *)calloc(DMESH_PORT_SPACE, sizeof(struct dmesh_port_slot));
     if (!ctx->ports) goto fail;
     for (uint32_t p = 0; p < DMESH_PORT_SPACE; p++)
-        ctx->ports[p].tx_head = -1;
+        ctx->ports[p].tx_region = -1;
     pthread_mutex_init(&ctx->port_lock, NULL);
     ctx->next_port = 1;
 
@@ -824,22 +836,13 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
 
     /* Free resources BEFORE destroying locks they depend on. */
 
-    /* Free any still-un-ACKed TX slots parked in the per-conn custody lists, then
-     * the custody arrays + sharded locks. (PE thread already joined above → no
-     * concurrent track/ACK; ctx->slot_next + ports are still valid here.) */
-    if (ctx->ports && ctx->custody_next) {
-        for (uint32_t p = 0; p < DMESH_PORT_SPACE; p++) {
-            int32_t s = ctx->ports[p].tx_head;
-            while (s >= 0) { int32_t nx = ctx->custody_next[s]; dpumesh_tx_free(ctx, s); s = nx; }
-            ctx->ports[p].tx_head = -1;
-        }
-    }
-    for (unsigned j = 0; j < TX_CUSTODY_SHARDS; j++)
-        pthread_mutex_destroy(&ctx->custody_locks[j]);
-    if (ctx->custody_key)  { free(ctx->custody_key);  ctx->custody_key  = NULL; }
-    if (ctx->custody_next) { free(ctx->custody_next); ctx->custody_next = NULL; }
-    if (ctx->arena_used)   { free(ctx->arena_used);   ctx->arena_used   = NULL; }
-    pthread_mutex_destroy(&ctx->arena_lock);
+    /* Per-conn TX byte-rings need no drain at teardown — in-flight bytes die with the
+     * ctx. (PE thread joined above → no concurrent reserve/reclaim.) Free the region
+     * pool + send-unit FIFOs. */
+    if (ctx->region_free) { free(ctx->region_free); ctx->region_free = NULL; }
+    if (ctx->su_seq)      { free(ctx->su_seq);      ctx->su_seq      = NULL; }
+    if (ctx->su_end)      { free(ctx->su_end);      ctx->su_end      = NULL; }
+    pthread_mutex_destroy(&ctx->region_lock);
 
     /* Destroy DMA landing-zone mmap + buffer (Host RX DMA buffer).
      * Must happen before cleanup_objects destroys the device. */
@@ -856,7 +859,6 @@ static void cleanup_ctx(dpumesh_ctx_t *ctx) {
 
     for (int j = 0; j < MAX_EU_PER_POD; j++)
         if (ctx->dma_rings[j]) { free(ctx->dma_rings[j]->seq); ctx->dma_rings[j]->seq = NULL; }
-    if (ctx->slot_next) free(ctx->slot_next);
     if (ctx->rx_ring) free(ctx->rx_ring);
     if (ctx->ports) { free(ctx->ports); ctx->ports = NULL; pthread_mutex_destroy(&ctx->port_lock); }
 
@@ -873,79 +875,184 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx) {
  * TX functions
  * ==================================================================== */
 
-int dpumesh_tx_alloc(dpumesh_ctx_t *ctx) {
-    /* Lock-free pop from the Treiber free-list (O(1), no slot_lock / no O(n) scan
-     * / no cond). Backpressure: the caller has committed to this request, so when
-     * the list is empty spin with a short capped backoff until a slot frees —
-     * mirrors the old blocking behavior without the mutex/cond host-CPU cost. */
-    struct timespec backoff = {0, 1000};  /* 1µs initial */
+/* ---- Per-conn TX region pool: borrow/return a contiguous slot region ---- */
+/* Borrow a free region id (connect/accept), or -1 if the pool is exhausted
+ * (max concurrent conns reached — caller fails the connect/accept with ENOMEM).
+ * Off the hot path (connect/close only), so the small lock is uncontended. */
+int dpumesh_region_borrow(dpumesh_ctx_t *ctx) {
+    pthread_mutex_lock(&ctx->region_lock);
+    int rid = (ctx->region_top > 0) ? ctx->region_free[--ctx->region_top] : -1;
+    pthread_mutex_unlock(&ctx->region_lock);
+    return rid;
+}
+void dpumesh_region_return(dpumesh_ctx_t *ctx, int rid) {
+    if (rid < 0 || rid >= ctx->conn_pool) return;
+    pthread_mutex_lock(&ctx->region_lock);
+    if (ctx->region_top < ctx->conn_pool) ctx->region_free[ctx->region_top++] = rid;
+    pthread_mutex_unlock(&ctx->region_lock);
+}
+
+#define TX_NO_WMARK (~(uint64_t)0)   /* tx_wmark sentinel: no bip pad pending */
+
+/* Borrow a region for a conn and reset its byte-ring (all 4 cursors + send-unit
+ * FIFO to 0, no pad). 0 = ok, -1 = pool exhausted → caller fails connect/accept. */
+static int port_take_region(dpumesh_ctx_t *ctx, struct dmesh_port_slot *psl) {
+    int rid = dpumesh_region_borrow(ctx);
+    if (rid < 0) return -1;
+    psl->tx_w = psl->tx_c = psl->tx_s = 0;
+    atomic_store_explicit(&psl->tx_f, 0, memory_order_relaxed);
+    psl->tx_wmark = TX_NO_WMARK;
+    atomic_store_explicit(&psl->su_head, 0, memory_order_relaxed);
+    atomic_store_explicit(&psl->su_tail, 0, memory_order_relaxed);
+    psl->tx_region = rid;
+    return 0;
+}
+
+/* Return a CLOSED conn's region — but only once its byte-ring has DRAINED (tx_f ==
+ * tx_w = every shipped byte ACKed = the DPU finished reading it), so a byte is never
+ * overwritten mid-DMA by the next conn to borrow this region. NON-BLOCKING: called
+ * by free_port (owner, at close) and tx_reclaim_ack (PE, on each ACK). Role is
+ * checked FIRST (acquire) so the owner's final tx_w write is visible before the PE
+ * reads it. The region_lock + tx_region>=0 recheck make exactly one caller return it
+ * (no double-free). Never blocks the app thread; until returned the port stays
+ * FREE-but-draining (tx_region>=0) and the alloc paths skip it (no reuse pre-drain). */
+static void try_return_region(dpumesh_ctx_t *ctx, struct dmesh_port_slot *psl) {
+    if (psl->tx_region < 0) return;                       /* already returned / none */
+    if (__atomic_load_n(&psl->role, __ATOMIC_ACQUIRE) != DMESH_ROLE_FREE)
+        return;                                           /* live conn — owner owns tx_w */
+    if (psl->tx_w != atomic_load_explicit(&psl->tx_f, memory_order_acquire))
+        return;                                           /* ring not drained yet */
+    pthread_mutex_lock(&ctx->region_lock);
+    int rid = psl->tx_region;
+    if (rid >= 0) {
+        psl->tx_region = -1;
+        if (ctx->region_top < ctx->conn_pool) ctx->region_free[ctx->region_top++] = rid;
+    }
+    pthread_mutex_unlock(&ctx->region_lock);
+}
+
+/* ---- Per-conn TX BYTE-RING: reserve → (fill) → commit → send → (ACK) free ---- */
+
+/* Reserve `len` CONTIGUOUS bytes at this conn's write head. Returns a pointer into
+ * the shared TX mmap to fill (then dpumesh_tx_commit with the actual length). Blocks
+ * with capped backoff while the ring lacks room (own ACKs advance tx_f). Bip-buffer:
+ * a body that would straddle the region end pads the tail (records tx_wmark so send
+ * skips it) and places the body at offset 0. NULL if the conn holds no region or
+ * len==0 / len>conn_bytes. Owner thread only (sole writer of tx_w/tx_c/tx_wmark). */
+uint8_t *dpumesh_tx_reserve(dpumesh_ctx_t *ctx, uint16_t port, uint32_t len) {
+    if (port == 0 || port >= DMESH_PORT_SPACE) return NULL;
+    struct dmesh_port_slot *psl = &ctx->ports[port];
+    int rid = psl->tx_region;
+    uint32_t cb = (uint32_t)ctx->conn_bytes;
+    if (rid < 0 || len == 0 || len > cb) return NULL;
+    struct timespec backoff = {0, 1000};
     for (;;) {
-        uint_fast64_t old = atomic_load_explicit(&ctx->free_head, memory_order_acquire);
-        int empty = 0;
-        for (;;) {
-            uint32_t head = (uint32_t)(old & 0xFFFFFFFFu);
-            if (head >= (uint32_t)ctx->arena_base) { empty = 1; break; }   /* pool exhausted */
-            uint_fast64_t newv = (((old >> 32) + 1) << 32) | (uint_fast64_t)ctx->slot_next[head];
-            if (atomic_compare_exchange_weak_explicit(&ctx->free_head, &old, newv,
-                    memory_order_acquire, memory_order_acquire))
-                return (int)head;
-            /* CAS failed: old reloaded — retry inner loop */
+        uint64_t w = psl->tx_w;
+        uint64_t f = atomic_load_explicit(&psl->tx_f, memory_order_acquire);
+        uint32_t off = (uint32_t)(w % cb);
+        uint32_t pad = (off + len > cb) ? (cb - off) : 0;      /* bip tail pad */
+        if ((w - f) + pad + len <= (uint64_t)cb) {
+            if (pad) { psl->tx_wmark = w; w += pad; psl->tx_w = w; off = 0; }
+            return (uint8_t *)ctx->dma_buffer + (size_t)rid * cb + off;
         }
-        if (empty) {
-            nanosleep(&backoff, NULL);
-            if (backoff.tv_nsec < 50000) backoff.tv_nsec *= 2;  /* cap 50µs */
-        }
+        nanosleep(&backoff, NULL);
+        if (backoff.tv_nsec < 50000) backoff.tv_nsec *= 2;     /* cap 50µs */
     }
 }
 
-uint8_t *dpumesh_tx_buf(dpumesh_ctx_t *ctx, int slot) {
-    if (slot < 0 || slot >= ctx->num_slots) return NULL;
-    return (uint8_t *)ctx->dma_buffer + ((size_t)slot * ctx->slot_size);
+/* Finalize `len` bytes (<= the reserved len) at the write head as committed message
+ * bytes, ready to ship. Advances tx_w + tx_c. Owner thread. */
+void dpumesh_tx_commit(dpumesh_ctx_t *ctx, uint16_t port, uint32_t len) {
+    struct dmesh_port_slot *psl = &ctx->ports[port];
+    if (psl->tx_region < 0) return;
+    psl->tx_w += len;
+    psl->tx_c  = psl->tx_w;
 }
 
-void dpumesh_tx_free(dpumesh_ctx_t *ctx, int slot) {
-    if (slot < 0 || slot >= ctx->num_slots) return;
-    /* Arena slot → clear its bitmap bit (a contiguous run reappears once all its
-     * slots are freed). Per-slot free matches the DPU's per-(port,seq) TX_ACK. */
-    if (slot >= ctx->arena_base) {
-        pthread_mutex_lock(&ctx->arena_lock);
-        ctx->arena_used[slot - ctx->arena_base] = 0;
-        pthread_mutex_unlock(&ctx->arena_lock);
-        return;
-    }
-    /* Pool slot → lock-free push onto the Treiber free-list (no mutex, no cond). */
-    uint_fast64_t old = atomic_load_explicit(&ctx->free_head, memory_order_relaxed);
-    for (;;) {
-        uint32_t head = (uint32_t)(old & 0xFFFFFFFFu);
-        ctx->slot_next[slot] = head;                 /* slot -> old head */
-        uint_fast64_t newv = (((old >> 32) + 1) << 32) | (uint_fast64_t)(uint32_t)slot;
-        if (atomic_compare_exchange_weak_explicit(&ctx->free_head, &old, newv,
-                memory_order_release, memory_order_relaxed))
-            return;
-    }
+/* Discard committed-but-UNSENT bytes (close-before-flush): rewind the commit + write
+ * heads back to the send head. Shipped bytes (in flight) are untouched. Owner thread. */
+void dpumesh_tx_discard_unsent(dpumesh_ctx_t *ctx, uint16_t port) {
+    struct dmesh_port_slot *psl = &ctx->ports[port];
+    if (psl->tx_region < 0) return;
+    psl->tx_c = psl->tx_s;
+    psl->tx_w = psl->tx_s;
+    psl->tx_wmark = TX_NO_WMARK;
 }
 
-int dpumesh_arena_alloc(dpumesh_ctx_t *ctx, int n) {
-    /* First-fit over the arena bitmap under arena_lock (n>1 is the rare large
-     * path). Returns the base slot index of n contiguous free slots, or -1 if
-     * there is no arena or no run of n. Each slot is later freed independently
-     * by dpumesh_tx_free (per-(port,seq) TX_ACK); a run reappears once all clear. */
-    if (n <= 0 || !ctx->arena_used) return -1;
-    int arena_n = ctx->num_slots - ctx->arena_base;
-    if (n > arena_n) return -1;
-    pthread_mutex_lock(&ctx->arena_lock);
-    int run = 0, base = 0;
-    for (int i = 0; i < arena_n; i++) {
-        if (ctx->arena_used[i]) { run = 0; continue; }
-        if (run == 0) base = i;
-        if (++run == n) {                       /* n consecutive free slots found */
-            for (int j = base; j < base + n; j++) ctx->arena_used[j] = 1;
-            pthread_mutex_unlock(&ctx->arena_lock);
-            return ctx->arena_base + base;      /* absolute slot index */
-        }
+/* Get the next descriptor to ship from the committed-but-unsent range [tx_s, tx_c).
+ * Returns 1 + its byte offset in the shared mmap (*out_moff) and length (*out_len,
+ * <= slot_size, never crossing the ring wrap or a bip pad), or 0 if nothing to ship.
+ * Skips a bip pad transparently. BLOCKS (backoff) if the send-unit FIFO is full
+ * (>=TX_SU_DEPTH descriptors in flight; the PE drains it via ACK). Does NOT advance
+ * tx_s — call dpumesh_tx_sent once the descriptor is enqueued. Owner thread. */
+int dpumesh_tx_next_send(dpumesh_ctx_t *ctx, uint16_t port, size_t *out_moff, uint32_t *out_len) {
+    struct dmesh_port_slot *psl = &ctx->ports[port];
+    int rid = psl->tx_region;
+    if (rid < 0) return 0;
+    uint32_t cb = (uint32_t)ctx->conn_bytes;
+    /* If the send head sits exactly on a bip pad, jump it to the next boundary
+     * (no descriptor; the pad is reclaimed by the following unit's ACK). */
+    if (psl->tx_wmark != TX_NO_WMARK && psl->tx_s == psl->tx_wmark) {
+        uint32_t off = (uint32_t)(psl->tx_s % cb);
+        psl->tx_s += (cb - off);
+        psl->tx_wmark = TX_NO_WMARK;
     }
-    pthread_mutex_unlock(&ctx->arena_lock);
-    return -1;
+    if (psl->tx_s >= psl->tx_c) return 0;                  /* nothing committed to ship */
+    /* Back-pressure on the send-unit FIFO (bounds in-flight descriptors per conn). */
+    struct timespec backoff = {0, 1000};
+    while ((uint16_t)(atomic_load_explicit(&psl->su_head, memory_order_relaxed) -
+                      atomic_load_explicit(&psl->su_tail, memory_order_acquire)) >= (uint16_t)TX_SU_DEPTH) {
+        nanosleep(&backoff, NULL);
+        if (backoff.tv_nsec < 50000) backoff.tv_nsec *= 2;
+    }
+    uint64_t limit = psl->tx_c;
+    if (psl->tx_wmark != TX_NO_WMARK && psl->tx_wmark > psl->tx_s && psl->tx_wmark < limit)
+        limit = psl->tx_wmark;                             /* don't ship across the pad */
+    uint32_t off   = (uint32_t)(psl->tx_s % cb);
+    uint64_t avail = limit - psl->tx_s;
+    uint32_t chunk = (avail < (uint64_t)ctx->slot_size) ? (uint32_t)avail : (uint32_t)ctx->slot_size;
+    if (off + chunk > cb) chunk = cb - off;                /* don't cross the ring wrap */
+    *out_moff = (size_t)rid * cb + off;
+    *out_len  = chunk;
+    return 1;
+}
+
+/* Record a shipped descriptor's (seq -> end cursor) in the send-unit FIFO and advance
+ * the send head. A BATCH_FWD_ACK(port,seq) later pops it (FIFO) to advance tx_f. `len`
+ * = the descriptor length from dpumesh_tx_next_send (0 for a FIN — holds no bytes).
+ * Owner thread (sole su_head writer + tx_s writer). */
+void dpumesh_tx_sent(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq, uint32_t len) {
+    struct dmesh_port_slot *psl = &ctx->ports[port];
+    int rid = psl->tx_region;
+    if (rid < 0) return;
+    uint16_t h = atomic_load_explicit(&psl->su_head, memory_order_relaxed);
+    size_t idx = (size_t)rid * TX_SU_DEPTH + (h & (TX_SU_DEPTH - 1));
+    psl->tx_s += len;
+    ctx->su_seq[idx] = seq;
+    ctx->su_end[idx] = psl->tx_s;                          /* end cursor after this unit */
+    atomic_store_explicit(&psl->su_head, (uint_fast16_t)(h + 1), memory_order_release);
+}
+
+/* Reclaim on BATCH_FWD_ACK(port,seq): pop the send-unit FIFO front when its seq
+ * matches (FIFO — a conn ships + ACKs in seq order) and advance the free cursor tx_f
+ * to that unit's end (reclaiming any bip pad folded before it). Runs on the PE thread
+ * (sole tx_f + su_tail writer). */
+static inline void tx_reclaim_ack(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq) {
+    if (port == 0 || port >= DMESH_PORT_SPACE) return;
+    struct dmesh_port_slot *psl = &ctx->ports[port];
+    int rid = psl->tx_region;
+    if (rid < 0) return;
+    uint16_t tail = atomic_load_explicit(&psl->su_tail, memory_order_relaxed);
+    uint16_t head = atomic_load_explicit(&psl->su_head, memory_order_acquire);
+    if (tail == head) return;                              /* nothing outstanding */
+    size_t idx = (size_t)rid * TX_SU_DEPTH + (tail & (TX_SU_DEPTH - 1));
+    if (ctx->su_seq[idx] == seq) {
+        atomic_store_explicit(&psl->tx_f, ctx->su_end[idx], memory_order_release);
+        atomic_store_explicit(&psl->su_tail, (uint_fast16_t)(tail + 1), memory_order_release);
+        /* If this ACK drained a CLOSED conn's ring, return its region (free_port left
+         * it FREE-but-draining). No-op on a live conn. */
+        try_return_region(ctx, psl);
+    }
 }
 
 int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
@@ -962,9 +1069,13 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
      * are distinguished even on the same host. The DPU may also route a service to
      * the sender's own pod. No reject here. */
 
-    if (desc->body_buf_slot < 0 || desc->body_buf_slot >= ctx->num_slots) {
-        DOCA_LOG_ERR("ENQUEUE rejected: invalid body_buf_slot=%d (num_slots=%d)",
-                     desc->body_buf_slot, ctx->num_slots);
+    /* body_buf_slot now carries a BYTE OFFSET into the shared TX mmap (per-conn
+     * byte-ring), not a slot index. Bounds-check the offset + length. */
+    if (desc->body_buf_slot < 0 ||
+        (size_t)desc->body_buf_slot + desc->body_len > (size_t)ctx->num_slots * ctx->slot_size) {
+        DOCA_LOG_ERR("ENQUEUE rejected: byte offset=%d + len=%u out of TX buffer (%zu)",
+                     desc->body_buf_slot, desc->body_len,
+                     (size_t)ctx->num_slots * ctx->slot_size);
         return -1;
     }
 
@@ -1026,8 +1137,7 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
      * request-vs-response is not a wire flag, just the oriented tuple. */
 
     dma->mmap = ctx->dpa_mmap_handle;
-    dma->addr = (uint64_t)ctx->dma_buffer +
-                ((size_t)desc->body_buf_slot * ctx->slot_size);
+    dma->addr = (uint64_t)ctx->dma_buffer + (size_t)desc->body_buf_slot;  /* byte offset */
     dma->size = desc->body_len;
     /* oriented endpoint tuple → DPA passthrough → DPU routes (dst_pod==BLANK).
      * src identity is stamped from the ctx (this node), not the caller's desc. */
@@ -1159,7 +1269,7 @@ uint16_t dpumesh_alloc_port(dpumesh_ctx_t *ctx, int role, void *user) {
         uint32_t p = ctx->next_port;
         ctx->next_port = (p + 1 >= DMESH_UPORT_BASE) ? 1 : p + 1;  /* wrap in [1, UPORT_BASE) */
         struct dmesh_port_slot *psl = &ctx->ports[p];
-        if (psl->role == DMESH_ROLE_FREE) {
+        if (psl->role == DMESH_ROLE_FREE && psl->tx_region < 0) {  /* skip FREE-but-draining */
             /* Per-port inbound ring is allocated once and KEPT for the lifetime of
              * the process (reused when this port number is reallocated) — never
              * freed mid-run, so a stale PE delivery can't use-after-free it. */
@@ -1179,8 +1289,12 @@ uint16_t dpumesh_alloc_port(dpumesh_ctx_t *ctx, int role, void *user) {
             psl->peer_pod   = DMESH_POD_BLANK;
             psl->peer_port  = 0;
             psl->user       = user;     /* visible before role (publish ordering below) */
+            if (port_take_region(ctx, psl) < 0) {   /* region pool exhausted → fail connect */
+                pthread_mutex_unlock(&ctx->port_lock);
+                return 0;
+            }
             /* Publish role LAST (RELEASE) so the PE's ACQUIRE-load sees the fully
-             * initialized inbox/head/tail/user before it can deliver here. */
+             * initialized inbox/head/tail/user/region before it can deliver here. */
             __atomic_store_n(&psl->role, (uint8_t)role, __ATOMIC_RELEASE);
             pthread_mutex_unlock(&ctx->port_lock);
             return (uint16_t)p;
@@ -1201,9 +1315,9 @@ uint16_t dpumesh_alloc_port_specific(dpumesh_ctx_t *ctx, uint16_t p, int role, v
     if (p == 0 || p >= DMESH_PORT_SPACE) return 0;
     pthread_mutex_lock(&ctx->port_lock);
     struct dmesh_port_slot *psl = &ctx->ports[p];
-    if (psl->role != DMESH_ROLE_FREE) {
+    if (psl->role != DMESH_ROLE_FREE || psl->tx_region >= 0) {
         pthread_mutex_unlock(&ctx->port_lock);
-        return 0;   /* already live (duplicate accept before coalescing) */
+        return 0;   /* already live, or FREE-but-draining (region not yet returned) */
     }
     if (!psl->inbox) {
         psl->inbox = (sw_descriptor_t *)malloc(DMESH_INBOX_RING * sizeof(sw_descriptor_t));
@@ -1219,6 +1333,10 @@ uint16_t dpumesh_alloc_port_specific(dpumesh_ctx_t *ctx, uint16_t p, int role, v
     psl->peer_pod  = DMESH_POD_BLANK;
     psl->peer_port = 0;
     psl->user      = user;
+    if (port_take_region(ctx, psl) < 0) {   /* region pool exhausted → fail accept */
+        pthread_mutex_unlock(&ctx->port_lock);
+        return 0;
+    }
     __atomic_store_n(&psl->role, (uint8_t)role, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&ctx->port_lock);
     return p;
@@ -1250,8 +1368,14 @@ uint16_t dpumesh_accept_port(dpumesh_ctx_t *ctx, uint16_t port, void *user) {
 void dpumesh_free_port(dpumesh_ctx_t *ctx, uint16_t port) {
     if (port == 0 || port >= DMESH_PORT_SPACE) return;
     struct dmesh_port_slot *psl = &ctx->ports[port];
+    /* Mark FREE first, then try to return the TX region — NON-BLOCKING. If sends
+     * are still un-ACKed the region is NOT returned here; the PE's reclaim returns
+     * it on the last ACK (try_return_region). Until then the port is FREE-but-
+     * draining (tx_region>=0) and the alloc paths skip it, so its slots are never
+     * reused mid-DMA. Close never blocks the app thread. */
     __atomic_store_n(&psl->role, DMESH_ROLE_FREE, __ATOMIC_RELEASE);
     psl->user = NULL;
+    try_return_region(ctx, psl);
     if (psl->inbox) {
         sw_descriptor_t d;
         while (inbox_pop(psl, &d)) rx_credit_return(ctx, d.body_buf_slot);
@@ -1289,20 +1413,3 @@ void *dpumesh_next_ready(dpumesh_ctx_t *ctx) {
     return NULL;
 }
 
-/* Record a SENT TX slot so the DPU's BATCH_FWD_ACK (rx_data_hook) can free it. The
- * slot is pushed (LIFO) onto its conn's un-ACKed custody list, keyed by (port,seq).
- * Unbounded: a conn may keep any number of sends outstanding (pipelining); total
- * live nodes are bounded by num_slots since a slot can't be re-allocated until its
- * ACK unlinks it. Sharded by port so a conn's track (app thread) serializes only
- * against its own ACK-free (PE thread). Never blocks. */
-void dpumesh_tx_track(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq, int tx_slot) {
-    if (tx_slot < 0 || tx_slot >= ctx->num_slots) return;
-    if (port == 0 || port >= DMESH_PORT_SPACE) return;
-    struct dmesh_port_slot *psl = &ctx->ports[port];
-    pthread_mutex_t *lk = &ctx->custody_locks[port & (TX_CUSTODY_SHARDS - 1)];
-    pthread_mutex_lock(lk);
-    ctx->custody_key[tx_slot]  = dmesh_key(port, seq);
-    ctx->custody_next[tx_slot] = psl->tx_head;
-    psl->tx_head = (int32_t)tx_slot;
-    pthread_mutex_unlock(lk);
-}

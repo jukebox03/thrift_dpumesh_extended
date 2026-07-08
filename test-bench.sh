@@ -500,6 +500,8 @@ spec:
         # Pipeline depth (mode=2 / dpumesh-pipeline): outstanding msgs PER conn.
         # Default 8 (unchanged); set >16 to exercise deep-pipeline TX-slot custody.
         - { name: BENCH_PIPELINE, value: "${BENCH_PIPELINE:-8}" }
+        # Coalesce (mode=2): 1 → pack a fill burst into ONE flush (fewer host→DPU DMAs).
+        - { name: BENCH_COALESCE, value: "${BENCH_COALESCE:-0}" }
         securityContext: { privileged: true }
         # CPU 1-core 제한은 pin_pods()의 taskset으로 처리 (CFS quota 미사용).
         volumeMounts:

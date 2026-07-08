@@ -97,14 +97,13 @@ static void run_loopback(int conn_fd, long N, int size, int zc) {
         double t0 = now_sec();
         int sent;
         if (zc) {
-            /* ZERO-COPY: alloc n contiguous slots, fill transport memory directly,
-             * register (adopt as the conn's outbound), flush ships it (no memcpy). */
-            int nslots = (size + msgmax - 1) / msgmax;
-            dmesh_buf_t bz = dmesh_alloc(g_s, nslots);
-            if (!bz.ptr) { fail++; dmesh_close(c); c = dmesh_connect(g_s, g_service); continue; }
-            bz.ptr[0] = p; bz.ptr[size / 2] = p; bz.ptr[size - 1] = p;
-            int old = dmesh_slot_register(c, bz, (uint32_t)size);
-            if (old >= 0) { dmesh_buf_t ob = { NULL, old, 1 }; dmesh_free(g_s, ob); }
+            /* ZERO-COPY: reserve `size` contiguous bytes in the conn's byte-ring, fill
+             * transport DMA memory directly, commit + flush (no memcpy). flush carves
+             * it into <= slot_size descriptors; the reader reassembles the byte stream. */
+            uint8_t *bz = dmesh_alloc(c, (size_t)size);
+            if (!bz) { fail++; dmesh_close(c); c = dmesh_connect(g_s, g_service); continue; }
+            bz[0] = p; bz[size / 2] = p; bz[size - 1] = p;
+            dmesh_commit(c, (size_t)size);
             sent = (dmesh_flush(c) >= 0);
         } else {
             body[0] = p; body[size / 2] = p; body[size - 1] = p;

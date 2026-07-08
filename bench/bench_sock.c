@@ -40,6 +40,9 @@ static dmesh_channel_t *g_s = NULL;            /* the façade endpoint (shared, 
 static int    g_dst_pod_id = 11;
 static int    g_async_threads = 4;
 static int    g_pipeline_depth = 8;            /* mode=2: messages in flight PER conn (BENCH_PIPELINE) */
+static int    g_coalesce = 0;                  /* mode=2: BENCH_COALESCE=1 → pack a fill burst into ONE
+                                                * flush (fewer, bigger host→DPU DMAs; tests the DMA-count
+                                                * lever). 0 = flush per message (baseline). */
 
 /* Observability (reset per RUN): connection reuse + fail breakdown. Printed to
  * stderr in the DONE line (NOT in the OK reply, which test-bench.sh parses). */
@@ -261,6 +264,7 @@ static void *worker_fn_pipeline(void *arg) {
             /* Model B: the DPU owns the upstream and the server host coalesces
              * pipelined messages (2..P) before accept, so a client can pipeline from
              * message 1 — no establish-before-pipeline dance. */
+            int wrote = 0;
             while ((q->tail - q->head) < P && next_j < w->budget) {
                 double scheduled = w->start_at + (double)next_j * w->interval_sec;
                 if (now_sec() < scheduled) break;
@@ -272,12 +276,19 @@ static void *worker_fn_pipeline(void *arg) {
                 uint8_t stamp = (uint8_t)id;
                 memcpy(body, &id, sizeof id);
                 body[w->msg_size / 2] = stamp; body[w->msg_size - 1] = stamp;
-                if (dmesh_write(q->c, body, (size_t)w->msg_size) < 0 || dmesh_flush(q->c) < 0) {
+                /* Coalesce: accumulate WITHOUT a per-message flush so the fill burst
+                 * packs into 8KB slots → fewer, bigger host→DPU DMAs (one flush ships
+                 * the burst). Baseline flushes each message (one descriptor each). */
+                if (dmesh_write(q->c, body, (size_t)w->msg_size) < 0 ||
+                    (!g_coalesce && dmesh_flush(q->c) < 0)) {
                     dmesh_close(q->c); q->c = NULL; break;
                 }
                 int i = q->tail % P;
                 q->sched[i] = scheduled; q->sent[i] = now_sec(); q->rid[i] = id;
-                q->tail++; next_j++; did_work = 1;
+                q->tail++; next_j++; did_work = 1; wrote = 1;
+            }
+            if (g_coalesce && wrote && q->c && dmesh_flush(q->c) < 0) {
+                dmesh_close(q->c); q->c = NULL;   /* ship the coalesced burst as one+ descriptors */
             }
             if (!q->c) continue;
             /* ---- harvest: drain THIS conn's ready replies — each dmesh_read returns
@@ -651,6 +662,7 @@ int main(void) {
     if (getenv("BENCH_DST_POD_ID")) g_dst_pod_id   = atoi(getenv("BENCH_DST_POD_ID"));  /* dst SERVICE */
     if (getenv("ASYNC_THREADS"))    g_async_threads = atoi(getenv("ASYNC_THREADS"));
     if (getenv("BENCH_PIPELINE"))   g_pipeline_depth = atoi(getenv("BENCH_PIPELINE"));
+    if (getenv("BENCH_COALESCE"))   g_coalesce       = atoi(getenv("BENCH_COALESCE"));
 
     /* Pure client: advertises no service. The DPU assigns our pod_id. */
     g_s = dmesh_create_channel(DMESH_SVC_NONE);              /* socket() + bind() */

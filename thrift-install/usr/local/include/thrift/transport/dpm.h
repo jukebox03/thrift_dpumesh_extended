@@ -90,20 +90,9 @@ typedef struct dmesh_conn {
     uint32_t       rx_len;
     uint32_t       rx_pos;
 
-    /* outbound (buffered until flush) */
-    int       tx_slot;         /* -1 = no message buffered; else the base slot */
-    uint8_t  *tx_buf;
-    uint32_t  tx_len;
-    int       tx_region_n;     /* >1 → tx_slot is the base of a registered contiguous
-                                * zero-copy region of this many slots (dmesh_slot_register);
-                                * 0/1 → an ordinary single buffered slot. */
-
-    /* route-affinity for auto-chunked large messages. cur_group = the current
-     * (un-flushed) message's route_group: 0 while it still fits one slot, assigned on
-     * its FIRST slot overflow (from the channel's GLOBAL id source) so every chunk of
-     * the message pins to ONE backend, cleared at flush. A single-slot message keeps
-     * cur_group=0 → normal per-message LB. */
-    uint8_t   cur_group;
+    /* Outbound bytes live in the CORE per-conn TX byte-ring (keyed by local_port):
+     * dmesh_write reserves+commits into it; dmesh_flush ships committed bytes as
+     * ≤slot_size descriptors. The conn holds no TX buffer state of its own. */
 
     /* CONNECTION-level route affinity (dmesh_pin_route): 0 = per-message LB (default,
      * bit-identical to the pre-pin behavior). Non-zero = a route_group stamped on
@@ -197,7 +186,6 @@ static inline dmesh_conn_t *dmesh_accept(dmesh_channel_t *s) {
     c->rx_buf      = dpumesh_rx_buf(s->ctx, req.body_buf_slot);
     c->rx_len      = req.body_len;
     c->rx_pos      = 0;
-    c->tx_slot     = -1;
     return c;
 }
 
@@ -217,7 +205,6 @@ static inline dmesh_conn_t *dmesh_connect(dmesh_channel_t *s, int dst_service_id
     c->remote_port = DMESH_PORT_BLANK;
     c->seq         = 0;
     c->rx_slot     = -1;
-    c->tx_slot     = -1;
     return c;
 }
 
@@ -281,57 +268,26 @@ static inline ssize_t dmesh_read(dmesh_conn_t *c, void *buf, size_t len) {
     return (ssize_t)n;
 }
 
-/* INTERNAL: ensure a TX slot (a new outbound message) is allocated. */
-static inline int dmesh_tx_ensure(dmesh_conn_t *c) {
-    if (c->tx_slot >= 0) return 0;
-    int slot = dpumesh_tx_alloc(c->ep->ctx);
-    if (slot < 0) { errno = EAGAIN; return -1; }
-    c->tx_slot = slot;
-    c->tx_buf  = dpumesh_tx_buf(c->ep->ctx, slot);
-    c->tx_len  = 0;
-    return 0;
-}
-
-/* INTERNAL: ship ONE slot as a message/chunk stamped with route_group `rg`
- * (0 = normal per-message LB; 1..255 = pin all chunks sharing this id to one
- * backend). seq++, build the descriptor, enqueue, hand the slot to TX custody
- * (the DPU's BATCH_FWD_ACK frees it once its DMA read completes). On enqueue
- * fault frees the slot immediately. Does NOT touch the conn's tx_slot/tx_buf/
- * tx_len — the caller owns those. Returns 0, or -1 (EBADMSG). */
-static inline int dmesh_ship_at(dmesh_conn_t *c, int slot, uint32_t len, uint8_t rg) {
+/* INTERNAL: build the oriented tuple for one outbound descriptor of this conn
+ * (client → service with per-message LB, or server → its learned peer), stamped
+ * with the conn's route-affinity group. `moff` = byte offset in the shared TX mmap,
+ * `len` = descriptor length. seq++. Returns 0, or -1 (EBADMSG) on enqueue fault. */
+static inline int dmesh_emit_desc(dmesh_conn_t *c, size_t moff, uint32_t len) {
     dpumesh_ctx_t *ctx = c->ep->ctx;
-    c->seq++;                                        /* per-conn outbound message id */
+    c->seq++;
     sw_descriptor_t d;
     memset(&d, 0, sizeof(d));
-    d.body_buf_slot = slot;
+    d.body_buf_slot = (int32_t)moff;                 /* BYTE offset into the TX mmap */
     d.body_len      = len;
     d.src_port      = c->local_port;
     d.seq           = c->seq;
     d.dst_service   = c->dst_service;
-    if (c->role == DMESH_ROLE_CLIENT) {              /* client → service (per-message LB) */
-        d.dst_pod  = DMESH_POD_BLANK;
-        d.dst_port = DMESH_PORT_BLANK;
-    } else {                                         /* server → its learned peer */
-        d.dst_pod  = c->remote_pod;
-        d.dst_port = c->remote_port;
-    }
-    d.route_group = rg;
+    if (c->role == DMESH_ROLE_CLIENT) { d.dst_pod = DMESH_POD_BLANK; d.dst_port = DMESH_PORT_BLANK; }
+    else                              { d.dst_pod = c->remote_pod;   d.dst_port = c->remote_port; }
+    d.route_group = c->pin_group;                    /* 0 = per-message LB per descriptor */
     d.valid = 1;
-    if (dpumesh_enqueue(ctx, &d) < 0) {
-        dpumesh_tx_free(ctx, slot);
-        errno = EBADMSG;
-        return -1;
-    }
-    dpumesh_tx_track(ctx, c->local_port, c->seq, slot);
+    if (dpumesh_enqueue(ctx, &d) < 0) { errno = EBADMSG; return -1; }
     return 0;
-}
-
-/* INTERNAL: ship the conn's currently-buffered single TX slot with route_group
- * `rg`, consuming the TX buffer. Returns 0, -1 (EBADMSG). */
-static inline int dmesh_ship_slot(dmesh_conn_t *c, uint8_t rg) {
-    int slot = c->tx_slot; uint32_t len = c->tx_len;
-    c->tx_slot = -1; c->tx_buf = NULL; c->tx_len = 0;   /* consume before ship */
-    return dmesh_ship_at(c, slot, len, rg);
 }
 
 /* write(): BUFFER outbound body bytes into the current message (shipped by flush).
@@ -342,103 +298,51 @@ static inline int dmesh_ship_slot(dmesh_conn_t *c, uint8_t rg) {
  * slot continues. So the app just writes ANY length; there is no size limit and no
  * EMSGSIZE. The receiver is a plain dmesh_read loop (it frames its own length). */
 static inline ssize_t dmesh_write(dmesh_conn_t *c, const void *buf, size_t len) {
+    dpumesh_ctx_t *ctx = c->ep->ctx;
     const uint8_t *p = (const uint8_t *)buf;
-    int cap = c->ep->slot_size;
+    uint32_t cap = (uint32_t)c->ep->slot_size;         /* reserve in <= slot_size runs */
     size_t done = 0;
     while (done < len) {
-        if (dmesh_tx_ensure(c) < 0) return done ? (ssize_t)done : -1;
-        size_t room = (size_t)cap - c->tx_len;
-        if (room == 0) {                             /* slot full + more to write → spill */
-            if (c->cur_group == 0) {                 /* first overflow → claim a group */
-                if (c->pin_group) {                  /* pinned conn: chunks ride ITS group */
-                    c->cur_group = c->pin_group;
-                } else {                             /* else claim a GLOBAL rolling group */
-                    uint32_t g = __atomic_fetch_add(&c->ep->next_group, 1u, __ATOMIC_RELAXED);
-                    c->cur_group = (uint8_t)((g % 255u) + 1u);   /* 1..255, never 0 */
-                }
-            }
-            if (dmesh_ship_slot(c, c->cur_group) < 0) { /* ship the full slot as a chunk */
-                /* The full (cap-byte) slot we tried to ship was DROPPED — don't
-                 * count it as written, and reset the group so the caller's next
-                 * message starts fresh (not pinned to this aborted one). */
-                c->cur_group = 0;
-                size_t sent = done >= (size_t)cap ? done - (size_t)cap : 0;
-                return sent ? (ssize_t)sent : -1;
-            }
-            continue;                                /* next iter tx_ensure gets a fresh slot */
-        }
-        size_t n = len - done; if (n > room) n = room;
-        memcpy(c->tx_buf + c->tx_len, p + done, n);
-        c->tx_len += (uint32_t)n;
-        done += n;
+        uint32_t chunk = (len - done > cap) ? cap : (uint32_t)(len - done);
+        uint8_t *dst = dpumesh_tx_reserve(ctx, c->local_port, chunk);   /* busy-spins on backpressure */
+        if (!dst) return done ? (ssize_t)done : -1;    /* no region (conn not established) */
+        memcpy(dst, p + done, chunk);
+        dpumesh_tx_commit(ctx, c->local_port, chunk);  /* append to the send stream */
+        done += chunk;
     }
     return (ssize_t)len;
 }
 
 /* sendfile(): append up to count bytes from in_fd into the current message. */
 static inline ssize_t dmesh_sendfile(dmesh_conn_t *c, int in_fd, off_t *offset, size_t count) {
-    if (dmesh_tx_ensure(c) < 0) return -1;
-    int cap = c->ep->slot_size;
-    size_t room = (size_t)cap - c->tx_len;
-    if (count > room) count = room;
+    dpumesh_ctx_t *ctx = c->ep->ctx;
+    uint32_t cap = (uint32_t)c->ep->slot_size;
+    if (count > cap) count = cap;                      /* one reserve <= slot_size */
     if (count == 0) { errno = EMSGSIZE; return -1; }
-    ssize_t n;
-    if (offset) n = pread(in_fd, c->tx_buf + c->tx_len, count, *offset);
-    else        n = read (in_fd, c->tx_buf + c->tx_len, count);
-    if (n <= 0) return n;
-    c->tx_len += (uint32_t)n;
+    uint8_t *dst = dpumesh_tx_reserve(ctx, c->local_port, (uint32_t)count);
+    if (!dst) { errno = EAGAIN; return -1; }
+    ssize_t n = offset ? pread(in_fd, dst, count, *offset) : read(in_fd, dst, count);
+    if (n <= 0) return n;                              /* reserved but not committed → space reused */
+    dpumesh_tx_commit(ctx, c->local_port, (uint32_t)n);
     if (offset) *offset += n;
     return n;
 }
 
-/* flush(): ship the buffered message's final chunk. REQUIRED to send. A message that
- * spanned slots (auto-chunked in write → cur_group set) ships this last chunk with the
- * same route_group (so it too pins to the message's backend), then clears the group
- * context; a single-slot message ships route_group=0 (normal per-message LB). A CLIENT
- * ships dst_pod=BLANK (DPU LB's per message); a SERVER ships to its learned peer. An
- * EMPTY flush (no bytes buffered) is a NO-OP (a 0-length wire message is the FIN only,
- * never a user message).
+/* flush(): SHIP the conn's committed-but-unsent bytes. REQUIRED to send. The core
+ * byte-ring carves [send, commit) into ≤slot_size descriptors — coalescing many small
+ * writes into fewer, bigger host→DPU DMAs — and this posts each with the conn's tuple
+ * + route group, recording it so its DPU TX_ACK reclaims the ring bytes. A CLIENT ships
+ * dst_pod=BLANK (per-message LB per descriptor; pin the conn for socket order); a SERVER
+ * ships to its learned peer. Nothing committed → NO-OP.
  *   0 = sent (or nothing to send); -1 EBADMSG = descriptor fault (close the conn). */
 static inline int dmesh_flush(dmesh_conn_t *c) {
-    if (c->tx_slot < 0 || c->tx_len == 0) {          /* nothing buffered → no-op (0-len = FIN only) */
-        if (c->tx_slot >= 0) {                       /* free an empty (registered/alloc'd) region */
-            int fn = c->tx_region_n > 1 ? c->tx_region_n : 1;
-            for (int i = 0; i < fn; i++) dpumesh_tx_free(c->ep->ctx, c->tx_slot + i);
-            c->tx_slot = -1; c->tx_buf = NULL; c->tx_len = 0;
-        }
-        c->cur_group = 0; c->tx_region_n = 0;
-        return 0;
+    dpumesh_ctx_t *ctx = c->ep->ctx;
+    size_t moff; uint32_t len;
+    while (dpumesh_tx_next_send(ctx, c->local_port, &moff, &len)) {
+        if (dmesh_emit_desc(c, moff, len) < 0) return -1;    /* EBADMSG; bytes stay committed */
+        dpumesh_tx_sent(ctx, c->local_port, c->seq, len);    /* c->seq = the seq emit_desc used */
     }
-    /* Registered contiguous zero-copy region (>1 slot) → ship each slot as a
-     * route-pinned chunk so the DPU reassembles them on one backend (like the
-     * auto-chunk path, but with no memcpy — the data is already in the slots). */
-    if (c->tx_region_n > 1) {
-        int cap = c->ep->slot_size;
-        int base = c->tx_slot, n = c->tx_region_n;
-        uint32_t remaining = c->tx_len;
-        c->tx_slot = -1; c->tx_buf = NULL; c->tx_len = 0; c->tx_region_n = 0;
-        uint8_t rg = c->cur_group;                   /* a multi-chunk message MUST pin */
-        if (rg == 0) rg = c->pin_group;              /* pinned conn: its fixed group */
-        if (rg == 0) {
-            uint32_t g = __atomic_fetch_add(&c->ep->next_group, 1u, __ATOMIC_RELAXED);
-            rg = (uint8_t)((g % 255u) + 1u);         /* 1..255, never 0 */
-        }
-        c->cur_group = 0;
-        int rc = 0, i = 0;
-        for (; i < n && remaining > 0; i++) {
-            uint32_t clen = remaining < (uint32_t)cap ? remaining : (uint32_t)cap;
-            if (dmesh_ship_at(c, base + i, clen, rg) < 0) { rc = -1; i++; break; }
-            remaining -= clen;
-        }
-        for (; i < n; i++)                           /* free unshipped / unused tail slots */
-            dpumesh_tx_free(c->ep->ctx, base + i);
-        return rc;                                   /* 0, or -1 (EBADMSG) if a chunk failed */
-    }
-    uint8_t rg = c->cur_group ? c->cur_group          /* auto-chunk group if spanning */
-                              : c->pin_group;         /* else the conn pin (0 = normal LB) */
-    int r = dmesh_ship_slot(c, rg);
-    c->cur_group = 0;                                /* clear: next write = a new message/unit */
-    return r;                                        /* 0 or -1 (EBADMSG) */
+    return 0;
 }
 
 /* ===== Zero-copy TX (dmesh_alloc / dmesh_slot_register) =====
@@ -449,51 +353,20 @@ static inline int dmesh_flush(dmesh_conn_t *c) {
  * DPUMESH_ARENA_SLOTS at deploy). Returns {ptr,slot,n}; on failure ptr==NULL
  * (n>1 with no/too-small arena, or n<=0). Fill ptr[0..len), then
  * dmesh_slot_register(c, buf, len) + dmesh_flush(c). */
-static inline dmesh_buf_t dmesh_alloc(dmesh_channel_t *s, int n) {
-    dmesh_buf_t b = { NULL, -1, 0 };
-    if (n <= 0) return b;
-    int slot = (n == 1) ? dpumesh_tx_alloc(s->ctx)          /* pool (lock-free) */
-                        : dpumesh_arena_alloc(s->ctx, n);   /* contiguous arena */
-    if (slot < 0) return b;                                 /* no arena / no run of n */
-    b.ptr  = dpumesh_tx_buf(s->ctx, slot);
-    b.slot = slot;
-    b.n    = n;
-    return b;
+/* dmesh_alloc(c, len): reserve `len` CONTIGUOUS bytes in this conn's TX byte-ring and
+ * return a pointer into transport DMA memory to fill DIRECTLY (no memcpy). Then
+ * dmesh_commit(c, actual_len) + dmesh_flush(c). Busy-spins under backpressure; NULL if
+ * len==0, len exceeds the per-conn ring, or the conn is not established. Zero-copy
+ * counterpart of dmesh_write — the same byte-ring, filled in place. */
+static inline void *dmesh_alloc(dmesh_conn_t *c, size_t len) {
+    return dpumesh_tx_reserve(c->ep->ctx, c->local_port, (uint32_t)len);
 }
 
-/* Release a dmesh_alloc buffer that was NOT shipped (never registered+flushed, or
- * you changed your mind). Frees all n slots. */
-static inline void dmesh_free(dmesh_channel_t *s, dmesh_buf_t b) {
-    for (int i = 0; i < b.n; i++) dpumesh_tx_free(s->ctx, b.slot + i);
-}
-
-/* Adopt a pre-filled dmesh_alloc buffer as this conn's outbound message — zero-copy:
- * dmesh_flush ships it straight from `b` with no memcpy. Any bytes ALREADY buffered
- * on the conn are FLUSHED FIRST (shipped, not lost). Returns the conn's previous
- * *empty* single TX slot for you to recycle with dmesh_free, or -1 (none / a
- * buffered message was flushed / an empty region was released). Call at a message
- * boundary, then dmesh_flush to send. len = valid bytes in b (<= b.n*slot_size).
- * -1 + EINVAL on a bad buffer; -1 + EBADMSG if the pre-flush ship faulted. */
-static inline int dmesh_slot_register(dmesh_conn_t *c, dmesh_buf_t b, uint32_t len) {
-    if (!b.ptr || b.slot < 0 || b.n <= 0) { errno = EINVAL; return -1; }
-    int old = -1;
-    if (c->tx_slot >= 0) {
-        if (c->tx_len > 0) {                     /* buffered bytes → ship them first */
-            if (dmesh_flush(c) < 0) return -1;   /* tx_slot now -1 */
-        } else if (c->tx_region_n > 1) {         /* empty region → free it (can't hand back) */
-            for (int i = 0; i < c->tx_region_n; i++) dpumesh_tx_free(c->ep->ctx, c->tx_slot + i);
-            c->tx_slot = -1; c->tx_buf = NULL; c->tx_len = 0; c->tx_region_n = 0;
-        } else {                                 /* empty single slot → hand it back */
-            old = c->tx_slot;
-            c->tx_slot = -1; c->tx_buf = NULL; c->tx_len = 0; c->tx_region_n = 0;
-        }
-    }
-    c->tx_slot     = b.slot;
-    c->tx_buf      = b.ptr;
-    c->tx_len      = len;
-    c->tx_region_n = b.n;                        /* >1 → flush ships route-pinned chunks */
-    c->cur_group   = 0;
-    return old;
+/* dmesh_commit(c, len): finalize `len` (<= the alloc'd len) bytes at the write head as
+ * committed message bytes, ready for dmesh_flush. Returns 0. */
+static inline int dmesh_commit(dmesh_conn_t *c, size_t len) {
+    dpumesh_tx_commit(c->ep->ctx, c->local_port, (uint32_t)len);
+    return 0;
 }
 
 /* INTERNAL: send a FIN — a zero-length message addressed to the established peer.
@@ -508,44 +381,35 @@ static inline int dmesh_slot_register(dmesh_conn_t *c, dmesh_buf_t b, uint32_t l
  * its learned peer. */
 static inline void dmesh_send_fin(dmesh_conn_t *c) {
     dpumesh_ctx_t *ctx = c->ep->ctx;
-    int slot = dpumesh_tx_alloc(ctx);
-    if (slot < 0) return;                                  /* no slot → best-effort skip */
     c->seq++;
     sw_descriptor_t d;
     memset(&d, 0, sizeof(d));
-    d.body_buf_slot = slot;
+    d.body_buf_slot = 0;                                   /* 0-length FIN: offset unused (0-byte DMA) */
     d.body_len      = 0;                                   /* FIN marker (0-length) */
     d.src_port      = c->local_port;
     d.seq           = c->seq;
     d.dst_service   = c->dst_service;
     d.dst_pod       = c->remote_pod;                       /* the learned peer conn */
     d.dst_port      = c->remote_port;
-    d.route_group   = c->pin_group;                        /* informational: neither DPU FIN path
-                                                            * routes by rg (client FIN = conntrack
-                                                            * fan-out; server FIN = concrete dst) */
+    d.route_group   = c->pin_group;
     d.valid         = 1;
-    if (dpumesh_enqueue(ctx, &d) < 0) { dpumesh_tx_free(ctx, slot); return; }
-    dpumesh_tx_track(ctx, c->local_port, c->seq, slot);    /* freed by its own TX_ACK */
+    /* Best-effort: rides after all prior data (seq order). Holds NO ring bytes, so it
+     * needs no send-unit / reclaim — its TX_ACK is a harmless FIFO no-op. */
+    dpumesh_enqueue(ctx, &d);
 }
 
-/* close(): graceful close. If established, sends a FIN so the peer reclaims its conn
- * (no leak across runs). Then frees the conn: reclaims held RX credit + recycles the
- * eventfd; un-ACKed sent TX slots are freed by their own TX_ACKs. A buffered-but-
- * unflushed message is discarded (flush first). Safe on NULL. Returns 0. */
+/* close(): graceful close. Drops any buffered-but-unflushed bytes, then (if established)
+ * sends a FIN so the peer + DPU-owned upstream tear down (no leak across runs). Shipped-
+ * but-un-ACKed bytes are reclaimed by their own TX_ACKs (the region returns once drained).
+ * Reclaims held RX credit. Safe on NULL. Returns 0. */
 static inline int dmesh_close(dmesh_conn_t *c) {
     if (!c) return 0;
     dpumesh_ctx_t *ctx = c->ep->ctx;
-    /* Send a FIN so the peer (and the DPU-owned upstream) is torn down. A SERVER
-     * FINs once established; a CLIENT FINs if it ever sent (seq>0) so the DPU frees
-     * the upstream it created. Skip if we're closing on the peer's FIN. */
+    dpumesh_tx_discard_unsent(ctx, c->local_port);        /* buffered, never flushed → drop */
     if (!c->peer_closed && (c->role == DMESH_ROLE_SERVER || c->seq > 0))
         dmesh_send_fin(c);
     conn_free_rx(c);                                       /* return the held RX credit */
-    if (c->tx_slot >= 0) {                                 /* buffered, never flushed → free */
-        int fn = c->tx_region_n > 1 ? c->tx_region_n : 1;  /* a whole region if registered */
-        for (int i = 0; i < fn; i++) dpumesh_tx_free(ctx, c->tx_slot + i);
-    }
-    if (c->local_port)   dpumesh_free_port(ctx, c->local_port);
+    if (c->local_port) dpumesh_free_port(ctx, c->local_port);
     free(c);
     return 0;
 }
