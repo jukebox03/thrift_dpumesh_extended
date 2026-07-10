@@ -31,18 +31,6 @@ _Static_assert(DPA_DMA_COPY_MAX <= DPUMESH_SLOT_SIZE,
  * drain_all_rings inner iter. */
 #define RING_BATCH_CAP  32
 
-/* Reverse admission accounting — per-EU file-scope globals (fast DPA memory),
- * indexed by [eu_index][ring]. Each EU owns its own row (thread_arg->eu_index)
- * → single-writer per row, no atomics.
- *   dpa_cached_freed[e][r] = host's freed_cumulative cached for EU e, ring r
- *   dpa_sent_count[e][r]   = reverse DMAs EU e has issued for ring r */
-uint64_t dpa_cached_freed[MAX_DPA_RINGS][MAX_DPA_RINGS] = {{0}};
-uint64_t dpa_sent_count[MAX_DPA_RINGS][MAX_DPA_RINGS] = {{0}};
-
-/* Lazy-refresh margin: refresh credit when computed inflight is within
- * this many slots of the cap. */
-#define CREDIT_REFRESH_MARGIN 64
-
 /*
  * RPC for initializing DPA IO thread called before running the thread
  *
@@ -73,39 +61,6 @@ static void handle_dpu_msg(struct dpa_thread_arg *thread_arg, const struct comch
                                      add_msg->ring.pod_id, thread_arg->num_rings);
             } else {
                 DOCA_DPA_DEV_LOG_INFO("Ring add failed: too many rings=%u\n", thread_arg->num_rings);
-            }
-            break;
-        }
-        case DPA_MSG_REV_RING_ADD: {
-            struct comch_add_rev_ring_msg *add_msg = (struct comch_add_rev_ring_msg *)msg;
-            /* Check if ring for this pod_id already exists (update case) */
-            int found = 0;
-            for (uint32_t ri = 0; ri < thread_arg->num_rev_rings; ri++) {
-                if (thread_arg->rev_rings[ri].pod_id == add_msg->ring.pod_id) {
-                    thread_arg->rev_rings[ri] = add_msg->ring;
-                    /* Re-add = the host reconnected with a FRESH credit block
-                     * (freed_cumulative restarts at 0). Reset this EU/ring's
-                     * reverse-admission accounting so the stale (high) sent_count
-                     * vs new (0) freed can't make inflight >= rq_depth forever and
-                     * wedge every reverse DMA. During first-time setup no reverse
-                     * DMA has issued yet, so both are already 0 → this is a no-op. */
-                    dpa_cached_freed[thread_arg->eu_index][ri] = 0;
-                    dpa_sent_count[thread_arg->eu_index][ri] = 0;
-                    DOCA_DPA_DEV_LOG_INFO("ADD_REV_RING updated: pod_id=%d host_mmap=0x%lx\n",
-                                         add_msg->ring.pod_id, add_msg->ring.host_mmap);
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found) {
-                if (thread_arg->num_rev_rings < MAX_DPA_RINGS) {
-                    thread_arg->rev_rings[thread_arg->num_rev_rings] = add_msg->ring;
-                    DOCA_DPA_DEV_LOG_INFO("ADD_REV_RING received: pod_id=%d, buf_arr_size=%u\n",
-                                         add_msg->ring.pod_id, add_msg->ring.buf_arr_size);
-                    thread_arg->num_rev_rings++;
-                } else {
-                    DOCA_DPA_DEV_LOG_INFO("Rev ring add failed: too many=%u\n", thread_arg->num_rev_rings);
-                }
             }
             break;
         }
@@ -218,17 +173,27 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
             break;
         }
 
-        /* dma_copy requires 128B-aligned size; DPU buffer pos advances by it.
-         * A FIN carries desc->size==0 (comp.length stays 0 → receiver reads EOF);
-         * still issue one min 128B transfer so the DMA engine never sees a
-         * zero-length descriptor (the copied bytes are ignored at length 0). */
+        /* dma_copy requires 128B-aligned size. A FIN carries desc->size==0
+         * (comp.length stays 0 → receiver reads EOF); still issue one min 128B
+         * transfer so the DMA engine never sees a zero-length descriptor. */
         uint32_t chunk = ALIGN_UP_128(desc->size);
         if (chunk == 0) chunk = DMA_COPY_SIZE_ALIGN;
-        if (thread_arg->pos[r] + chunk > ring->dpu_buf_size)
-            thread_arg->pos[r] = 0;
+
+        /* PER-CONN CONTIGUOUS STAGING (mirror of the host TX byte-ring). Land each
+         * chunk at the SAME offset it occupies in the host TX buffer, so a conn's
+         * bytes are contiguous in staging (a mirror of its per-conn TX region) and
+         * the L7 parser sees a contiguous per-conn byte stream — no arrival-boundary
+         * seam. moff = desc->addr - host_addr is the host TX byte offset; the pod's
+         * staging base = dpu_addr - region_off (dpu_addr points at this ring's old
+         * EU-shard region). Occupancy mirrors the host TX byte-ring (bounded by
+         * tx_w - tx_f <= conn_bytes) so staging never overflows — no ring wrap. The
+         * pod staging buffer carries a small tail slack (dpa.c) so a final message's
+         * ALIGN_UP_128 rounding cannot write past the buffer end. */
+        uint32_t moff = (uint32_t)(desc->addr - ring->host_addr);
+        uint64_t staging_base = ring->dpu_addr - (uint64_t)ring->region_off;
 
         comp.type = DPA_MSG_FWD_DONE;
-        comp.pos = ring->region_off + thread_arg->pos[r];  /* absolute (EU-sharding) */
+        comp.pos = moff;                         /* staging offset == host TX offset */
         comp.length = (uint16_t)desc->size;
         /* Endpoint tuple — opaque passthrough from the host-posted desc. src_service
          * is NOT carried (16B budget); the DPU derives it from src_pod. */
@@ -243,7 +208,7 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
         doca_dpa_dev_comch_producer_dma_copy(producer,
                                     dpu_consumer_id,
                                     ring->dpu_mmap,
-                                    ring->dpu_addr + thread_arg->pos[r],
+                                    staging_base + moff,
                                     ring->host_mmap,
                                     desc->addr,
                                     chunk,
@@ -251,10 +216,7 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
                                     sizeof(struct comch_dma_comp_msg),
                                     DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH |
                                     DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS);
-
-        thread_arg->pos[r] += chunk;
-        if (thread_arg->pos[r] >= ring->dpu_buf_size)
-            thread_arg->pos[r] = 0;
+        /* no pos[r] advance — the staging offset is host-driven (mirror) */
 
         /* Flip valid=0; the actual host-visible writeback is batched once per
          * drain_all_rings inner iter. Each desc owns its own 64B cache line, so
@@ -269,138 +231,15 @@ static int process_fwd_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
 }
 
 /*
- * Drain reverse descriptors (DPU→CPU) from ring r: up to RING_BATCH_CAP
- * consecutive valid descs per call.
- *   Source      = DPU TX buffer (or desc->mmap under in-place forwarding)
- *   Destination = Host RX buffer (host_mmap/host_addr in ring info)
- * Completion is sent to the DPU ARM, which forwards it to the Host.
- * Returns the number of dma_copy ops issued (0 if ring idle).
- */
-static int process_rev_ring(struct dpa_thread_arg *thread_arg, uint32_t r)
-{
-    struct dpa_ring_info *ring = &thread_arg->rev_rings[r];
-    /* Same msgq producer as forward direction — DPU ARM receives all
-     * completions and forwards to Host via the comch control path. */
-    doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
-    uint32_t dpu_consumer_id = thread_arg->dpu_consumer_id;
-    uint32_t e = thread_arg->eu_index;   /* this EU's row in the per-EU admission globals */
-    struct comch_dma_comp_msg comp;
-    int total_chunks = 0;
-
-    /* Window is fresh from the single read_inv in drain_all_rings. */
-    for (int b = 0; b < RING_BATCH_CAP; b++) {
-        doca_dpa_dev_buf_t buf =
-            doca_dpa_dev_buf_array_get_buf(ring->buf_arr, thread_arg->rev_desc_idx[r]);
-        struct dma_desc *desc =
-            (struct dma_desc *)doca_dpa_dev_buf_get_external_ptr(buf);
-
-        if (!desc->valid)
-            break;                       /* ring drained */
-
-        /* Reverse body size inherited from forward DMA, host-capped at 8KB. */
-        if (desc->size > DPA_DMA_COPY_MAX) {
-            DOCA_DPA_DEV_LOG_INFO("REV: desc size %u > %u (slot cap); dropping ring=%u slot=%u\n",
-                                  desc->size, DPA_DMA_COPY_MAX, r, thread_arg->rev_desc_idx[r]);
-            desc->valid = 0;   /* flushed by the batched writeback in drain_all_rings */
-            thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
-            total_chunks += 1;
-            continue;
-        }
-
-        /* Under in-place forwarding desc->mmap is the SOURCE of reverse DMA
-         * (DPU ARM set it to the original sender's local_mmap DPA handle).
-         * dpu_enqueue_reverse_dma always sets a nonzero mmap and refuses to
-         * post a reverse desc when local_mmap_dpa_handle==0 (dpu_worker.c),
-         * so a live reverse desc can never carry mmap==0 — the old
-         * ring->dpu_mmap/dpu_addr fallback was unreachable and is removed. */
-        doca_dpa_dev_mmap_t src_mmap = desc->mmap;
-        uint64_t src_base = desc->addr;
-
-        /* === Admission gate using cached_freed[] (refreshed in drain_all_rings) ===
-         * If inflight reverse DMAs >= rq_depth, host's RX RQ is at capacity —
-         * stop the batch (desc stays valid, retried next iter after cache refresh). */
-        if (ring->host_credit_buf_arr != 0 && ring->rq_depth != 0) {
-            if (dpa_sent_count[e][r] - dpa_cached_freed[e][r] >= ring->rq_depth) {
-                break;
-            }
-        }
-
-        /* Wait for DPU consumer availability; on timeout clear + stop batch. */
-        int aborted = 0;
-        {
-            uint32_t wait = 0;
-            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, dpu_consumer_id) == 1) {
-                if (++wait >= DMA_CONSUMER_EMPTY_WAIT_LOOPS) { aborted = 1; break; }
-            }
-        }
-        if (aborted) {
-            desc->valid = 0;
-            thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
-            total_chunks += 1;
-            break;
-        }
-
-        /* FIN (desc->size==0): min 128B transfer so the engine never sees a
-         * zero-length reverse descriptor; comp.length stays 0 → host reads EOF. */
-        uint32_t chunk = ALIGN_UP_128(desc->size);
-        if (chunk == 0) chunk = DMA_COPY_SIZE_ALIGN;
-        if (thread_arg->rev_pos[r] + chunk > ring->host_buf_size)
-            thread_arg->rev_pos[r] = 0;
-
-        /* src_pod_id is the ORIGINAL forward sender (set by DPU on the desc).
-         * The reverse ring's ring->pod_id is the RECEIVER, so the source
-         * identity must come from the descriptor. */
-        comp.type = DPA_MSG_REV_DONE;
-        comp.route_group = 0;   /* forward-only field; keep the wire byte deterministic */
-        comp.pos = ring->region_off + thread_arg->rev_pos[r];  /* absolute (EU-sharding) */
-        comp.length = (uint16_t)desc->size;
-        /* Endpoint tuple — opaque passthrough from the DPU-posted reverse desc.
-         * src_service is NOT carried (16B); the DPU derives it from src_pod. */
-        comp.seq = desc->seq;
-        comp.src_port = desc->src_port;
-        comp.dst_port = desc->dst_port;
-        comp.dst_service = desc->dst_service;
-        comp.src_pod_id = desc->src_pod_id;      /* reverse: original sender carried in desc */
-        comp.dst_pod_id = desc->dst_pod_id;      /* resolved target */
-
-        doca_dpa_dev_comch_producer_dma_copy(producer,
-                                    dpu_consumer_id,
-                                    ring->host_mmap,
-                                    ring->host_addr + thread_arg->rev_pos[r],
-                                    src_mmap,
-                                    src_base,
-                                    chunk,
-                                    (uint8_t *)&comp,
-                                    sizeof(struct comch_dma_comp_msg),
-                                    DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH |
-                                    DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS);
-
-        thread_arg->rev_pos[r] += chunk;
-        if (thread_arg->rev_pos[r] >= ring->host_buf_size)
-            thread_arg->rev_pos[r] = 0;
-        /* Successfully consumed one host RX slot (admission accounting) */
-        dpa_sent_count[e][r]++;
-
-        /* valid=0 flushed by the batched writeback in drain_all_rings. */
-        desc->valid = 0;
-
-        thread_arg->rev_desc_idx[r] = (thread_arg->rev_desc_idx[r] + 1) % ring->buf_arr_size;
-        total_chunks += 1;
-    }
-
-    return total_chunks;
-}
-
-/*
- * Drain all valid descriptors across all rings (both directions).
+ * Drain all valid forward descriptors across all rings.
  * Returns total number of dma_copy calls issued. Producer-side backpressure
  * is handled by the SDK; we only need to ack producer completions periodically
  * (drain_producer_completions throttle below) so the completion queue cycles.
  *
  * Throttled actions inside the inner iter:
  *  - handle_msgs: PCIe-touching consumer-completion poll. Steady-state messages
- *    are only wake triggers and deploy-time ADD_RING / ADD_REV_RING, so every-iter
- *    polling would waste EU cycles on empty completions.
+ *    are only wake triggers and deploy-time ADD_RING, so every-iter polling would
+ *    waste EU cycles on empty completions.
  *  - drain_producer_completions: acks producer send completions to free queue slots.
  *
  * The outer run_dma_manager loop calls handle_msgs and drain_producer_completions
@@ -418,7 +257,6 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg, int poll_msgs)
     int total_dma_calls = 0;
     int found;
     uint32_t iter_counter = 0;
-    uint32_t e = thread_arg->eu_index;   /* this EU's row in the per-EU admission globals */
 
     do {
         found = 0;
@@ -428,10 +266,9 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg, int poll_msgs)
             drain_producer_completions(thread_arg);
         iter_counter++;
 
-        /* One window invalidation per iteration covers every ring's desc reads
-         * plus the credit slot below: read_inv is a window-wide read fence
-         * (__DPA_MMIO, R, R), so the first read of each address this iter is
-         * fresh. */
+        /* One window invalidation per iteration covers every ring's desc reads:
+         * read_inv is a window-wide read fence (__DPA_MMIO, R, R), so the first
+         * read of each address this iter is fresh. */
         __dpa_thread_window_read_inv();
 
         /* Forward rings (Host→DPU) */
@@ -444,42 +281,11 @@ static int drain_all_rings(struct dpa_thread_arg *thread_arg, int poll_msgs)
             }
         }
 
-        /* Lazy credit refresh: only PCIe-read the credit slot when computed
-         * inflight is approaching the cap. At low/medium load, inflight is
-         * tiny relative to rq_depth so this never fires — zero overhead.
-         * At cap, refreshes once every ~(rq_depth - MARGIN) sends. The
-         * credit slot lives at index DMA_RING_SIZE within each pod's
-         * forward buf_arr (host's dma_ring extended by 1 slot). */
-        uint32_t nr_rev = thread_arg->num_rev_rings;
-        for (uint32_t r = 0; r < nr_rev; r++) {
-            struct dpa_ring_info *rev = &thread_arg->rev_rings[r];
-            if (rev->host_credit_buf_arr == 0 || rev->rq_depth == 0)
-                continue;
-            uint64_t inflight = dpa_sent_count[e][r] - dpa_cached_freed[e][r];
-            if (inflight + CREDIT_REFRESH_MARGIN < (uint64_t)rev->rq_depth)
-                continue;  /* still plenty of headroom — skip PCIe read */
-            doca_dpa_dev_buf_t cbuf =
-                doca_dpa_dev_buf_array_get_buf(rev->host_credit_buf_arr,
-                                               DMA_RING_SIZE);
-            doca_dpa_dev_uintptr_t cptr = doca_dpa_dev_buf_get_external_ptr(cbuf);
-            volatile uint64_t *fp = (volatile uint64_t *)cptr;
-            dpa_cached_freed[e][r] = *fp;
-        }
-
-        /* Reverse rings (DPU→Host) */
-        for (uint32_t r = 0; r < nr_rev; r++) {
-            int chunks = process_rev_ring(thread_arg, r);
-            if (chunks > 0) {
-                found++;
-                total_dma_calls += chunks;
-            }
-        }
-
-        /* Batched writeback: process_fwd_ring/process_rev_ring only store
-         * desc->valid=0 in DPA cache; this single window-wide fence flushes all
-         * of this iteration's frees to host memory at once. Each desc owns its
-         * own 64B cache line, so the batched flush never touches a neighbouring
-         * slot the host is concurrently filling. */
+        /* Batched writeback: process_fwd_ring only stores desc->valid=0 in DPA
+         * cache; this single window-wide fence flushes all of this iteration's
+         * frees to host memory at once. Each desc owns its own 64B cache line, so
+         * the batched flush never touches a neighbouring slot the host is
+         * concurrently filling. */
         if (found)
             __dpa_thread_window_writeback();
     } while (found > 0);

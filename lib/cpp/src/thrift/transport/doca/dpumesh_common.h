@@ -2,10 +2,10 @@
 #define DPUMESH_COMMON_H
 
 /* ====== DOCA / DPA limits ====== */
-#define MAX_DPA_RINGS       8   /* per-EU ring capacity (forward + reverse each) */
+#define MAX_DPA_RINGS       8   /* per-EU forward ring capacity */
 #define MAX_PODS            8
 
-/* EU-sharding: a pod spreads its forward+reverse traffic across K rings, each on
+/* EU-sharding: a pod spreads its forward traffic across K rings, each on
  * a distinct EU, so a 2-pod pair can drive >2 EUs. K = DPUMESH_RINGS_PER_POD.
  * Default 2 = the measured production config (K=2 drives 4 EUs for a 2-pod pair);
  * set to 1 for the legacy single-ring-per-pod path. MAX_EU_PER_POD bounds the
@@ -18,11 +18,11 @@
  * wire fields if pod_id ever needs to exceed 127. */
 #define POD_ID_SPACE        128
 
-/* DPU-side DMA buffer size per pod (intermediate forward/reverse DMA staging).
- * MUST equal DPUMESH_NUM_SLOTS_DEFAULT × DPUMESH_SLOT_SIZE_DEFAULT so end-node
- * slot-based admission bounds in-flight bytes ≤ DPU buffer size.
- * Caveat: a dst pod's reverse staging aggregates entries from all sources that
- * target it; N concurrent sources need a DPU_BUFFER_SIZE scaled by N. */
+/* DPU-side DMA staging buffer per pod: the forward host→DPU hop, from which the
+ * ARM SG-DMA egress reads bodies in place. MUST equal DPUMESH_NUM_SLOTS_DEFAULT ×
+ * DPUMESH_SLOT_SIZE_DEFAULT — each conn's staging MIRRORS its host TX byte-ring
+ * offset-for-offset (moff = desc->addr - host_addr), so staging occupancy is
+ * bounded by the source's own host TX buffer and never overflows. */
 #define DPU_BUFFER_SIZE     (32 * 1024 * 1024)  /* 32MB = 4096 × 8KB */
 #define DPUMESH_SLOT_SIZE   8192               /* matches DPUMESH_SLOT_SIZE_DEFAULT */
 /* DMA descriptor ring depth (host→DPU forward). Mirrored from ring.h so

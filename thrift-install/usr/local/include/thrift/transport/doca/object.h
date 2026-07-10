@@ -28,22 +28,20 @@ typedef uint32_t doca_dpa_dev_mmap_t;
  * overflow it above BP_HIGH even at MAX_DPA_RINGS active EUs. */
 #define DPU_COMP_QUEUE_SIZE 16384
 
-#define COMP_ENTRY_FORWARD     0  /* Forward DMA completed (CPU→DPU), needs TX_ACK + reverse route */
-#define COMP_ENTRY_REV_NOTIFY  1  /* Reverse DMA completed (DPU→CPU), needs Host notification */
-
+/* One forward-DMA completion (CPU→DPU), handed from the DPA recv callback to the
+ * main loop, which feeds it to the SG-DMA egress engine (dpu_proxy.c). */
 typedef struct {
-    uint8_t  entry_type;   /* COMP_ENTRY_FORWARD or COMP_ENTRY_REV_NOTIFY */
     int32_t  src_pod_id;
-    int32_t  dst_pod_id;   /* FORWARD: DMESH_POD_BLANK -> resolve dst_service */
+    int32_t  dst_pod_id;   /* DMESH_POD_BLANK -> resolve dst_service */
     int16_t  src_service;  /* caller service (opaque passthrough) */
     int16_t  dst_service;  /* callee service (routing input when dst_pod_id==BLANK) */
     uint16_t src_port;     /* sender port (opaque passthrough) */
     uint16_t dst_port;     /* dest port (opaque passthrough; PORT_BLANK -> accept queue on host) */
     uint16_t seq;          /* per-conn sequence (opaque passthrough) */
     uint32_t length;
-    uint32_t buf_offset;   /* FORWARD: offset in pod's RX DMA buffer; REV_NOTIFY: pos in Host RX buf */
-    uint8_t  route_group;  /* FORWARD: route-affinity key (0 = normal LB); REV_NOTIFY: unused */
-    int32_t  pod_idx;      /* FORWARD: index into pods[]; REV_NOTIFY: unused (-1) */
+    uint32_t buf_offset;   /* offset of the body in the pod's DPU staging buffer */
+    uint8_t  route_group;  /* route-affinity key (0 = normal LB) */
+    int32_t  pod_idx;      /* index into pods[] (staging owner) */
 } dpu_comp_entry_t;
 
 typedef struct {
@@ -154,34 +152,21 @@ struct pod_state {
     /* Per-pod DPA buffer arrays (one over each forward ring) */
     struct doca_buf_arr *buf_arrs[MAX_EU_PER_POD];
 
-    /* Per-pod RX DMA buffer (DPU receives CPU→DPU data here, and under
-     * in-place forwarding also serves as the source of reverse DMA when this
-     * pod is a forward sender). Slot lifetime is the full RTT, so the host's
-     * TX-slot accounting must hold the slot until the reverse TX_ACK lands. */
+    /* Per-pod DPU staging buffer: forward DMA lands CPU→DPU data here (per-conn
+     * contiguous, mirroring the host TX byte-ring) and the SG-DMA egress engine
+     * reads its segments out in place — no separate DPU-side copy. */
     struct doca_mmap *local_mmap;
     void *dma_buffer;
-    /* DPA handle for local_mmap so the reverse desc enqueued by DPU ARM can
-     * carry it as desc->mmap, letting DPA read directly from this pod's
-     * dma_buffer. */
-    doca_dpa_dev_mmap_t local_mmap_dpa_handle;
 
-    /* === Reverse direction (DPU→CPU) === */
+    /* === Reverse direction (DPU→host): SG-DMA egress engine (dpu_proxy.c) === */
 
-    /* DPU→CPU descriptor rings (K, one per EU). Under in-place forwarding the
-     * reverse DMA reads from the source pod's dma_buffer via desc->mmap/addr, so
-     * there is no separate destination TX data buffer. The single ARM thread is
-     * the sole writer of all K rings, so each stays single-producer (lock-free). */
-    struct dma_ring *tx_rings[MAX_EU_PER_POD];
-    struct doca_mmap *tx_ring_mmaps[MAX_EU_PER_POD];
-    struct doca_buf_arr *tx_buf_arrs[MAX_EU_PER_POD];
-
-    /* Host RX buffer mmap (exported from Host, DPA DMAs into this) */
+    /* Host RX buffer mmap (exported from Host; the egress SG-DMA lands into it) */
     struct doca_mmap *host_rx_mmap;
     void *host_rx_addr;
     size_t host_rx_buf_size;
 
-    /* Host's RX RQ depth (= num_slots), derived from host_rx_buf_size.
-     * Used by DPA admission gate as the cap on in-flight reverse DMAs. */
+    /* Host's RX RQ depth (= num_slots), derived from host_rx_buf_size. Used by the
+     * SG-DMA egress admission as the cap on in-flight reverse DMAs (dpu_proxy.c). */
     uint32_t rq_depth;
 
     /* Batched TX_ACK accumulator. Response-forward TX_ACKs destined to THIS pod
@@ -199,11 +184,11 @@ struct pod_state {
 };
 
 /* Data-plane publication gate. `dma_ready` is set with RELEASE at the END of
- * setup_pod_dma (after dma_buffer / local_mmap_dpa_handle / tx_ring are all
- * written). When setup writes run on thread B while the hot path reads run on
- * thread A, the `registered` gate is not sufficient for the data fields, which
- * are written later. ACQUIRE-loading dma_ready before dereferencing dma_buffer/
- * tx_ring/local_mmap_dpa_handle establishes the missing happens-before. */
+ * setup_pod_dma (after dma_buffer and the forward rings are all written). When
+ * setup writes run on thread B while the hot path reads run on thread A, the
+ * `registered` gate is not sufficient for the data fields, which are written
+ * later. ACQUIRE-loading dma_ready before dereferencing dma_buffer establishes
+ * the missing happens-before. */
 static inline int pod_data_ready(const struct pod_state *pod) {
     return __atomic_load_n(&pod->dma_ready, __ATOMIC_ACQUIRE);
 }
@@ -377,10 +362,11 @@ struct objects {
      * self-healing (a stale pin only risks a suboptimal same-service backend). 128×256×4B
      * = 128 KB. Single ARM thread → no lock. -1 = unset. */
     int32_t  route_group_backend[POD_ID_SPACE][256];
-    /* L7-proxy L4 engine (dpu_proxy.c) — NULL (production default, env
-     * DPUMESH_PROXY unset) = legacy per-slot path, bit-identical. Non-NULL =
-     * every forward completion (request AND reply) runs the per-conn input
-     * window → proxy_route (mock) → per-dst SG-DMA egress machinery. */
+    /* SG-DMA egress engine (dpu_proxy.c) — the unified, always-on DPU→host reverse
+     * path (px_init aborts the worker on failure, so this is never NULL at run
+     * time). Every forward completion (request AND reply) runs the per-conn input
+     * window → proxy_route (mock) → per-dst SG-DMA egress machinery. DPUMESH_PROXY
+     * only selects the request parser (passthru default / frame / L7). */
     struct dmesh_proxy *proxy;
     int dpa_thread_running[MAX_DPA_RINGS];  /* per-EU: 1 = thread k started */
     int dpa_thread_running_any;             /* 1 = at least one EU started (keepalive guard) */

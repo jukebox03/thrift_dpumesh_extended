@@ -339,12 +339,12 @@ Header + body must fit one ≤ 8 KB message (chunk larger payloads at the app la
   design. (An `is_last`-DELETE that frees the pin per message was considered and **rejected** —
   under either hazard it can free a pin mid-message and scatter the chunks; the bounded
   self-healing table is used instead.)
-- **L7 routing (body-aware).** By default (production) the DPU routes on **metadata only** — the
-  service table + route-affinity above — and never reads a body. To make the DPU an Envoy-like L7
-  proxy that **parses the byte stream and content-routes**, enable the L7-proxy engine
-  (`DPUMESH_PROXY`, **§8**): it reframes a connection's bytes into routing segments and ships each
-  by scatter-gather DMA. It is off unless enabled (then bit-identical), and a real body-parsing L7
-  is the future step — the mock reframers today validate the L4 substrate.
+- **L7 routing (body-aware).** The byte-stream proxy engine that ships every reply is **always on**
+  (§8); its default parser (`passthru`) routes on **metadata only** — the service table +
+  route-affinity above — and never reads a body (**bit-identical** to the legacy per-message LB). To
+  make the DPU an Envoy-like L7 proxy that **parses the byte stream and content-routes**, select the
+  L7 parser for a service (`DPUMESH_PROXY_L7_SVC`, **§8**). The real body-parsing hook is the future
+  step — the mock reframers today validate the L4 substrate.
 - **Response↔request matching is the app's job.** The transport does no matching, and this DPU
   proxy routes at the **connection** level, not the **request** level (it never parses the body). A
   protocol-parsing L7 proxy could correlate by stream-id; a metadata-driven DPU cannot. Carry a
@@ -378,8 +378,8 @@ Scenario: **pod 10** is a client of **service 11**, which has two backends, **po
     • PE thread  (delivers RX → inbox)      │    reuse (pod,port,backend) → uP        │                  ══════════════════════════
                                             └────────────────────────────────────────┘                   dmesh_channel_t
                                             ┌── DPA EUs (data plane) ───────────────┐                     • ports[uP2] = server conn
-                                            │  dma_copy  host ↔ DPU-staging          │                     •   peer = (pod10, uP2)
-                                            │  staging[pod]  (32 MB, host→DPU→host)  │                     • RX buffer  rx_dma_buffer
+                                            │  fwd dma_copy: host → DPU-staging      │                     •   peer = (pod10, uP2)
+                                            │  staging[pod]  (32 MB per pod)         │                     • RX buffer  rx_dma_buffer
                                             └────────────────────────────────────────┘                     • PE thread + event_fd
 
    descriptor posted per message (dma_desc, 64 B — the body is NOT in it, only a pointer + the tuple):
@@ -396,14 +396,14 @@ Scenario: **pod 10** is a client of **service 11**, which has two backends, **po
   (2) DPA EU  dma_copy  host10 dma_buffer[slot]  →  DPU staging[pod10]
   (3) ARM     dpu_route(11) → pod 11 ;  reuse or create upstream → uP1 ;  upstream[uP1]={10,pC,pod11}
               rewrite tuple → src=(10, uP1)  dst=(pod11, uP1)            ← backend will see the DPU id uP1
-  (4) DPA EU  dma_copy  DPU staging[pod10]  →  host11 rx_dma_buffer      (in-place; no DPU CPU copy)
+  (4) ARM     SG-DMA   DPU staging[pod10]  →  host11 rx_dma_buffer      (egress; in-place, no DPU CPU copy)
   (5) host11  PE: dst_port=uP1 not live → accept queue → dmesh_accept → server conn uP1, peer=(10,uP1)
               app dmesh_read → the message
       ARM     TX_ACK to (pod10, pC, s)   ← uP1 translated back to pC → frees host10's TX slot
 
   REPLY  (backend → its peer)
   (6) host11  write → flush     src=(11, uP1)   dst=(pod10, uP1)          ← concrete dst → no LB, direct
-  (7) DPA     dma_copy  host11 → DPU staging[pod11] → host10 rx_dma_buffer
+  (7) DPA     dma_copy  host11 → DPU staging[pod11] ;  ARM SG-DMA  staging → host10 rx_dma_buffer
   (8) ARM     dst_port=uP1 is an owned upstream → map uP1 → (pod10, pC) → rewrite dst → (pod10, pC)
               TX_ACK to (pod11, uP1)  → frees host11's TX slot
   (9) host10  PE: dst_port=pC → client conn pC inbox → ready list → dmesh_read → the reply
@@ -505,14 +505,15 @@ OPEN with tripwires armed (scale_log 07-03 session 3).
 
 ---
 
-## 8. L7 proxy — byte-stream reframing (`DPUMESH_PROXY`, experimental)
+## 8. L7 proxy — byte-stream reframing (`DPUMESH_PROXY` = parser selector)
 
-Where the default L4 route (§5) picks a backend per *whole message* on metadata alone (boundaries
-kept), this engine treats a connection as a **byte stream**, hands it to a **mock** L7 function that
-reframes it into **routing segments**, and the L4 engine ships each segment to its backend by
-**scatter-gather DMA**. The backend receives a byte stream and frames it **itself** (an
-ordinary server behind an envoy). Off by default (`DPUMESH_PROXY` unset = legacy per-slot path,
-**bit-identical**); the L7 parser is a MOCK today (real body parsing is future).
+DPU→host egress is **always** this per-conn byte-stream engine — the sole reverse path. The forward
+DMA lands a connection's bytes in DPU staging; an L7 function reframes the stream into **routing
+segments**; the engine ships each to its backend by **scatter-gather DMA** (ARM). The backend
+receives a byte stream and frames it **itself** (an ordinary server behind an envoy). `DPUMESH_PROXY`
+does **not** toggle the engine — it selects the deploy-default **request parser**: `passthru`
+(default; one segment per arrived message on the §5 metadata route — **bit-identical** to legacy
+per-message LB) or `frame`. The real body-parsing L7 hook is a MOCK today; replies always pass through.
 
 **The deliverable — what an L7 function returns:**
 ```c
@@ -574,7 +575,7 @@ choice. So a vanilla (shim) app, the frame demo, and a real L7 service **coexist
 independently.
 | env | behavior | purpose |
 |---|---|---|
-| `DPUMESH_PROXY` *(unset)* | engine absent — legacy per-slot path | production default, **bit-identical** |
+| `DPUMESH_PROXY` *(unset)* | same as `passthru` — the engine is **always on** | production default, **bit-identical** to legacy per-message LB |
 | `DPUMESH_PROXY=passthru` \| `1` | deploy default = **passthru**: one segment per arrived message; `dst` = the §5 L4 route. Works with **any** byte stream (no app framing). | parity / regression + the vanilla (shim) path |
 | `DPUMESH_PROXY=frame` | deploy default = **frame** for every request stream (legacy all-frame) | the byte-stream demo |
 | `DPUMESH_PROXY_FRAME_SVC=<csv>` | services whose **request** streams use the frame demo parser `[u32 len][u8 svc][payload]` (routes each whole frame by `svc`; a >8 KB frame ships as ≤8 KB chunks) | mix app kinds: `DPUMESH_PROXY=passthru DPUMESH_PROXY_FRAME_SVC=16` |
@@ -608,11 +609,11 @@ engine is validated and the L7 plug-in slot (`dpu_l7.c`) is wired; writing the r
 
 ## 9. Baked data-plane configuration (reference)
 
-The data-plane tuning that used to be `DPUMESH_*` env knobs is now **compiled in** at the values
-measured as best; the only runtime env left is `DPUMESH_PROXY` + `DPUMESH_PROXY_FRAME_SVC` +
-`DPUMESH_PROXY_L7_SVC` (§8), `DPUMESH_PCI_ADDR`, `DPUMESH_SERVICE_ID`, `DPUMESH_CONN_POOL` (§1),
-and the `DMESH_PRELOAD_*` shim vars (§7). **To
-change a baked value, edit the named constant/assignment and rebuild** (no env override).
+Most data-plane tuning is **compiled in** at the values measured as best; the runtime env knobs are
+`DPUMESH_PROXY` + `DPUMESH_PROXY_FRAME_SVC` + `DPUMESH_PROXY_L7_SVC` (§8), `DPUMESH_ARM_EGRESS_THREADS`
++ `DPUMESH_RINGS_PER_POD` (table below), `DPUMESH_PCI_ADDR`, `DPUMESH_SERVICE_ID`, `DPUMESH_CONN_POOL`
+(§1), and the `DMESH_PRELOAD_*` shim vars (§7). **To change a *baked* value, edit the named
+constant/assignment and rebuild** (no env override).
 
 | Setting | Baked value | Constant / assignment | File |
 |---|---|---|---|
@@ -620,7 +621,8 @@ change a baked value, edit the named constant/assignment and rebuild** (no env o
 | Slot size (max wire DMA) | `8192` (8 KB — DPA `dma_copy` cap) | `DPUMESH_SLOT_SIZE_DEFAULT` → `ctx->slot_size` | `dpumesh.h` / `dpumesh_doca.c` |
 | Per-conn TX rings (max concurrent conns) | `256` (128 KB byte-ring each) | `DPUMESH_CONN_POOL` env → `ctx->conn_pool` | `dpumesh_doca.c` |
 | DPA EU threads (N) | `4` | `objs->num_dpa_threads = 4` | `doca/dpu_worker.c` |
-| Forward rings per pod / EU-sharding (K) | `2` | `DPUMESH_RINGS_PER_POD_DEFAULT` → `k_rings` | `doca/dpumesh_common.h` (DPU + host) |
+| Forward rings per pod / EU-sharding (K) | `2` — env `DPUMESH_RINGS_PER_POD` | `DPUMESH_RINGS_PER_POD_DEFAULT` → `k_rings` | `doca/dpumesh_common.h` (DPU + host) |
+| ARM SG-DMA egress workers (n_eng) | `1` — env `DPUMESH_ARM_EGRESS_THREADS` (use `2`) | `getenv` → `px->n_eng` | `doca/dpu_proxy.c` |
 | DPU main loop | event-driven epoll (busy-poll auto-fallback on setup failure) | — (literal path) | `doca/dpu_worker.c` |
 | Host RX (PE) thread | sleep on the notification fd | `want_epoll = 1` | `dpumesh_doca.c` |
 | Proxy seam cap (max contiguous parser view) | `512 KB` | `PX_SEAM_MAX_DEFAULT` | `doca/dpu_proxy.c` |

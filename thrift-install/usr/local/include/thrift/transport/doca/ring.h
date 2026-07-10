@@ -11,9 +11,6 @@ struct objects;
 
 struct dma_ring {
     struct doca_mmap *mmap;
-    uint32_t head;             /* SPSC producer cursor — DPU reverse ring ONLY
-                                * (get_next_dma_desc, single ARM producer). The host
-                                * forward ring uses enq_pos/seq below, not this. */
     uint32_t size;
     struct dma_desc *descs;
     /* Host forward ring — LOCK-FREE MPSC (Vyukov bounded queue). Producers claim a
@@ -23,12 +20,11 @@ struct dma_ring {
      * published (seq==t-size+1) AND the DPA consumed it (desc.valid==0) → reclaim.
      * A stalled producer leaves seq unadvanced, so a lapping producer waits rather
      * than overwriting — generation-safe with just the existing `valid` flag, no
-     * lock, DPA untouched. Both unused by the DPU reverse ring (single-producer). */
+     * lock, DPA untouched. */
     uint64_t  enq_pos;
     uint64_t *seq;
     /* "ring busy" WARN rate-limit state (best-effort under lock-free contention;
      * a racy probe count only mis-throttles a diagnostic, never corrupts). */
-    uint32_t busy_head;
     uint64_t busy_probes;
 };
 
@@ -36,11 +32,4 @@ struct dma_ring {
  * slot). EU-sharding allocates K of these; each is exported as DMA_RING and the
  * DPU pairs them in arrival order. */
 int setup_dma_ring(struct objects *objs, size_t size, struct dma_ring **out_ring);
-
-/* Create a DPU-side DMA ring for reverse direction (DPU→CPU).
- * Allocates ring memory locally (PCI-accessible), does NOT export to remote. */
-int setup_dpu_tx_ring(struct doca_dev *dev, size_t size,
-                      struct dma_ring **out_ring, struct doca_mmap **out_mmap);
-
-struct dma_desc *get_next_dma_desc(struct dma_ring *ring);
 #endif /* RING_H */

@@ -106,16 +106,6 @@ typedef struct dmesh_conn {
     uint8_t   pin_group;
 } dmesh_conn_t;
 
-/* Zero-copy TX allocation: a contiguous run of `n` transport slots you fill
- * directly (no memcpy), then hand to dmesh_slot_register. ptr == NULL = failure.
- * `slot` is the base slot index; the transport recovers it from ptr arithmetically,
- * but `n` is carried here because a pointer can't encode the region size. */
-typedef struct dmesh_buf {
-    uint8_t *ptr;   /* DMA-source pointer into transport memory (write here) */
-    int      slot;  /* base slot index */
-    int      n;     /* number of contiguous slots */
-} dmesh_buf_t;
-
 /* ===== Endpoint lifecycle ===== */
 
 /* service_id = the service this node advertises (DMESH_SVC_NONE for a pure
@@ -290,13 +280,12 @@ static inline int dmesh_emit_desc(dmesh_conn_t *c, size_t moff, uint32_t len) {
     return 0;
 }
 
-/* write(): BUFFER outbound body bytes into the current message (shipped by flush).
- * Consecutive writes accumulate; the first write after a flush starts a NEW message.
- * A message LARGER than one slot is AUTO-CHUNKED across slots — on overflow the full
- * slot ships as a chunk (all chunks of the message share one route_group so the DPU
- * pins them to ONE backend, reassemble-able even under per-message LB) and a fresh
- * slot continues. So the app just writes ANY length; there is no size limit and no
- * EMSGSIZE. The receiver is a plain dmesh_read loop (it frames its own length). */
+/* write(): APPEND outbound body bytes to this conn's TX byte-ring (shipped by flush).
+ * Any length — the bytes just accumulate in the ring; dmesh_flush later carves the
+ * committed run into <=slot_size wire descriptors (coalescing). There is no size
+ * limit and no EMSGSIZE. Ordering on a connection to ONE backend is send order;
+ * across backends (only when a service has several) use dmesh_pin_route for socket
+ * order. The receiver is a plain dmesh_read loop (it frames its own length). */
 static inline ssize_t dmesh_write(dmesh_conn_t *c, const void *buf, size_t len) {
     dpumesh_ctx_t *ctx = c->ep->ctx;
     const uint8_t *p = (const uint8_t *)buf;
@@ -345,14 +334,9 @@ static inline int dmesh_flush(dmesh_conn_t *c) {
     return 0;
 }
 
-/* ===== Zero-copy TX (dmesh_alloc / dmesh_slot_register) =====
+/* ===== Zero-copy TX (dmesh_alloc / dmesh_commit) =====
  * Fill transport DMA memory directly instead of memcpy'ing through dmesh_write. */
 
-/* Allocate n contiguous TX slots to write into directly (the DMA source). n==1
- * uses the lock-free pool; n>1 uses the contiguous arena (needs a non-zero
- * DPUMESH_ARENA_SLOTS at deploy). Returns {ptr,slot,n}; on failure ptr==NULL
- * (n>1 with no/too-small arena, or n<=0). Fill ptr[0..len), then
- * dmesh_slot_register(c, buf, len) + dmesh_flush(c). */
 /* dmesh_alloc(c, len): reserve `len` CONTIGUOUS bytes in this conn's TX byte-ring and
  * return a pointer into transport DMA memory to fill DIRECTLY (no memcpy). Then
  * dmesh_commit(c, actual_len) + dmesh_flush(c). Busy-spins under backpressure; NULL if
@@ -416,14 +400,13 @@ static inline int dmesh_close(dmesh_conn_t *c) {
 
 /* ===== Large messages (> slot_size) — transparent, NO special API =====
  * There is no write_large/read_large. A payload larger than one slot is handled by
- * plain dmesh_write + dmesh_flush: write AUTO-CHUNKS across slots and pins every chunk
- * of the message to ONE backend (a shared route_group, §route-affinity), so the chunks
- * arrive in order on that backend and can be reassembled. The receiver is a plain
- * dmesh_read LOOP: read chunks in arrival order and concatenate until you have the
- * length YOUR protocol declares (framing/completeness is the app's job, like a byte
- * stream). Because the chunks are pinned + in order, arrival order == send order — if
- * affinity ever failed the chunks would arrive out of order and the app's content
- * check would catch it. bench/bench_sock.c (mode=3) is the worked example. */
+ * plain dmesh_write + dmesh_flush: the bytes buffer in the conn's TX byte-ring and
+ * flush ships them as <=slot_size wire descriptors, IN SEND ORDER on a connection to
+ * one backend. The receiver is a plain dmesh_read LOOP: read chunks in arrival order
+ * and concatenate until you have the length YOUR protocol declares (framing is the
+ * app's job, like a byte stream). If a service load-balances across SEVERAL backends,
+ * dmesh_pin_route(c) first so the whole conn stays on one backend and the chunks stay
+ * in order. bench/bench_sock.c (mode=3) is the worked example. */
 
 /* ===== Event-loop integration =====
  * ONE fd: dmesh_event_fd(s). Register it in a vanilla epoll set; it becomes readable

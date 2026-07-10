@@ -9,10 +9,6 @@
 
 DOCA_LOG_REGISTER(RING);
 
-/* Rate-limit the "DMA ring busy" WARN: log first probe of a stuck head, then
- * once per RING_BUSY_LOG_EVERY probes. Must be a power of two (used as a mask). */
-#define RING_BUSY_LOG_EVERY 4096u
-
 int setup_dma_ring(struct objects *objs, size_t size, struct dma_ring **out_ring)
 {
     doca_error_t result;
@@ -23,10 +19,8 @@ int setup_dma_ring(struct objects *objs, size_t size, struct dma_ring **out_ring
         return DOCA_ERROR_NO_MEMORY;
     *out_ring = ring;
     ring->size = size;          /* logical ring size (host wraps at this) */
-    ring->head = 0;
     ring->enq_pos = 0;
     ring->descs = NULL;
-    ring->busy_head = 0xFFFFFFFFu;
     ring->busy_probes = 0;
 
     /* Per-slot Vyukov cell sequence (host memory): seq[i]=i so slot i is first
@@ -63,7 +57,7 @@ int setup_dma_ring(struct objects *objs, size_t size, struct dma_ring **out_ring
     result = export_mmap_to_remote(objs, ring->mmap,
                                    ring->descs,
                                    alloc_slots * sizeof(struct dma_desc),
-                                   DMA_RING, HOST_TO_DPU);
+                                   DMA_RING);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to export mmap and buffer to DPU: %s", doca_error_get_descr(result));
         destroy_mmap_and_free_buffer(ring->mmap, ring->descs);
@@ -75,59 +69,3 @@ int setup_dma_ring(struct objects *objs, size_t size, struct dma_ring **out_ring
     return 0;
 }
 
-int setup_dpu_tx_ring(struct doca_dev *dev, size_t size,
-                      struct dma_ring **out_ring, struct doca_mmap **out_mmap)
-{
-    doca_error_t result;
-    struct dma_ring *ring;
-
-    ring = (struct dma_ring *)malloc(sizeof(struct dma_ring));
-    if (!ring) return DOCA_ERROR_NO_MEMORY;
-
-    ring->size = size;
-    ring->head = 0;
-    ring->enq_pos = 0;
-    ring->seq = NULL;           /* reverse ring is single-producer → no Vyukov seq */
-    ring->descs = NULL;
-    ring->busy_head = 0xFFFFFFFFu;
-    ring->busy_probes = 0;
-
-    result = alloc_buffer_and_set_mmap(&ring->mmap, dev,
-                           (void **)&ring->descs,
-                           ring->size * sizeof(struct dma_desc),
-                           DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_READ_WRITE);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to allocate DPU TX ring: %s", doca_error_get_descr(result));
-        free(ring);
-        return result;
-    }
-
-    memset(ring->descs, 0, ring->size * sizeof(struct dma_desc));
-
-    *out_ring = ring;
-    *out_mmap = ring->mmap;
-    return 0;
-}
-
-struct dma_desc *get_next_dma_desc(struct dma_ring *ring)
-{
-    /* Valid bit is owned by DPA consumer; if still set, producer must not overwrite. */
-    struct dma_desc *desc = ring->descs + ring->head;
-
-    if (desc->valid) {
-        /* Reset the probe counter whenever head moves, so a climbing count
-         * tracks a single stuck head. Per-ring state (see struct dma_ring). */
-        if (ring->head != ring->busy_head) {
-            ring->busy_head = ring->head;
-            ring->busy_probes = 0;
-        }
-        if ((ring->busy_probes++ & (RING_BUSY_LOG_EVERY - 1)) == 0)
-            DOCA_LOG_WARN("DMA ring busy at head=%u (size=%u) [stuck x%llu]",
-                          ring->head, ring->size,
-                          (unsigned long long)ring->busy_probes);
-        return NULL;
-    }
-
-    ring->head = (ring->head + 1) % ring->size;
-    return desc;
-}

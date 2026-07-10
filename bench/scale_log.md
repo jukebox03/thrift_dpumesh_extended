@@ -3776,3 +3776,171 @@ Byte-stream delivery both ends (receiver frames its own; §8 L7 direction). Rout
 of >8KB messages is DROPPED (byte-stream has no boundaries) — pin the conn for socket order, or
 rely on a single backend. A single dmesh_write > conn_bytes (128KB) needs an intervening flush
 (not hit by any bench). Deployed; api.md rewrite pending.
+
+---
+
+# 2026-07-09 (session 2) — Reverse egress UNIFICATION to ARM SG-DMA (Level 0) — REGRESSION + WEDGE
+
+Design goal (user): unify the data plane — reverse (DPU→host) egress = ARM SG-DMA for BOTH
+engines; DPUMESH_PROXY becomes a PARSER selector only (passthru default / frame / L7), not an
+engine toggle. Level 0 = make the SG-DMA egress engine ALWAYS on (px_init), DPA reverse left
+dormant. Change: dpu_proxy.c px_init (drop the `env NULL → proxy off` early-out; default parser
+= passthru), + 2 stale comments. DPU built OK (15 objs). Deploy: `DPUMESH_PROXY_FRAME_SVC=16`
+→ log confirms "PROXY MODE ON, request-default=passthru, frame-services=1". fair pin, RPC mode 8KB.
+
+## dpumesh RPC 8KB ramp (fair, 1-core)
+| target | achieved | p50 | p99 | ok/fail | note |
+|---|---|---|---|---|---|
+| 30,000  | 29,836  | 162µs   | 488µs   | 300,000/0 | healthy |
+| 100,000 | 97,522  | 117.3ms | 319.7ms | 1,000,000/0 | 0-fail but p50 8× baseline — overloaded |
+| 150,000 | 100,275 | 2.31s   | 5.62s   | 1,500,000/0 | deep overload, ceiling ~100K |
+| 200,000 | —       | —       | —       | no response | client 40s timeout |
+| 50,000 (post-200K) | — | — | — | no response | **WEDGED — no recovery** |
+| 80,000 (post-200K) | — | — | — | no response | still wedged |
+
+## Verdict: functionally CORRECT (0-fail ≤150K) but 2× THROUGHPUT REGRESSION + permanent WEDGE
+- Sustainable ceiling collapsed to ~100K (vs ~200K DPA-reverse baseline); p50 at 100K = 117ms
+  (baseline ~14ms). The single ARM thread now does ALL reverse egress (SG-DMA + parse + route +
+  conntrack + per-lane credit DMA-reads + custody + TX_ACK), replacing the 4 parallel DPA EUs.
+- After the 200K overload the system WEDGES and does not recover (even 50K → no response).
+  Evidence: all pods Running (0 restarts, no crash); DPU log FROZEN at the overload timestamp
+  (last lines = px_drop_window "stale upstream (client closed)" flood); DPU ARM thread at **2.0%
+  CPU (IDLE, not pegged)**. → idle-wedge / liveness-stall, NOT CPU saturation. A wake/recovery
+  path that the fast DPA-reverse never triggered (never got this backed up) fails under the deep
+  backpressure the slow ARM egress creates.
+- Interpretation: the ~100K may be a stall/backpressure limit (ARM idle when wedged, not pegged),
+  not necessarily a raw ARM CPU ceiling — the credit-refresh DMA-reads + custody backpressure are
+  the suspects. Needs the wedge root-caused before the throughput number is trustworthy.
+- STOPPED per hang-discipline (captured logs, no auto-redeploy). System currently wedged — a
+  redeploy is needed to clear it. Blocks Level 1 (per-conn RX) until the egress viability is resolved.
+
+## Root-cause: ARM egress is CPU-BOUND on the single worker thread (2026-07-09 s2)
+Redeployed (wedge cleared). Sustained 80K/25s/8KB, sampled DPU ARM per-thread CPU DURING load:
+| | main worker thread | 2 helper threads | bench (80K) |
+|---|---|---|---|
+| sample 1/2 | **94–96% / 94.1%** (R, pegged) | ~0–1% / 0% | 79,801 · p50 162µs · p99 958µs · 2M/0 |
+
+→ CONFIRMED CPU-bound: the ONE ARM worker thread saturates a core doing the per-message DOCA
+egress lifecycle (doca_buf inventory get/set/free + doca_dma task alloc/submit + credit-refresh
+DMA-reads + completion/custody/TX_ACK). Mock parse is FREE (px_mock_passthru writes 3 fields,
+never reads the body); route/conntrack are array/hash lookups — NOT the cost. The 2× regression =
+4 parallel DPA EUs → 1 ARM thread. Sustainable ceiling ≈ 80K/core (healthy p50 162µs). The
+earlier wedge-idle (2%) was the POST-stall state, not under-load. Lever = parallelize ARM egress
+across cores (mirror DPA EU-sharding). Wedge under deep overload is a SEPARATE liveness bug (TODO).
+
+## FIX: multi-threaded ARM egress (DPUMESH_ARM_EGRESS_THREADS) — recovers baseline + kills wedge (2026-07-09 s2)
+Root cause was the single ARM worker doing ALL SG-DMA egress (94-96% CPU/core). Fix: split the
+proxy egress into 1 INGEST thread (main: consumer_pe + parse/route/conntrack + ship + REV_DONE +
+custody + all comch + all unit/piece/arrival pools) + N EGRESS workers (own doca dma/PE/inventory
+/batch-pool; own lanes by pod_idx % n_eng; do the heavy per-msg SG-DMA lifecycle). Handoff = per-
+lane SPSC inbox (ingest→worker) + per-engine done-queue (worker→ingest). unit/piece/arrival pools
++ comch stay INGEST-only (no cross-thread), batch pool worker-only → no shared-pool locks. Knob
+`DPUMESH_ARM_EGRESS_THREADS` (dpu_proxy.c px_init; forwarded by test-bench.sh start_dpu). n_eng==1
+= the proven inline path, untouched. Files: dpu_proxy.c (engine struct + parameterized submit/
+refresh/emit + retire/engine_emit/pump/worker + px_init), test-bench.sh.
+
+### Scaling — dpumesh RPC 8KB fair (RAMPED 30→200K each; passthru default + frame svc16)
+| n_eng | threads | sustainable | p50@ceiling | overload recovery | notes |
+|---|---|---|---|---|---|
+| 1 (inline) | 1 | ~80K | 162µs | **WEDGES** (idle-park, no recover) | = the regression |
+| 2 | 1 ingest + 2 workers | **~200-220K** | 232µs @200K | **recovers** (100K after 250K = 0-fail) | == DPA baseline; no wedge |
+| 4 (pre idle-backoff) | 1 + 4 (2 idle SPIN) | ~150K, wedges @260K | 1.2ms @220K | wedges | over-provisioned: idle spinners oversubscribe |
+| 4 (idle-backoff) | 1 + 4 (2 idle SLEEP) | ~200K | 278µs @200K | graceful | ≈ n_eng=2 (bounded by 2 active pods) |
+
+n_eng=2 detail: 30K/80K/120K/160K/180K/200K = 29.8K/79.6K/119K/159K/179K/198.9K, ALL 0-fail,
+p50 160-240µs. Ceiling ~220K (p99 climbs); knee ~237K. ARM CPU @160K: ingest + 2 workers ALL
+~99% (ingest is now co-bottleneck — REV_DONE+custody+comch per msg on one thread).
+
+### Two findings
+1. **Multi-threading recovers the baseline AND fixes the wedge.** The single-thread wedge was the
+   event-loop idle-parking under egress backpressure; busy-polling workers keep egress draining, so
+   the stall never forms. n_eng=2 recovers from deep overload (250K→100K = 0-fail).
+2. **Egress parallelism is bounded by # active dst pods** (each pod's lanes → one worker). This bench
+   has ~2 (client + echo), so n_eng=2 is optimal; n_eng>2 just adds workers with no lanes. FIX =
+   idle workers back off to a 50µs sleep (after 4096 idle spins) so over-provisioning degrades
+   gracefully instead of oversubscribing the ARM cores (n_eng=4 pre-fix wedged; post-fix = ~200K).
+
+### Full-suite validation @ n_eng=2 (idle-backoff), all 0-fail
+| test | result |
+|---|---|
+| dpumesh RPC 200K/8KB (ramped) | 198,895 · p50 232µs · 2M/0 |
+| loopback self-route 50000×8KB | 50,000/0 · served 50,000 |
+| preload vanilla-TCP 5000×1KB×64c | 5,000/0 · 20,198 RPS |
+| stream FRAME 20000×1KB (svc16) | 20,000/0 · served 20,580,000 B byte-exact |
+
+Verdict: reverse=ARM-SG-DMA unification is VIABLE at n_eng=2 — full ~200K baseline, 0-fail across
+passthru RPC / self-route / vanilla-shim / frame paths, wedge gone. Code default still n_eng=1
+(proven inline); RECOMMEND baking n_eng=2 (or ≈active-pod-count). Testing note: MUST ramp — a cold
+jump to 200K wedges the host forward ring (my error mid-session, unrelated to DPU code).
+
+## Deploy option: DPUMESH_RINGS_PER_POD (K forward rings/pod) (2026-07-10)
+K was baked (=2). Now a deploy env, read on BOTH host (dpumesh_doca.c init_config) and DPU
+(dpu_worker.c run_dpu_worker) — the host sizes K forward rings at init (before register) so it
+can't learn K from the DPU later; both must land on the same K (fwd rings pair 1:1, mismatch stalls
+dma_ready). Clamp [1, min(N=4, MAX_EU_PER_POD)]. Wired in test-bench.sh (start_dpu env + all dpumesh
+pod specs). Verified: K=4 deploy → DPU log "K forward rings/pod = 4", host matched (0-fail 30/120/
+200K = 198.7K); K=4 ~200K == K=2 (K=4 flat, as prior). Default unset → K=2. conn→ring: a conn pins
+to ONE ring (src_port % K); conns spread across K. Ceiling is ARM-ingest-bound, so K is not a
+throughput lever at 2 pods (it's an EU-spread knob for many pods); exposed per request.
+
+---
+
+# 2026-07-10 (session 2) — DELETE the dead legacy DPA-reverse data plane — BUILT + HW-VALIDATED
+
+Since the egress unification (07-09 s2), `px_init` allocates the proxy unconditionally and the DPU
+worker aborts if it fails (`dpu_worker.c` — `px_init` fatal), so `objs->proxy` is ALWAYS non-NULL and
+the ARM SG-DMA egress is the SOLE DPU→host reverse path. That made the entire legacy DPA-reverse
+machinery **unreachable dead code** (it only ran on the `objs->proxy==NULL` branch). User decision:
+delete ALL of it; keep `DPUMESH_ARM_EGRESS_THREADS` (n_eng) as a deploy env knob (tune later).
+
+## Removed (host + DPA-device + wire, one coherent change)
+- **dpu_worker.c**: `process_forward_entry`, `dpu_enqueue_reverse_dma`, `process_rev_notify_entry`,
+  `dpu_route` (kept `dpu_route_l4`/`lb_pick` — proxy uses them), `batch_or_send_rev_done`
+  (kept `flush_rev_done_batch` + `rev_done_batch` — the proxy fills/flushes them). `process_completion_queue`
+  simplified to the single `px_ingest_forward` dispatch (no entry_type branch).
+- **ring.c/h**: `setup_dpu_tx_ring`, `get_next_dma_desc`, `dma_ring.head`/`busy_head`, `RING_BUSY_LOG_EVERY`.
+- **dpa.c**: the `DPA_MSG_REV_DONE` recv case, the whole reverse-ring setup block in `setup_pod_dma`,
+  `update_rev_ring_host_rx`, `pod->local_mmap_dpa_handle` assignment.
+- **dpa_kernel.c (device)**: `process_rev_ring`, `DPA_MSG_REV_RING_ADD` handler, the reverse-admission
+  globals (`dpa_cached_freed`/`dpa_sent_count`) + `CREDIT_REFRESH_MARGIN` + the credit-refresh loop.
+- **object.h**: `pod_state.tx_rings[]`/`tx_ring_mmaps[]`/`tx_buf_arrs[]`/`local_mmap_dpa_handle`;
+  `dpu_comp_entry_t.entry_type` + `COMP_ENTRY_*`.
+- **dpa_common.h (WIRE)**: `dpa_thread_arg` reverse fields (`rev_rings`/`num_rev_rings`/`rev_desc_idx`/
+  `rev_pos`) + the dead forward `pos[]` cursor; `dpa_ring_info` reverse fields (`host_buf_size`/
+  `dpu_buf_size`/`host_credit_buf_arr`/`rq_depth`); `dma_desc.landing_pos` (→ `reserved[27]`, size stable
+  64B); `comch_add_rev_ring_msg`; `DPA_MSG_REV_RING_ADD`/`DPA_MSG_REV_DONE`. ABI asserts recomputed:
+  dpa_ring_info **72→48**, comch_add_ring_msg **80→56**, comch_msg **84→60**, dma_desc **64** (unchanged).
+- Mechanical cruft: `dmesh_key` (dead), `enum msg_direction`/`DPU_TO_HOST` + the dead
+  `export_mmap_to_remote` else-branch (param dropped), plus ~15 stale/contradictory comments the sweep
+  found (proxy "off by default", "legacy per-slot path", "test RR-LB", req_id, custody-list, etc.).
+  Kept (intentional, not legacy): the proxy `stat_*` counters, `dmesh_sendfile`, `dmesh_get_worker_id`.
+
+## Verification
+- `gcc -fsyntax-only -DDOCA_ARCH_DPU` clean (exit 0) on every edited file — dpa.c compiling clean
+  **validates the hand-computed ABI asserts** (they're outside the DOCA_ARCH_DPU guard).
+- **Real deploy built clean** — dpacc compiled the DPA-kernel + wire edits on the BF3; `px_init` log:
+  `egress-threads=2, request-default=passthru, frame-services=1`.
+
+### HW results (DPUMESH_PROXY=passthru + FRAME_SVC=16 + ARM_EGRESS_THREADS=2)
+| test | result | vs baseline |
+|---|---|---|
+| RPC 30K/5s/8KB | 150,000/0 · p50 167µs | = baseline (162µs) |
+| RPC 100K/8s/8KB | 800,000/0 · p50 162µs | = baseline |
+| loopback self-route 50000×8KB | 50,000/0 · served 50,000 | = baseline |
+| preload vanilla-TCP 5000×1KB×8c | 5,000/0 · p50 115µs | = baseline |
+| stream FRAME 20000×1KB (svc16) | 20,000/0 · served 20,580,000 B | byte-exact |
+| stream FRAME **>8KB** 200×20000 (seam) | 200/0 · served Δ **4,001,000 = 200×20005** | **byte-exact = 07-05** |
+
+DPU log 100% clean through all of it (0 drops/errors); ARM idle 1-3% between runs, egress workers
+accumulated 2:33/1:30 CPU-time (they did the work). **Conclusion: the legacy-reverse deletion is
+behavior-neutral — every live path (forward staging-mirror, passthru, self-route, shim, frame, >8KB
+seam) is 0-fail and byte-exact; no throughput regression at 100K (p50 = baseline).**
+
+## Caveat (test methodology, NOT the code)
+RPC cold-started at 150K and 200K each returned "no response" — the documented host forward-ring
+cold-start wedge (the bench invocation targets a fixed RPS with no internal warm-up; the wedge
+threshold for this fair 1-core pod is between 100K–150K). Evidence it is host-side, not the DPU:
+DPU log stayed clean (no stale-upstream drop flood), ARM idle (the load never reached it), pods 0
+restarts, and loopback/preload/frame (other pods) all passed 0-fail AFTER the 200K wedge. Reaching
+~200K needs a warmed ramp (as the 07-10 K-knob session did with 30/120/200); stopped pushing after
+2 wedges per hang-discipline. Deployed state: n_eng=2, passthru default + frame svc16.

@@ -15,25 +15,15 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 struct dpa_ring_info {
 	doca_dpa_dev_buf_arr_t buf_arr;
 	uint32_t buf_arr_size;
-	doca_dpa_dev_mmap_t host_mmap;   /* Host DMA buffer mmap */
-	uint64_t host_addr;              /* Host DMA buffer base address */
-	uint64_t host_buf_size;          /* Host DMA buffer size */
-	doca_dpa_dev_mmap_t dpu_mmap;    /* DPU local buffer mmap */
-	uint64_t dpu_addr;               /* DPU local buffer addr */
-	uint32_t dpu_buf_size;
+	doca_dpa_dev_mmap_t host_mmap;   /* Host TX buffer mmap (forward DMA source) */
+	uint64_t host_addr;              /* Host TX buffer base VA (moff = desc->addr - host_addr) */
+	doca_dpa_dev_mmap_t dpu_mmap;    /* DPU staging buffer mmap (forward DMA dest) */
+	uint64_t dpu_addr;               /* this ring's DPU staging region base VA */
 	int32_t pod_id;
-	/* Credit return (reverse rings only — admission gate on DPA side).
-	 * Host atomically increments freed_cumulative in the credit block;
-	 * DPA reads it before issuing reverse DMA via host_credit_buf_arr (a
-	 * 1-element buf_arr over the host credit mmap, exactly like dma_ring).
-	 * host_credit_buf_arr=0 means "skip admission check" (forward rings,
-	 * or not yet wired). */
-	doca_dpa_dev_buf_arr_t host_credit_buf_arr;
-	uint32_t rq_depth;
-	/* EU-sharding: byte offset of THIS ring's region within the shared per-pod
-	 * buffer (forward: DPU staging; reverse: host RX). The DPA adds it to its
-	 * relative pos cursor so the reported completion pos is absolute. 0 for K=1
-	 * (region == whole buffer) → completion pos == relative pos (legacy). */
+	/* Byte offset of THIS forward ring's region within the pod's DPU staging
+	 * buffer. Under per-conn contiguous staging the DPA lands each chunk at the
+	 * host TX byte offset, recovering the pod staging base as dpu_addr - region_off
+	 * (the K-way region split is vestigial). 0 for K=1. */
 	uint32_t region_off;
 } __attribute__((__packed__, aligned(8)));
 
@@ -44,25 +34,16 @@ struct dpa_thread_arg {
 	uint64_t dpa_producer;
 	uint64_t dpa_consumer;
 	uint32_t dpu_consumer_id; /* DPU-side comch consumer ID for DPA->DPU sends */
-	uint32_t eu_index; /* which EU this thread is (0..N-1); indexes the per-EU
-	                    * reverse-admission globals in dpa_kernel.c. */
+	uint32_t eu_index; /* which EU this thread is (0..N-1) */
 
-	/* Forward rings (CPU→DPU, per-pod) */
+	/* Forward rings (CPU→DPU, per-pod). Reverse (DPU→host) egress is the ARM
+	 * SG-DMA engine (dpu_proxy.c), not a DPA ring — no reverse ring state here.
+	 * Forward staging mirrors the host TX byte offset, so there is no per-ring
+	 * landing cursor either (the completion pos == host offset). */
 	volatile uint32_t num_rings;
 	uint32_t _pad2;
 	struct dpa_ring_info rings[MAX_DPA_RINGS];
 	uint32_t desc_idx[MAX_DPA_RINGS];
-	uint32_t pos[MAX_DPA_RINGS];
-
-	/* Reverse rings (DPU→CPU, per-pod) */
-	volatile uint32_t num_rev_rings;
-	uint32_t _pad3;
-	struct dpa_ring_info rev_rings[MAX_DPA_RINGS];
-	uint32_t rev_desc_idx[MAX_DPA_RINGS];
-	uint32_t rev_pos[MAX_DPA_RINGS];
-	/* Reverse admission accounting (dpa_sent_count/dpa_cached_freed) is NOT
-	 * stored here — it lives in file-scope globals in dpa_kernel.c indexed by
-	 * [eu_index][ring], kept per-EU-isolated via eu_index. */
 } __attribute__((__packed__, aligned(8)));
 
 /* ====== Per-message payload layout ======
@@ -83,12 +64,12 @@ struct dpa_thread_arg {
  * Explicit values, contiguous from 1; 0 is reserved INVALID so a zeroed buffer
  * hits the default-reject arm (fail-safe). */
 enum dpa_msg_type {
-	DPA_MSG_INVALID      = 0, /* reserved: zeroed buffer hits default-reject */
-	DPA_MSG_RING_ADD     = 1, /* DPU→DPA: add forward (CPU→DPU) ring */
-	DPA_MSG_REV_RING_ADD = 2, /* DPU→DPA: add reverse (DPU→CPU) ring */
-	DPA_MSG_WAKE         = 3, /* DPU→DPA: wake up the EU thread (no payload) */
-	DPA_MSG_FWD_DONE     = 4, /* DPA→DPU: forward DMA completed (CPU→DPU) */
-	DPA_MSG_REV_DONE     = 5, /* DPA→DPU: reverse DMA completed (DPU→CPU) */
+	DPA_MSG_INVALID  = 0, /* reserved: zeroed buffer hits default-reject */
+	DPA_MSG_RING_ADD = 1, /* DPU→DPA: add forward (CPU→DPU) ring */
+	DPA_MSG_WAKE     = 2, /* DPU→DPA: wake up the EU thread (no payload) */
+	DPA_MSG_FWD_DONE = 3, /* DPA→DPU: forward DMA completed (CPU→DPU) */
+	/* Reverse (DPU→host) egress is the ARM SG-DMA engine (dpu_proxy.c), not a DPA
+	 * ring: there is no REV_RING_ADD / REV_DONE on this channel anymore. */
 };
 
 /* DPA->DPU completion immediate — packed to 20 bytes (route_group added; 2nd WQE BB) to
@@ -102,7 +83,7 @@ enum dpa_msg_type {
  * Layout is naturally aligned (uint16 on even offsets, pos@12); route_group@16 adds 3B tail pad:
  *   type0 src_pod1 dst_pod2 dst_svc3 src_port4 dst_port6 seq8 length10 pos12 route_group16 = 20B. */
 struct comch_dma_comp_msg {
-	uint8_t  type;        /* DPA_MSG_FWD_DONE / DPA_MSG_REV_DONE (offset 0 — peeked) */
+	uint8_t  type;        /* DPA_MSG_FWD_DONE (offset 0 — peeked) */
 	int8_t   src_pod_id;  /* originating pod (always concrete) */
 	int8_t   dst_pod_id;  /* dest pod; DMESH_POD_BLANK -> DPU resolves dst_service */
 	int8_t   dst_service; /* callee service id (routing input when dst_pod==BLANK) */
@@ -137,19 +118,12 @@ struct comch_add_ring_msg {
 	struct dpa_ring_info ring;
 } __attribute__((__packed__, aligned(8)));
 
-struct comch_add_rev_ring_msg {
-	enum dpa_msg_type type;
-	uint32_t _pad;
-	struct dpa_ring_info ring;
-} __attribute__((__packed__, aligned(8)));
-
 struct comch_msg {
 	enum dpa_msg_type type;
 	union
 	{
 		struct comch_dma_comp_msg dma_comp_msg;
 		struct comch_add_ring_msg add_ring_msg;
-		struct comch_add_rev_ring_msg add_rev_ring_msg;
 	};
 } __attribute__((__packed__, aligned(4)));
 
@@ -158,11 +132,10 @@ struct comch_msg {
  * inside dpa_thread_arg; comch_msg is the configured msgq imm_data_len). Lock
  * their layout so any ABI drift between toolchains fails the build instead of
  * silently corrupting the wire. */
-_Static_assert(sizeof(struct dpa_ring_info) == 72, "dpa_ring_info ABI drift");
-_Static_assert(sizeof(struct comch_add_ring_msg) == 80, "comch_add_ring_msg ABI drift");
-_Static_assert(sizeof(struct comch_add_rev_ring_msg) == 80, "comch_add_rev_ring_msg ABI drift");
+_Static_assert(sizeof(struct dpa_ring_info) == 48, "dpa_ring_info ABI drift");
+_Static_assert(sizeof(struct comch_add_ring_msg) == 56, "comch_add_ring_msg ABI drift");
 _Static_assert(offsetof(struct comch_add_ring_msg, ring) == 8, "comch_add_ring_msg.ring offset drift");
-_Static_assert(sizeof(struct comch_msg) == 84, "comch_msg ABI drift");
+_Static_assert(sizeof(struct comch_msg) == 60, "comch_msg ABI drift");
 
 /* ====== DMA ring descriptor ====== */
 
@@ -189,16 +162,11 @@ struct dma_desc {
 	                                * 0 = normal per-message LB; !=0 pins every chunk of one large
 	                                * (SAR) message to ONE backend so they reassemble. FORWARD-only. */
 	uint8_t pad0[3];               /* 3B alignment for src_pod_id */
-	int32_t src_pod_id;            /* 4B (original forward sender; on reverse rings,
-	                                * ring->pod_id is the receiver, so the source
-	                                * must be carried in the descriptor itself.
-	                                * Forward path: DPA derives src from ring->pod_id
-	                                * and ignores this field. Reverse path: DPU sets
-	                                * it in dpu_enqueue_reverse_dma; DPA copies into
-	                                * comp.src_pod_id so the receiving host can
-	                                * capture the peer (src) and demux by dst_port without
-	                                * an in-payload sw_descriptor. */
-	uint8_t reserved[27];          /* 27B */
+	int32_t src_pod_id;            /* 4B. Set by the host enqueue; the DPA forward
+	                                * handler derives the sender from ring->pod_id and
+	                                * does not read this field. Kept for wire-ABI
+	                                * stability (dma_desc is a fixed 64B cache line). */
+	uint8_t reserved[27];          /* 27B (absorbed the removed REVERSE-only landing_pos) */
 	volatile uint8_t valid;        /* 1B */
 } __attribute__((__packed__, aligned(8)));
 

@@ -24,8 +24,8 @@
  * egress DMA that read those bytes completes (batched). Early release would
  * let the host overwrite the staging bytes mid-read.
  *
- * Enabled by env DPUMESH_PROXY (unset = engine absent, legacy per-slot path
- * bit-identical). The mock is chosen PER CONNECTION, not once per deploy, so a
+ * The SG-DMA egress engine is ALWAYS on (the unified DPU→host reverse path);
+ * DPUMESH_PROXY only selects the REQUEST parser, PER CONNECTION not per deploy, so a
  * single DPU can serve vanilla (LD_PRELOAD / shim) apps AND the frame validator
  * at the same time — they are fully independent:
  *
@@ -35,7 +35,7 @@
  *                             identical boundaries/routing. Works with ANY
  *                             byte stream (no app framing needed).
  *   DPUMESH_PROXY=frame       deploy default = frame for EVERY request stream
- *                             (legacy all-frame behavior).
+ *                             (all-frame mode).
  *   DPUMESH_PROXY_FRAME_SVC=<csv>  the services whose REQUEST streams use the
  *                             length-prefixed frame demo parser ([u32 len][u8
  *                             svc][payload]); every other service's requests use

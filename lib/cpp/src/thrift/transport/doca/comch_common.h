@@ -8,11 +8,6 @@
 
 struct objects;
 
-enum msg_direction {
-    HOST_TO_DPU = 0,
-    DPU_TO_HOST = 1,
-};
-
 /* Control-channel message types (Host ↔ DPU ARM, over the DOCA Comch control
  * path). Explicit values, contiguous from 1; 0 is reserved INVALID so a zeroed
  * buffer never decodes to a live type. The verb vocabulary (POD_, MMAP_, FWD_,
@@ -121,7 +116,7 @@ struct dmesh_comch_msg {
     enum dmesh_msg_type type;
 };
 doca_error_t
-export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer, size_t buf_size, enum mmap_type mmap_type, enum msg_direction direction);
+export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer, size_t buf_size, enum mmap_type mmap_type);
 struct doca_comch_connection;
 doca_error_t
 process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,

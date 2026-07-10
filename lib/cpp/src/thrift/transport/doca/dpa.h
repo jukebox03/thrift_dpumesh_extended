@@ -82,9 +82,6 @@ setup_dpa_buf_array_pod(struct objects *objs, size_t num_elem,
 
 doca_error_t
 setup_pod_dma(struct objects *objs, struct pod_state *pod);
-
-doca_error_t
-update_rev_ring_host_rx(struct objects *objs, struct pod_state *pod);
 #endif /* DOCA_ARCH_DPU */
 
 #endif

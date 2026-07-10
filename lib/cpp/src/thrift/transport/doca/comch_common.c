@@ -13,7 +13,7 @@ DOCA_LOG_REGISTER(COMCH_COMMON);
 
 
 doca_error_t
-export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer, size_t buf_size, enum mmap_type mmap_type, enum msg_direction direction)
+export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer, size_t buf_size, enum mmap_type mmap_type)
 {
     doca_error_t result;
     struct dmesh_mmap_msg *msg;
@@ -46,12 +46,8 @@ export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer
     msg->export_desc_len = htonq(export_desc_len);
     memcpy(msg->export_desc, export_desc, export_desc_len);
     
-    /* Send export descriptor to DPU via comch */
-    if (direction == HOST_TO_DPU) {
-        return client_send_msg(objs, (const char *)msg, sizeof(struct dmesh_mmap_msg) + export_desc_len);
-    } else {
-        return server_send_msg(objs, (const char *)msg, sizeof(struct dmesh_mmap_msg) + export_desc_len);
-    }
+    /* Send export descriptor to DPU via comch (host→DPU only). */
+    return client_send_msg(objs, (const char *)msg, sizeof(struct dmesh_mmap_msg) + export_desc_len);
 }
 
 doca_error_t
@@ -134,8 +130,9 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		      (void *)pod->remote_mmap, (void *)pod->host_rx_mmap);
 
 	/* Trigger per-pod DMA setup when both forward-direction mmaps have arrived.
-	 * setup_pod_dma / update_rev_ring_host_rx send ADD_RING/ADD_REV_RING to the
-	 * DPA. Rare (pod registration), off the steady path; runs on the single
+	 * setup_pod_dma sends ADD_RING to the DPA (forward rings only; the DPU→host
+	 * reverse path is the ARM SG-DMA egress engine, not a DPA ring).
+	 * Rare (pod registration), off the steady path; runs on the single
 	 * worker thread that also drains consumer_pe, so no lock is needed.
 	 * GATED on objs->dpu_ready: a fast host can export its mmaps DURING DPU init
 	 * (before init_comch_dpa_msgq builds the DPA msgq), and this callback runs on
@@ -152,14 +149,6 @@ process_mmap_msg(struct objects *objs, struct doca_comch_connection *conn,
 		}
 	}
 
-	/* If Host RX buffer arrived after DMA setup, update the DPA reverse ring info */
-	if (mmap_msg->mmap_type == DMA_HOST_RX_BUFFER && pod->dma_ready) {
-		result = update_rev_ring_host_rx(objs, pod);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_WARN("update_rev_ring_host_rx failed for pod %d: %s",
-				      pod->pod_id, doca_error_get_descr(result));
-		}
-	}
 #else
 	/* Host side: the DPU→host MMAP_EXPORT import path is DEAD — the host reverse
 	 * path lands into its OWN ctx->rx_dma_buffer and never reads an imported DPU

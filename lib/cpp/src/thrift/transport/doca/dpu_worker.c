@@ -31,7 +31,7 @@ DOCA_LOG_REGISTER(DPU_WORKER);
 /* ====== TX_ACK send helper ====== */
 
 /* Try to send TX_ACK; on EAGAIN park to the deferred queue. No-op when src_pod
- * is gone (its host — and the slot's custody list — died with it). */
+ * is gone (its host died with it). */
 static void
 send_or_defer_tx_ack(struct objects *objs, struct pod_state *src_pod,
                      uint16_t port, uint16_t seq)
@@ -52,7 +52,7 @@ send_or_defer_tx_ack(struct objects *objs, struct pod_state *src_pod,
             objs->deferred_tx_acks[n].seq  = seq;
         } else {
             DOCA_LOG_ERR("deferred TX_ACK queue full — dropping port=%u seq=%u (pod %d). "
-                         "Host TX slot stays in custody until close.",
+                         "Host TX byte-ring bytes stall until close.",
                          port, seq, src_pod->pod_id);
         }
         return;
@@ -123,104 +123,14 @@ flush_rev_done_batch(struct objects *objs, struct pod_state *pod)
     pod->rev_done_batch_n = 0;   /* sent (a hard error drops the batch) */
 }
 
-/* Accumulate one REV_DONE into the target pod's batch; flush when full. Returns
- * 1 = accumulated, 0 = batch full AND a prior flush is still AGAIN (caller must
- * retain the comp entry → ingest backpressure, exactly like the un-batched send). */
-static int
-batch_or_send_rev_done(struct objects *objs, struct pod_state *target_pod,
-                       const dpu_comp_entry_t *ce)
-{
-    if (target_pod->rev_done_batch_n >= BATCH_REVDONE_MAX)
-        flush_rev_done_batch(objs, target_pod);          /* try to make room */
-    if (target_pod->rev_done_batch_n >= BATCH_REVDONE_MAX)
-        return 0;                                        /* still full (send pool busy) */
-    struct dmesh_rev_done_entry *e = &target_pod->rev_done_batch[target_pod->rev_done_batch_n++];
-    e->src_pod_id  = (int8_t)ce->src_pod_id;
-    e->src_service = (int8_t)ce->src_service;
-    e->dst_service = (int8_t)ce->dst_service;
-    e->_pad = 0;
-    e->src_port = ce->src_port;
-    e->dst_port = ce->dst_port;
-    e->seq = ce->seq;
-    e->length = (uint16_t)ce->length;
-    e->pos = ce->buf_offset;                             /* landing pos in host RX buffer */
-    if (target_pod->rev_done_batch_n >= BATCH_REVDONE_MAX)
-        flush_rev_done_batch(objs, target_pod);
-    return 1;
-}
-
-/* ====== Reverse DMA Enqueue (DPU→CPU) ====== */
-
-/*
- * Enqueue a reverse-DMA descriptor for in-place forwarding.
- *
- * Source = src_pod->dma_buffer at src_buf_offset (where forward DMA landed);
- * no DPU-side staging copy. Each descriptor carries the source mmap handle and
- * full virtual address so the DPA reverse handler dispatches to the right pod's
- * buffer per request.
- *
- * Slot lifecycle: src's RX slot is held from forward-completion through
- * reverse-completion (full RTT). TX_ACK to src is therefore deferred to
- * process_rev_notify_entry, not sent here.
- *
- * Returns DOCA_SUCCESS or DOCA_ERROR_AGAIN (TX descriptor ring full).
- */
-static doca_error_t
-dpu_enqueue_reverse_dma(struct pod_state *src_pod,
-                        struct pod_state *dst_pod, int ring_k,
-                        const dpu_comp_entry_t *ce, int32_t resolved_dst_pod,
-                        uint32_t src_buf_offset, uint32_t body_len,
-                        uint16_t out_src_port, uint16_t out_dst_port)
-{
-    /* Post the reverse desc to dst_pod's ring ring_k (the EU-sharding ring whose
-     * EU owns dst_pod's rev region ring_k). The single ARM thread is the sole
-     * writer of every ring → each stays single-producer (lock-free). */
-    if (!dst_pod->tx_rings[ring_k]) {
-        DOCA_LOG_ERR("dpu_enqueue_reverse_dma: pod %d reverse ring %d not ready", dst_pod->pod_id, ring_k);
-        return DOCA_ERROR_NOT_CONNECTED;
-    }
-    if (!src_pod->dma_buffer || src_pod->local_mmap_dpa_handle == 0) {
-        DOCA_LOG_ERR("dpu_enqueue_reverse_dma: src pod %d dma_buffer/handle not ready",
-                     src_pod->pod_id);
-        return DOCA_ERROR_NOT_CONNECTED;
-    }
-
-    /* Post descriptor to TX ring */
-    struct dma_desc *dma = get_next_dma_desc(dst_pod->tx_rings[ring_k]);
-    if (!dma) {
-        DOCA_LOG_WARN("dpu_enqueue_reverse_dma: TX ring %d full for pod %d", ring_k, dst_pod->pod_id);
-        return DOCA_ERROR_AGAIN;
-    }
-
-    /* Fill descriptor: DPA reverse handler reads the source from
-     * (desc->mmap, desc->addr). desc->addr is the full virtual address inside
-     * src_pod's local_mmap range (DOCA dma_copy expects raw VA). */
-    dma->mmap = src_pod->local_mmap_dpa_handle;
-    dma->addr = (uint64_t)src_pod->dma_buffer + src_buf_offset;
-    dma->size = body_len;
-    /* Full tuple, opaque passthrough → DPA copies into REV_DONE → host demux. */
-    dma->seq         = ce->seq;
-    dma->src_port    = out_src_port;       /* rewritten by the caller (model B) */
-    dma->dst_port    = out_dst_port;       /* rewritten by the caller (model B) */
-    dma->src_service = (int8_t)ce->src_service;
-    dma->dst_service = (int8_t)ce->dst_service;
-    dma->dst_pod_id  = resolved_dst_pod;   /* resolved target (direct, not BLANK) */
-    dma->src_pod_id  = ce->src_pod_id;     /* forward sender (client for a request) */
-
-    __sync_synchronize();
-    dma->valid = 1;
-
-    return DOCA_SUCCESS;
-}
-
 /* ====== L4 routing ======
  *
- * dpu_route() is the single point where the DPU decides the destination pod for a
- * forward completion: service_table[svc] (one backend per service), with ROUTE-
+ * dpu_route_l4() is the single point where the DPU picks the destination pod for a
+ * forward segment: service_table[svc] (one backend per service), with ROUTE-
  * AFFINITY layered on top — a non-zero route_group pins every chunk of one large
  * (SAR) message to ONE backend so they reassemble. Single ARM thread → the group
- * table needs no lock. (A body-parsing L7 proxy lives in the separate
- * DPUMESH_PROXY engine, dpu_proxy.c — see api.md §8.)
+ * table needs no lock. Called by the SG-DMA egress engine (dpu_proxy.c) for
+ * DEFERred request segs; a body-parsing L7 proxy is the future step (api.md §8).
  */
 static inline int32_t
 lb_pick(struct objects *objs, int16_t svc)
@@ -233,10 +143,9 @@ lb_pick(struct objects *objs, int16_t svc)
     return -1;
 }
 
-/* L4 default route: service table + route-affinity pin (no "already resolved"
- * short-circuit). This is the shared body used by both dpu_route() below and the
- * proxy engine's DEFERred request segs (dpu_proxy.c → dpu_route_l4). Single ARM
- * thread → the pin table needs no lock. */
+/* L4 default route: service table + route-affinity pin. The single point that
+ * resolves a DEFERred request seg's backend for the SG-DMA egress engine
+ * (dpu_proxy.c → dpu_route_l4). Single ARM thread → the pin table needs no lock. */
 int32_t
 dpu_route_l4(struct objects *objs, int16_t svc, uint8_t rg)
 {
@@ -277,145 +186,7 @@ dpu_route_l4(struct objects *objs, int16_t svc, uint8_t rg)
     return -1;
 }
 
-static inline int32_t
-dpu_route(struct objects *objs, const dpu_comp_entry_t *entry)
-{
-    /* Already resolved (established request or any response → dst_pod filled by the
-     * client/server) → deliver direct, no re-routing (connection-level LB). */
-    if (entry->dst_pod_id != DMESH_POD_BLANK)
-        return entry->dst_pod_id;
-
-    return dpu_route_l4(objs, entry->dst_service, entry->route_group);
-}
-
 /* ====== Deferred Completion Queue Drain ====== */
-
-/*
- * Process a COMP_ENTRY_FORWARD entry: enqueue reverse DMA for in-place
- * forwarding. No TX_ACK on the success path — that fires from
- * process_rev_notify_entry once reverse DMA completes (the slot must stay held
- * in src's dma_buffer until DPA finishes reading it). Error paths do send
- * TX_ACK here, since reverse will not fire.
- *
- * Returns 1 if processed, 0 if should retry (TX desc ring full), -1 on error.
- */
-static int
-process_forward_entry(struct objects *objs, dpu_comp_entry_t *entry)
-{
-    struct dpu_conntrack *ct = objs->conntrack;
-
-    /* Original sender identity for the ERROR-path TX_ACK, captured BEFORE any
-     * rewrite. For a client request this is the client's real (pod,port); for a
-     * backend reply it is the backend's (pod,uP). The entry itself is never
-     * mutated (so a TX-ring-full retry re-runs cleanly). */
-    int32_t  ack_pod  = entry->src_pod_id;
-    uint16_t ack_port = entry->src_port;
-
-    /* The forward DMA landed in pods[entry->pod_idx]->dma_buffer at
-     * entry->buf_offset. That same offset is the source for reverse DMA. */
-    struct pod_state *fwd_buf_pod = NULL;
-    if (entry->pod_idx >= 0 && entry->pod_idx < objs->num_pods)
-        fwd_buf_pod = &objs->pods[entry->pod_idx];
-    if (!fwd_buf_pod || !pod_data_ready(fwd_buf_pod) || !fwd_buf_pod->dma_buffer ||
-        fwd_buf_pod->local_mmap_dpa_handle == 0) {
-        DOCA_LOG_ERR("comp_queue: invalid pod_idx=%d for seq=%u", entry->pod_idx, entry->seq);
-        send_or_defer_tx_ack(objs, find_pod_by_id(objs, ack_pod), ack_port, entry->seq);
-        return -1;
-    }
-
-    /* Rewritten tuple for the reverse desc (locals, not the entry). */
-    int32_t  resolved_dst_pod;
-    uint16_t out_src_port, out_dst_port;
-
-    if (entry->dst_pod_id == DMESH_POD_BLANK && entry->length == 0) {
-        /* ---- CLIENT FIN (0-length): fan-out teardown ----
-         * Under per-message LB this downstream may have opened upstreams to
-         * SEVERAL backends. Tear down EVERY one: scan the registered pods, find
-         * each upstream (client_pod, client_port, backend), send it a FIN (0-len
-         * reverse, best-effort) so that backend closes its server conn, and free
-         * the DPU table entry unconditionally (this is what stops the uP leak).
-         * Ack the client's FIN slot directly — the entry still carries the
-         * client's REAL port, so no uP translation is needed here. */
-        for (int i = 0; i < objs->num_pods; i++) {
-            int32_t b = objs->pods[i].pod_id;
-            uint16_t uP = dpu_upstream_find(objs->conntrack, entry->src_pod_id, entry->src_port, b);
-            if (uP == 0) continue;
-            struct pod_state *B = find_pod_by_id(objs, b);
-            if (B && pod_data_ready(B) && B->tx_rings[0]) {
-                int kr = B->k_rings > 0 ? B->k_rings : 1;
-                (void)dpu_enqueue_reverse_dma(fwd_buf_pod, B,
-                                              (int)((uint32_t)uP % (uint32_t)kr),
-                                              entry, b, entry->buf_offset, 0 /*FIN*/, uP, uP);
-            }
-            dpu_upstream_free(objs->conntrack, uP);
-        }
-        send_or_defer_tx_ack(objs, find_pod_by_id(objs, ack_pod), ack_port, entry->seq);
-        return 1;
-    }
-
-    if (entry->dst_pod_id == DMESH_POD_BLANK) {
-        /* ---- CLIENT REQUEST: resolve service -> backend, own an upstream ---- */
-        int32_t B = dpu_route(objs, entry);
-        if (B < 0) {
-            DOCA_LOG_ERR("forward: unresolved service=%d seq=%u", entry->dst_service, entry->seq);
-            send_or_defer_tx_ack(objs, find_pod_by_id(objs, ack_pod), ack_port, entry->seq);
-            return -1;
-        }
-        uint16_t uP = dpu_upstream_find(ct, entry->src_pod_id, entry->src_port, B);
-        if (uP == 0) uP = dpu_upstream_create(ct, entry->src_pod_id, entry->src_port, B);
-        if (uP == 0) {
-            DOCA_LOG_ERR("forward: upstream space full (client %d:%u -> pod %d)",
-                         entry->src_pod_id, entry->src_port, B);
-            send_or_defer_tx_ack(objs, find_pod_by_id(objs, ack_pod), ack_port, entry->seq);
-            return -1;
-        }
-        resolved_dst_pod = B;
-        out_src_port = uP;   /* backend sees the sender as (client_pod, uP) ... */
-        out_dst_port = uP;   /* ... and demuxes its server conn by dst_port=uP  */
-    } else {
-        /* ---- BACKEND REPLY: dst_pod concrete, dst_port == uP → map to client ---- */
-        struct dpu_upstream *u = (entry->dst_port >= DMESH_UPORT_BASE)
-                                     ? &ct->upstream[entry->dst_port] : NULL;
-        if (!u || !u->in_use) {
-            DOCA_LOG_ERR("reply: stale upstream uP=%u (pod %d) seq=%u",
-                         entry->dst_port, entry->dst_pod_id, entry->seq);
-            /* backend's data was read out → its slot is free; still ack it */
-            send_or_defer_tx_ack(objs, find_pod_by_id(objs, ack_pod), ack_port, entry->seq);
-            return -1;
-        }
-        resolved_dst_pod = u->client_pod;
-        out_src_port = entry->src_port;   /* backend's (pod,uP) — client ignores src */
-        out_dst_port = u->client_port;    /* client demuxes to its real conn */
-    }
-
-    struct pod_state *target_pod = find_pod_by_id(objs, resolved_dst_pod);
-    if (!target_pod || !pod_data_ready(target_pod) || !target_pod->tx_rings[0]) {
-        DOCA_LOG_ERR("forward: dst pod %d not ready seq=%u", resolved_dst_pod, entry->seq);
-        send_or_defer_tx_ack(objs, find_pod_by_id(objs, ack_pod), ack_port, entry->seq);
-        return -1;
-    }
-
-    /* conn-sharding (reverse): shard by the DESTINATION conn's (rewritten) port so
-     * a conn's inbound stays FIFO on ONE EU. Single ARM writer → no lock. */
-    int kr = target_pod->k_rings > 0 ? target_pod->k_rings : 1;
-    int ring_k = (int)((uint32_t)out_dst_port % (uint32_t)kr);
-
-    doca_error_t fwd_result = dpu_enqueue_reverse_dma(
-        fwd_buf_pod, target_pod, ring_k, entry, resolved_dst_pod,
-        entry->buf_offset, entry->length, out_src_port, out_dst_port);
-
-    if (fwd_result == DOCA_ERROR_AGAIN)
-        return 0;  /* TX descriptor ring full — preserve entry, retry next iter */
-    if (fwd_result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Forward failed seq=%u dst_pod=%d: %s",
-                     entry->seq, resolved_dst_pod, doca_error_get_descr(fwd_result));
-        send_or_defer_tx_ack(objs, find_pod_by_id(objs, ack_pod), ack_port, entry->seq);
-        return -1;
-    }
-
-    /* Success: TX_ACK fires from process_rev_notify_entry on reverse completion. */
-    return 1;
-}
 
 /*
  * Drain the deferred TX_ACK queue. Called every main-loop iteration after
@@ -448,9 +219,9 @@ drain_deferred_tx_acks(struct objects *objs)
             kept++;
             continue;
         }
-        /* Hard error — log and drop (the slot stays in the host's custody
-         * list until that conn closes; only these once-in-a-blue-moon hard
-         * failures ever leak one). */
+        /* Hard error — log and drop (the host's TX byte-ring bytes stay
+         * unreclaimed until that conn closes; only these once-in-a-blue-moon
+         * hard failures ever leak one). */
         DOCA_LOG_WARN("deferred TX_ACK fatal for port=%u seq=%u: %s",
                       d->port, d->seq, doca_error_get_descr(rc));
         sent++;  /* count as "removed from queue" */
@@ -460,60 +231,12 @@ drain_deferred_tx_acks(struct objects *objs)
 }
 
 /*
- * Process a COMP_ENTRY_REV_NOTIFY entry: reverse DMA completed (DPU→CPU).
- * Send DMA_COMPLETION to the destination host pod, then TX_ACK to the src pod.
- * The src's dma_buffer slot is held through the whole RTT — releasing it earlier
- * would let the host overwrite it before DPA's reverse DMA finished reading.
- *
- * If DMA_COMPLETION returns AGAIN, retry the whole entry next iter (return 0
- * leaves the comp_queue entry in place). TX_ACK has its own deferred queue for
- * the partial case where DMA_COMPLETION succeeded but TX_ACK hits EAGAIN.
- *
- * Returns 1 if processed, 0 if should retry, -1 on error.
- */
-static int
-process_rev_notify_entry(struct objects *objs, dpu_comp_entry_t *entry)
-{
-    struct dpu_conntrack *ct = objs->conntrack;
-    int32_t target_id = entry->dst_pod_id;
-    struct pod_state *target_pod = find_pod_by_id(objs, target_id);
-
-    /* TX_ACK target = the ORIGINAL sender. On the client-request (forward-to-backend)
-     * leg the reverse carries dst_port = uP (a DPU upstream id) and src_port was
-     * rewritten to uP; translate uP -> the client's real (pod,port) so the CLIENT frees
-     * its slot. On the reply leg (dst_port = a real client port) no translation — the
-     * sender is the backend at (pod, uP = its real local port). Upstream TEARDOWN
-     * happens in the client-FIN fan-out (process_forward_entry), not here. */
-    int32_t  ack_pod  = entry->src_pod_id;
-    uint16_t ack_port = entry->src_port;
-    if (entry->dst_port >= DMESH_UPORT_BASE && ct->upstream[entry->dst_port].in_use) {
-        struct dpu_upstream *u = &ct->upstream[entry->dst_port];
-        ack_pod  = u->client_pod;
-        ack_port = u->client_port;
-    }
-
-    if (!target_pod || !target_pod->connection) {
-        DOCA_LOG_ERR("REV_NOTIFY: target pod %d not found or no connection", target_id);
-        send_or_defer_tx_ack(objs, find_pod_by_id(objs, ack_pod), ack_port, entry->seq);
-        return -1;
-    }
-
-    /* Deliver REV_DONE to the destination host, BATCHED so the host PE reaps 1
-     * comch msg per K responses. */
-    if (batch_or_send_rev_done(objs, target_pod, entry) == 0)
-        return 0;  /* batch full + send pool busy → retain entry (backpressure) */
-
-    /* Release the original sender's TX slot (translated for the client leg). */
-    batch_or_send_tx_ack(objs, find_pod_by_id(objs, ack_pod), ack_port, entry->seq);
-    return 1;
-}
-
-/*
  * Process up to max_batch entries from the deferred completion queue.
  * Called from the main loop to avoid blocking inside consumer callbacks.
- * All comch sends (TX_ACK, REV_DMA notify) happen here — never inside
- * consumer callbacks, which would risk re-entrant doca_pe_progress.
- * Returns number of entries processed.
+ * Every forward completion (request AND reply) feeds the per-conn input window
+ * → proxy_route (mock) → per-dst SG-DMA egress engine (dpu_proxy.c). All comch
+ * sends happen here — never inside consumer callbacks, which would risk
+ * re-entrant doca_pe_progress. Returns number of entries processed.
  */
 static int
 process_completion_queue(struct objects *objs, int max_batch)
@@ -528,27 +251,11 @@ process_completion_queue(struct objects *objs, int max_batch)
         if (!entry)
             break;
 
-        int result;
-        if (entry->entry_type == COMP_ENTRY_REV_NOTIFY) {
-            /* Legacy DPA reverse-DMA completion. In proxy mode egress runs
-             * through the ARM SG-DMA engine, so no REV_NOTIFY is ever produced;
-             * the branch stays as a safety net. */
-            result = process_rev_notify_entry(objs, entry);
-            if (result == 0)
-                break;  /* comch send busy, retry next iteration */
-        } else if (objs->proxy) {
-            /* Proxy mode: request AND reply forward completions feed the per-conn
-             * input window → proxy_route (mock) → per-dst SG-DMA egress engine.
-             * Returns 1 consumed, 0 retry (alloc/pool pressure — retain entry),
-             * -1 dropped (sender already TX_ACKed). */
-            result = px_ingest_forward(objs, entry);
-            if (result == 0)
-                break;  /* engine backpressure, retry next iteration */
-        } else {
-            result = process_forward_entry(objs, entry);
-            if (result == 0)
-                break;  /* TX buffer full, retry next iteration */
-        }
+        /* Returns 1 consumed, 0 retry (alloc/pool pressure — retain entry),
+         * -1 dropped (sender already TX_ACKed). */
+        int result = px_ingest_forward(objs, entry);
+        if (result == 0)
+            break;  /* engine backpressure, retry next iteration */
 
         comp_queue_dequeue(&objs->comp_queue);
         processed++;
@@ -580,15 +287,14 @@ dpu_drain_iteration(struct objects *objs)
      * tasks recycled. */
     int proc = process_completion_queue(objs, 128);
 
-    /* Proxy egress: submit queued per-dst SG-DMA batches + emit completed
-     * batches' REV_DONE entries and custody TX_ACKs. No-op (returns 0) when the
-     * engine is off (objs->proxy == NULL). */
+    /* SG-DMA egress: submit queued per-dst batches + emit completed batches'
+     * REV_DONE entries and custody TX_ACKs (the unified DPU→host reverse path). */
     int px_progressed = px_drain(objs);
 
     /* Idle (no completions this pass) → flush partial TX_ACK + REV_DONE batches so
      * low-load latency is not held by coalescing. This is the only batch-flush
-     * site (the periodic keepalive no longer flushes here). In proxy mode the SG
-     * engine emits into these same accumulators, so this flushes its tail too. */
+     * site (the periodic keepalive no longer flushes here). The SG engine emits
+     * into these same accumulators, so this flushes its tail too. */
     if (proc == 0)
         for (int i = 0; i < objs->num_pods; i++) {
             flush_txack_batch(objs, &objs->pods[i]);
@@ -701,7 +407,23 @@ run_dpu_worker(struct objects *objs)
      * (else it rejects a pod's 2nd forward ring and that pod never reaches
      * dma_ready). init_dpa_objects re-checks `<= 0`, so it reuses these. */
     objs->num_dpa_threads = 4;
+    /* K = forward rings per pod (EU-sharding). Deploy option DPUMESH_RINGS_PER_POD
+     * (default 2); clamped to [1, min(N, MAX_EU_PER_POD)]. The HOST reads the SAME
+     * env (dpumesh_doca.c) and MUST land on the same K — forward rings pair 1:1, a
+     * mismatch makes a pod never reach dma_ready. A conn pins to ONE ring
+     * (src_port % K); different conns spread across the K rings. K≤N (=4). */
     objs->k_rings = DPUMESH_RINGS_PER_POD_DEFAULT;   /* = 2 */
+    { const char *ke = getenv("DPUMESH_RINGS_PER_POD");
+      if (ke && *ke) {
+          int v = atoi(ke);
+          if (v >= 1) {
+              if (v > objs->num_dpa_threads) v = objs->num_dpa_threads;
+              if (v > MAX_EU_PER_POD) v = MAX_EU_PER_POD;
+              objs->k_rings = v;
+          }
+      } }
+    DOCA_LOG_WARN("K forward rings/pod = %d (DPUMESH_RINGS_PER_POD; N=%d)",
+                  objs->k_rings, objs->num_dpa_threads);
 
     /* 1. comch control path server (waits for first connection) */
     result = init_comch_ctrl_path_server("DPUMesh", objs, true);
@@ -770,20 +492,14 @@ run_dpu_worker(struct objects *objs)
                                  pod->pod_id, doca_error_get_descr(result));
                     continue;
                 }
-                if (pod->host_rx_mmap) {   /* host RX already exported → wire reverse ring */
-                    result = update_rev_ring_host_rx(objs, pod);
-                    if (result != DOCA_SUCCESS)
-                        DOCA_LOG_WARN("deferred update_rev_ring_host_rx failed for pod %d: %s",
-                                      pod->pod_id, doca_error_get_descr(result));
-                }
             }
         }
     }
 
-    /* 7. L7-proxy L4 engine (dpu_proxy.c). Requires objs->dev (opened in
-     *    dpu_main before run_dpu_worker) + objs->pe (step 1) live. env
-     *    DPUMESH_PROXY unset → objs->proxy stays NULL and every path above is
-     *    bit-identical (the legacy per-slot forward/reverse machinery). */
+    /* 7. SG-DMA egress engine (dpu_proxy.c) — the UNIFIED DPU→host reverse path,
+     *    ALWAYS on. Requires objs->dev (opened in dpu_main before run_dpu_worker)
+     *    + objs->pe (step 1) live. DPUMESH_PROXY only selects the request parser
+     *    (passthru default = metadata L4 route; frame; L7). */
     result = px_init(objs);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to init L7-proxy L4 engine: %s",

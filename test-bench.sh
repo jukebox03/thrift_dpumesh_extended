@@ -304,11 +304,13 @@ start_dpu() {
     local proxy="${DPUMESH_PROXY:-}"
     local frame_svc="${DPUMESH_PROXY_FRAME_SVC:-}"
     local l7_svc="${DPUMESH_PROXY_L7_SVC:-}"
-    step "=== Starting dpumesh_dpu (proxy='$proxy' frame_svc='$frame_svc' l7_svc='$l7_svc') ==="
+    local arm_threads="${DPUMESH_ARM_EGRESS_THREADS:-}"   # ARM SG-DMA egress workers (1=inline default)
+    local rings="${DPUMESH_RINGS_PER_POD:-}"              # K forward rings/pod (must match host pods; default 2)
+    step "=== Starting dpumesh_dpu (proxy='$proxy' frame_svc='$frame_svc' l7_svc='$l7_svc' arm_egress_threads='$arm_threads' rings_per_pod='$rings') ==="
     stop_dpu
     ssh "$DPU_HOST" "cat > /tmp/start_dpu_bench.sh << 'LAUNCHER'
 #!/bin/bash
-screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_PROXY=$proxy DPUMESH_PROXY_FRAME_SVC=$frame_svc DPUMESH_PROXY_L7_SVC=$l7_svc ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
+screen -dmS dpumesh-bench bash -c \"cd /home/jukebox/$DPU_BUILD && DPUMESH_PROXY=$proxy DPUMESH_PROXY_FRAME_SVC=$frame_svc DPUMESH_PROXY_L7_SVC=$l7_svc DPUMESH_ARM_EGRESS_THREADS=$arm_threads DPUMESH_RINGS_PER_POD=$rings ./dpumesh_dpu $DPU_PCI -l $log_level > $DPU_LOG 2>&1\"
 sleep 2
 pgrep -f 'dpumesh_dpu.*03:00' || echo NO_PID
 LAUNCHER
@@ -494,6 +496,7 @@ spec:
         ports: [{ containerPort: $CTRL_PORT }]
         env:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
+        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
         - { name: BENCH_WORKER_ID, value: "10" }
         - { name: BENCH_DST_POD_ID, value: "11" }
         - { name: ASYNC_THREADS, value: "${ASYNC_THREADS:-4}" }
@@ -535,6 +538,7 @@ spec:
         imagePullPolicy: Never
         env:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
+        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
         - { name: BENCH_WORKER_ID, value: "11" }
         - { name: ECHO_THREADS, value: "${ECHO_THREADS:-3}" }
         securityContext: { privileged: true }
@@ -565,6 +569,7 @@ spec:
         imagePullPolicy: Never
         env:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
+        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
         - { name: BENCH_WORKER_ID, value: "13" }
         - { name: ECHO_THREADS, value: "${ECHO_THREADS:-3}" }
         securityContext: { privileged: true }
@@ -592,6 +597,7 @@ spec:
         imagePullPolicy: Never
         env:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
+        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
         - { name: BENCH_WORKER_ID, value: "14" }
         - { name: ECHO_THREADS, value: "${ECHO_THREADS:-3}" }
         securityContext: { privileged: true }
@@ -623,6 +629,7 @@ spec:
         ports: [{ containerPort: $CTRL_PORT }]
         env:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
+        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
         - { name: BENCH_WORKER_ID, value: "12" }
         - { name: DPUMESH_ARENA_SLOTS, value: "${DPUMESH_ARENA_SLOTS:-512}" }  # zero-copy arena (dmesh_alloc)
         securityContext: { privileged: true }
@@ -664,6 +671,7 @@ spec:
         ports: [{ containerPort: $CTRL_PORT }]
         env:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
+        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
         - { name: BENCH_WORKER_ID, value: "16" }
         securityContext: { privileged: true }
         volumeMounts:
@@ -703,6 +711,7 @@ spec:
         ports: [{ containerPort: $CTRL_PORT }]
         env:
         - { name: DPUMESH_PCI_ADDR, value: "$HOST_PCI" }
+        - { name: DPUMESH_RINGS_PER_POD, value: "${DPUMESH_RINGS_PER_POD:-2}" }
         - { name: PRELOAD_SVC, value: "15" }
         - { name: ECHO_PORT, value: "9095" }
         - { name: DMESH_PRELOAD_DEBUG, value: "${DMESH_PRELOAD_DEBUG:-0}" }

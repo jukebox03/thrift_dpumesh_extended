@@ -129,11 +129,6 @@ static inline int inbox_pop(struct dmesh_port_slot *psl, sw_descriptor_t *out) {
     atomic_store_explicit(&psl->in_head, h + 1, memory_order_release);
     return 1;
 }
-/* (port,seq) → 32-bit TX-custody key (matches a BATCH_FWD_ACK to its slot). */
-static inline uint32_t dmesh_key(uint16_t port, uint16_t seq) {
-    return ((uint32_t)port << 16) | (uint32_t)seq;
-}
-
 /* One cell of the lock-free bounded SPMC RX ring (Vyukov's bounded-MPMC cell/seq
  * design, producer side specialized to a single producer). `seq` carries the
  * turn-stamp: the producer may write cell i only when seq==enq_pos; a consumer
@@ -559,8 +554,8 @@ static void rx_data_hook(void *hook_ctx, const uint8_t *data, uint32_t len) {
 
 
     if (mtype == DMESH_MSG_BATCH_FWD_ACK) {
-        /* Batched TX_ACK: free the TX slot of each req_id (owner-guarded).
-         * One message → K frees. */
+        /* Batched TX_ACK: reclaim each (port,seq)'s bytes from the conn's TX
+         * byte-ring (FIFO tail-reclaim). One message → K frees. */
         if (len < 4) {
             DOCA_LOG_ERR("BATCH_TX_ACK: too short (len=%u)", len);
             return;
@@ -616,8 +611,14 @@ static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config, int 
     ctx->slot_size = (config && config->slot_size > 0) ? config->slot_size
                                                        : DPUMESH_SLOT_SIZE_DEFAULT;
 
-    /* K = forward rings per pod (EU-sharding), baked to 2 — must match the DPU. */
+    /* K = forward rings per pod (EU-sharding). Deploy option DPUMESH_RINGS_PER_POD
+     * (default 2) — MUST match the DPU's K (forward rings pair 1:1; a mismatch stalls
+     * dma_ready). A conn pins to ONE ring (src_port % K); conns spread across K.
+     * K ≤ N (=4 on the DPU); values > MAX_EU_PER_POD are clamped. */
     ctx->k_rings = DPUMESH_RINGS_PER_POD_DEFAULT;
+    { const char *ke = getenv("DPUMESH_RINGS_PER_POD");
+      if (ke && *ke) { int v = atoi(ke);
+                       if (v >= 1 && v <= MAX_EU_PER_POD) ctx->k_rings = v; } }
 
     /* Per-conn TX byte-ring pool: partition the num_slots*slot_size TX buffer into
      * DPUMESH_CONN_POOL regions (default 256 → conn_rslots = num_slots/256 = 16 slots
@@ -723,7 +724,7 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
 
     result = export_mmap_to_remote(&ctx->doca_objs, ctx->doca_objs.local_mmap,
                                    ctx->doca_objs.dma_buffer, buf_size,
-                                   DMA_BUFFER, HOST_TO_DPU);
+                                   DMA_BUFFER);
     if (result != DOCA_SUCCESS) return result;
 
     result = doca_mmap_dev_get_dpa_handle(ctx->doca_objs.local_mmap, ctx->doca_objs.dev, &ctx->dpa_mmap_handle);
@@ -746,7 +747,7 @@ static doca_error_t init_datapath(dpumesh_ctx_t *ctx) {
     /* Export Host RX buffer to DPU so DPA can get mmap handle for reverse DMA */
     result = export_mmap_to_remote(&ctx->doca_objs, ctx->rx_dma_mmap,
                                    ctx->rx_dma_buffer, ctx->rx_dma_buf_size,
-                                   DMA_HOST_RX_BUFFER, HOST_TO_DPU);
+                                   DMA_HOST_RX_BUFFER);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_WARN("Failed to export Host RX buffer to DPU: %s", doca_err_str(result));
     }
@@ -1089,9 +1090,9 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
      * pod's traffic spreads over K EUs. Each ring has its own lock (single-
      * producer per ring). K=1 → always ring 0 (legacy single-ring path).
      *
-     * Flow control: end-to-end via slot-based admission only. dpumesh_tx_alloc
-     * has already gated this call on free-list slot availability, and num_slots ×
-     * slot_size = DPU_BUFFER_SIZE, so total in-flight bytes inside DPU's
+     * Flow control: end-to-end via byte-ring admission only. dpumesh_tx_reserve
+     * has already back-pressured the writer on the conn's own un-ACKed bytes, and
+     * num_slots × slot_size = DPU_BUFFER_SIZE, so total in-flight bytes inside DPU's
      * buffer can never exceed buffer size. DPU/DPA do no FC of their own. */
     /* conn-sharding: a connection's messages ALL use one ring (hashed by the
      * sender's local port), so they stay FIFO on one EU → per-conn send order is
@@ -1131,9 +1132,10 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc) {
         }
     }
 
-    /* TX slot lifetime: the façade calls dpumesh_tx_track right after this enqueue
-     * to park the slot in the conn's custody list; the DPU's BATCH_FWD_ACK frees it
-     * (rx_data_hook). Both legs (client request / server reply) are identical —
+    /* TX byte lifetime: the façade calls dpumesh_tx_sent right after this enqueue
+     * to record the shipped descriptor (seq -> end cursor) in the conn's send-unit
+     * FIFO; the DPU's BATCH_FWD_ACK advances the conn's free cursor (rx_data_hook ->
+     * tx_reclaim_ack). Both legs (client request / server reply) are identical —
      * request-vs-response is not a wire flag, just the oriented tuple. */
 
     dma->mmap = ctx->dpa_mmap_handle;

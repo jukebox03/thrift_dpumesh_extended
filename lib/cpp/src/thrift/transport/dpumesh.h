@@ -20,8 +20,9 @@ extern "C" {
 
 /* ====== Default constants ====== */
 #define DPUMESH_SLOT_SIZE_DEFAULT       8192            /* 8KB */
-/* Slot pool size (host TX + host RX). num_slots × slot_size MUST equal
- * DPU_BUFFER_SIZE so slot-based admission bounds in-flight bytes inside DPU. */
+/* Slot pool size (host TX byte-ring + host RX). num_slots × slot_size MUST equal
+ * DPU_BUFFER_SIZE so in-flight bytes inside the DPU staging stay bounded (TX
+ * byte-ring occupancy; RX slot admission). */
 #define DPUMESH_NUM_SLOTS_DEFAULT       4096
 /* The host→DPU descriptor ring depth is NOT configurable: it is the wire-ABI
  * constant DMA_RING_SIZE (doca/dpumesh_common.h), which the host and the DPA
